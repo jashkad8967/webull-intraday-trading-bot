@@ -262,6 +262,7 @@ class AutoTrader:
     ) -> None:
         if not self.market_agent:
             return
+        research_limit = min(self.config.agent_max_symbols, 5)
         held = [
             {
                 "symbol": item.get("symbol"),
@@ -272,9 +273,10 @@ class AutoTrader:
             }
             for item in positions
             if Decimal(str(item.get("quantity", "0"))) != 0
-        ]
+        ][:research_limit]
+        candidate_limit = max(0, research_limit - len(held))
         candidates = list(self.agent_candidates.values())[
-            : self.config.agent_max_symbols
+            :candidate_limit
         ]
         self.agent_candidates.clear()
         if not force and not candidates and not held:
