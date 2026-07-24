@@ -1,4 +1,5 @@
 import logging
+import math
 import sys
 import time
 from datetime import datetime
@@ -55,6 +56,7 @@ class AutoTrader:
         self.invalid_stock_symbols: set[str] = set()
         self.option_contracts: list[dict] = []
         self.stock_prices: dict[str, Decimal] = {}
+        self.stock_activity: dict[str, float] = {}
         self.pending_stock_exits: set[str] = set()
         self.pending_option_exits: set[str] = set()
         self.stock_cursor = 0
@@ -120,6 +122,7 @@ class AutoTrader:
         self.option_contracts = self.api.resolve_options()
         self.discover_all_options = "ALL" in self.config.option_roots()
         self.stock_prices.clear()
+        self.stock_activity.clear()
         self.stock_cursor = 0
         self.option_cursor = 0
         self.option_discovery_cursor = 0
@@ -144,6 +147,72 @@ class AutoTrader:
         size = min(batch_size, len(items))
         batch = [items[(cursor + offset) % len(items)] for offset in range(size)]
         return batch, (cursor + size) % len(items)
+
+    @staticmethod
+    def quote_number(quote: dict, *fields: str) -> float:
+        for field in fields:
+            try:
+                value = float(quote.get(field, ""))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                return value
+        return 0.0
+
+    def update_stock_activity(self, quote: dict) -> None:
+        symbol = str(quote.get("symbol", "")).upper()
+        if not symbol:
+            return
+        regular_volume = self.quote_number(quote, "volume")
+        extended_volume = self.quote_number(quote, "extend_hour_volume")
+        volume = max(0.0, regular_volume + extended_volume)
+        movement = max(
+            abs(self.quote_number(quote, "change_ratio")),
+            abs(self.quote_number(quote, "extend_hour_change_ratio")),
+        )
+        price = self.quote_number(
+            quote,
+            "extend_hour_last_price",
+            "price",
+        )
+        high = self.quote_number(quote, "extend_hour_high", "high")
+        low = self.quote_number(quote, "extend_hour_low", "low")
+        range_ratio = (high - low) / price if price > 0 and high >= low else 0.0
+        self.stock_activity[symbol] = (
+            math.log10(1.0 + volume)
+            + 50.0 * movement
+            + 25.0 * max(0.0, range_ratio)
+        )
+
+    def prioritized_stock_batch(self, positions: list[dict]) -> list[str]:
+        if not self.stock_symbols:
+            return []
+        size = min(self.config.stock_batch_size, len(self.stock_symbols))
+        available = set(self.stock_symbols)
+        held = [
+            str(item.get("symbol", "")).upper()
+            for item in positions
+            if item.get("instrument_type") == "EQUITY"
+            and Decimal(str(item.get("quantity", "0"))) != 0
+            and str(item.get("symbol", "")).upper() in available
+        ]
+        priority_count = int(size * self.config.stock_priority_fraction)
+        ranked = sorted(
+            (
+                symbol
+                for symbol in self.stock_activity
+                if symbol in available
+            ),
+            key=lambda symbol: self.stock_activity[symbol],
+            reverse=True,
+        )
+        exploration, self.stock_cursor = self.rotating_batch(
+            self.stock_symbols,
+            self.stock_cursor,
+            size,
+        )
+        selected = list(dict.fromkeys(held + ranked[:priority_count] + exploration))
+        return selected[:size]
 
     def discover_option_contracts(self) -> None:
         if (
@@ -412,11 +481,7 @@ class AutoTrader:
         buying_power: Decimal,
     ) -> Decimal:
         open_count = self.open_position_count(positions)
-        batch, self.stock_cursor = self.rotating_batch(
-            self.stock_symbols,
-            self.stock_cursor,
-            self.config.stock_batch_size,
-        )
+        batch = self.prioritized_stock_batch(positions)
         quotes: list[dict] = []
         invalid: set[str] = set()
         grouped: dict[str, list[str]] = {"US_STOCK": [], "US_ETF": []}
@@ -460,6 +525,8 @@ class AutoTrader:
         quote_by_symbol = {
             str(quote.get("symbol", "")).upper(): quote for quote in quotes
         }
+        for quote in quotes:
+            self.update_stock_activity(quote)
         for symbol in batch:
             try:
                 quote = quote_by_symbol.get(symbol)
@@ -492,6 +559,24 @@ class AutoTrader:
                         "symbol": symbol,
                         "type": self.stock_categories.get(symbol, "US_STOCK"),
                         "price": str(price),
+                        "volume": str(
+                            int(
+                                self.quote_number(quote, "volume")
+                                + self.quote_number(quote, "extend_hour_volume")
+                            )
+                        ),
+                        "change_ratio": str(
+                            max(
+                                abs(self.quote_number(quote, "change_ratio")),
+                                abs(
+                                    self.quote_number(
+                                        quote,
+                                        "extend_hour_change_ratio",
+                                    )
+                                ),
+                            )
+                        ),
+                        "activity_score": f"{self.stock_activity.get(symbol, 0):.3f}",
                         "technical_signal": "BUY",
                     }
                 if quantity == 0:

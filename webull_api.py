@@ -144,7 +144,7 @@ class WebullAPI:
                 lambda: self.data.market_data.get_snapshot(
                     symbols,
                     category,
-                    False,
+                    True,
                     False,
                 ),
                 "market",
@@ -550,7 +550,14 @@ class WebullAPI:
 
     @staticmethod
     def quote_price(quote: dict) -> Decimal:
-        for field in ("price", "ask", "bid"):
+        regular_time = int(quote.get("last_trade_time") or 0)
+        extended_time = int(quote.get("extend_hour_last_trade_time") or 0)
+        fields = (
+            ("extend_hour_last_price", "price", "ask", "bid")
+            if extended_time >= regular_time and extended_time > 0
+            else ("price", "ask", "bid", "extend_hour_last_price")
+        )
+        for field in fields:
             value = quote.get(field)
             if value in (None, ""):
                 continue

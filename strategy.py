@@ -85,9 +85,9 @@ class TradingStrategy:
         if trend != "BUY":
             return Decision("HOLD", "EMA entry not ready")
 
-        if agent_required:
-            if not agent_values:
-                return Decision("RESEARCH", "agent values pending")
+        if agent_required and not agent_values:
+            return Decision("RESEARCH", "agent values pending")
+        if agent_values:
             score = self.agent_entry_score(agent_values)
             if (
                 agent_values.get("action") != "BUY"

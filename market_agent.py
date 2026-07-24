@@ -2,6 +2,8 @@ import json
 import queue
 import threading
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from strategy import TradingStrategy
 
@@ -26,15 +28,45 @@ class MarketResearchAgent:
         self._assessments: dict[str, dict] = {}
         self._market_regime: dict | None = None
         self._last_run = 0.0
+        self._last_submitted = 0.0
+        self._request_date = None
+        self._requests_today = 0
+        self._timezone = ZoneInfo(config.trading_timezone)
+        self._limit_logged_date = None
         threading.Thread(target=self._worker, daemon=True).start()
+        self.log.info(
+            "AGENT  | enabled | model=%s | interval=%ss | budget=%s/day | symbols=%s",
+            config.groq_model,
+            config.agent_research_seconds,
+            config.agent_daily_request_limit,
+            min(config.agent_max_symbols, 5),
+        )
 
     def submit(self, state: dict, force: bool = False) -> None:
+        today = datetime.now(self._timezone).date()
+        if self._request_date != today:
+            self._request_date = today
+            self._requests_today = 0
+            self._limit_logged_date = None
+        if self._requests_today >= self.config.agent_daily_request_limit:
+            if self._limit_logged_date != today:
+                self.log.warning(
+                    "AGENT  | daily request budget reached | used=%s/%s",
+                    self._requests_today,
+                    self.config.agent_daily_request_limit,
+                )
+                self._limit_logged_date = today
+            return
+        elapsed = time.monotonic() - self._last_submitted
         if (
-            not force
-            and time.monotonic() - self._last_run
-            < self.config.agent_research_seconds
+            elapsed < self.config.agent_research_seconds
+            and not (
+                force
+                and elapsed >= 3
+            )
         ):
             return
+        self._last_submitted = time.monotonic()
         try:
             self._work.put_nowait(state)
         except queue.Full:
@@ -160,6 +192,9 @@ class MarketResearchAgent:
         }
 
     def _research(self, state: dict) -> None:
+        if self._requests_today >= self.config.agent_daily_request_limit:
+            return
+        self._requests_today += 1
         expected_symbols = {
             str(item.get("symbol", "")).upper()
             for group in ("positions", "entry_candidates")
@@ -182,9 +217,11 @@ class MarketResearchAgent:
             + json.dumps(state, separators=(",", ":"), default=str)
         )
         self.log.info(
-            "AGENT  | requesting research | symbols=%s | bytes=%s",
+            "AGENT  | requesting research | symbols=%s | bytes=%s | daily=%s/%s",
             len(expected_symbols),
             len(prompt.encode("utf-8")),
+            self._requests_today,
+            self.config.agent_daily_request_limit,
         )
         response = self.client.chat.completions.create(
             model=self.config.groq_model,

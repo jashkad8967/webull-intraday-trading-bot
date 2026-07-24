@@ -114,12 +114,19 @@ The default includes every tradable US stock and ETF:
 STOCK_SYMBOLS=ALL
 MAX_SYMBOLS=0
 STOCK_BATCH_SIZE=100
+STOCK_PRIORITY_FRACTION=0.60
 ```
 
 The bot downloads the current lists directly from Webull at the start of each
 trading day and keeps each instrument's required `US_STOCK` or `US_ETF`
 category. A static ticker list is intentionally not embedded because listings
 and trading status change. `MAX_SYMBOLS=0` means no cap.
+
+Each batch always includes held stocks, then dedicates 60% of its capacity to
+the highest observed activity scores and the rest to rotating discovery. The
+score combines current volume, absolute price change, and intraday or
+extended-hours range. This repeatedly scans liquid, fast-moving stocks without
+starving the rest of the universe.
 
 If Webull's instrument directory contains a stale or delisted symbol, the bot
 uses the rejected-symbol list returned by Webull, skips those symbols for the
@@ -265,9 +272,11 @@ Create a free Groq developer key at
 AGENT_ENABLED=true
 GROQ_API_KEY=your_groq_api_key
 GROQ_MODEL=groq/compound-mini
-AGENT_RESEARCH_SECONDS=60
-AGENT_MAX_SYMBOLS=5
-AGENT_REQUIRED_FOR_ENTRY=true
+AGENT_RESEARCH_SECONDS=235
+AGENT_DAILY_REQUEST_LIMIT=245
+AGENT_MAX_SYMBOLS=3
+AGENT_TIMEOUT_SECONDS=60
+AGENT_REQUIRED_FOR_ENTRY=false
 AGENT_MIN_CONFIDENCE=0.65
 AGENT_MIN_ENTRY_SCORE=0.15
 AGENT_MAX_DOWNSIDE_RISK=0.55
@@ -280,11 +289,14 @@ LOSS_REEVALUATION_SECONDS=120
 ```
 
 `groq/compound-mini` is the low-latency Compound system and can perform one
-built-in web search per research request. Groq free-tier requests are subject
-to the limits shown for your account. With
-`AGENT_REQUIRED_FOR_ENTRY=true`, a technical entry waits for a fresh agent
-`BUY` assessment at or above the confidence threshold. Profit exits and daily
-closeout never wait for the agent.
+built-in web search per research request. The free tier currently allows 250
+Compound Mini requests per day. The bot budgets 245, spaces routine calls about
+235 seconds apart across the 4:00 AM–8:00 PM stock session, and reserves five
+requests. With `AGENT_REQUIRED_FOR_ENTRY=false`, the EMA strategy continues
+making decisions between research calls. A fresh agent assessment still blocks
+an entry when it is not `BUY`, has insufficient confidence or score, or exceeds
+the configured risk limits. Profit exits and daily closeout never wait for the
+agent.
 
 Every research response contains the same global values:
 `market_action`, `market_confidence`, `market_direction`, and
@@ -493,12 +505,13 @@ WEBULL_LOG_LEVEL=WARNING
 
 STOCK_SYMBOLS=ALL
 OPTION_CONTRACTS=
-OPTION_UNDERLYINGS=ALL
+OPTION_UNDERLYINGS=
 OPTION_TYPE=BOTH
 OPTION_MIN_DTE=7
 OPTION_MAX_DTE=45
 MAX_SYMBOLS=0
 STOCK_BATCH_SIZE=100
+STOCK_PRIORITY_FRACTION=0.60
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
 OPTION_DISCOVERY_SECONDS=15
@@ -525,10 +538,11 @@ ORDER_REQUESTS_PER_MINUTE=480
 AGENT_ENABLED=false
 GROQ_API_KEY=
 GROQ_MODEL=groq/compound-mini
-AGENT_RESEARCH_SECONDS=60
-AGENT_MAX_SYMBOLS=5
-AGENT_TIMEOUT_SECONDS=45
-AGENT_REQUIRED_FOR_ENTRY=true
+AGENT_RESEARCH_SECONDS=235
+AGENT_DAILY_REQUEST_LIMIT=245
+AGENT_MAX_SYMBOLS=3
+AGENT_TIMEOUT_SECONDS=60
+AGENT_REQUIRED_FOR_ENTRY=false
 AGENT_MIN_CONFIDENCE=0.65
 AGENT_MIN_ENTRY_SCORE=0.15
 AGENT_MAX_DOWNSIDE_RISK=0.55

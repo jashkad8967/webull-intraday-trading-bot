@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     option_max_dte: int = Field(default=45, ge=0, le=730)
     max_symbols: int = Field(default=0, ge=0, le=50000)
     stock_batch_size: int = Field(default=100, ge=1, le=100)
+    stock_priority_fraction: float = Field(default=0.60, ge=0, le=0.90)
     option_batch_size: int = Field(default=20, ge=1, le=20)
     option_discovery_per_cycle: int = Field(default=1, ge=1, le=10)
     option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)
@@ -59,10 +60,11 @@ class Settings(BaseSettings):
     agent_enabled: bool = False
     groq_api_key: str = ""
     groq_model: str = "groq/compound-mini"
-    agent_research_seconds: int = Field(default=60, ge=15, le=3600)
-    agent_max_symbols: int = Field(default=5, ge=1, le=50)
-    agent_timeout_seconds: int = Field(default=45, ge=5, le=180)
-    agent_required_for_entry: bool = True
+    agent_research_seconds: int = Field(default=235, ge=15, le=3600)
+    agent_daily_request_limit: int = Field(default=245, ge=1, le=250)
+    agent_max_symbols: int = Field(default=3, ge=1, le=50)
+    agent_timeout_seconds: int = Field(default=60, ge=5, le=180)
+    agent_required_for_entry: bool = False
     agent_min_confidence: float = Field(default=0.65, ge=0, le=1)
     agent_min_entry_score: float = Field(default=0.15, ge=-1, le=1)
     agent_max_downside_risk: float = Field(default=0.55, ge=0, le=1)
