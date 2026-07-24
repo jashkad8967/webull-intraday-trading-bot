@@ -7,10 +7,10 @@ official Python SDK against the US production API. It can:
 - Trade exact OCC option contracts.
 - Progressively discover current ATM calls and puts for every optionable stock.
 - Scan every second, every few minutes, or up to once per hour.
-- Buy on EMA crossovers or an active uptrend, take configured penny-scale
-  profits, and re-enter while the uptrend remains active.
+- Buy on EMA crossovers or an active uptrend, target percentage-based profits,
+  enforce percentage stops, and re-enter while the uptrend remains active.
 - Stop opening positions at the configured end-of-day time.
-- Cancel working orders and repeatedly close account positions before 4:00 PM
+- Cancel working orders and repeatedly close stock positions before 8:00 PM
   New York time.
 
 Webull supports stock market orders. Webull options do not support market
@@ -19,7 +19,7 @@ orders, so option entries and exits use refreshed aggressive limit prices.
 ## Recreate the application from code
 
 Create one folder on the destination computer and copy the contents of these
-11 files into files with the same names:
+12 files into files with the same names:
 
 ```text
 .env.example
@@ -29,6 +29,7 @@ requirements.txt
 setup.ps1
 config.py
 strategy.py
+wash_sale.py
 market_agent.py
 webull_api.py
 connect.py
@@ -114,7 +115,9 @@ The default includes every tradable US stock and ETF:
 STOCK_SYMBOLS=ALL
 MAX_SYMBOLS=0
 STOCK_BATCH_SIZE=100
-STOCK_PRIORITY_FRACTION=0.60
+STOCK_PRIORITY_FRACTION=0.55
+STOCK_PENNY_FRACTION=0.25
+PENNY_STOCK_MAX_PRICE=5.00
 ```
 
 The bot downloads the current lists directly from Webull at the start of each
@@ -228,7 +231,9 @@ TRADE_COOLDOWN_SECONDS=5
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
-STOCK_TAKE_PROFIT_PER_SHARE=0.01
+STOCK_MIN_NET_PROFIT_PERCENT=0.01
+STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
+STOCK_STOP_LOSS_PERCENT=0.02
 OPTION_TAKE_PROFIT_PRICE=0.01
 ```
 
@@ -262,8 +267,8 @@ request throttles remain enforced.
 
 The strategy and execution loop do not wait for the agent. A background worker
 uses Groq Compound Mini's built-in web search to research current news and catalysts for
-held positions and EMA entry candidates. The result can confirm or reject new
-entries, but the agent cannot call Webull or submit orders.
+held positions and EMA entry candidates. Its output changes which symbols are
+scanned most often; it cannot approve, reject, or submit an order.
 
 Create a free Groq developer key at
 [console.groq.com/keys](https://console.groq.com/keys), then add it to `.env`:
@@ -272,67 +277,71 @@ Create a free Groq developer key at
 AGENT_ENABLED=true
 GROQ_API_KEY=your_groq_api_key
 GROQ_MODEL=groq/compound-mini
-AGENT_RESEARCH_SECONDS=235
-AGENT_DAILY_REQUEST_LIMIT=245
+AGENT_CORE_RESEARCH_SECONDS=120
+AGENT_EXTENDED_RESEARCH_SECONDS=622
+AGENT_DAILY_REQUEST_LIMIT=250
 AGENT_MAX_SYMBOLS=3
 AGENT_TIMEOUT_SECONDS=60
-AGENT_REQUIRED_FOR_ENTRY=false
-AGENT_MIN_CONFIDENCE=0.65
-AGENT_MIN_ENTRY_SCORE=0.15
-AGENT_MAX_DOWNSIDE_RISK=0.55
-AGENT_MAX_LIQUIDITY_RISK=0.50
 LOSS_CIRCUIT_BREAKER_ENABLED=true
 LOSS_SPREE_POSITION_COUNT=3
 LOSS_SPREE_TOTAL_DOLLARS=1.00
-LOSS_SPREE_LOW_OUTLOOK_FRACTION=0.60
 LOSS_REEVALUATION_SECONDS=120
 ```
 
 `groq/compound-mini` is the low-latency Compound system and can perform one
 built-in web search per research request. The free tier currently allows 250
-Compound Mini requests per day. The bot budgets 245, spaces routine calls about
-235 seconds apart across the 4:00 AM–8:00 PM stock session, and reserves five
-requests. With `AGENT_REQUIRED_FOR_ENTRY=false`, the EMA strategy continues
-making decisions between research calls. A fresh agent assessment still blocks
-an entry when it is not `BUY`, has insufficient confidence or score, or exceeds
-the configured risk limits. Profit exits and daily closeout never wait for the
-agent.
+Compound Mini requests per day. During the 9:30 AM–4:00 PM core session, the
+bot allows one call every 120 seconds, allocating up to 195 calls. During the
+4:00–9:30 AM and 4:00–8:00 PM extended sessions, it allows one call every 622
+seconds and uses up to the remaining 55 calls. A hard 250-call daily limit
+applies across both windows. Unused calls are not manufactured when there are
+no symbols to research. The EMA strategy continues making every order decision
+between calls. Groq only adds an attention boost to the activity ranking.
 
-Every research response contains the same global values:
-`market_action`, `market_confidence`, `market_direction`, and
-`market_volatility`. Every researched symbol contains `action`, `confidence`,
+Every research response contains `market_direction` and `market_volatility`.
+Every researched symbol contains `priority`, `spread_opportunity`, `confidence`,
 `news_sentiment`, `catalyst_strength`, `expected_move_percent`,
 `horizon_minutes`, `downside_risk`, and `liquidity_risk`. Missing symbol output
 is replaced with conservative values rather than silently accepted.
 
-`strategy.py` combines those values into a deterministic entry score:
-positive sentiment, catalysts, expected move, and market direction increase
-the score; downside and liquidity risks reduce it. A new entry must meet the
-configured score, confidence, downside, and liquidity thresholds.
+Groq values never trigger or block an order. They only affect how frequently a
+symbol returns to the quote/EMA scan. Research prioritizes popular,
+high-volume, volatile, actively changing stocks and evaluates the supplied live
+bid/ask gap. A large spread only receives a strong opportunity score when
+current volume, liquidity, catalysts, and price movement suggest that the gap
+is executable rather than stale or illiquid.
 
 ### Loss-spree circuit breaker
 
 The optional portfolio circuit breaker liquidates all positions when at least
-`LOSS_SPREE_POSITION_COUNT` positions are losing and either:
-
-- their combined loss reaches twice `LOSS_SPREE_TOTAL_DOLLARS`; or
-- their combined loss reaches `LOSS_SPREE_TOTAL_DOLLARS` and the configured
-  fraction have a confident agent `HOLD` or `AVOID` outlook.
+`LOSS_SPREE_POSITION_COUNT` positions are losing and their combined loss
+reaches `LOSS_SPREE_TOTAL_DOLLARS`.
 
 After liquidation, entries remain paused for at least
-`LOSS_REEVALUATION_SECONDS` and resume only after a fresh, confident agent
-`RESUME` assessment. This intentionally overrides the normal profit-only rule.
+`LOSS_REEVALUATION_SECONDS`. This rule is deterministic and does not wait for
+Groq.
 
-All entry and normal-session exit policy now lives in `strategy.py`.
-`bot.py` handles scheduling, state, API calls, and order execution;
-`market_agent.py` performs non-blocking research.
+Repository responsibilities are intentionally separated:
 
-For stocks, a `STOCK_TAKE_PROFIT_PER_SHARE` value of `0.01` requests an exit
-at a limit price one cent above the reported average cost. For options,
+- `strategy.py`: activity scoring, penny/popular allocation, Groq priority
+  weighting, EMA rules, targets, stops, sizing, and portfolio policy.
+- `bot.py`: session scheduling, account caching, wash-block coordination, and
+  order workflow.
+- `webull_api.py`: Webull authentication, throttling, market data, and order
+  transport.
+- `market_agent.py`: paced, non-blocking Groq research.
+- `wash_sale.py`: persistent repurchase blocks.
+
+For stocks, the default gross target is 1.2% above average cost: 1% configured
+minimum net profit plus a configurable 0.2% allowance for spread, fees, and
+other round-trip costs. The default stop submits an exit at a 2% decline. For options,
 `OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one premium cent
 above average cost, normally $1 per standard 100-share contract before fees.
-EMA sell signals and the legacy `*_STOP_LOSS_*` settings do not close a
-position at a loss. A profit order waits until its limit can fill.
+A profit or stop order remains subject to its limit being filled.
+
+When a stock loss exit is submitted, the symbol is persisted in
+`conf/wash_sale_blocks.json` and blocked from new purchases for 60 calendar
+days. This is a conservative same-symbol control, not a tax determination.
 
 The end-of-day closeout is the exception: it cancels working profit orders and
 closes remaining positions before market close, which can realize a loss.
@@ -401,8 +410,10 @@ EOD_RETRY_SECONDS=10
 
 Stocks run in Webull's `ALL` session from 4:00 AM through 8:00 PM New York
 time. All stock entries and exits use limit orders because market orders are
-not eligible throughout the extended session. `STOCK_LIMIT_OFFSET=0.005`
-allows a stock close or entry limit to cross the current quote by 0.5%.
+not eligible throughout the extended session. Buy limits use the bid/ask
+midpoint rounded down to the nearest cent, never an amount above the displayed
+ask. `STOCK_LIMIT_OFFSET=0.005` only lets stock closeout sells cross below the
+current bid by 0.5%.
 
 Options remain restricted to their supported core session. At 3:50 PM the bot
 cancels working orders and repeatedly sends aggressive option close limits.
@@ -511,7 +522,9 @@ OPTION_MIN_DTE=7
 OPTION_MAX_DTE=45
 MAX_SYMBOLS=0
 STOCK_BATCH_SIZE=100
-STOCK_PRIORITY_FRACTION=0.60
+STOCK_PRIORITY_FRACTION=0.55
+STOCK_PENNY_FRACTION=0.25
+PENNY_STOCK_MAX_PRICE=5.00
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
 OPTION_DISCOVERY_SECONDS=15
@@ -527,7 +540,9 @@ TRADE_COOLDOWN_SECONDS=5
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
-STOCK_TAKE_PROFIT_PER_SHARE=0.01
+STOCK_MIN_NET_PROFIT_PERCENT=0.01
+STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
+STOCK_STOP_LOSS_PERCENT=0.02
 OPTION_TAKE_PROFIT_PRICE=0.01
 MARKET_REQUESTS_PER_MINUTE=240
 OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
@@ -538,19 +553,14 @@ ORDER_REQUESTS_PER_MINUTE=480
 AGENT_ENABLED=false
 GROQ_API_KEY=
 GROQ_MODEL=groq/compound-mini
-AGENT_RESEARCH_SECONDS=235
-AGENT_DAILY_REQUEST_LIMIT=245
+AGENT_CORE_RESEARCH_SECONDS=120
+AGENT_EXTENDED_RESEARCH_SECONDS=622
+AGENT_DAILY_REQUEST_LIMIT=250
 AGENT_MAX_SYMBOLS=3
 AGENT_TIMEOUT_SECONDS=60
-AGENT_REQUIRED_FOR_ENTRY=false
-AGENT_MIN_CONFIDENCE=0.65
-AGENT_MIN_ENTRY_SCORE=0.15
-AGENT_MAX_DOWNSIDE_RISK=0.55
-AGENT_MAX_LIQUIDITY_RISK=0.50
 LOSS_CIRCUIT_BREAKER_ENABLED=false
 LOSS_SPREE_POSITION_COUNT=3
 LOSS_SPREE_TOTAL_DOLLARS=1.00
-LOSS_SPREE_LOW_OUTLOOK_FRACTION=0.60
 LOSS_REEVALUATION_SECONDS=120
 
 TRADING_TIMEZONE=America/New_York
@@ -562,6 +572,8 @@ OPTION_EOD_CLOSE_TIME=15:50
 OPTION_MARKET_CLOSE_TIME=16:00
 EOD_RETRY_SECONDS=10
 MARKET_HOLIDAYS=
+WASH_SALE_BLOCK_DAYS=60
+WASH_SALE_STATE_FILE=conf/wash_sale_blocks.json
 STOCK_LIMIT_OFFSET=0.005
 OPTION_LIMIT_OFFSET=0.03
 ```

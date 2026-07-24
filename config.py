@@ -27,7 +27,9 @@ class Settings(BaseSettings):
     option_max_dte: int = Field(default=45, ge=0, le=730)
     max_symbols: int = Field(default=0, ge=0, le=50000)
     stock_batch_size: int = Field(default=100, ge=1, le=100)
-    stock_priority_fraction: float = Field(default=0.60, ge=0, le=0.90)
+    stock_priority_fraction: float = Field(default=0.55, ge=0, le=0.90)
+    stock_penny_fraction: float = Field(default=0.25, ge=0, le=0.50)
+    penny_stock_max_price: Decimal = Field(default=Decimal("5"), gt=0)
     option_batch_size: int = Field(default=20, ge=1, le=20)
     option_discovery_per_cycle: int = Field(default=1, ge=1, le=10)
     option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)
@@ -42,10 +44,14 @@ class Settings(BaseSettings):
     ema_fast_period: int = Field(default=3, ge=2, le=500)
     ema_slow_period: int = Field(default=8, ge=3, le=1000)
     reenter_on_trend: bool = True
-    stock_take_profit_per_share: Decimal = Field(default=Decimal("0.01"), ge=0)
-    stock_stop_loss_per_share: Decimal = Field(default=Decimal("0.05"), ge=0)
+    stock_min_net_profit_percent: Decimal = Field(default=Decimal("0.01"), ge=0, le=1)
+    stock_estimated_round_trip_cost_percent: Decimal = Field(
+        default=Decimal("0.002"),
+        ge=0,
+        le=Decimal("0.10"),
+    )
+    stock_stop_loss_percent: Decimal = Field(default=Decimal("0.02"), ge=0, le=1)
     option_take_profit_price: Decimal = Field(default=Decimal("0.01"), ge=0)
-    option_stop_loss_price: Decimal = Field(default=Decimal("0.05"), ge=0)
     market_requests_per_minute: int = Field(default=240, ge=1, le=300)
     option_instrument_requests_per_minute: int = Field(default=45, ge=1, le=60)
     stock_instrument_requests_per_30_seconds: int = Field(default=9, ge=1, le=10)
@@ -60,19 +66,14 @@ class Settings(BaseSettings):
     agent_enabled: bool = False
     groq_api_key: str = ""
     groq_model: str = "groq/compound-mini"
-    agent_research_seconds: int = Field(default=235, ge=15, le=3600)
-    agent_daily_request_limit: int = Field(default=245, ge=1, le=250)
+    agent_core_research_seconds: int = Field(default=120, ge=15, le=3600)
+    agent_extended_research_seconds: int = Field(default=622, ge=15, le=3600)
+    agent_daily_request_limit: int = Field(default=250, ge=1, le=250)
     agent_max_symbols: int = Field(default=3, ge=1, le=50)
     agent_timeout_seconds: int = Field(default=60, ge=5, le=180)
-    agent_required_for_entry: bool = False
-    agent_min_confidence: float = Field(default=0.65, ge=0, le=1)
-    agent_min_entry_score: float = Field(default=0.15, ge=-1, le=1)
-    agent_max_downside_risk: float = Field(default=0.55, ge=0, le=1)
-    agent_max_liquidity_risk: float = Field(default=0.50, ge=0, le=1)
     loss_circuit_breaker_enabled: bool = False
     loss_spree_position_count: int = Field(default=3, ge=2, le=100)
     loss_spree_total_dollars: Decimal = Field(default=Decimal("1"), gt=0)
-    loss_spree_low_outlook_fraction: float = Field(default=0.6, ge=0, le=1)
     loss_reevaluation_seconds: int = Field(default=120, ge=30, le=3600)
 
     trading_timezone: str = "America/New_York"
@@ -84,6 +85,8 @@ class Settings(BaseSettings):
     option_market_close_time: str = "16:00"
     eod_retry_seconds: int = Field(default=10, ge=2, le=120)
     market_holidays: str = ""
+    wash_sale_block_days: int = Field(default=60, ge=31, le=365)
+    wash_sale_state_file: str = "conf/wash_sale_blocks.json"
     stock_limit_offset: Decimal = Field(
         default=Decimal("0.005"),
         ge=0,
@@ -116,6 +119,10 @@ class Settings(BaseSettings):
             raise ValueError("EMA_FAST_PERIOD must be lower than EMA_SLOW_PERIOD")
         if self.option_min_dte > self.option_max_dte:
             raise ValueError("OPTION_MIN_DTE must not exceed OPTION_MAX_DTE")
+        if self.stock_priority_fraction + self.stock_penny_fraction > 0.90:
+            raise ValueError(
+                "STOCK_PRIORITY_FRACTION + STOCK_PENNY_FRACTION must be <= 0.90"
+            )
         if not (
             self.session_time(self.market_open_time)
             < self.session_time(self.eod_close_time)
@@ -138,10 +145,6 @@ class Settings(BaseSettings):
             raise ValueError("Production mode requires LIVE_TRADING_ENABLED=true")
         if self.agent_enabled and not self.groq_api_key:
             raise ValueError("GROQ_API_KEY is required when AGENT_ENABLED=true")
-        if self.loss_circuit_breaker_enabled and not self.agent_enabled:
-            raise ValueError(
-                "LOSS_CIRCUIT_BREAKER_ENABLED requires AGENT_ENABLED=true"
-            )
 
     def stocks(self) -> list[str]:
         return [item.strip().upper() for item in self.stock_symbols.split(",") if item.strip()]

@@ -3,7 +3,7 @@ import re
 import threading
 import time
 from datetime import date, timedelta
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from uuid import uuid4
 
 from config import Settings
@@ -520,10 +520,17 @@ class WebullAPI:
     def stock_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.stock_limit_offset
         if side == "BUY":
-            base = Decimal(
-                str(quote.get("ask") or quote.get("price") or quote.get("bid"))
+            bid = self._quote_decimal(quote, "bid")
+            ask = self._quote_decimal(quote, "ask")
+            if not bid or not ask or bid > ask:
+                raise QuoteUnavailableError(
+                    "stock quote has no valid bid/ask spread for a buy"
+                )
+            price = (bid + ask) / 2
+            return max(Decimal("0.01"), price).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_DOWN,
             )
-            price = base * (Decimal("1") + offset)
         else:
             base = Decimal(
                 str(quote.get("bid") or quote.get("price") or quote.get("ask"))
@@ -537,16 +544,34 @@ class WebullAPI:
     def option_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.option_limit_offset
         if side == "BUY":
-            base = Decimal(
-                str(quote.get("ask") or quote.get("price") or quote.get("bid"))
+            bid = self._quote_decimal(quote, "bid")
+            ask = self._quote_decimal(quote, "ask")
+            if not bid or not ask or bid > ask:
+                raise QuoteUnavailableError(
+                    "option quote has no valid bid/ask spread for a buy"
+                )
+            price = (bid + ask) / 2
+            return max(Decimal("0.01"), price).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_DOWN,
             )
-            price = base * (Decimal("1") + offset)
         else:
             base = Decimal(
                 str(quote.get("bid") or quote.get("price") or quote.get("ask"))
             )
             price = base * (Decimal("1") - offset)
         return max(Decimal("0.01"), price).quantize(Decimal("0.01"), rounding=ROUND_UP)
+
+    @staticmethod
+    def _quote_decimal(quote: dict, field: str) -> Decimal | None:
+        value = quote.get(field)
+        if value in (None, ""):
+            return None
+        try:
+            number = Decimal(str(value))
+        except Exception:
+            return None
+        return number if number.is_finite() and number > 0 else None
 
     @staticmethod
     def quote_price(quote: dict) -> Decimal:
@@ -713,6 +738,7 @@ class WebullAPI:
     def close_all_positions(
         self,
         instrument_types: set[str] | None = None,
+        loss_callback=None,
     ) -> list[str]:
         positions = [
             position
@@ -731,6 +757,19 @@ class WebullAPI:
             if position.get("instrument_type") == "EQUITY":
                 side = "SELL" if quantity > 0 else "BUY"
                 quote = self.stock_quote(position["symbol"])
+                market_price = self.quote_price(quote)
+                average_cost = Decimal(str(position.get("cost_price") or "0"))
+                loss_exit = (
+                    quantity > 0
+                    and average_cost > 0
+                    and market_price < average_cost
+                ) or (
+                    quantity < 0
+                    and average_cost > 0
+                    and market_price > average_cost
+                )
+                if loss_exit and loss_callback:
+                    loss_callback(position["symbol"], "loss closeout submitted")
                 limit_price = self.stock_limit_price(quote, side)
                 submitted.append(
                     self.place_stock(
