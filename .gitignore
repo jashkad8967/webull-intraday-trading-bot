@@ -1,0 +1,7 @@
+.env
+.venv/
+.webull-skill-venv/
+conf/
+__pycache__/
+*.py[cod]
+*.log

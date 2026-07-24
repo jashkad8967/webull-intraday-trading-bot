@@ -1,38 +1,394 @@
-# Webull Trading Bot
+# Compact Webull production stock and options auto trader
 
-Python 3.12+ trading platform scaffold using a broker abstraction. It starts in safe paper mode and never submits a live order as distributed.
+This application contains fewer than 15 copyable files and uses Webull's
+official Python SDK against the US production API. It can:
 
-## Quick start
+- Download and rotate through Webull's complete tradable US stock universe.
+- Trade exact OCC option contracts.
+- Progressively discover current ATM calls and puts for every optionable stock.
+- Scan every second, every few minutes, or up to once per hour.
+- Buy on EMA crossovers or an active uptrend, take configured penny-scale
+  profits, and re-enter while the uptrend remains active.
+- Stop opening positions at the configured end-of-day time.
+- Cancel working orders and repeatedly close account positions before 4:00 PM
+  New York time.
 
-```bash
-cp .env.example .env
-python -m venv .venv
-. .venv/bin/activate  # Windows: .venv\\Scripts\\Activate.ps1
-pip install -r requirements.txt
-uvicorn app.dashboard.api:app --reload
+Webull supports stock market orders. Webull options do not support market
+orders, so option entries and exits use refreshed aggressive limit prices.
+
+## Recreate the application from code
+
+Create one folder on the destination computer and copy the contents of these
+10 files into files with the same names:
+
+```text
+.env.example
+.gitignore
+README.md
+requirements.txt
+setup.ps1
+config.py
+strategy.py
+webull_api.py
+connect.py
+bot.py
 ```
 
-To make a paper trade, first set a quote using `POST /paper/quote/AAPL/210.33`, then send `POST /orders/buy/AAPL/10`. Inspect state at `GET /account` and `GET /health`.
+Do not copy `.venv`, `.webull-skill-venv`, or create `.env` manually. The setup
+script recreates both local environments, installs every dependency, and copies
+`.env.example` exactly to `.env`. You then enter your private production Webull
+credentials in `.env`.
 
-## Configuration
+## 1. Install Python and packages
 
-Keep `MODE=PAPER` during development. Copy `.env.example` to `.env`, enter `WEBULL_APP_KEY`, `WEBULL_APP_SECRET`, and `ACCOUNT_ID`, then install `webull-openapi-python-sdk`. The official SDK signs each call and handles 2FA token flow—do not set or commit a secret header. Begin with `WEBULL_API_ENDPOINT=https://api.sandbox.webull.com`; production is `https://api.webull.com`.
+Open PowerShell in the copied folder:
 
-The official SDK broker uses `account_v2`, `order_v3`, and `data_client` for stock trading. `MODE=LIVE` is the required deliberate gate before it can submit or cancel an order. Options use the same `order_v3.place_order` endpoint with `instrument_type=OPTION`; keep `OPTIONS_ENABLED=false` until the account has options approval and you have tested its payloads in sandbox.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
 
-`EOD_FLATTEN_TIME` is the New York-time cutoff for the `EndOfDayFlattener` job. Deploy it through an external, reliable scheduler and add exchange-calendar checks, retry handling, cancellation of open orders, and an operator alert before enabling live trading. Options are controlled by `OPTIONS_ENABLED=false`; the broker must validate contract symbols, expiry, multiplier, and permissions before supporting options.
+The script:
 
-## Design
+1. Finds Python 3.12.
+2. Installs Python 3.12 through `winget` if necessary.
+3. Creates `.venv` for the autonomous trader.
+4. Installs the current official Webull SDK and required packages.
+5. Creates `.webull-skill-venv` for Webull Agent Skills.
+6. Installs the official Webull Agent Skills 1.1.2 package.
+7. Copies `.env.example` exactly to `.env` if `.env` does not exist.
 
-- `app/broker`: interchangeable paper and Webull adapters.
-- `app/strategies`: common signal interface plus EMA-cross strategy.
-- `app/risk`: mandatory buying-power, position-limit, and stop-loss risk checks.
-- `app/execution`: broker-neutral `buy`, `sell`, and `cancel_order` interface.
-- `app/execution/eod.py`: broker-neutral position-flattening job for end-of-day liquidation.
-- `app/dashboard`: FastAPI health, account, quote, and order endpoints.
+The two files are identical immediately after setup. `.env.example` remains the
+copyable template, while `.env` is ignored by Git and holds your real secrets.
 
-Run tests with `pytest -q`; run the service in Docker with `docker compose up --build`.
+## 2. Enter Webull credentials
 
-## Live-trading checklist
+Open `.env`:
 
-Read [docs/LIVE_TRADING.md](docs/LIVE_TRADING.md). Implement and integration-test confirmed official Webull order/cancel calls, authenticated dashboard access, database audit logs, notification credentials, and backtest validation before allowing live execution. Automated trading has material financial risk.
+```powershell
+notepad .env
+```
+
+Enter the production credentials issued through Webull OpenAPI Management:
+
+```dotenv
+MODE=LIVE
+WEBULL_APP_KEY=your_app_key
+WEBULL_APP_SECRET=your_app_secret
+ACCOUNT_ID=
+WEBULL_API_ENDPOINT=api.webull.com
+WEBULL_ENVIRONMENT=prod
+WEBULL_REGION_ID=us
+LIVE_TRADING_ENABLED=true
+```
+
+If 2FA is enabled, authenticate once and approve the request in the Webull
+mobile app:
+
+```powershell
+.\.webull-skill-venv\Scripts\webull-skill.exe auth
+```
+
+The token is stored under `conf` and reused by Agent Skills. The Webull SDK
+also handles the production token flow when required.
+
+Get the production Account ID:
+
+```powershell
+.\.venv\Scripts\python.exe connect.py
+```
+
+Copy the returned `account_id` into `.env`, then run the command again:
+
+```powershell
+.\.venv\Scripts\python.exe connect.py
+```
+
+It will display buying power, positions, and the first configured stock quote.
+
+## 3. Select stocks
+
+The default includes every tradable US stock:
+
+```dotenv
+STOCK_SYMBOLS=ALL
+MAX_SYMBOLS=0
+STOCK_BATCH_SIZE=100
+```
+
+The bot downloads the current list directly from Webull at the start of each
+trading day. A static ticker list is intentionally not embedded because
+listings and trading status change. `MAX_SYMBOLS=0` means no cap.
+
+Webull accepts up to 100 stock symbols in one snapshot request. The bot rotates
+through the universe in batches of 100 instead of making one request per stock.
+
+To restrict trading to a smaller list instead:
+
+```dotenv
+STOCK_SYMBOLS=AAPL,MSFT,NVDA,SPY
+MAX_SYMBOLS=0
+```
+
+To keep `ALL` but limit it to the first 500 returned tradable symbols, set
+`MAX_SYMBOLS=500`.
+
+## 4. Select options
+
+### All optionable stocks
+
+The default checks the complete downloaded stock universe:
+
+```dotenv
+OPTION_CONTRACTS=
+OPTION_UNDERLYINGS=ALL
+OPTION_TYPE=BOTH
+OPTION_MIN_DTE=7
+OPTION_MAX_DTE=45
+OPTION_BATCH_SIZE=20
+OPTION_DISCOVERY_PER_CYCLE=1
+```
+
+Discovery is progressive because requesting every listed strike and expiration
+simultaneously would exceed the instrument limits. On each cycle the bot checks
+another underlying and retains the nearest-expiration ATM call and put within
+the configured DTE range. Every exact listed contract remains usable through
+`OPTION_CONTRACTS`.
+
+Webull accepts up to 20 option symbols in a snapshot request, so discovered
+contracts are scanned in rotating batches of 20.
+
+### Exact contracts
+
+Enter one or more current OCC option symbols:
+
+```dotenv
+OPTION_CONTRACTS=AAPL260918C00200000,SPY260918P00550000
+OPTION_UNDERLYINGS=
+```
+
+The bot queries Webull for each contract's strike, expiration, type, underlying,
+and trading status.
+
+### Automatic ATM calls or puts
+
+Let the bot choose the nearest strike within a DTE range:
+
+```dotenv
+OPTION_CONTRACTS=
+OPTION_UNDERLYINGS=AAPL,SPY,NVDA
+OPTION_TYPE=BOTH
+OPTION_MIN_DTE=7
+OPTION_MAX_DTE=45
+```
+
+Use only one contract type if preferred:
+
+```dotenv
+OPTION_TYPE=CALL
+```
+
+or:
+
+```dotenv
+OPTION_TYPE=PUT
+```
+
+You can use exact contracts and automatic selection together.
+
+## 5. Set the trading speed
+
+EMA periods count price samples. With `REENTER_ON_TREND=true`, the bot may buy
+again after a take-profit exit while the fast EMA remains above the slow EMA.
+Actual fills depend on price movement, liquidity, spreads, and the number of
+configured instruments.
+
+Fast scanning, allowing multiple instruments to trade in a minute:
+
+```dotenv
+POLL_SECONDS=1
+TRADE_COOLDOWN_SECONDS=5
+EMA_FAST_PERIOD=3
+EMA_SLOW_PERIOD=8
+REENTER_ON_TREND=true
+STOCK_TAKE_PROFIT_PER_SHARE=0.01
+STOCK_STOP_LOSS_PER_SHARE=0.05
+OPTION_TAKE_PROFIT_PRICE=0.01
+OPTION_STOP_LOSS_PRICE=0.05
+```
+
+Medium cadence:
+
+```dotenv
+POLL_SECONDS=60
+TRADE_COOLDOWN_SECONDS=300
+EMA_FAST_PERIOD=5
+EMA_SLOW_PERIOD=15
+```
+
+Slower, up to hourly:
+
+```dotenv
+POLL_SECONDS=900
+TRADE_COOLDOWN_SECONDS=3600
+EMA_FAST_PERIOD=3
+EMA_SLOW_PERIOD=8
+```
+
+`POLL_SECONDS` accepts values from 1 through 3600.
+
+For stocks, a `STOCK_TAKE_PROFIT_PER_SHARE` value of `0.01` requests an exit
+after a one-cent favorable move from the reported average cost. For options,
+`OPTION_TAKE_PROFIT_PRICE=0.01` is a $0.01 premium move, normally $1 per
+standard 100-share contract before spread, fees, and execution differences.
+
+With the default five-second cooldown, the code can attempt multiple orders per
+minute across several instruments. With `ALL`, each batch is processed quickly,
+but the complete universe takes multiple cycles. It does not promise a fixed
+trade count: EMA direction, target price movement, fills, API response time,
+open-position limits, and Webull rate limits determine the actual count.
+
+One cent multiplied by 1,000 completed one-share trades is $10 gross. With 100
+shares, a one-cent favorable move is $1 per completed trade. Net results also
+include losing trades, bid/ask spread, slippage, regulatory fees, commissions
+that may apply, and orders that do not fill.
+
+## 6. Set sizes and limits
+
+```dotenv
+STOCK_QUANTITY=1
+OPTION_QUANTITY=1
+MAX_OPEN_POSITIONS=5
+MAX_ORDER_NOTIONAL=1000
+```
+
+Option notional is calculated as premium x 100 x contracts.
+
+## 7. API request pacing
+
+Keep these defaults unless Webull changes the limits assigned to your
+application:
+
+```dotenv
+MARKET_REQUESTS_PER_MINUTE=240
+OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
+STOCK_INSTRUMENT_REQUESTS_PER_30_SECONDS=9
+ACCOUNT_REQUESTS_PER_SECOND=0.8
+ORDER_REQUESTS_PER_MINUTE=480
+```
+
+The bot maintains an independent timer for each API group, sends stock quotes
+in groups of 100 and option quotes in groups of 20, and retries throttling or
+temporary server errors with backoff. Order submissions are not automatically
+retried because a timed-out order may already have reached the broker.
+
+## 8. Configure daily closeout
+
+```dotenv
+TRADING_TIMEZONE=America/New_York
+MARKET_OPEN_TIME=09:30
+EOD_CLOSE_TIME=15:50
+MARKET_CLOSE_TIME=16:00
+EOD_RETRY_SECONDS=10
+```
+
+At 3:50 PM New York time the bot stops running the strategy. It then:
+
+1. Cancels currently reported working orders.
+2. Sends market orders to close stock positions.
+3. Sends aggressive limit orders to close single-leg option positions.
+4. Refreshes positions.
+5. Repeats cancellation and closeout every `EOD_RETRY_SECONDS` until positions
+   are gone or the market closes.
+
+The closeout operates on positions in the configured Webull account, including
+positions that existed before the bot started.
+
+Add full-day exchange holidays as comma-separated dates:
+
+```dotenv
+MARKET_HOLIDAYS=2026-01-01,2026-12-25
+```
+
+## 9. Run the bot
+
+```powershell
+.\.venv\Scripts\python.exe bot.py
+```
+
+Stop it with:
+
+```text
+Ctrl+C
+```
+
+The terminal reports selected targets, signals that become orders, API errors,
+and end-of-day closeout progress.
+
+## 10. Use Webull Agent Skills
+
+```powershell
+.\.webull-skill-venv\Scripts\webull-skill.exe trading --action account-list
+.\.webull-skill-venv\Scripts\webull-skill.exe trading --action balance --account-id YOUR_ACCOUNT_ID
+.\.webull-skill-venv\Scripts\webull-skill.exe market-data --action stock-snapshot --symbols AAPL
+```
+
+Agent Skills is the companion interface for manual or AI-assistant commands.
+The autonomous loop uses its own `.venv` and calls the official SDK directly,
+which avoids starting a new CLI process for every market-data batch.
+
+## Complete configuration example
+
+```dotenv
+MODE=LIVE
+WEBULL_APP_KEY=
+WEBULL_APP_SECRET=
+ACCOUNT_ID=
+WEBULL_API_ENDPOINT=api.webull.com
+WEBULL_ENVIRONMENT=prod
+WEBULL_REGION_ID=us
+LIVE_TRADING_ENABLED=true
+WEBULL_MAX_ORDER_NOTIONAL_USD=1000
+WEBULL_MAX_ORDER_QUANTITY=1000
+WEBULL_SYMBOL_WHITELIST=
+WEBULL_TOKEN_DIR=conf
+WEBULL_LOG_LEVEL=WARNING
+
+STOCK_SYMBOLS=ALL
+OPTION_CONTRACTS=
+OPTION_UNDERLYINGS=ALL
+OPTION_TYPE=BOTH
+OPTION_MIN_DTE=7
+OPTION_MAX_DTE=45
+MAX_SYMBOLS=0
+STOCK_BATCH_SIZE=100
+OPTION_BATCH_SIZE=20
+OPTION_DISCOVERY_PER_CYCLE=1
+
+STOCK_QUANTITY=1
+OPTION_QUANTITY=1
+MAX_OPEN_POSITIONS=5
+MAX_ORDER_NOTIONAL=1000
+
+POLL_SECONDS=1
+TRADE_COOLDOWN_SECONDS=5
+EMA_FAST_PERIOD=3
+EMA_SLOW_PERIOD=8
+REENTER_ON_TREND=true
+STOCK_TAKE_PROFIT_PER_SHARE=0.01
+STOCK_STOP_LOSS_PER_SHARE=0.05
+OPTION_TAKE_PROFIT_PRICE=0.01
+OPTION_STOP_LOSS_PRICE=0.05
+MARKET_REQUESTS_PER_MINUTE=240
+OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
+STOCK_INSTRUMENT_REQUESTS_PER_30_SECONDS=9
+ACCOUNT_REQUESTS_PER_SECOND=0.8
+ORDER_REQUESTS_PER_MINUTE=480
+
+TRADING_TIMEZONE=America/New_York
+MARKET_OPEN_TIME=09:30
+EOD_CLOSE_TIME=15:50
+MARKET_CLOSE_TIME=16:00
+EOD_RETRY_SECONDS=10
+MARKET_HOLIDAYS=
+OPTION_LIMIT_OFFSET=0.03
+```
