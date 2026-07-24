@@ -1,7 +1,7 @@
 import logging
 import time
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
 from rich.logging import RichHandler
@@ -48,6 +48,8 @@ class AutoTrader:
         self.invalid_stock_symbols: set[str] = set()
         self.option_contracts: list[dict] = []
         self.stock_prices: dict[str, Decimal] = {}
+        self.pending_stock_exits: set[str] = set()
+        self.pending_option_exits: set[str] = set()
         self.stock_cursor = 0
         self.option_cursor = 0
         self.option_discovery_cursor = 0
@@ -183,14 +185,26 @@ class AutoTrader:
         elapsed = time.monotonic() - self.last_trade.get(key, float("-inf"))
         return elapsed >= float(self.config.trade_cooldown_seconds)
 
-    def record_trade(self, key: str, order_id: str, action: str) -> None:
+    def record_trade(
+        self,
+        key: str,
+        order_id: str,
+        action: str,
+        limit_price: Decimal | None = None,
+    ) -> None:
         self.last_trade[key] = time.monotonic()
         instrument_type, symbol = key.split(":", 1)
+        limit_text = (
+            f" | limit={limit_price}"
+            if limit_price is not None
+            else ""
+        )
         log.info(
-            "ORDER  | %-11s | %-6s | %-8s | id=%s",
+            "ORDER  | %-11s | %-6s | %-8s%s | id=%s",
             instrument_type,
             action,
             symbol,
+            limit_text,
             order_id,
         )
 
@@ -202,7 +216,11 @@ class AutoTrader:
             if Decimal(str(item.get("quantity", "0"))) != 0
         )
 
-    def trade_stocks(self, positions: list[dict]) -> None:
+    def trade_stocks(
+        self,
+        positions: list[dict],
+        buying_power: Decimal,
+    ) -> Decimal:
         open_count = self.open_position_count(positions)
         batch, self.stock_cursor = self.rotating_batch(
             self.stock_symbols,
@@ -237,7 +255,7 @@ class AutoTrader:
             if isinstance(exc, MarketDataPermissionError):
                 raise
             log.error("STOCKS | quote batch failed | %s", exc)
-            return
+            return buying_power
         if invalid:
             self.invalid_stock_symbols.update(invalid)
             self.stock_symbols = [
@@ -266,24 +284,45 @@ class AutoTrader:
                 )
                 quantity, cost = self.api.stock_position(symbol, positions)
                 key = f"STOCK:{symbol}"
+                if quantity == 0:
+                    self.pending_stock_exits.discard(symbol)
                 if signal == "BUY" and quantity == 0:
-                    notional = price * self.config.stock_quantity
+                    buffered_price = price * Decimal("1.03")
+                    affordable = int(
+                        (buying_power / buffered_price).to_integral_value(
+                            rounding=ROUND_DOWN
+                        )
+                    )
+                    order_limit = int(
+                        (
+                            self.config.max_order_notional / price
+                        ).to_integral_value(rounding=ROUND_DOWN)
+                    )
+                    buy_quantity = min(
+                        self.config.stock_quantity,
+                        affordable,
+                        order_limit,
+                    )
                     if (
                         open_count < self.config.max_open_positions
-                        and notional <= self.config.max_order_notional
+                        and buy_quantity > 0
                         and self.cooldown_ready(key)
                     ):
                         order_id = self.api.place_stock(
                             symbol,
                             "BUY",
-                            self.config.stock_quantity,
+                            buy_quantity,
                         )
                         self.record_trade(key, order_id, "BUY")
+                        buying_power = max(
+                            Decimal("0"),
+                            buying_power - buffered_price * buy_quantity,
+                        )
                         positions.append(
                             {
                                 "instrument_type": "EQUITY",
                                 "symbol": symbol,
-                                "quantity": str(self.config.stock_quantity),
+                                "quantity": str(buy_quantity),
                             }
                         )
                         open_count += 1
@@ -292,28 +331,41 @@ class AutoTrader:
                     and cost > 0
                     and price - cost >= self.config.stock_take_profit_per_share
                 )
-                stop_loss = (
-                    quantity > 0
-                    and cost > 0
-                    and cost - price >= self.config.stock_stop_loss_per_share
-                )
                 if (
-                    quantity > 0
-                    and (signal == "SELL" or take_profit or stop_loss)
+                    take_profit
+                    and symbol not in self.pending_stock_exits
                     and self.cooldown_ready(key)
                 ):
-                    order_id = self.api.place_stock(symbol, "SELL", quantity)
-                    reason = "TAKE_PROFIT" if take_profit else "STOP_LOSS" if stop_loss else "SELL"
-                    self.record_trade(key, order_id, reason)
+                    target = cost + self.config.stock_take_profit_per_share
+                    order_id = self.api.place_stock(
+                        symbol,
+                        "SELL",
+                        quantity,
+                        limit_price=target,
+                    )
+                    self.pending_stock_exits.add(symbol)
+                    self.record_trade(key, order_id, "PROFIT", target)
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
                     continue
+                if "BUYING_POWER_INSUFFICIENT" in str(exc):
+                    buying_power = Decimal("0")
+                    log.warning(
+                        "FUNDS  | %s | buy skipped | insufficient buying power",
+                        symbol,
+                    )
+                    continue
                 log.error("STOCK  | %s | %s", symbol, exc)
         self.discover_option_contracts()
+        return buying_power
 
-    def trade_options(self, positions: list[dict]) -> None:
+    def trade_options(
+        self,
+        positions: list[dict],
+        buying_power: Decimal,
+    ) -> Decimal:
         if not self.options_enabled:
-            return
+            return buying_power
         open_count = self.open_position_count(positions)
         batch, self.option_cursor = self.rotating_batch(
             self.option_contracts,
@@ -330,9 +382,9 @@ class AutoTrader:
                 log.warning(
                     "OPTIONS | disabled | OPRA OpenAPI quotes not subscribed"
                 )
-                return
+                return buying_power
             log.error("OPTIONS | quote batch failed | %s", exc)
-            return
+            return buying_power
         quote_by_symbol = {
             str(quote.get("symbol", "")).upper(): quote for quote in quotes
         }
@@ -350,27 +402,48 @@ class AutoTrader:
                     self.config.reenter_on_trend,
                 )
                 quantity, cost = self.api.option_position(contract, positions)
+                if quantity == 0:
+                    self.pending_option_exits.discard(option_symbol)
                 if signal == "BUY" and quantity == 0:
-                    premium = price * 100 * self.config.option_quantity
+                    limit_price = self.api.option_limit_price(quote, "BUY")
+                    contract_cost = limit_price * 100
+                    affordable = int(
+                        (buying_power / contract_cost).to_integral_value(
+                            rounding=ROUND_DOWN
+                        )
+                    )
+                    order_limit = int(
+                        (
+                            self.config.max_order_notional / contract_cost
+                        ).to_integral_value(rounding=ROUND_DOWN)
+                    )
+                    buy_quantity = min(
+                        self.config.option_quantity,
+                        affordable,
+                        order_limit,
+                    )
                     if (
                         open_count < self.config.max_open_positions
-                        and premium <= self.config.max_order_notional
+                        and buy_quantity > 0
                         and self.cooldown_ready(key)
                     ):
-                        limit_price = self.api.option_limit_price(quote, "BUY")
                         order_id = self.api.place_option(
                             contract,
                             "BUY",
-                            self.config.option_quantity,
+                            buy_quantity,
                             limit_price,
                             "BUY_TO_OPEN",
                         )
                         self.record_trade(key, order_id, "BUY")
+                        buying_power = max(
+                            Decimal("0"),
+                            buying_power - contract_cost * buy_quantity,
+                        )
                         positions.append(
                             {
                                 "instrument_type": "OPTION",
                                 "symbol": option_symbol,
-                                "quantity": str(self.config.option_quantity),
+                                "quantity": str(buy_quantity),
                             }
                         )
                         open_count += 1
@@ -379,17 +452,18 @@ class AutoTrader:
                     and cost > 0
                     and price - cost >= self.config.option_take_profit_price
                 )
-                stop_loss = (
-                    quantity > 0
-                    and cost > 0
-                    and cost - price >= self.config.option_stop_loss_price
-                )
                 if (
-                    quantity > 0
-                    and (signal == "SELL" or take_profit or stop_loss)
+                    take_profit
+                    and option_symbol not in self.pending_option_exits
                     and self.cooldown_ready(key)
                 ):
-                    limit_price = self.api.option_limit_price(quote, "SELL")
+                    target = (
+                        cost + self.config.option_take_profit_price
+                    ).quantize(Decimal("0.01"))
+                    limit_price = max(
+                        target,
+                        self.api.option_limit_price(quote, "SELL"),
+                    )
                     order_id = self.api.place_option(
                         contract,
                         "SELL",
@@ -397,12 +471,20 @@ class AutoTrader:
                         limit_price,
                         "SELL_TO_CLOSE",
                     )
-                    reason = "TAKE_PROFIT" if take_profit else "STOP_LOSS" if stop_loss else "SELL"
-                    self.record_trade(key, order_id, reason)
+                    self.pending_option_exits.add(option_symbol)
+                    self.record_trade(key, order_id, "PROFIT", limit_price)
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
                     continue
+                if "BUYING_POWER_INSUFFICIENT" in str(exc):
+                    buying_power = Decimal("0")
+                    log.warning(
+                        "FUNDS  | %s | buy skipped | insufficient buying power",
+                        option_symbol,
+                    )
+                    continue
                 log.error("OPTION | %s | %s", option_symbol, exc)
+        return buying_power
 
     def close_everything(self) -> bool:
         now = time.monotonic()
@@ -458,18 +540,20 @@ class AutoTrader:
 
             self.resolve_targets(moment)
             try:
+                buying_power = self.api.buying_power()
                 positions = self.api.positions()
-                self.trade_stocks(positions)
-                self.trade_options(positions)
+                buying_power = self.trade_stocks(positions, buying_power)
+                buying_power = self.trade_options(positions, buying_power)
                 if time.monotonic() - self.last_status_log >= 30:
                     self.last_status_log = time.monotonic()
                     log.info(
-                        "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s",
+                        "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s | buying power=$%.2f",
                         min(self.config.stock_batch_size, len(self.stock_symbols)),
                         len(self.stock_symbols),
                         min(self.config.option_batch_size, len(self.option_contracts)),
                         len(self.option_contracts),
                         self.open_position_count(positions),
+                        buying_power,
                     )
             except Exception as exc:
                 if isinstance(exc, MarketDataPermissionError):

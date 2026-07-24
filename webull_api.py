@@ -107,15 +107,18 @@ class WebullAPI:
             ),
             {},
         )
+        buying_power_values: list[Decimal] = []
         for field in (
+            "day_buying_power",
             "buying_power",
             "overnight_buying_power",
-            "day_buying_power",
-            "cash_balance",
         ):
             if usd.get(field) not in (None, ""):
-                return Decimal(str(usd[field]))
-        return Decimal("0")
+                buying_power_values.append(Decimal(str(usd[field])))
+        if buying_power_values:
+            return max(Decimal("0"), *buying_power_values)
+        cash = usd.get("cash_balance")
+        return Decimal(str(cash)) if cash not in (None, "") else Decimal("0")
 
     def positions(self) -> list[dict]:
         return self._call(
@@ -479,7 +482,13 @@ class WebullAPI:
                 )
         return unique
 
-    def place_stock(self, symbol: str, side: str, quantity: int) -> str:
+    def place_stock(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        limit_price: Decimal | None = None,
+    ) -> str:
         client_order_id = uuid4().hex
         order = {
             "combo_type": "NORMAL",
@@ -487,13 +496,17 @@ class WebullAPI:
             "symbol": symbol,
             "instrument_type": "EQUITY",
             "market": "US",
-            "order_type": "MARKET",
+            "order_type": "LIMIT" if limit_price is not None else "MARKET",
             "quantity": str(quantity),
             "support_trading_session": "CORE",
             "side": side,
             "time_in_force": "DAY",
             "entrust_type": "QTY",
         }
+        if limit_price is not None:
+            order["limit_price"] = str(
+                limit_price.quantize(Decimal("0.01"), rounding=ROUND_UP)
+            )
         self._call(
             lambda: self.trade.order_v3.place_order(
                 self.config.account_id,

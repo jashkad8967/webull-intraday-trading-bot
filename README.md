@@ -219,9 +219,7 @@ EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
 STOCK_TAKE_PROFIT_PER_SHARE=0.01
-STOCK_STOP_LOSS_PER_SHARE=0.05
 OPTION_TAKE_PROFIT_PRICE=0.01
-OPTION_STOP_LOSS_PRICE=0.05
 ```
 
 Medium cadence:
@@ -245,9 +243,14 @@ EMA_SLOW_PERIOD=8
 `POLL_SECONDS` accepts values from 1 through 3600.
 
 For stocks, a `STOCK_TAKE_PROFIT_PER_SHARE` value of `0.01` requests an exit
-after a one-cent favorable move from the reported average cost. For options,
-`OPTION_TAKE_PROFIT_PRICE=0.01` is a $0.01 premium move, normally $1 per
-standard 100-share contract before spread, fees, and execution differences.
+at a limit price one cent above the reported average cost. For options,
+`OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one premium cent
+above average cost, normally $1 per standard 100-share contract before fees.
+EMA sell signals and the legacy `*_STOP_LOSS_*` settings do not close a
+position at a loss. A profit order waits until its limit can fill.
+
+The end-of-day closeout is the exception: it cancels working profit orders and
+closes remaining positions before market close, which can realize a loss.
 
 With the default five-second cooldown, the code can attempt multiple orders per
 minute across several instruments. With `ALL`, each batch is processed quickly,
@@ -270,6 +273,14 @@ MAX_ORDER_NOTIONAL=1000
 ```
 
 Option notional is calculated as premium x 100 x contracts.
+
+Before every trading cycle, the bot refreshes Webull buying power. Stock market
+buys reserve a 3% price cushion, which exceeds Webull's required 2% volatility
+buffer. If the configured quantity is too large, the bot reduces it to the
+largest affordable whole-share quantity. Option quantities are similarly
+reduced using the submitted limit price. Remaining buying power is reserved
+locally as each order is submitted so later orders in the same cycle cannot
+reuse it.
 
 ## 7. API request pacing
 
@@ -412,9 +423,7 @@ EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
 STOCK_TAKE_PROFIT_PER_SHARE=0.01
-STOCK_STOP_LOSS_PER_SHARE=0.05
 OPTION_TAKE_PROFIT_PRICE=0.01
-OPTION_STOP_LOSS_PRICE=0.05
 MARKET_REQUESTS_PER_MINUTE=240
 OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
 STOCK_INSTRUMENT_REQUESTS_PER_30_SECONDS=9
