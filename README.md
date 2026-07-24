@@ -135,9 +135,10 @@ MAX_SYMBOLS=0
 ```
 
 To keep `ALL` but limit it to the first 500 returned tradable symbols, set
-`MAX_SYMBOLS=500`. The capped universe is divided between stocks and ETFs so
-both asset categories are represented. Startup prints `LOAD` progress while
-the current symbols are downloaded.
+`MAX_SYMBOLS=500`. Webull's listed-equity directory can contain both stocks and
+ETFs. The bot checks rejected snapshot symbols against the other category,
+corrects stock/ETF mismatches, and skips only symbols invalid in both
+categories. Startup prints `LOAD` progress while symbols are downloaded.
 
 ## 4. Select options
 
@@ -341,6 +342,24 @@ and end-of-day closeout progress in a compact colored format:
 ```
 
 Verbose Webull SDK request objects and authentication headers are suppressed.
+
+### Required production quote subscriptions
+
+Production trading requires market prices, and Webull licenses those prices
+separately for OpenAPI. A quote package purchased in the Webull mobile or
+desktop application does not grant OpenAPI access.
+
+1. Sign in to the Webull Technology website.
+2. Select your avatar, then **Advanced Quotes**.
+3. Open **OpenAPI Advanced Quotes**.
+4. Enable **Nasdaq Basic Non-Display** for US stocks and ETFs.
+5. Enable **OPRA Real-Time Non-Display** to trade options.
+6. Restart `bot.py` after Webull activates the subscriptions.
+
+If the stock subscription is missing, the bot prints one `STOP` message and
+exits instead of repeating permanent 401 errors. If stocks work but the OPRA
+option subscription is missing, options are disabled for that run and stock
+trading continues.
 
 ## 10. Use Webull Agent Skills
 

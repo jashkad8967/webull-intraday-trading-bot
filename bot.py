@@ -8,7 +8,11 @@ from rich.logging import RichHandler
 
 from config import settings
 from strategy import EMACrossStrategy
-from webull_api import WebullAPI
+from webull_api import (
+    MarketDataPermissionError,
+    QuoteUnavailableError,
+    WebullAPI,
+)
 
 
 logging.basicConfig(
@@ -49,6 +53,7 @@ class AutoTrader:
         self.option_discovery_cursor = 0
         self.option_discovery_attempted: set[str] = set()
         self.discover_all_options = False
+        self.options_enabled = True
         self.resolved_date = None
         self.last_close_attempt = 0.0
         self.last_status_log = 0.0
@@ -124,7 +129,11 @@ class AutoTrader:
         return batch, (cursor + size) % len(items)
 
     def discover_option_contracts(self) -> None:
-        if not self.discover_all_options or not self.stock_symbols:
+        if (
+            not self.options_enabled
+            or not self.discover_all_options
+            or not self.stock_symbols
+        ):
             return
         discovered = {item["underlying_symbol"] for item in self.option_contracts}
         attempts = 0
@@ -211,8 +220,22 @@ class AutoTrader:
                     self.api.stock_quotes_resilient(category_symbols, category)
                 )
                 quotes.extend(category_quotes)
-                invalid.update(category_invalid)
+                if category_invalid:
+                    alternate = "US_ETF" if category == "US_STOCK" else "US_STOCK"
+                    alternate_quotes, alternate_invalid = (
+                        self.api.stock_quotes_resilient(
+                            sorted(category_invalid),
+                            alternate,
+                        )
+                    )
+                    quotes.extend(alternate_quotes)
+                    corrected = category_invalid - alternate_invalid
+                    for symbol in corrected:
+                        self.stock_categories[symbol] = alternate
+                    invalid.update(alternate_invalid)
         except Exception as exc:
+            if isinstance(exc, MarketDataPermissionError):
+                raise
             log.error("STOCKS | quote batch failed | %s", exc)
             return
         if invalid:
@@ -283,10 +306,14 @@ class AutoTrader:
                     reason = "TAKE_PROFIT" if take_profit else "STOP_LOSS" if stop_loss else "SELL"
                     self.record_trade(key, order_id, reason)
             except Exception as exc:
+                if isinstance(exc, QuoteUnavailableError):
+                    continue
                 log.error("STOCK  | %s | %s", symbol, exc)
         self.discover_option_contracts()
 
     def trade_options(self, positions: list[dict]) -> None:
+        if not self.options_enabled:
+            return
         open_count = self.open_position_count(positions)
         batch, self.option_cursor = self.rotating_batch(
             self.option_contracts,
@@ -298,6 +325,12 @@ class AutoTrader:
                 [contract["symbol"] for contract in batch]
             )
         except Exception as exc:
+            if isinstance(exc, MarketDataPermissionError):
+                self.options_enabled = False
+                log.warning(
+                    "OPTIONS | disabled | OPRA OpenAPI quotes not subscribed"
+                )
+                return
             log.error("OPTIONS | quote batch failed | %s", exc)
             return
         quote_by_symbol = {
@@ -367,6 +400,8 @@ class AutoTrader:
                     reason = "TAKE_PROFIT" if take_profit else "STOP_LOSS" if stop_loss else "SELL"
                     self.record_trade(key, order_id, reason)
             except Exception as exc:
+                if isinstance(exc, QuoteUnavailableError):
+                    continue
                 log.error("OPTION | %s | %s", option_symbol, exc)
 
     def close_everything(self) -> bool:
@@ -437,6 +472,9 @@ class AutoTrader:
                         self.open_position_count(positions),
                     )
             except Exception as exc:
+                if isinstance(exc, MarketDataPermissionError):
+                    log.critical("STOP   | %s", exc)
+                    return
                 log.error("CYCLE  | failed | %s", exc)
 
             seconds_to_closeout = max(

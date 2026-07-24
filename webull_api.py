@@ -9,6 +9,14 @@ from uuid import uuid4
 from config import Settings
 
 
+class MarketDataPermissionError(RuntimeError):
+    pass
+
+
+class QuoteUnavailableError(RuntimeError):
+    pass
+
+
 class WebullAPI:
     def __init__(self, config: Settings):
         config.validate_connection(require_account=False)
@@ -128,15 +136,24 @@ class WebullAPI:
             raise ValueError("Webull stock snapshots accept at most 100 symbols")
         if category not in (Category.US_STOCK.name, Category.US_ETF.name):
             raise ValueError(f"Unsupported stock snapshot category: {category}")
-        return self._call(
-            lambda: self.data.market_data.get_snapshot(
-                symbols,
-                category,
-                False,
-                False,
-            ),
-            "market",
-        )
+        try:
+            return self._call(
+                lambda: self.data.market_data.get_snapshot(
+                    symbols,
+                    category,
+                    False,
+                    False,
+                ),
+                "market",
+            )
+        except Exception as exc:
+            if self._subscription_required(exc):
+                raise MarketDataPermissionError(
+                    "OpenAPI stock quotes are not subscribed. "
+                    "Enable Nasdaq Basic Non-Display in Webull's "
+                    "OpenAPI Advanced Quotes center, then restart."
+                ) from None
+            raise
 
     def stock_quotes_resilient(
         self,
@@ -202,12 +219,29 @@ class WebullAPI:
             return []
         if len(option_symbols) > 20:
             raise ValueError("Webull option snapshots accept at most 20 symbols")
-        return self._call(
-            lambda: self.data.option_market_data.get_option_snapshot(
-                option_symbols,
-                Category.US_OPTION.name,
-            ),
-            "market",
+        try:
+            return self._call(
+                lambda: self.data.option_market_data.get_option_snapshot(
+                    option_symbols,
+                    Category.US_OPTION.name,
+                ),
+                "market",
+            )
+        except Exception as exc:
+            if self._subscription_required(exc):
+                raise MarketDataPermissionError(
+                    "OpenAPI option quotes are not subscribed. "
+                    "Enable OPRA Real-Time Non-Display in Webull's "
+                    "OpenAPI Advanced Quotes center, then restart."
+                ) from None
+            raise
+
+    @staticmethod
+    def _subscription_required(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            ("unauthorized" in message or "insufficient permission" in message)
+            and ("subscribe" in message or "permission" in message)
         )
 
     def option_quote(self, option_symbol: str) -> dict:
@@ -278,60 +312,39 @@ class WebullAPI:
         from webull.data.common.category import Category
 
         categories: dict[str, str] = {}
-        instrument_categories = (Category.US_STOCK.name, Category.US_ETF.name)
-        if self.config.max_symbols:
-            stock_limit = (self.config.max_symbols + 1) // 2
-            category_limits = {
-                Category.US_STOCK.name: stock_limit,
-                Category.US_ETF.name: self.config.max_symbols - stock_limit,
-            }
-        else:
-            category_limits = {category: 0 for category in instrument_categories}
-
-        for category in instrument_categories:
-            category_count = 0
-            category_limit = category_limits[category]
-            cursor = None
-            while True:
-                page_size = (
-                    1000
-                    if category_limit == 0
-                    else min(1000, category_limit - category_count)
-                )
-                if page_size <= 0:
-                    break
-                page = self._call(
-                    lambda category=category, cursor=cursor, page_size=page_size: (
-                        self.data.instrument.get_instrument(
-                            category=category,
-                            last_instrument_id=cursor,
-                            page_size=page_size,
-                        )
-                    ),
-                    "stock_instrument",
-                )
-                if not page:
-                    break
-                for item in page:
-                    symbol = str(item.get("symbol", "")).upper()
-                    if symbol and item.get("tradable_status", "OC") == "OC":
-                        # ETF is fetched second and intentionally wins if the
-                        # instrument endpoint returns it in both categories.
-                        categories[symbol] = category
-                        category_count += 1
-                        if category_limit and category_count >= category_limit:
-                            break
-                if progress:
-                    progress(category, category_count, category_limit)
-                next_cursor = page[-1].get("instrument_id")
-                if (
-                    (category_limit and category_count >= category_limit)
-                    or len(page) < page_size
-                    or not next_cursor
-                    or str(next_cursor) == cursor
-                ):
-                    break
-                cursor = str(next_cursor)
+        limit = self.config.max_symbols
+        cursor = None
+        while limit == 0 or len(categories) < limit:
+            page_size = 1000 if limit == 0 else min(1000, limit - len(categories))
+            page = self._call(
+                lambda cursor=cursor, page_size=page_size: (
+                    self.data.instrument.get_instrument(
+                        category=Category.US_STOCK.name,
+                        last_instrument_id=cursor,
+                        page_size=page_size,
+                    )
+                ),
+                "stock_instrument",
+            )
+            if not page:
+                break
+            for item in page:
+                symbol = str(item.get("symbol", "")).upper()
+                if symbol and item.get("tradable_status", "OC") == "OC":
+                    categories[symbol] = Category.US_STOCK.name
+                    if limit and len(categories) >= limit:
+                        break
+            if progress:
+                progress("US_LISTED", len(categories), limit)
+            next_cursor = page[-1].get("instrument_id")
+            if (
+                (limit and len(categories) >= limit)
+                or len(page) < page_size
+                or not next_cursor
+                or str(next_cursor) == cursor
+            ):
+                break
+            cursor = str(next_cursor)
         return categories
 
     def option_contracts(
@@ -507,10 +520,17 @@ class WebullAPI:
 
     @staticmethod
     def quote_price(quote: dict) -> Decimal:
-        value = quote.get("price") or quote.get("ask") or quote.get("bid")
-        if value in (None, ""):
-            raise RuntimeError("Quote did not contain a usable price")
-        return Decimal(str(value))
+        for field in ("price", "ask", "bid"):
+            value = quote.get(field)
+            if value in (None, ""):
+                continue
+            try:
+                price = Decimal(str(value))
+            except Exception:
+                continue
+            if price.is_finite() and price > 0:
+                return price
+        raise QuoteUnavailableError("quote has no numeric positive price")
 
     def place_option(
         self,
