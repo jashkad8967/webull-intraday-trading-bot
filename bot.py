@@ -51,6 +51,7 @@ class AutoTrader:
         self.discover_all_options = False
         self.resolved_date = None
         self.last_close_attempt = 0.0
+        self.last_status_log = 0.0
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -73,9 +74,19 @@ class AutoTrader:
             return
         requested_stocks = self.config.stocks()
         if requested_stocks == ["ALL"]:
-            self.stock_categories = self.api.stock_universe()
+            limit = self.config.max_symbols or "ALL"
+            log.info("LOAD   | downloading stocks and ETFs | limit=%s", limit)
+            self.stock_categories = self.api.stock_universe(
+                lambda category, count, category_limit: log.info(
+                    "LOAD   | %-8s | %s/%s",
+                    category,
+                    count,
+                    category_limit or "ALL",
+                )
+            )
             self.stock_symbols = list(self.stock_categories)
         else:
+            log.info("LOAD   | resolving %s configured symbols", len(requested_stocks))
             self.stock_symbols = (
                 requested_stocks
                 if self.config.max_symbols == 0
@@ -415,6 +426,16 @@ class AutoTrader:
                 positions = self.api.positions()
                 self.trade_stocks(positions)
                 self.trade_options(positions)
+                if time.monotonic() - self.last_status_log >= 30:
+                    self.last_status_log = time.monotonic()
+                    log.info(
+                        "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s",
+                        min(self.config.stock_batch_size, len(self.stock_symbols)),
+                        len(self.stock_symbols),
+                        min(self.config.option_batch_size, len(self.option_contracts)),
+                        len(self.option_contracts),
+                        self.open_position_count(positions),
+                    )
             except Exception as exc:
                 log.error("CYCLE  | failed | %s", exc)
 

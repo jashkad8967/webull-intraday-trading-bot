@@ -61,8 +61,12 @@ Write-Host "Using Python: $pythonExe"
 $venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 $venvHealthy = $false
 if (Test-Path -LiteralPath $venvPython) {
-    & $venvPython --version 2>$null
-    $venvHealthy = $LASTEXITCODE -eq 0
+    try {
+        & $venvPython --version 2>$null
+        $venvHealthy = $LASTEXITCODE -eq 0
+    } catch {
+        $venvHealthy = $false
+    }
 }
 if (-not $venvHealthy) {
     $venvDirectory = Join-Path $PSScriptRoot ".venv"
@@ -78,8 +82,12 @@ if (-not $venvHealthy) {
 $skillVenvPython = Join-Path $PSScriptRoot ".webull-skill-venv\Scripts\python.exe"
 $skillVenvHealthy = $false
 if (Test-Path -LiteralPath $skillVenvPython) {
-    & $skillVenvPython --version 2>$null
-    $skillVenvHealthy = $LASTEXITCODE -eq 0
+    try {
+        & $skillVenvPython --version 2>$null
+        $skillVenvHealthy = $LASTEXITCODE -eq 0
+    } catch {
+        $skillVenvHealthy = $false
+    }
 }
 if (-not $skillVenvHealthy) {
     $skillVenvDirectory = Join-Path $PSScriptRoot ".webull-skill-venv"

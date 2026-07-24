@@ -135,7 +135,9 @@ MAX_SYMBOLS=0
 ```
 
 To keep `ALL` but limit it to the first 500 returned tradable symbols, set
-`MAX_SYMBOLS=500`.
+`MAX_SYMBOLS=500`. The capped universe is divided between stocks and ETFs so
+both asset categories are represented. Startup prints `LOAD` progress while
+the current symbols are downloaded.
 
 ## 4. Select options
 
@@ -331,7 +333,9 @@ and end-of-day closeout progress in a compact colored format:
 
 ```text
 09:30:00 INFO     START  | mode=LIVE | poll=1s | cooldown=5s
-09:30:18 INFO     READY  | stocks=12483 | options=0 | option scan=ON
+09:30:00 INFO     LOAD   | downloading stocks and ETFs | limit=500
+09:30:04 INFO     READY  | stocks=500 | options=0 | option scan=ON
+09:30:19 INFO     SCAN   | stocks=100/500 | options=0/0 | positions=0
 09:30:21 INFO     ORDER  | STOCK       | BUY    | AAPL     | id=...
 15:50:02 INFO     CLOSE  | submitted=3 | remaining=0
 ```

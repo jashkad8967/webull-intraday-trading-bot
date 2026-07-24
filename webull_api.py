@@ -271,19 +271,41 @@ class WebullAPI:
                 + self._stock_instruments_resilient(symbols[middle:], category)
             )
 
-    def stock_universe(self) -> dict[str, str]:
+    def stock_universe(
+        self,
+        progress=None,
+    ) -> dict[str, str]:
         from webull.data.common.category import Category
 
         categories: dict[str, str] = {}
-        for category in (Category.US_STOCK.name, Category.US_ETF.name):
+        instrument_categories = (Category.US_STOCK.name, Category.US_ETF.name)
+        if self.config.max_symbols:
+            stock_limit = (self.config.max_symbols + 1) // 2
+            category_limits = {
+                Category.US_STOCK.name: stock_limit,
+                Category.US_ETF.name: self.config.max_symbols - stock_limit,
+            }
+        else:
+            category_limits = {category: 0 for category in instrument_categories}
+
+        for category in instrument_categories:
+            category_count = 0
+            category_limit = category_limits[category]
             cursor = None
             while True:
+                page_size = (
+                    1000
+                    if category_limit == 0
+                    else min(1000, category_limit - category_count)
+                )
+                if page_size <= 0:
+                    break
                 page = self._call(
-                    lambda category=category, cursor=cursor: (
+                    lambda category=category, cursor=cursor, page_size=page_size: (
                         self.data.instrument.get_instrument(
                             category=category,
                             last_instrument_id=cursor,
-                            page_size=1000,
+                            page_size=page_size,
                         )
                     ),
                     "stock_instrument",
@@ -296,16 +318,20 @@ class WebullAPI:
                         # ETF is fetched second and intentionally wins if the
                         # instrument endpoint returns it in both categories.
                         categories[symbol] = category
+                        category_count += 1
+                        if category_limit and category_count >= category_limit:
+                            break
+                if progress:
+                    progress(category, category_count, category_limit)
                 next_cursor = page[-1].get("instrument_id")
                 if (
-                    len(page) < 1000
+                    (category_limit and category_count >= category_limit)
+                    or len(page) < page_size
                     or not next_cursor
                     or str(next_cursor) == cursor
                 ):
                     break
                 cursor = str(next_cursor)
-        if self.config.max_symbols:
-            return dict(list(categories.items())[: self.config.max_symbols])
         return categories
 
     def option_contracts(
