@@ -520,6 +520,7 @@ class AutoTrader:
                             symbol,
                             "BUY",
                             buy_quantity,
+                            limit_price=self.api.stock_limit_price(quote, "BUY"),
                         )
                         self.record_trade(key, order_id, "BUY")
                         buying_power = max(
@@ -561,7 +562,6 @@ class AutoTrader:
                     )
                     continue
                 log.error("STOCK  | %s | %s", symbol, exc)
-        self.discover_option_contracts()
         return buying_power
 
     def trade_options(
@@ -708,16 +708,19 @@ class AutoTrader:
                 log.error("OPTION | %s | %s", option_symbol, exc)
         return buying_power
 
-    def close_everything(self) -> bool:
+    def close_instruments(self, instrument_types: set[str]) -> bool:
         now = time.monotonic()
         if now - self.last_close_attempt < self.config.eod_retry_seconds:
             return False
         self.last_close_attempt = now
         try:
-            submitted = self.api.close_all_positions()
+            submitted = self.api.close_all_positions(instrument_types)
+            self.pending_stock_exits.clear()
+            self.pending_option_exits.clear()
             remaining = [
                 item
                 for item in self.api.positions()
+                if item.get("instrument_type") in instrument_types
                 if Decimal(str(item.get("quantity", "0"))) != 0
             ]
             log.info(
@@ -746,19 +749,34 @@ class AutoTrader:
             market_open = self.session_moment(moment, self.config.market_open_time)
             closeout = self.session_moment(moment, self.config.eod_close_time)
             market_close = self.session_moment(moment, self.config.market_close_time)
+            option_open = self.session_moment(
+                moment,
+                self.config.option_market_open_time,
+            )
+            option_closeout = self.session_moment(
+                moment,
+                self.config.option_eod_close_time,
+            )
+            option_close = self.session_moment(
+                moment,
+                self.config.option_market_close_time,
+            )
 
             if moment < market_open:
                 time.sleep(min(60, max(1, (market_open - moment).total_seconds())))
                 continue
 
             if closeout <= moment < market_close:
-                finished = self.close_everything()
+                finished = self.close_instruments({"EQUITY"})
                 time.sleep(60 if finished else self.config.eod_retry_seconds)
                 continue
 
             if moment >= market_close:
                 time.sleep(60)
                 continue
+
+            if option_closeout <= moment < option_close:
+                self.close_instruments({"OPTION"})
 
             self.resolve_targets(moment)
             cycle_started = time.monotonic()
@@ -770,7 +788,9 @@ class AutoTrader:
                 )
                 if not circuit_active:
                     buying_power = self.trade_stocks(positions, buying_power)
-                    buying_power = self.trade_options(positions, buying_power)
+                    if option_open <= moment < option_closeout:
+                        self.discover_option_contracts()
+                        buying_power = self.trade_options(positions, buying_power)
                     self.cached_buying_power = buying_power
                     self.cached_positions = [dict(item) for item in positions]
                     self.submit_agent_research(positions, buying_power)

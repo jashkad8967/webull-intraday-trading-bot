@@ -74,11 +74,19 @@ class Settings(BaseSettings):
     loss_reevaluation_seconds: int = Field(default=120, ge=30, le=3600)
 
     trading_timezone: str = "America/New_York"
-    market_open_time: str = "09:30"
-    eod_close_time: str = "15:50"
-    market_close_time: str = "16:00"
+    market_open_time: str = "04:00"
+    eod_close_time: str = "19:50"
+    market_close_time: str = "20:00"
+    option_market_open_time: str = "09:30"
+    option_eod_close_time: str = "15:50"
+    option_market_close_time: str = "16:00"
     eod_retry_seconds: int = Field(default=10, ge=2, le=120)
     market_holidays: str = ""
+    stock_limit_offset: Decimal = Field(
+        default=Decimal("0.005"),
+        ge=0,
+        le=Decimal("0.10"),
+    )
     option_limit_offset: Decimal = Field(default=Decimal("0.03"), ge=0, le=Decimal("0.25"))
 
     def host(self) -> str:
@@ -106,6 +114,24 @@ class Settings(BaseSettings):
             raise ValueError("EMA_FAST_PERIOD must be lower than EMA_SLOW_PERIOD")
         if self.option_min_dte > self.option_max_dte:
             raise ValueError("OPTION_MIN_DTE must not exceed OPTION_MAX_DTE")
+        if not (
+            self.session_time(self.market_open_time)
+            < self.session_time(self.eod_close_time)
+            < self.session_time(self.market_close_time)
+        ):
+            raise ValueError(
+                "Stock session times must be ordered: MARKET_OPEN_TIME, "
+                "EOD_CLOSE_TIME, MARKET_CLOSE_TIME"
+            )
+        if not (
+            self.session_time(self.option_market_open_time)
+            < self.session_time(self.option_eod_close_time)
+            < self.session_time(self.option_market_close_time)
+        ):
+            raise ValueError(
+                "Option session times must be ordered: OPTION_MARKET_OPEN_TIME, "
+                "OPTION_EOD_CLOSE_TIME, OPTION_MARKET_CLOSE_TIME"
+            )
         if not self.live_trading_enabled:
             raise ValueError("Production mode requires LIVE_TRADING_ENABLED=true")
         if self.agent_enabled and not self.groq_api_key:

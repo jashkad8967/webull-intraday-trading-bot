@@ -377,20 +377,26 @@ retried because a timed-out order may already have reached the broker.
 
 ```dotenv
 TRADING_TIMEZONE=America/New_York
-MARKET_OPEN_TIME=09:30
-EOD_CLOSE_TIME=15:50
-MARKET_CLOSE_TIME=16:00
+MARKET_OPEN_TIME=04:00
+EOD_CLOSE_TIME=19:50
+MARKET_CLOSE_TIME=20:00
+OPTION_MARKET_OPEN_TIME=09:30
+OPTION_EOD_CLOSE_TIME=15:50
+OPTION_MARKET_CLOSE_TIME=16:00
+STOCK_LIMIT_OFFSET=0.005
 EOD_RETRY_SECONDS=10
 ```
 
-At 3:50 PM New York time the bot stops running the strategy. It then:
+Stocks run in Webull's `ALL` session from 4:00 AM through 8:00 PM New York
+time. All stock entries and exits use limit orders because market orders are
+not eligible throughout the extended session. `STOCK_LIMIT_OFFSET=0.005`
+allows a stock close or entry limit to cross the current quote by 0.5%.
 
-1. Cancels currently reported working orders.
-2. Sends market orders to close stock positions.
-3. Sends aggressive limit orders to close single-leg option positions.
-4. Refreshes positions.
-5. Repeats cancellation and closeout every `EOD_RETRY_SECONDS` until positions
-   are gone or the market closes.
+Options remain restricted to their supported core session. At 3:50 PM the bot
+cancels working orders and repeatedly sends aggressive option close limits.
+Stock trading continues afterward. At 7:50 PM the bot cancels working orders
+and repeatedly sends stock close limits until positions are gone or the stock
+extended session closes at 8:00 PM.
 
 The closeout operates on positions in the configured Webull account, including
 positions that existed before the bot started.
@@ -428,12 +434,12 @@ The terminal reports selected targets, signals that become orders, API errors,
 and end-of-day closeout progress in a compact colored format:
 
 ```text
-09:30:00 INFO     START  | mode=LIVE | poll=1s | cooldown=5s
-09:30:00 INFO     LOAD   | downloading stocks and ETFs | limit=500
-09:30:04 INFO     READY  | stocks=500 | options=0 | option scan=ON
-09:30:19 INFO     SCAN   | stocks=100/500 | options=0/0 | positions=0
-09:30:21 INFO     ORDER  | STOCK       | BUY    | AAPL     | id=...
-15:50:02 INFO     CLOSE  | submitted=3 | remaining=0
+04:00:00 INFO     START  | mode=LIVE | poll=1s | cooldown=5s
+04:00:00 INFO     LOAD   | downloading stocks and ETFs | limit=500
+04:00:04 INFO     READY  | stocks=500 | options=0 | option scan=ON
+04:00:19 INFO     SCAN   | stocks=100/500 | options=0/0 | positions=0
+04:00:21 INFO     ORDER  | STOCK       | BUY    | AAPL     | id=...
+19:50:02 INFO     CLOSE  | submitted=3 | remaining=0
 ```
 
 Verbose Webull SDK request objects and authentication headers are suppressed.
@@ -534,10 +540,14 @@ LOSS_SPREE_LOW_OUTLOOK_FRACTION=0.60
 LOSS_REEVALUATION_SECONDS=120
 
 TRADING_TIMEZONE=America/New_York
-MARKET_OPEN_TIME=09:30
-EOD_CLOSE_TIME=15:50
-MARKET_CLOSE_TIME=16:00
+MARKET_OPEN_TIME=04:00
+EOD_CLOSE_TIME=19:50
+MARKET_CLOSE_TIME=20:00
+OPTION_MARKET_OPEN_TIME=09:30
+OPTION_EOD_CLOSE_TIME=15:50
+OPTION_MARKET_CLOSE_TIME=16:00
 EOD_RETRY_SECONDS=10
 MARKET_HOLIDAYS=
+STOCK_LIMIT_OFFSET=0.005
 OPTION_LIMIT_OFFSET=0.03
 ```

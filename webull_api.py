@@ -498,7 +498,7 @@ class WebullAPI:
             "market": "US",
             "order_type": "LIMIT" if limit_price is not None else "MARKET",
             "quantity": str(quantity),
-            "support_trading_session": "CORE",
+            "support_trading_session": "ALL",
             "side": side,
             "time_in_force": "DAY",
             "entrust_type": "QTY",
@@ -516,6 +516,23 @@ class WebullAPI:
             retry=False,
         )
         return client_order_id
+
+    def stock_limit_price(self, quote: dict, side: str) -> Decimal:
+        offset = self.config.stock_limit_offset
+        if side == "BUY":
+            base = Decimal(
+                str(quote.get("ask") or quote.get("price") or quote.get("bid"))
+            )
+            price = base * (Decimal("1") + offset)
+        else:
+            base = Decimal(
+                str(quote.get("bid") or quote.get("price") or quote.get("ask"))
+            )
+            price = base * (Decimal("1") - offset)
+        return max(Decimal("0.01"), price).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_UP,
+        )
 
     def option_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.option_limit_offset
@@ -686,17 +703,35 @@ class WebullAPI:
                 return contract
         return None
 
-    def close_all_positions(self) -> list[str]:
+    def close_all_positions(
+        self,
+        instrument_types: set[str] | None = None,
+    ) -> list[str]:
+        positions = [
+            position
+            for position in self.positions()
+            if instrument_types is None
+            or position.get("instrument_type") in instrument_types
+        ]
+        if not positions:
+            return []
         self.cancel_all_orders()
         submitted: list[str] = []
-        for position in self.positions():
+        for position in positions:
             quantity = int(Decimal(str(position.get("quantity", "0"))))
             if not quantity:
                 continue
             if position.get("instrument_type") == "EQUITY":
                 side = "SELL" if quantity > 0 else "BUY"
+                quote = self.stock_quote(position["symbol"])
+                limit_price = self.stock_limit_price(quote, side)
                 submitted.append(
-                    self.place_stock(position["symbol"], side, abs(quantity))
+                    self.place_stock(
+                        position["symbol"],
+                        side,
+                        abs(quantity),
+                        limit_price,
+                    )
                 )
             elif position.get("instrument_type") == "OPTION":
                 contract = self.contract_from_position(position)
