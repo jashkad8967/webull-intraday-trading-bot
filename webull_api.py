@@ -1,3 +1,5 @@
+import logging
+import re
 import threading
 import time
 from datetime import date, timedelta
@@ -23,6 +25,16 @@ class WebullAPI:
             config.webull_region_id,
         )
         client.add_endpoint(config.webull_region_id, config.host())
+        # DataClient otherwise enables verbose SDK logging that can include
+        # authentication headers in an error response.
+        client._stream_logger_set = True
+        client._file_logger_set = True
+        for logger_name in ("webull", "webull.core", "webull.core.client"):
+            sdk_logger = logging.getLogger(logger_name)
+            sdk_logger.setLevel(logging.CRITICAL)
+            sdk_logger.propagate = False
+            sdk_logger.handlers.clear()
+            sdk_logger.addHandler(logging.NullHandler())
         self.trade = TradeClient(client)
         self.data = DataClient(client)
         self.config = config
@@ -60,7 +72,7 @@ class WebullAPI:
             response = callback()
             if 200 <= response.status_code < 300:
                 return response.json()
-            if response.status_code not in (417, 429, 500, 502, 503, 504):
+            if response.status_code not in (429, 500, 502, 503, 504):
                 break
             if attempt + 1 < attempts:
                 retry_after = response.headers.get("Retry-After", "")
@@ -103,25 +115,82 @@ class WebullAPI:
             "account",
         )
 
-    def stock_quotes(self, symbols: list[str]) -> list[dict]:
+    def stock_quotes(
+        self,
+        symbols: list[str],
+        category: str = "US_STOCK",
+    ) -> list[dict]:
         from webull.data.common.category import Category
 
         if not symbols:
             return []
         if len(symbols) > 100:
             raise ValueError("Webull stock snapshots accept at most 100 symbols")
+        if category not in (Category.US_STOCK.name, Category.US_ETF.name):
+            raise ValueError(f"Unsupported stock snapshot category: {category}")
         return self._call(
             lambda: self.data.market_data.get_snapshot(
                 symbols,
-                Category.US_STOCK.name,
+                category,
                 False,
                 False,
             ),
             "market",
         )
 
-    def stock_quote(self, symbol: str) -> dict:
-        data = self.stock_quotes([symbol])
+    def stock_quotes_resilient(
+        self,
+        symbols: list[str],
+        category: str,
+    ) -> tuple[list[dict], set[str]]:
+        if not symbols:
+            return [], set()
+        try:
+            return self.stock_quotes(symbols, category), set()
+        except Exception as exc:
+            message = str(exc)
+            invalid_symbol = (
+                "INVALID_SYMBOL" in message
+                or "does not exist in the category" in message
+            )
+            if not invalid_symbol:
+                raise
+            reported = self._invalid_symbols(message, symbols)
+            if reported:
+                valid = [symbol for symbol in symbols if symbol not in reported]
+                if not valid:
+                    return [], reported
+                quotes, additional = self.stock_quotes_resilient(valid, category)
+                return quotes, reported | additional
+            if len(symbols) == 1:
+                return [], {symbols[0]}
+            middle = len(symbols) // 2
+            left_quotes, left_invalid = self.stock_quotes_resilient(
+                symbols[:middle],
+                category,
+            )
+            right_quotes, right_invalid = self.stock_quotes_resilient(
+                symbols[middle:],
+                category,
+            )
+            return left_quotes + right_quotes, left_invalid | right_invalid
+
+    @staticmethod
+    def _invalid_symbols(message: str, requested: list[str]) -> set[str]:
+        match = re.search(r"\[([^\]]+)\]", message)
+        if not match:
+            return set()
+        allowed = set(requested)
+        return {
+            value.strip().upper()
+            for value in match.group(1).split(",")
+            if value.strip().upper() in allowed
+        }
+
+    def stock_quote(self, symbol: str, category: str | None = None) -> dict:
+        if category is None:
+            category = self.stock_categories([symbol]).get(symbol.upper(), "US_STOCK")
+        data = self.stock_quotes([symbol], category)
         if not data:
             raise RuntimeError(f"No stock snapshot returned for {symbol}")
         return data[0]
@@ -147,39 +216,97 @@ class WebullAPI:
             raise RuntimeError(f"No option snapshot returned for {option_symbol}")
         return data[0]
 
-    def stock_universe(self) -> list[str]:
+    def stock_categories(self, symbols: list[str]) -> dict[str, str]:
         from webull.data.common.category import Category
 
-        symbols: list[str] = []
-        cursor = None
-        while self.config.max_symbols == 0 or len(symbols) < self.config.max_symbols:
-            remaining = (
-                1000
-                if self.config.max_symbols == 0
-                else self.config.max_symbols - len(symbols)
-            )
-            page_size = min(1000, remaining)
-            page = self._call(
+        requested = list(dict.fromkeys(symbol.upper() for symbol in symbols))
+        categories: dict[str, str] = {}
+        for category in (Category.US_STOCK.name, Category.US_ETF.name):
+            for start in range(0, len(requested), 100):
+                batch = requested[start : start + 100]
+                page = self._stock_instruments_resilient(batch, category)
+                for item in page or []:
+                    symbol = str(item.get("symbol", "")).upper()
+                    if (
+                        symbol in batch
+                        and item.get("tradable_status", "OC") == "OC"
+                    ):
+                        categories[symbol] = category
+        return categories
+
+    def _stock_instruments_resilient(
+        self,
+        symbols: list[str],
+        category: str,
+    ) -> list[dict]:
+        if not symbols:
+            return []
+        try:
+            return self._call(
                 lambda: self.data.instrument.get_instrument(
-                    category=Category.US_STOCK.name,
-                    last_instrument_id=cursor,
-                    page_size=page_size,
+                    symbols=symbols,
+                    category=category,
+                    page_size=len(symbols),
                 ),
                 "stock_instrument",
             )
-            if not page:
-                break
-            symbols.extend(
-                item["symbol"]
-                for item in page
-                if item.get("symbol") and item.get("tradable_status", "OC") == "OC"
+        except Exception as exc:
+            message = str(exc)
+            if (
+                "INVALID_SYMBOL" not in message
+                and "does not exist in the category" not in message
+            ):
+                raise
+            invalid = self._invalid_symbols(message, symbols)
+            if invalid:
+                return self._stock_instruments_resilient(
+                    [symbol for symbol in symbols if symbol not in invalid],
+                    category,
+                )
+            if len(symbols) == 1:
+                return []
+            middle = len(symbols) // 2
+            return (
+                self._stock_instruments_resilient(symbols[:middle], category)
+                + self._stock_instruments_resilient(symbols[middle:], category)
             )
-            next_cursor = page[-1].get("instrument_id")
-            if len(page) < page_size or not next_cursor or next_cursor == cursor:
-                break
-            cursor = str(next_cursor)
-        unique = list(dict.fromkeys(symbols))
-        return unique if self.config.max_symbols == 0 else unique[: self.config.max_symbols]
+
+    def stock_universe(self) -> dict[str, str]:
+        from webull.data.common.category import Category
+
+        categories: dict[str, str] = {}
+        for category in (Category.US_STOCK.name, Category.US_ETF.name):
+            cursor = None
+            while True:
+                page = self._call(
+                    lambda category=category, cursor=cursor: (
+                        self.data.instrument.get_instrument(
+                            category=category,
+                            last_instrument_id=cursor,
+                            page_size=1000,
+                        )
+                    ),
+                    "stock_instrument",
+                )
+                if not page:
+                    break
+                for item in page:
+                    symbol = str(item.get("symbol", "")).upper()
+                    if symbol and item.get("tradable_status", "OC") == "OC":
+                        # ETF is fetched second and intentionally wins if the
+                        # instrument endpoint returns it in both categories.
+                        categories[symbol] = category
+                next_cursor = page[-1].get("instrument_id")
+                if (
+                    len(page) < 1000
+                    or not next_cursor
+                    or str(next_cursor) == cursor
+                ):
+                    break
+                cursor = str(next_cursor)
+        if self.config.max_symbols:
+            return dict(list(categories.items())[: self.config.max_symbols])
+        return categories
 
     def option_contracts(
         self,
@@ -306,7 +433,11 @@ class WebullAPI:
             try:
                 self.cancel(order_id)
             except Exception as exc:
-                print(f"Cancel failed for {order_id}: {exc}")
+                logging.getLogger("webull-bot").error(
+                    "CANCEL | id=%s | %s",
+                    order_id,
+                    exc,
+                )
         return unique
 
     def place_stock(self, symbol: str, side: str, quantity: int) -> str:
@@ -511,7 +642,10 @@ class WebullAPI:
             elif position.get("instrument_type") == "OPTION":
                 contract = self.contract_from_position(position)
                 if not contract:
-                    print(f"Could not resolve option position: {position}")
+                    logging.getLogger("webull-bot").error(
+                        "CLOSE  | unresolved option=%s",
+                        position.get("symbol", "UNKNOWN"),
+                    )
                     continue
                 side = "SELL" if quantity > 0 else "BUY"
                 intent = "SELL_TO_CLOSE" if quantity > 0 else "BUY_TO_CLOSE"

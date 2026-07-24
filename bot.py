@@ -4,6 +4,8 @@ from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+from rich.logging import RichHandler
+
 from config import settings
 from strategy import EMACrossStrategy
 from webull_api import WebullAPI
@@ -11,7 +13,17 @@ from webull_api import WebullAPI
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(message)s",
+    handlers=[
+        RichHandler(
+            show_time=True,
+            show_level=True,
+            show_path=False,
+            markup=False,
+            log_time_format="%H:%M:%S",
+            omit_repeated_times=False,
+        )
+    ],
 )
 log = logging.getLogger("webull-bot")
 
@@ -28,6 +40,8 @@ class AutoTrader:
         self.timezone = ZoneInfo(self.config.trading_timezone)
         self.last_trade: dict[str, float] = {}
         self.stock_symbols: list[str] = []
+        self.stock_categories: dict[str, str] = {}
+        self.invalid_stock_symbols: set[str] = set()
         self.option_contracts: list[dict] = []
         self.stock_prices: dict[str, Decimal] = {}
         self.stock_cursor = 0
@@ -58,15 +72,18 @@ class AutoTrader:
         if self.resolved_date == moment.date():
             return
         requested_stocks = self.config.stocks()
-        self.stock_symbols = (
-            self.api.stock_universe()
-            if requested_stocks == ["ALL"]
-            else (
+        if requested_stocks == ["ALL"]:
+            self.stock_categories = self.api.stock_universe()
+            self.stock_symbols = list(self.stock_categories)
+        else:
+            self.stock_symbols = (
                 requested_stocks
                 if self.config.max_symbols == 0
                 else requested_stocks[: self.config.max_symbols]
             )
-        )
+            self.stock_categories = self.api.stock_categories(self.stock_symbols)
+            for symbol in self.stock_symbols:
+                self.stock_categories.setdefault(symbol, "US_STOCK")
         self.option_contracts = self.api.resolve_options()
         self.discover_all_options = "ALL" in self.config.option_roots()
         self.stock_prices.clear()
@@ -74,12 +91,13 @@ class AutoTrader:
         self.option_cursor = 0
         self.option_discovery_cursor = 0
         self.option_discovery_attempted.clear()
+        self.invalid_stock_symbols.clear()
         self.resolved_date = moment.date()
         log.info(
-            "Targets: %s stocks, %s initial options, all-options-discovery=%s",
+            "READY  | stocks=%s | options=%s | option scan=%s",
             len(self.stock_symbols),
             len(self.option_contracts),
-            self.discover_all_options,
+            "ON" if self.discover_all_options else "OFF",
         )
 
     @staticmethod
@@ -125,16 +143,16 @@ class AutoTrader:
                 self.option_contracts.extend(contracts)
                 discovered.add(underlying)
                 log.info(
-                    "Options discovered %s for %s (%s/%s checked)",
-                    ",".join(contract["symbol"] for contract in contracts),
+                    "OPTIONS | %s | found=%s | progress=%s/%s",
                     underlying,
+                    ",".join(contract["symbol"] for contract in contracts),
                     len(self.option_discovery_attempted),
                     len(self.stock_symbols),
                 )
             except Exception as exc:
                 if len(self.option_discovery_attempted) % 100 == 0:
                     log.info(
-                        "Option discovery progress %s/%s; latest=%s: %s",
+                        "OPTIONS | progress=%s/%s | latest=%s | %s",
                         len(self.option_discovery_attempted),
                         len(self.stock_symbols),
                         underlying,
@@ -147,7 +165,14 @@ class AutoTrader:
 
     def record_trade(self, key: str, order_id: str, action: str) -> None:
         self.last_trade[key] = time.monotonic()
-        log.info("%s %s order=%s", action, key, order_id)
+        instrument_type, symbol = key.split(":", 1)
+        log.info(
+            "ORDER  | %-11s | %-6s | %-8s | id=%s",
+            instrument_type,
+            action,
+            symbol,
+            order_id,
+        )
 
     @staticmethod
     def open_position_count(positions: list[dict]) -> int:
@@ -164,11 +189,32 @@ class AutoTrader:
             self.stock_cursor,
             self.config.stock_batch_size,
         )
+        quotes: list[dict] = []
+        invalid: set[str] = set()
+        grouped: dict[str, list[str]] = {"US_STOCK": [], "US_ETF": []}
+        for symbol in batch:
+            grouped[self.stock_categories.get(symbol, "US_STOCK")].append(symbol)
         try:
-            quotes = self.api.stock_quotes(batch)
+            for category, category_symbols in grouped.items():
+                category_quotes, category_invalid = (
+                    self.api.stock_quotes_resilient(category_symbols, category)
+                )
+                quotes.extend(category_quotes)
+                invalid.update(category_invalid)
         except Exception as exc:
-            log.error("Stock quote batch: %s", exc)
+            log.error("STOCKS | quote batch failed | %s", exc)
             return
+        if invalid:
+            self.invalid_stock_symbols.update(invalid)
+            self.stock_symbols = [
+                symbol for symbol in self.stock_symbols if symbol not in invalid
+            ]
+            self.stock_cursor %= max(1, len(self.stock_symbols))
+            log.warning(
+                "SKIP   | invalid=%s | %s",
+                len(invalid),
+                ",".join(sorted(invalid)),
+            )
         quote_by_symbol = {
             str(quote.get("symbol", "")).upper(): quote for quote in quotes
         }
@@ -226,7 +272,7 @@ class AutoTrader:
                     reason = "TAKE_PROFIT" if take_profit else "STOP_LOSS" if stop_loss else "SELL"
                     self.record_trade(key, order_id, reason)
             except Exception as exc:
-                log.error("Stock %s: %s", symbol, exc)
+                log.error("STOCK  | %s | %s", symbol, exc)
         self.discover_option_contracts()
 
     def trade_options(self, positions: list[dict]) -> None:
@@ -241,7 +287,7 @@ class AutoTrader:
                 [contract["symbol"] for contract in batch]
             )
         except Exception as exc:
-            log.error("Option quote batch: %s", exc)
+            log.error("OPTIONS | quote batch failed | %s", exc)
             return
         quote_by_symbol = {
             str(quote.get("symbol", "")).upper(): quote for quote in quotes
@@ -310,7 +356,7 @@ class AutoTrader:
                     reason = "TAKE_PROFIT" if take_profit else "STOP_LOSS" if stop_loss else "SELL"
                     self.record_trade(key, order_id, reason)
             except Exception as exc:
-                log.error("Option %s: %s", option_symbol, exc)
+                log.error("OPTION | %s | %s", option_symbol, exc)
 
     def close_everything(self) -> bool:
         now = time.monotonic()
@@ -325,18 +371,18 @@ class AutoTrader:
                 if Decimal(str(item.get("quantity", "0"))) != 0
             ]
             log.info(
-                "End-of-day closeout submitted=%s remaining=%s",
+                "CLOSE  | submitted=%s | remaining=%s",
                 len(submitted),
                 len(remaining),
             )
             return not remaining
         except Exception as exc:
-            log.error("End-of-day closeout: %s", exc)
+            log.error("CLOSE  | failed | %s", exc)
             return False
 
     def run(self) -> None:
         log.info(
-            "Starting mode=%s poll=%ss cooldown=%ss",
+            "START  | mode=%s | poll=%ss | cooldown=%ss",
             self.config.mode,
             self.config.poll_seconds,
             self.config.trade_cooldown_seconds,
@@ -370,7 +416,7 @@ class AutoTrader:
                 self.trade_stocks(positions)
                 self.trade_options(positions)
             except Exception as exc:
-                log.error("Trading cycle: %s", exc)
+                log.error("CYCLE  | failed | %s", exc)
 
             seconds_to_closeout = max(
                 1.0,
@@ -383,4 +429,4 @@ if __name__ == "__main__":
     try:
         AutoTrader().run()
     except KeyboardInterrupt:
-        log.info("Stopped")
+        log.info("STOPPED")

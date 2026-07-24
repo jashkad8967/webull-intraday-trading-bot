@@ -3,7 +3,7 @@
 This application contains fewer than 15 copyable files and uses Webull's
 official Python SDK against the US production API. It can:
 
-- Download and rotate through Webull's complete tradable US stock universe.
+- Download and rotate through Webull's complete tradable US stock and ETF universe.
 - Trade exact OCC option contracts.
 - Progressively discover current ATM calls and puts for every optionable stock.
 - Scan every second, every few minutes, or up to once per hour.
@@ -49,8 +49,8 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 The script:
 
-1. Finds Python 3.12.
-2. Installs Python 3.12 through `winget` if necessary.
+1. Prefers Python 3.12 and accepts a newer installed Python.
+2. Installs Python 3.12 through `winget` if no compatible Python is available.
 3. Creates `.venv` for the autonomous trader.
 4. Installs the current official Webull SDK and required packages.
 5. Creates `.webull-skill-venv` for Webull Agent Skills.
@@ -107,7 +107,7 @@ It will display buying power, positions, and the first configured stock quote.
 
 ## 3. Select stocks
 
-The default includes every tradable US stock:
+The default includes every tradable US stock and ETF:
 
 ```dotenv
 STOCK_SYMBOLS=ALL
@@ -115,9 +115,14 @@ MAX_SYMBOLS=0
 STOCK_BATCH_SIZE=100
 ```
 
-The bot downloads the current list directly from Webull at the start of each
-trading day. A static ticker list is intentionally not embedded because
-listings and trading status change. `MAX_SYMBOLS=0` means no cap.
+The bot downloads the current lists directly from Webull at the start of each
+trading day and keeps each instrument's required `US_STOCK` or `US_ETF`
+category. A static ticker list is intentionally not embedded because listings
+and trading status change. `MAX_SYMBOLS=0` means no cap.
+
+If Webull's instrument directory contains a stale or delisted symbol, the bot
+uses the rejected-symbol list returned by Webull, skips those symbols for the
+rest of that day, and immediately retries only the valid part of the batch.
 
 Webull accepts up to 100 stock symbols in one snapshot request. The bot rotates
 through the universe in batches of 100 instead of making one request per stock.
@@ -322,7 +327,16 @@ Ctrl+C
 ```
 
 The terminal reports selected targets, signals that become orders, API errors,
-and end-of-day closeout progress.
+and end-of-day closeout progress in a compact colored format:
+
+```text
+09:30:00 INFO     START  | mode=LIVE | poll=1s | cooldown=5s
+09:30:18 INFO     READY  | stocks=12483 | options=0 | option scan=ON
+09:30:21 INFO     ORDER  | STOCK       | BUY    | AAPL     | id=...
+15:50:02 INFO     CLOSE  | submitted=3 | remaining=0
+```
+
+Verbose Webull SDK request objects and authentication headers are suppressed.
 
 ## 10. Use Webull Agent Skills
 

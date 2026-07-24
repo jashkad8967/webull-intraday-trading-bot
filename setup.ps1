@@ -3,16 +3,32 @@ Set-Location -LiteralPath $PSScriptRoot
 
 function Find-Python {
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        $resolved = & py "-3.12" -c "import sys; print(sys.executable)" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $resolved) {
-            return $resolved.Trim()
+        try {
+            $resolved = & py "-3.12" -c "import sys; print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $resolved) {
+                return $resolved.Trim()
+            }
+        } catch {
+            $resolved = $null
+        }
+        try {
+            $resolved = & py -c "import sys; assert sys.version_info >= (3, 12); print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $resolved) {
+                return $resolved.Trim()
+            }
+        } catch {
+            $resolved = $null
         }
     }
 
     if (Get-Command python -ErrorAction SilentlyContinue) {
-        $resolved = & python -c "import sys; assert sys.version_info[:2] == (3, 12); print(sys.executable)" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $resolved) {
-            return $resolved.Trim()
+        try {
+            $resolved = & python -c "import sys; assert sys.version_info >= (3, 12); print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $resolved) {
+                return $resolved.Trim()
+            }
+        } catch {
+            $resolved = $null
         }
     }
 
@@ -22,7 +38,7 @@ function Find-Python {
 $pythonExe = Find-Python
 if (-not $pythonExe) {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        throw "Python 3.12 and winget were not found. Install Python 3.12 from python.org, then rerun setup.ps1."
+        throw "Python 3.12+ and winget were not found. Install Python 3.12 or newer from python.org, then rerun setup.ps1."
     }
 
     Write-Host "Installing Python 3.12..."
