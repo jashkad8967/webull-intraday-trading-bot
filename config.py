@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     stock_batch_size: int = Field(default=100, ge=1, le=100)
     option_batch_size: int = Field(default=20, ge=1, le=20)
     option_discovery_per_cycle: int = Field(default=1, ge=1, le=10)
+    option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)
 
     stock_quantity: int = Field(default=1, ge=1)
     option_quantity: int = Field(default=1, ge=1)
@@ -53,6 +54,24 @@ class Settings(BaseSettings):
         le=Decimal("1"),
     )
     order_requests_per_minute: int = Field(default=480, ge=1, le=600)
+    account_refresh_seconds: Decimal = Field(default=Decimal("5"), ge=1, le=60)
+
+    agent_enabled: bool = False
+    groq_api_key: str = ""
+    groq_model: str = "groq/compound-mini"
+    agent_research_seconds: int = Field(default=60, ge=15, le=3600)
+    agent_max_symbols: int = Field(default=5, ge=1, le=50)
+    agent_timeout_seconds: int = Field(default=45, ge=5, le=180)
+    agent_required_for_entry: bool = True
+    agent_min_confidence: float = Field(default=0.65, ge=0, le=1)
+    agent_min_entry_score: float = Field(default=0.15, ge=-1, le=1)
+    agent_max_downside_risk: float = Field(default=0.55, ge=0, le=1)
+    agent_max_liquidity_risk: float = Field(default=0.50, ge=0, le=1)
+    loss_circuit_breaker_enabled: bool = False
+    loss_spree_position_count: int = Field(default=3, ge=2, le=100)
+    loss_spree_total_dollars: Decimal = Field(default=Decimal("1"), gt=0)
+    loss_spree_low_outlook_fraction: float = Field(default=0.6, ge=0, le=1)
+    loss_reevaluation_seconds: int = Field(default=120, ge=30, le=3600)
 
     trading_timezone: str = "America/New_York"
     market_open_time: str = "09:30"
@@ -89,6 +108,12 @@ class Settings(BaseSettings):
             raise ValueError("OPTION_MIN_DTE must not exceed OPTION_MAX_DTE")
         if not self.live_trading_enabled:
             raise ValueError("Production mode requires LIVE_TRADING_ENABLED=true")
+        if self.agent_enabled and not self.groq_api_key:
+            raise ValueError("GROQ_API_KEY is required when AGENT_ENABLED=true")
+        if self.loss_circuit_breaker_enabled and not self.agent_enabled:
+            raise ValueError(
+                "LOSS_CIRCUIT_BREAKER_ENABLED requires AGENT_ENABLED=true"
+            )
 
     def stocks(self) -> list[str]:
         return [item.strip().upper() for item in self.stock_symbols.split(",") if item.strip()]

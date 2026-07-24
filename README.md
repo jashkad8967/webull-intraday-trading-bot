@@ -19,7 +19,7 @@ orders, so option entries and exits use refreshed aggressive limit prices.
 ## Recreate the application from code
 
 Create one folder on the destination computer and copy the contents of these
-10 files into files with the same names:
+11 files into files with the same names:
 
 ```text
 .env.example
@@ -29,6 +29,7 @@ requirements.txt
 setup.ps1
 config.py
 strategy.py
+market_agent.py
 webull_api.py
 connect.py
 bot.py
@@ -154,6 +155,7 @@ OPTION_MIN_DTE=7
 OPTION_MAX_DTE=45
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
+OPTION_DISCOVERY_SECONDS=15
 ```
 
 Discovery is progressive because requesting every listed strike and expiration
@@ -214,6 +216,7 @@ Fast scanning, allowing multiple instruments to trade in a minute:
 
 ```dotenv
 POLL_SECONDS=1
+ACCOUNT_REFRESH_SECONDS=5
 TRADE_COOLDOWN_SECONDS=5
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
@@ -241,6 +244,76 @@ EMA_SLOW_PERIOD=8
 ```
 
 `POLL_SECONDS` accepts values from 1 through 3600.
+
+The loop uses a start-to-start cadence: time spent processing is subtracted
+from `POLL_SECONDS` instead of adding another full sleep afterward. Account
+balance and positions are cached briefly with `ACCOUNT_REFRESH_SECONDS=5`, and
+option discovery runs independently at `OPTION_DISCOVERY_SECONDS=15`. Webull's
+request throttles remain enforced.
+
+## Optional web-research agent
+
+The strategy and execution loop do not wait for the agent. A background worker
+uses Groq Compound Mini's built-in web search to research current news and catalysts for
+held positions and EMA entry candidates. The result can confirm or reject new
+entries, but the agent cannot call Webull or submit orders.
+
+Create a free Groq developer key at
+[console.groq.com/keys](https://console.groq.com/keys), then add it to `.env`:
+
+```dotenv
+AGENT_ENABLED=true
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=groq/compound-mini
+AGENT_RESEARCH_SECONDS=60
+AGENT_MAX_SYMBOLS=5
+AGENT_REQUIRED_FOR_ENTRY=true
+AGENT_MIN_CONFIDENCE=0.65
+AGENT_MIN_ENTRY_SCORE=0.15
+AGENT_MAX_DOWNSIDE_RISK=0.55
+AGENT_MAX_LIQUIDITY_RISK=0.50
+LOSS_CIRCUIT_BREAKER_ENABLED=true
+LOSS_SPREE_POSITION_COUNT=3
+LOSS_SPREE_TOTAL_DOLLARS=1.00
+LOSS_SPREE_LOW_OUTLOOK_FRACTION=0.60
+LOSS_REEVALUATION_SECONDS=120
+```
+
+`groq/compound-mini` is the low-latency Compound system and can perform one
+built-in web search per research request. Groq free-tier requests are subject
+to the limits shown for your account. With
+`AGENT_REQUIRED_FOR_ENTRY=true`, a technical entry waits for a fresh agent
+`BUY` assessment at or above the confidence threshold. Profit exits and daily
+closeout never wait for the agent.
+
+Every research response contains the same global values:
+`market_action`, `market_confidence`, `market_direction`, and
+`market_volatility`. Every researched symbol contains `action`, `confidence`,
+`news_sentiment`, `catalyst_strength`, `expected_move_percent`,
+`horizon_minutes`, `downside_risk`, and `liquidity_risk`. Missing symbol output
+is replaced with conservative values rather than silently accepted.
+
+`strategy.py` combines those values into a deterministic entry score:
+positive sentiment, catalysts, expected move, and market direction increase
+the score; downside and liquidity risks reduce it. A new entry must meet the
+configured score, confidence, downside, and liquidity thresholds.
+
+### Loss-spree circuit breaker
+
+The optional portfolio circuit breaker liquidates all positions when at least
+`LOSS_SPREE_POSITION_COUNT` positions are losing and either:
+
+- their combined loss reaches twice `LOSS_SPREE_TOTAL_DOLLARS`; or
+- their combined loss reaches `LOSS_SPREE_TOTAL_DOLLARS` and the configured
+  fraction have a confident agent `HOLD` or `AVOID` outlook.
+
+After liquidation, entries remain paused for at least
+`LOSS_REEVALUATION_SECONDS` and resume only after a fresh, confident agent
+`RESUME` assessment. This intentionally overrides the normal profit-only rule.
+
+All entry and normal-session exit policy now lives in `strategy.py`.
+`bot.py` handles scheduling, state, API calls, and order execution;
+`market_agent.py` performs non-blocking research.
 
 For stocks, a `STOCK_TAKE_PROFIT_PER_SHARE` value of `0.01` requests an exit
 at a limit price one cent above the reported average cost. For options,
@@ -340,6 +413,17 @@ Stop it with:
 Ctrl+C
 ```
 
+Force account-wide closeout at any time:
+
+```powershell
+.\.venv\Scripts\python.exe bot.py --close-all
+```
+
+This bypasses signals, cancels all working orders, and submits closes for every
+position in `ACCOUNT_ID`, including positions opened outside this bot. It
+cannot override a closed market, trading halt, rejected order, or unfilled
+option limit.
+
 The terminal reports selected targets, signals that become orders, API errors,
 and end-of-day closeout progress in a compact colored format:
 
@@ -411,6 +495,7 @@ MAX_SYMBOLS=0
 STOCK_BATCH_SIZE=100
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
+OPTION_DISCOVERY_SECONDS=15
 
 STOCK_QUANTITY=1
 OPTION_QUANTITY=1
@@ -418,6 +503,7 @@ MAX_OPEN_POSITIONS=5
 MAX_ORDER_NOTIONAL=1000
 
 POLL_SECONDS=1
+ACCOUNT_REFRESH_SECONDS=5
 TRADE_COOLDOWN_SECONDS=5
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
@@ -429,6 +515,23 @@ OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
 STOCK_INSTRUMENT_REQUESTS_PER_30_SECONDS=9
 ACCOUNT_REQUESTS_PER_SECOND=0.8
 ORDER_REQUESTS_PER_MINUTE=480
+
+AGENT_ENABLED=false
+GROQ_API_KEY=
+GROQ_MODEL=groq/compound-mini
+AGENT_RESEARCH_SECONDS=60
+AGENT_MAX_SYMBOLS=5
+AGENT_TIMEOUT_SECONDS=45
+AGENT_REQUIRED_FOR_ENTRY=true
+AGENT_MIN_CONFIDENCE=0.65
+AGENT_MIN_ENTRY_SCORE=0.15
+AGENT_MAX_DOWNSIDE_RISK=0.55
+AGENT_MAX_LIQUIDITY_RISK=0.50
+LOSS_CIRCUIT_BREAKER_ENABLED=false
+LOSS_SPREE_POSITION_COUNT=3
+LOSS_SPREE_TOTAL_DOLLARS=1.00
+LOSS_SPREE_LOW_OUTLOOK_FRACTION=0.60
+LOSS_REEVALUATION_SECONDS=120
 
 TRADING_TIMEZONE=America/New_York
 MARKET_OPEN_TIME=09:30

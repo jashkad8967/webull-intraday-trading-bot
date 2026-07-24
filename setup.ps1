@@ -106,7 +106,7 @@ if (-not (Test-Path -LiteralPath ".env")) {
 
 Write-Host ""
 Write-Host "Setup complete."
-Write-Host "1. Edit .env and add the Webull credentials."
+Write-Host "1. Edit .env and add the Webull credentials and GROQ_API_KEY."
 Write-Host "2. If 2FA is enabled: .\.webull-skill-venv\Scripts\webull-skill.exe auth"
 Write-Host "3. Run: .\.venv\Scripts\python.exe connect.py"
 Write-Host "4. Run: .\.venv\Scripts\python.exe bot.py"

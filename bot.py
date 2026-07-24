@@ -1,4 +1,5 @@
 import logging
+import sys
 import time
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
@@ -7,7 +8,8 @@ from zoneinfo import ZoneInfo
 from rich.logging import RichHandler
 
 from config import settings
-from strategy import EMACrossStrategy
+from market_agent import MarketResearchAgent
+from strategy import TradingStrategy
 from webull_api import (
     MarketDataPermissionError,
     QuoteUnavailableError,
@@ -37,9 +39,14 @@ class AutoTrader:
         self.config = settings()
         self.config.validate_runtime()
         self.api = WebullAPI(self.config)
-        self.strategy = EMACrossStrategy(
+        self.strategy = TradingStrategy(
             self.config.ema_fast_period,
             self.config.ema_slow_period,
+        )
+        self.market_agent = (
+            MarketResearchAgent(self.config, log)
+            if self.config.agent_enabled
+            else None
         )
         self.timezone = ZoneInfo(self.config.trading_timezone)
         self.last_trade: dict[str, float] = {}
@@ -59,6 +66,14 @@ class AutoTrader:
         self.resolved_date = None
         self.last_close_attempt = 0.0
         self.last_status_log = 0.0
+        self.last_option_discovery = 0.0
+        self.last_account_refresh = 0.0
+        self.cached_buying_power = Decimal("0")
+        self.cached_positions: list[dict] = []
+        self.agent_candidates: dict[str, dict] = {}
+        self.entries_paused = False
+        self.circuit_breaker_time = 0.0
+        self.last_circuit_research = 0.0
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -137,6 +152,12 @@ class AutoTrader:
             or not self.stock_symbols
         ):
             return
+        if (
+            time.monotonic() - self.last_option_discovery
+            < float(self.config.option_discovery_seconds)
+        ):
+            return
+        self.last_option_discovery = time.monotonic()
         discovered = {item["underlying_symbol"] for item in self.option_contracts}
         attempts = 0
         examined = 0
@@ -216,6 +237,173 @@ class AutoTrader:
             if Decimal(str(item.get("quantity", "0"))) != 0
         )
 
+    def account_state(self) -> tuple[Decimal, list[dict]]:
+        now = time.monotonic()
+        if (
+            now - self.last_account_refresh
+            >= float(self.config.account_refresh_seconds)
+        ):
+            self.cached_buying_power = self.api.buying_power()
+            self.cached_positions = self.api.positions()
+            self.last_account_refresh = now
+        return self.cached_buying_power, [dict(item) for item in self.cached_positions]
+
+    def agent_assessment(self, symbol: str) -> dict | None:
+        if not self.market_agent:
+            return None
+        return self.market_agent.assessment(symbol)
+
+    def submit_agent_research(
+        self,
+        positions: list[dict],
+        buying_power: Decimal,
+        force: bool = False,
+        event: str = "ROUTINE_RESEARCH",
+    ) -> None:
+        if not self.market_agent:
+            return
+        held = [
+            {
+                "symbol": item.get("symbol"),
+                "type": item.get("instrument_type"),
+                "quantity": item.get("quantity"),
+                "average_cost": item.get("cost_price"),
+                "unrealized_pnl": str(self.position_unrealized_pnl(item)),
+            }
+            for item in positions
+            if Decimal(str(item.get("quantity", "0"))) != 0
+        ]
+        candidates = list(self.agent_candidates.values())[
+            : self.config.agent_max_symbols
+        ]
+        self.agent_candidates.clear()
+        if not force and not candidates and not held:
+            return
+        self.market_agent.submit(
+            {
+                "event": event,
+                "time": self.now().isoformat(),
+                "buying_power": str(buying_power),
+                "positions": held,
+                "entry_candidates": candidates,
+            },
+            force=force,
+        )
+
+    @staticmethod
+    def position_unrealized_pnl(position: dict) -> Decimal:
+        reported = position.get("unrealized_profit_loss")
+        if reported not in (None, ""):
+            try:
+                return Decimal(str(reported))
+            except Exception:
+                pass
+        try:
+            quantity = Decimal(str(position.get("quantity", "0")))
+            cost = Decimal(str(position.get("cost_price", "0")))
+            price = Decimal(
+                str(
+                    position.get("last_price")
+                    or position.get("market_price")
+                    or "0"
+                )
+            )
+            multiplier = (
+                Decimal("100")
+                if position.get("instrument_type") == "OPTION"
+                else Decimal("1")
+            )
+            return (price - cost) * quantity * multiplier
+        except Exception:
+            return Decimal("0")
+
+    def handle_portfolio_circuit_breaker(
+        self,
+        positions: list[dict],
+        buying_power: Decimal,
+    ) -> bool:
+        if not self.config.loss_circuit_breaker_enabled:
+            return False
+
+        now = time.monotonic()
+        if self.entries_paused:
+            regime = self.market_agent.market_regime() if self.market_agent else None
+            old_enough = (
+                now - self.circuit_breaker_time
+                >= self.config.loss_reevaluation_seconds
+            )
+            fresh = regime and regime["updated_at"] > self.circuit_breaker_time
+            approved = (
+                fresh
+                and regime["action"] == "RESUME"
+                and regime["confidence"] >= self.config.agent_min_confidence
+            )
+            if old_enough and approved:
+                self.entries_paused = False
+                log.warning(
+                    "CIRCUIT | resumed | confidence=%.2f | %s",
+                    regime["confidence"],
+                    regime["summary"],
+                )
+                return False
+            if (
+                self.market_agent
+                and now - self.last_circuit_research
+                >= self.config.loss_reevaluation_seconds
+            ):
+                self.last_circuit_research = now
+                self.submit_agent_research(
+                    positions,
+                    buying_power,
+                    force=True,
+                    event="POST_LIQUIDATION_REEVALUATION",
+                )
+            return True
+
+        states = []
+        for position in positions:
+            if Decimal(str(position.get("quantity", "0"))) == 0:
+                continue
+            symbol = str(position.get("symbol", "")).upper()
+            assessment = self.agent_assessment(symbol) or {}
+            states.append(
+                {
+                    "symbol": symbol,
+                    "unrealized_pnl": self.position_unrealized_pnl(position),
+                    "agent_action": assessment.get("action"),
+                    "agent_confidence": assessment.get("confidence", 0),
+                }
+            )
+        decision = self.strategy.portfolio_decision(
+            states,
+            self.config.loss_spree_position_count,
+            self.config.loss_spree_total_dollars,
+            self.config.loss_spree_low_outlook_fraction,
+            self.config.agent_min_confidence,
+        )
+        if decision.action != "LIQUIDATE":
+            return False
+
+        log.critical(
+            "CIRCUIT | LIQUIDATE | losers=%s | loss=$%.2f | %s",
+            decision.losing_positions,
+            decision.total_loss,
+            decision.reason,
+        )
+        submitted = self.api.close_all_positions()
+        log.warning("CIRCUIT | close orders submitted=%s | entries paused", len(submitted))
+        self.entries_paused = True
+        self.circuit_breaker_time = now
+        self.last_circuit_research = now
+        self.last_account_refresh = 0.0
+        self.submit_agent_research(
+            positions,
+            buying_power,
+            force=True,
+            event="LOSS_CIRCUIT_BREAKER_LIQUIDATION",
+        )
+        return True
+
     def trade_stocks(
         self,
         positions: list[dict],
@@ -277,16 +465,36 @@ class AutoTrader:
                     continue
                 price = self.api.quote_price(quote)
                 self.stock_prices[symbol] = price
-                signal = self.strategy.signal(
-                    f"STOCK:{symbol}",
-                    float(price),
-                    self.config.reenter_on_trend,
-                )
                 quantity, cost = self.api.stock_position(symbol, positions)
                 key = f"STOCK:{symbol}"
+                agent_values = self.agent_assessment(symbol)
+                decision = self.strategy.decide(
+                    key=key,
+                    price=price,
+                    quantity=quantity,
+                    average_cost=cost,
+                    take_profit=self.config.stock_take_profit_per_share,
+                    reenter_on_trend=self.config.reenter_on_trend,
+                    agent_values=agent_values,
+                    agent_required=(
+                        self.market_agent is not None
+                        and self.config.agent_required_for_entry
+                    ),
+                    agent_min_confidence=self.config.agent_min_confidence,
+                    agent_min_entry_score=self.config.agent_min_entry_score,
+                    agent_max_downside_risk=self.config.agent_max_downside_risk,
+                    agent_max_liquidity_risk=self.config.agent_max_liquidity_risk,
+                )
+                if decision.action == "RESEARCH":
+                    self.agent_candidates[symbol] = {
+                        "symbol": symbol,
+                        "type": self.stock_categories.get(symbol, "US_STOCK"),
+                        "price": str(price),
+                        "technical_signal": "BUY",
+                    }
                 if quantity == 0:
                     self.pending_stock_exits.discard(symbol)
-                if signal == "BUY" and quantity == 0:
+                if decision.action == "BUY" and quantity == 0:
                     buffered_price = price * Decimal("1.03")
                     affordable = int(
                         (buying_power / buffered_price).to_integral_value(
@@ -326,17 +534,14 @@ class AutoTrader:
                             }
                         )
                         open_count += 1
-                take_profit = (
-                    quantity > 0
-                    and cost > 0
-                    and price - cost >= self.config.stock_take_profit_per_share
-                )
                 if (
-                    take_profit
+                    decision.action == "PROFIT"
                     and symbol not in self.pending_stock_exits
                     and self.cooldown_ready(key)
                 ):
-                    target = cost + self.config.stock_take_profit_per_share
+                    target = decision.target_price
+                    if target is None:
+                        continue
                     order_id = self.api.place_stock(
                         symbol,
                         "SELL",
@@ -396,15 +601,37 @@ class AutoTrader:
                 if not quote:
                     continue
                 price = self.api.quote_price(quote)
-                signal = self.strategy.signal(
-                    key,
-                    float(price),
-                    self.config.reenter_on_trend,
-                )
                 quantity, cost = self.api.option_position(contract, positions)
+                underlying = contract["underlying_symbol"]
+                agent_values = self.agent_assessment(underlying)
+                decision = self.strategy.decide(
+                    key=key,
+                    price=price,
+                    quantity=quantity,
+                    average_cost=cost,
+                    take_profit=self.config.option_take_profit_price,
+                    reenter_on_trend=self.config.reenter_on_trend,
+                    agent_values=agent_values,
+                    agent_required=(
+                        self.market_agent is not None
+                        and self.config.agent_required_for_entry
+                    ),
+                    agent_min_confidence=self.config.agent_min_confidence,
+                    agent_min_entry_score=self.config.agent_min_entry_score,
+                    agent_max_downside_risk=self.config.agent_max_downside_risk,
+                    agent_max_liquidity_risk=self.config.agent_max_liquidity_risk,
+                )
+                if decision.action == "RESEARCH":
+                    self.agent_candidates[underlying] = {
+                        "symbol": underlying,
+                        "type": "OPTION_UNDERLYING",
+                        "option_symbol": option_symbol,
+                        "option_price": str(price),
+                        "technical_signal": "BUY",
+                    }
                 if quantity == 0:
                     self.pending_option_exits.discard(option_symbol)
-                if signal == "BUY" and quantity == 0:
+                if decision.action == "BUY" and quantity == 0:
                     limit_price = self.api.option_limit_price(quote, "BUY")
                     contract_cost = limit_price * 100
                     affordable = int(
@@ -447,19 +674,14 @@ class AutoTrader:
                             }
                         )
                         open_count += 1
-                take_profit = (
-                    quantity > 0
-                    and cost > 0
-                    and price - cost >= self.config.option_take_profit_price
-                )
                 if (
-                    take_profit
+                    decision.action == "PROFIT"
                     and option_symbol not in self.pending_option_exits
                     and self.cooldown_ready(key)
                 ):
-                    target = (
-                        cost + self.config.option_take_profit_price
-                    ).quantize(Decimal("0.01"))
+                    if decision.target_price is None:
+                        continue
+                    target = decision.target_price.quantize(Decimal("0.01"))
                     limit_price = max(
                         target,
                         self.api.option_limit_price(quote, "SELL"),
@@ -539,21 +761,30 @@ class AutoTrader:
                 continue
 
             self.resolve_targets(moment)
+            cycle_started = time.monotonic()
             try:
-                buying_power = self.api.buying_power()
-                positions = self.api.positions()
-                buying_power = self.trade_stocks(positions, buying_power)
-                buying_power = self.trade_options(positions, buying_power)
+                buying_power, positions = self.account_state()
+                circuit_active = self.handle_portfolio_circuit_breaker(
+                    positions,
+                    buying_power,
+                )
+                if not circuit_active:
+                    buying_power = self.trade_stocks(positions, buying_power)
+                    buying_power = self.trade_options(positions, buying_power)
+                    self.cached_buying_power = buying_power
+                    self.cached_positions = [dict(item) for item in positions]
+                    self.submit_agent_research(positions, buying_power)
                 if time.monotonic() - self.last_status_log >= 30:
                     self.last_status_log = time.monotonic()
                     log.info(
-                        "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s | buying power=$%.2f",
+                        "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s | buying power=$%.2f | paused=%s",
                         min(self.config.stock_batch_size, len(self.stock_symbols)),
                         len(self.stock_symbols),
                         min(self.config.option_batch_size, len(self.option_contracts)),
                         len(self.option_contracts),
                         self.open_position_count(positions),
                         buying_power,
+                        "YES" if circuit_active else "NO",
                     )
             except Exception as exc:
                 if isinstance(exc, MarketDataPermissionError):
@@ -565,11 +796,35 @@ class AutoTrader:
                 1.0,
                 (closeout - self.now()).total_seconds(),
             )
-            time.sleep(min(float(self.config.poll_seconds), seconds_to_closeout))
+            cycle_elapsed = time.monotonic() - cycle_started
+            delay = max(0.0, float(self.config.poll_seconds) - cycle_elapsed)
+            if delay:
+                time.sleep(min(delay, seconds_to_closeout))
+
+
+def force_close_all() -> None:
+    config = settings()
+    config.validate_connection(require_account=True)
+    api = WebullAPI(config)
+    log.warning("MANUAL | cancelling orders and closing every account position")
+    submitted = api.close_all_positions()
+    remaining = [
+        item
+        for item in api.positions()
+        if Decimal(str(item.get("quantity", "0"))) != 0
+    ]
+    log.warning(
+        "MANUAL | submitted=%s | currently remaining=%s",
+        len(submitted),
+        len(remaining),
+    )
 
 
 if __name__ == "__main__":
     try:
-        AutoTrader().run()
+        if "--close-all" in sys.argv:
+            force_close_all()
+        else:
+            AutoTrader().run()
     except KeyboardInterrupt:
         log.info("STOPPED")
