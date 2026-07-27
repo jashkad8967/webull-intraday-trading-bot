@@ -538,25 +538,80 @@ It switches files automatically at midnight in `TRADING_TIMEZONE` and adds one
 message, so a process restart does not lose the day's accumulated context.
 Change `LOG_DIRECTORY` to place logs on durable storage.
 
-## 12. Run continuously on Render
+## 12. Run continuously on Oracle Cloud Always Free
 
-The repository includes a Docker image, a Render background-worker Blueprint,
-and GitHub Actions validation. This is a single-worker deployment because two
-simultaneous live instances could submit duplicate orders.
+The repository includes a multi-architecture Docker image, an Oracle VM
+bootstrap script, a single-container Compose definition, and GitHub Actions
+continuous deployment. Use one VM and one container: simultaneous live bot
+instances could submit duplicate orders.
 
-1. Push the repository to GitHub.
-2. In Render, create a new Blueprint and select this repository.
-3. Enter `WEBULL_APP_KEY`, `WEBULL_APP_SECRET`, `ACCOUNT_ID`, and
-   `GROQ_API_KEY` when prompted.
-4. Review the remaining environment variables in the Render dashboard before
-   enabling live trading.
-5. Deploy the Blueprint.
+### Create the VM
 
-The worker uses a persistent disk at `/var/data` for daily logs and wash-sale
-state. Every push to `main` runs the test workflow; Render deploys the same
-worker only after those checks pass. A disk-backed single worker has a short
-replacement pause during deployment, intentionally avoiding overlap between
-old and new trading processes.
+1. Create an Oracle Cloud Always Free compute instance in your home region.
+2. Select an Always Free-eligible Ubuntu 24.04 image and shape. Ampere A1 works
+   well; one OCPU and 6 GB memory is sufficient for this bot.
+3. Add your SSH public key during creation.
+4. Keep inbound access restricted to SSH port 22 from your own IP. The bot does
+   not require an inbound HTTP port.
+
+### Bootstrap the VM once
+
+Connect to the VM, clone this repository, and run:
+
+```bash
+git clone https://github.com/jashkad8967/webull-intraday-trading-bot.git
+cd webull-intraday-trading-bot
+sudo bash deploy/oracle/bootstrap.sh
+sudo nano /opt/webull-bot/shared/.env
+```
+
+Enter `WEBULL_APP_KEY`, `WEBULL_APP_SECRET`, `ACCOUNT_ID`, and `GROQ_API_KEY`
+in that VM-only `.env` file. Review every live-trading setting, save it, then
+log out and reconnect so the `ubuntu` user receives Docker group membership.
+Never commit this file.
+
+The bootstrap creates a persistent Docker volume named `webull-trading-data`.
+Daily logs and wash-sale state survive container replacements and VM reboots.
+They remain on the VM boot storage, but not after deleting the VM and its
+volume. Copy important logs off the VM periodically if you need separate
+recovery.
+
+### Connect GitHub deployment
+
+Add these GitHub Actions repository secrets:
+
+```text
+OCI_HOST                 VM public IP or hostname
+OCI_USER                 ubuntu
+OCI_SSH_PORT             22
+OCI_SSH_PRIVATE_KEY      matching private deployment key
+OCI_KNOWN_HOSTS          verified VM SSH known_hosts entry
+```
+
+Before storing `OCI_KNOWN_HOSTS`, verify the VM's ED25519 host-key fingerprint
+against the value shown from `/etc/ssh/ssh_host_ed25519_key.pub` on the Oracle
+console. Do not blindly trust an unverified `ssh-keyscan` result.
+
+Finally, add the repository variable:
+
+```text
+OCI_DEPLOY_ENABLED=true
+```
+
+Run the `Validate trading bot` workflow manually for the first deployment.
+Afterward, each push to `main` runs tests, uploads an exact release archive,
+builds the replacement while the current bot remains active, and then replaces
+the single container. If the new container exits during its startup check, the
+deployment script attempts to restore the previous release.
+
+Useful VM commands:
+
+```bash
+docker logs --tail 200 -f webull-trading-bot
+docker exec webull-trading-bot find /var/data/logs -type f
+docker exec webull-trading-bot tail -n 200 /var/data/logs/YYYY/MM/YYYY-MM-DD.log
+docker restart webull-trading-bot
+```
 
 ## Complete configuration example
 

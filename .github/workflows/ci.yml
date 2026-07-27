@@ -1,0 +1,78 @@
+name: Validate trading bot
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q .
+      - run: python -m unittest discover -s tests -v
+      - run: bash -n deploy/oracle/bootstrap.sh deploy/oracle/deploy.sh
+      - run: BOT_ENV_FILE=.env.example BOT_IMAGE_TAG=ci docker compose -f compose.oracle.yaml config
+      - run: docker build --tag webull-intraday-trading-bot:ci .
+
+  deploy-oracle:
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && vars.OCI_DEPLOY_ENABLED == 'true'
+    needs: validate
+    runs-on: ubuntu-latest
+    concurrency:
+      group: oracle-production
+      cancel-in-progress: false
+    env:
+      OCI_HOST: ${{ secrets.OCI_HOST }}
+      OCI_USER: ${{ secrets.OCI_USER }}
+      OCI_SSH_PORT: ${{ secrets.OCI_SSH_PORT || '22' }}
+      OCI_SSH_PRIVATE_KEY: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+      OCI_KNOWN_HOSTS: ${{ secrets.OCI_KNOWN_HOSTS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure verified SSH access
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$OCI_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$OCI_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Package release
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude=.venv \
+            --exclude=.webull-skill-venv \
+            --exclude=conf \
+            --exclude=logs \
+            --exclude=__pycache__ \
+            -czf "$RUNNER_TEMP/webull-bot-${GITHUB_SHA}.tar.gz" .
+
+      - name: Upload release
+        run: |
+          scp \
+            -P "$OCI_SSH_PORT" \
+            "$RUNNER_TEMP/webull-bot-${GITHUB_SHA}.tar.gz" \
+            "${OCI_USER}@${OCI_HOST}:/tmp/webull-bot-${GITHUB_SHA}.tar.gz"
+
+      - name: Activate one validated instance
+        run: |
+          ssh \
+            -p "$OCI_SSH_PORT" \
+            "${OCI_USER}@${OCI_HOST}" \
+            "/opt/webull-bot/bin/deploy '/tmp/webull-bot-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"
