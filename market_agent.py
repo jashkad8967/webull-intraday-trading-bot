@@ -122,6 +122,50 @@ class MarketResearchAgent:
         text = str(value or "").strip()
         return text[:500] if text else default
 
+    @staticmethod
+    def _extract_json_object(content: str) -> str | None:
+        depth = 0
+        start = None
+        in_string = False
+        escape = False
+        for index, character in enumerate(content):
+            if in_string:
+                if escape:
+                    escape = False
+                elif character == "\\":
+                    escape = True
+                elif character == '"':
+                    in_string = False
+                continue
+            if character == '"':
+                in_string = True
+            elif character == "{":
+                if depth == 0:
+                    start = index
+                depth += 1
+            elif character == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        return content[start : index + 1]
+        return None
+
+    def _parse_response(self, content: str) -> dict:
+        text = str(content or "").strip()
+        if not text:
+            return {}
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z0-9]*\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            candidate = self._extract_json_object(text)
+            if candidate is None:
+                raise
+            parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else {}
+
     def _normalize(self, payload, expected_symbols: set[str]) -> dict:
         if not isinstance(payload, dict):
             payload = {}
