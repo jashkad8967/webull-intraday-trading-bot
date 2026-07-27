@@ -231,7 +231,7 @@ TRADE_COOLDOWN_SECONDS=5
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
-STOCK_MIN_NET_PROFIT_PERCENT=0.01
+STOCK_MIN_NET_PROFIT_PERCENT=0.0001
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
 STOCK_STOP_LOSS_PERCENT=0.02
 OPTION_TAKE_PROFIT_PRICE=0.01
@@ -334,9 +334,12 @@ Repository responsibilities are intentionally separated:
 - `market_agent.py`: paced, non-blocking Groq research.
 - `wash_sale.py`: persistent repurchase blocks.
 
-For stocks, the default gross target is 1.2% above average cost: 1% configured
-minimum net profit plus a configurable 0.2% allowance for spread, fees, and
-other round-trip costs. The default stop submits an exit at a 2% decline. For options,
+For stocks, the default gross target is 0.21% above average cost: a 0.01%
+configured minimum net profit plus a configurable 0.2% allowance for spread,
+fees, and other round-trip costs. This aims to exit just beyond estimated costs
+instead of waiting for a 1% net gain. Actual proceeds can differ because of
+one-cent price increments, spread, slippage, and real broker or regulatory
+charges. The default stop submits an exit at a 2% decline. For options,
 `OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one premium cent
 above average cost, normally $1 per standard 100-share contract before fees.
 A profit or stop order remains subject to its limit being filled.
@@ -547,7 +550,7 @@ TRADE_COOLDOWN_SECONDS=5
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
-STOCK_MIN_NET_PROFIT_PERCENT=0.01
+STOCK_MIN_NET_PROFIT_PERCENT=0.0001
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
 STOCK_STOP_LOSS_PERCENT=0.02
 OPTION_TAKE_PROFIT_PRICE=0.01

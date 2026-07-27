@@ -44,7 +44,11 @@ class Settings(BaseSettings):
     ema_fast_period: int = Field(default=3, ge=2, le=500)
     ema_slow_period: int = Field(default=8, ge=3, le=1000)
     reenter_on_trend: bool = True
-    stock_min_net_profit_percent: Decimal = Field(default=Decimal("0.01"), ge=0, le=1)
+    stock_min_net_profit_percent: Decimal = Field(
+        default=Decimal("0.0001"),
+        ge=0,
+        le=1,
+    )
     stock_estimated_round_trip_cost_percent: Decimal = Field(
         default=Decimal("0.002"),
         ge=0,
