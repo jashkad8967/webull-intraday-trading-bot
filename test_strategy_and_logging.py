@@ -151,9 +151,11 @@ class AllocationAndLoggingTests(unittest.TestCase):
         self.assertEqual(config.stock_universe_limit(), 500)
         self.assertEqual(Settings(max_symbols=0).stock_universe_limit(), 500)
         self.assertTrue(
-            {"SPY", "QQQ", "NVDA", "TSLA", "AAPL", "GME", "AMC"}
+            {"NVDA", "TSLA", "AAPL", "GME", "AMC"}
             <= set(config.popular_stocks())
         )
+        self.assertNotIn("SPY", config.popular_stocks())
+        self.assertNotIn("QQQ", config.popular_stocks())
 
     def test_log_handler_writes_year_month_and_date_path(self):
         directory = Path("tests/.generated_logs")
@@ -213,6 +215,37 @@ class PayloadSizingTests(unittest.TestCase):
         )
         self.assertEqual(invalid, set())
         self.assertGreater(len(calls), 1)
+
+
+class HistoricalVolatilityTests(unittest.TestCase):
+    def test_amplitudes_parse_across_shapes_and_skip_bad_bars(self):
+        page = [
+            {
+                "symbol": "aaa",
+                "bars": [
+                    {"high": 11, "low": 9, "close": 10},
+                    {"high": 10.5, "low": 9.5, "close": 10},
+                ],
+            },
+            {"symbol": "BBB", "candles": [{"high": 5.5, "low": 4.5, "close": 5}]},
+            {"symbol": "CCC"},
+            {"symbol": "", "bars": [{"high": 2, "low": 1, "close": 1.5}]},
+            "junk",
+        ]
+        amplitudes = WebullAPI._parse_amplitudes(page, days=20)
+        self.assertAlmostEqual(amplitudes["AAA"], 15.0)
+        self.assertAlmostEqual(amplitudes["BBB"], 20.0)
+        self.assertNotIn("CCC", amplitudes)
+        self.assertNotIn("", amplitudes)
+
+    def test_average_amplitude_ignores_unusable_rows(self):
+        bars = [
+            {"high": "x", "low": 1, "close": 1},  # unparseable
+            {"high": 9, "low": 10, "close": 10},  # high < low
+            {"high": 12, "low": 8, "close": 10},  # 40%
+        ]
+        self.assertAlmostEqual(WebullAPI._average_amplitude(bars, days=20), 40.0)
+        self.assertIsNone(WebullAPI._average_amplitude([], days=20))
 
 
 if __name__ == "__main__":

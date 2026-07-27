@@ -408,26 +408,65 @@ class WebullAPI:
         results: dict[str, float] = {}
         unique = list(dict.fromkeys(symbol.upper() for symbol in symbols))
         count = str(max(days + 1, 6))
-        for start in range(0, len(unique), 100):
-            batch = unique[start : start + 100]
-            try:
-                page = self._call(
-                    lambda batch=batch: self.data.market_data.get_batch_history_bar(
-                        batch,
-                        Category.US_STOCK.name,
-                        Timespan.D.name,
-                        count,
-                    ),
-                    "market",
-                )
-            except Exception as exc:
-                logging.getLogger("webull-bot").warning(
-                    "VOLFILT | batch history failed | %s", exc
-                )
-                continue
+        for start in range(0, len(unique), 20):
+            batch = unique[start : start + 20]
+            page = self._history_bars_resilient(
+                batch,
+                Category.US_STOCK.name,
+                Timespan.D.name,
+                count,
+            )
             for symbol, amplitude in self._parse_amplitudes(page, days).items():
                 results[symbol] = amplitude
         return results
+
+    def _history_bars_resilient(
+        self,
+        symbols: list[str],
+        category: str,
+        timespan: str,
+        count: str,
+    ) -> list:
+        if not symbols:
+            return []
+        try:
+            return self._call(
+                lambda: self.data.market_data.get_batch_history_bar(
+                    symbols,
+                    category,
+                    timespan,
+                    count,
+                ),
+                "market",
+            )
+        except Exception as exc:
+            message = str(exc)
+            invalid_symbol = (
+                "INVALID_SYMBOL" in message
+                or "does not exist in the category" in message
+            )
+            if not invalid_symbol:
+                logging.getLogger("webull-bot").warning(
+                    "VOLFILT | batch history failed | %s", exc
+                )
+                return []
+            reported = self._invalid_symbols(message, symbols)
+            if reported:
+                remaining = [s for s in symbols if s not in reported]
+                return self._history_bars_resilient(
+                    remaining, category, timespan, count
+                )
+            if len(symbols) == 1:
+                return []
+            middle = len(symbols) // 2
+            return (
+                self._history_bars_resilient(
+                    symbols[:middle], category, timespan, count
+                )
+                + self._history_bars_resilient(
+                    symbols[middle:], category, timespan, count
+                )
+            )
 
     @classmethod
     def _parse_amplitudes(cls, page, days: int) -> dict[str, float]:
