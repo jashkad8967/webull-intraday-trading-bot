@@ -114,6 +114,7 @@ The default includes every tradable US stock and ETF:
 ```dotenv
 STOCK_SYMBOLS=ALL
 MAX_SYMBOLS=0
+STOCK_UNIVERSE_PAGE_SIZE=200
 STOCK_BATCH_SIZE=100
 STOCK_PRIORITY_FRACTION=0.70
 STOCK_PENNY_FRACTION=0.10
@@ -126,7 +127,8 @@ STOCK_PENNY_CAPITAL_FRACTION=0.10
 STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
 ```
 
-The bot downloads the current lists directly from Webull at the start of each
+The bot downloads the current lists directly from Webull in bounded pages at
+the start of each
 trading day and keeps each instrument's required `US_STOCK` or `US_ETF`
 category. The popular seed list is configurable, and every seed or
 research-discovered ticker is still checked against that current directory.
@@ -150,6 +152,8 @@ rest of that day, and immediately retries only the valid part of the batch.
 
 Webull accepts up to 100 stock symbols in one snapshot request. The bot rotates
 through the universe in batches of 100 instead of making one request per stock.
+If Webull reports that a directory or snapshot payload is too large, the bot
+automatically reduces that request and retries it without dropping symbols.
 
 To restrict trading to a smaller list instead:
 
@@ -637,6 +641,7 @@ OPTION_TYPE=BOTH
 OPTION_MIN_DTE=7
 OPTION_MAX_DTE=45
 MAX_SYMBOLS=0
+STOCK_UNIVERSE_PAGE_SIZE=200
 STOCK_BATCH_SIZE=100
 STOCK_PRIORITY_FRACTION=0.70
 STOCK_PENNY_FRACTION=0.10

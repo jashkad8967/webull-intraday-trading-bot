@@ -10,6 +10,7 @@ from config import Settings
 from daily_logging import DatedDailyFileHandler
 from market_agent import MarketResearchAgent
 from strategy import TradingStrategy
+from webull_api import WebullAPI
 
 
 class StrategySelectionTests(unittest.TestCase):
@@ -138,6 +139,7 @@ class AllocationAndLoggingTests(unittest.TestCase):
             config.stock_bucket_slot_limits(),
             {"POPULAR": 3, "PENNY": 1, "DISCOVERY": 1},
         )
+        self.assertEqual(config.stock_universe_page_size, 200)
 
     def test_log_handler_writes_year_month_and_date_path(self):
         directory = Path("tests/.generated_logs")
@@ -167,6 +169,36 @@ class AllocationAndLoggingTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "important context\n")
         finally:
             shutil.rmtree(directory, ignore_errors=True)
+
+
+class PayloadSizingTests(unittest.TestCase):
+    def test_payload_errors_are_detected(self):
+        self.assertTrue(WebullAPI._payload_too_large("HTTP 413"))
+        self.assertTrue(WebullAPI._payload_too_large("Payload Too Large"))
+        self.assertFalse(WebullAPI._payload_too_large("INVALID_SYMBOL"))
+
+    def test_oversized_stock_snapshot_is_bisected(self):
+        api = WebullAPI.__new__(WebullAPI)
+        calls = []
+
+        def stock_quotes(symbols, category):
+            calls.append(list(symbols))
+            if len(symbols) > 2:
+                raise RuntimeError("Webull API error 413: payload too large")
+            return [{"symbol": symbol} for symbol in symbols]
+
+        api.stock_quotes = stock_quotes
+        quotes, invalid = api.stock_quotes_resilient(
+            ["A", "B", "C", "D", "E"],
+            "US_STOCK",
+        )
+
+        self.assertEqual(
+            [item["symbol"] for item in quotes],
+            ["A", "B", "C", "D", "E"],
+        )
+        self.assertEqual(invalid, set())
+        self.assertGreater(len(calls), 1)
 
 
 if __name__ == "__main__":

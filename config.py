@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     option_min_dte: int = Field(default=7, ge=0, le=730)
     option_max_dte: int = Field(default=45, ge=0, le=730)
     max_symbols: int = Field(default=0, ge=0, le=50000)
+    stock_universe_page_size: int = Field(default=200, ge=25, le=1000)
     stock_batch_size: int = Field(default=100, ge=1, le=100)
     stock_priority_fraction: float = Field(default=0.70, ge=0, le=0.90)
     stock_penny_fraction: float = Field(default=0.10, ge=0, le=0.50)

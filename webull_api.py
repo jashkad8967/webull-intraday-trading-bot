@@ -169,12 +169,26 @@ class WebullAPI:
             return self.stock_quotes(symbols, category), set()
         except Exception as exc:
             message = str(exc)
+            oversized = self._payload_too_large(message)
             invalid_symbol = (
                 "INVALID_SYMBOL" in message
                 or "does not exist in the category" in message
             )
-            if not invalid_symbol:
+            if not invalid_symbol and not oversized:
                 raise
+            if oversized:
+                if len(symbols) == 1:
+                    raise
+                middle = len(symbols) // 2
+                left_quotes, left_invalid = self.stock_quotes_resilient(
+                    symbols[:middle],
+                    category,
+                )
+                right_quotes, right_invalid = self.stock_quotes_resilient(
+                    symbols[middle:],
+                    category,
+                )
+                return left_quotes + right_quotes, left_invalid | right_invalid
             reported = self._invalid_symbols(message, symbols)
             if reported:
                 valid = [symbol for symbol in symbols if symbol not in reported]
@@ -194,6 +208,16 @@ class WebullAPI:
                 category,
             )
             return left_quotes + right_quotes, left_invalid | right_invalid
+
+    @staticmethod
+    def _payload_too_large(message: str) -> bool:
+        lowered = message.lower()
+        return (
+            "payload too large" in lowered
+            or "request entity too large" in lowered
+            or "content too large" in lowered
+            or re.search(r"\b413\b", lowered) is not None
+        )
 
     @staticmethod
     def _invalid_symbols(message: str, requested: list[str]) -> set[str]:
@@ -317,18 +341,33 @@ class WebullAPI:
         categories: dict[str, str] = {}
         limit = self.config.max_symbols
         cursor = None
+        safe_page_size = self.config.stock_universe_page_size
         while limit == 0 or len(categories) < limit:
-            page_size = 1000 if limit == 0 else min(1000, limit - len(categories))
-            page = self._call(
-                lambda cursor=cursor, page_size=page_size: (
-                    self.data.instrument.get_instrument(
-                        category=Category.US_STOCK.name,
-                        last_instrument_id=cursor,
-                        page_size=page_size,
-                    )
-                ),
-                "stock_instrument",
+            page_size = (
+                safe_page_size
+                if limit == 0
+                else min(safe_page_size, limit - len(categories))
             )
+            try:
+                page = self._call(
+                    lambda cursor=cursor, page_size=page_size: (
+                        self.data.instrument.get_instrument(
+                            category=Category.US_STOCK.name,
+                            last_instrument_id=cursor,
+                            page_size=page_size,
+                        )
+                    ),
+                    "stock_instrument",
+                )
+            except Exception as exc:
+                if self._payload_too_large(str(exc)) and page_size > 25:
+                    safe_page_size = max(25, page_size // 2)
+                    logging.getLogger("webull-bot").warning(
+                        "LOAD   | payload too large | reducing directory page=%s",
+                        safe_page_size,
+                    )
+                    continue
+                raise
             if not page:
                 break
             for item in page:
