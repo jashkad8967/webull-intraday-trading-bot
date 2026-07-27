@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     option_min_dte: int = Field(default=7, ge=0, le=730)
     option_max_dte: int = Field(default=45, ge=0, le=730)
     max_symbols: int = Field(default=500, ge=0, le=50000)
+    stock_universe_reserve: int = Field(default=250, ge=0, le=50000)
     stock_universe_page_size: int = Field(default=200, ge=25, le=1000)
     stock_batch_size: int = Field(default=100, ge=1, le=100)
     stock_priority_fraction: float = Field(default=0.70, ge=0, le=0.90)
@@ -132,6 +133,7 @@ class Settings(BaseSettings):
     market_holidays: str = ""
     wash_sale_block_days: int = Field(default=60, ge=31, le=365)
     wash_sale_state_file: str = "conf/wash_sale_blocks.json"
+    invalid_symbol_state_file: str = "conf/invalid_symbols.json"
     stock_limit_offset: Decimal = Field(
         default=Decimal("0.005"),
         ge=0,
@@ -206,6 +208,9 @@ class Settings(BaseSettings):
 
     def stock_universe_limit(self) -> int:
         return self.max_symbols or 500
+
+    def stock_universe_pool(self) -> int:
+        return self.stock_universe_limit() + self.stock_universe_reserve
 
     def exact_options(self) -> list[str]:
         return [item.strip().upper() for item in self.option_contracts.split(",") if item.strip()]

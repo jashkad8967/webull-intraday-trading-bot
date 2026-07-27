@@ -335,11 +335,12 @@ class WebullAPI:
     def stock_universe(
         self,
         progress=None,
+        limit: int | None = None,
     ) -> dict[str, str]:
         from webull.data.common.category import Category
 
         categories: dict[str, str] = {}
-        limit = self.config.stock_universe_limit()
+        limit = self.config.stock_universe_limit() if limit is None else limit
         cursor = None
         safe_page_size = self.config.stock_universe_page_size
         while limit == 0 or len(categories) < limit:

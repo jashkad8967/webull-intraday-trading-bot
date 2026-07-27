@@ -9,6 +9,7 @@ from rich.logging import RichHandler
 
 from config import settings
 from daily_logging import add_daily_file_logging
+from invalid_symbols import InvalidSymbolTracker
 from market_agent import MarketResearchAgent
 from strategy import TradingStrategy
 from wash_sale import WashSaleTracker
@@ -54,9 +55,14 @@ class AutoTrader:
             self.timezone,
             log,
         )
+        self.invalid_symbols = InvalidSymbolTracker(
+            self.config.invalid_symbol_state_file,
+            log,
+        )
         self.wash_skip_logged: set[str] = set()
         self.last_trade: dict[str, float] = {}
         self.stock_symbols: list[str] = []
+        self.reserve_symbols: list[str] = []
         self.stock_categories: dict[str, str] = {}
         self.invalid_stock_symbols: set[str] = set()
         self.option_contracts: list[dict] = []
@@ -110,14 +116,20 @@ class AutoTrader:
         requested_stocks = self.config.stocks()
         if requested_stocks == ["ALL"]:
             limit = self.config.stock_universe_limit()
-            log.info("LOAD   | downloading stocks and ETFs | limit=%s", limit)
+            pool = self.config.stock_universe_pool()
+            log.info(
+                "LOAD   | downloading stocks and ETFs | limit=%s | pool=%s",
+                limit,
+                pool,
+            )
             self.stock_categories = self.api.stock_universe(
                 lambda category, count, category_limit: log.info(
                     "LOAD   | %-8s | %s/%s",
                     category,
                     count,
                     category_limit or "ALL",
-                )
+                ),
+                limit=pool,
             )
             preferred = self.config.popular_stocks()
             preferred_categories = self.api.stock_categories(preferred)
@@ -134,14 +146,28 @@ class AutoTrader:
                     "LOAD   | added %s popular symbols outside directory cap",
                     added,
                 )
-            self.stock_symbols = list(self.stock_categories)
+            for symbol in self.invalid_symbols.symbols:
+                self.stock_categories.pop(symbol, None)
+            eligible = [
+                symbol
+                for symbol in self.stock_categories
+                if symbol not in self.invalid_symbols
+            ]
+            self.stock_symbols = eligible[:limit]
+            self.reserve_symbols = eligible[limit:]
         else:
             log.info("LOAD   | resolving %s configured symbols", len(requested_stocks))
+            requested_stocks = [
+                symbol
+                for symbol in requested_stocks
+                if symbol not in self.invalid_symbols
+            ]
             self.stock_symbols = (
                 requested_stocks
                 if self.config.max_symbols == 0
                 else requested_stocks[: self.config.max_symbols]
             )
+            self.reserve_symbols = []
             self.stock_categories = self.api.stock_categories(self.stock_symbols)
             for symbol in self.stock_symbols:
                 self.stock_categories.setdefault(symbol, "US_STOCK")
@@ -477,6 +503,18 @@ class AutoTrader:
         )
         return True
 
+    def backfill_stock_symbols(self, count: int) -> int:
+        active = set(self.stock_symbols)
+        added = 0
+        while added < count and self.reserve_symbols:
+            candidate = self.reserve_symbols.pop(0)
+            if candidate in active or candidate in self.invalid_symbols:
+                continue
+            self.stock_symbols.append(candidate)
+            active.add(candidate)
+            added += 1
+        return added
+
     def trade_stocks(
         self,
         positions: list[dict],
@@ -557,14 +595,17 @@ class AutoTrader:
             return buying_power
         if invalid:
             self.invalid_stock_symbols.update(invalid)
+            self.invalid_symbols.add(invalid)
             self.stock_symbols = [
                 symbol for symbol in self.stock_symbols if symbol not in invalid
             ]
+            replacements = self.backfill_stock_symbols(len(invalid))
             self.stock_cursor %= max(1, len(self.stock_symbols))
             log.warning(
-                "SKIP   | invalid=%s | %s",
+                "SKIP   | invalid=%s | %s | backfilled=%s",
                 len(invalid),
                 ",".join(sorted(invalid)),
+                replacements,
             )
         quote_by_symbol = {
             str(quote.get("symbol", "")).upper(): quote for quote in quotes
