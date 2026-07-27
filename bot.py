@@ -74,6 +74,8 @@ class AutoTrader:
         self.last_option_discovery = 0.0
         self.last_account_refresh = 0.0
         self.last_order_monitor = 0.0
+        self.last_fill_time = time.monotonic()
+        self.last_stall_boost = 0.0
         self.cached_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
         self.working_orders: dict[str, dict] = {}
@@ -291,6 +293,8 @@ class AutoTrader:
 
         for order_id, order in list(self.working_orders.items()):
             if order_id not in open_ids:
+                if order.get("cancel_requested_at") is None:
+                    self.last_fill_time = now
                 self._release_pending_order(order)
                 del self.working_orders[order_id]
                 self.last_account_refresh = 0.0
@@ -833,6 +837,86 @@ class AutoTrader:
                 log.error("OPTION | %s | %s", option_symbol, exc)
         return buying_power
 
+    def boost_stalled_positions(
+        self,
+        positions: list[dict],
+        options_active: bool,
+    ) -> None:
+        if not self.config.stall_breaker_enabled:
+            return
+        now = time.monotonic()
+        stall_seconds = float(self.config.stall_breaker_seconds)
+        if now - self.last_fill_time < stall_seconds:
+            return
+        if now - self.last_stall_boost < stall_seconds:
+            return
+        self.last_stall_boost = now
+        min_profit = self.config.stall_breaker_min_profit
+        boosted = 0
+        for position in positions:
+            quantity = int(Decimal(str(position.get("quantity", "0"))))
+            if quantity <= 0:
+                continue
+            average_cost = Decimal(str(position.get("cost_price") or "0"))
+            if average_cost <= 0:
+                continue
+            symbol = str(position.get("symbol", "")).upper()
+            instrument_type = position.get("instrument_type")
+            try:
+                if instrument_type == "EQUITY":
+                    if symbol in self.pending_stock_exits:
+                        continue
+                    key = f"STOCK:{symbol}"
+                    if not self.cooldown_ready(key):
+                        continue
+                    quote = self.api.stock_quote(symbol)
+                    sell_price = self.api.stock_limit_price(quote, "SELL")
+                    if sell_price - average_cost < min_profit:
+                        continue
+                    order_id = self.api.place_stock(
+                        symbol,
+                        "SELL",
+                        quantity,
+                        limit_price=sell_price,
+                    )
+                    self.pending_stock_exits.add(symbol)
+                    self.record_trade(key, order_id, "PROFIT", sell_price)
+                    boosted += 1
+                elif instrument_type == "OPTION" and options_active:
+                    if symbol in self.pending_option_exits:
+                        continue
+                    key = f"OPTION:{symbol}"
+                    if not self.cooldown_ready(key):
+                        continue
+                    contract = self.api.contract_from_position(position)
+                    if not contract:
+                        continue
+                    quote = self.api.option_quote(contract["symbol"])
+                    sell_price = self.api.option_limit_price(quote, "SELL")
+                    if sell_price - average_cost < min_profit:
+                        continue
+                    order_id = self.api.place_option(
+                        contract,
+                        "SELL",
+                        quantity,
+                        sell_price,
+                        "SELL_TO_CLOSE",
+                    )
+                    self.pending_option_exits.add(symbol)
+                    self.record_trade(key, order_id, "PROFIT", sell_price)
+                    boosted += 1
+            except Exception as exc:
+                if isinstance(exc, QuoteUnavailableError):
+                    continue
+                log.error("STALL  | %s | %s", symbol, exc)
+        if boosted:
+            self.last_account_refresh = 0.0
+            log.info(
+                "STALL  | no fills for %ss | boosted %s profitable exit(s)",
+                self.config.stall_breaker_seconds,
+                boosted,
+            )
+
     def close_instruments(self, instrument_types: set[str]) -> bool:
         now = time.monotonic()
         if now - self.last_close_attempt < self.config.eod_retry_seconds:
@@ -921,6 +1005,10 @@ class AutoTrader:
                     if option_open <= moment < option_closeout:
                         self.discover_option_contracts()
                         buying_power = self.trade_options(positions, buying_power)
+                    self.boost_stalled_positions(
+                        positions,
+                        option_open <= moment < option_closeout,
+                    )
                     self.cached_buying_power = buying_power
                     self.cached_positions = [dict(item) for item in positions]
                     self.submit_agent_research(positions, buying_power)

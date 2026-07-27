@@ -94,6 +94,13 @@ class Settings(BaseSettings):
     account_refresh_seconds: Decimal = Field(default=Decimal("5"), ge=1, le=60)
     order_timeout_seconds: int = Field(default=120, ge=15, le=3600)
     order_monitor_seconds: Decimal = Field(default=Decimal("5"), ge=1, le=60)
+    stall_breaker_enabled: bool = True
+    stall_breaker_seconds: int = Field(default=120, ge=15, le=3600)
+    stall_breaker_min_profit: Decimal = Field(
+        default=Decimal("0.01"),
+        gt=0,
+        le=Decimal("10"),
+    )
 
     agent_enabled: bool = False
     groq_api_key: str = ""

@@ -346,6 +346,15 @@ After liquidation, entries remain paused for at least
 `LOSS_REEVALUATION_SECONDS`. This rule is deterministic and does not wait for
 Groq.
 
+### Stall breaker
+
+When `STALL_BREAKER_ENABLED` is true and no order fills for
+`STALL_BREAKER_SECONDS` (120 by default), the bot places marketable sell orders
+for any held position that can still lock in at least `STALL_BREAKER_MIN_PROFIT`
+per share (1 cent by default) above its average cost. This keeps activity moving
+during quiet stretches. It never sells at a loss, skips positions that already
+have a pending exit, and resets its timer whenever a real fill occurs.
+
 Repository responsibilities are intentionally separated:
 
 - `strategy.py`: activity scoring, penny/popular allocation, Groq priority
@@ -417,6 +426,9 @@ ACCOUNT_REQUESTS_PER_SECOND=0.8
 ORDER_REQUESTS_PER_MINUTE=480
 ORDER_TIMEOUT_SECONDS=120
 ORDER_MONITOR_SECONDS=5
+STALL_BREAKER_ENABLED=true
+STALL_BREAKER_SECONDS=120
+STALL_BREAKER_MIN_PROFIT=0.01
 ```
 
 The bot maintains an independent timer for each API group, sends stock quotes
@@ -680,6 +692,9 @@ ACCOUNT_REQUESTS_PER_SECOND=0.8
 ORDER_REQUESTS_PER_MINUTE=480
 ORDER_TIMEOUT_SECONDS=120
 ORDER_MONITOR_SECONDS=5
+STALL_BREAKER_ENABLED=true
+STALL_BREAKER_SECONDS=120
+STALL_BREAKER_MIN_PROFIT=0.01
 
 AGENT_ENABLED=false
 GROQ_API_KEY=
