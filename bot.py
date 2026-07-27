@@ -2,7 +2,7 @@ import logging
 import sys
 import time
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
 from rich.logging import RichHandler
@@ -870,7 +870,10 @@ class AutoTrader:
                     if not self.cooldown_ready(key):
                         continue
                     quote = self.api.stock_quote(symbol)
-                    sell_price = self.api.stock_limit_price(quote, "SELL")
+                    bid = self.api.quote_bid(quote)
+                    if bid is None or bid - average_cost < min_profit:
+                        continue
+                    sell_price = bid.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                     if sell_price - average_cost < min_profit:
                         continue
                     order_id = self.api.place_stock(
@@ -892,7 +895,10 @@ class AutoTrader:
                     if not contract:
                         continue
                     quote = self.api.option_quote(contract["symbol"])
-                    sell_price = self.api.option_limit_price(quote, "SELL")
+                    bid = self.api.quote_bid(quote)
+                    if bid is None or bid - average_cost < min_profit:
+                        continue
+                    sell_price = bid.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                     if sell_price - average_cost < min_profit:
                         continue
                     order_id = self.api.place_option(

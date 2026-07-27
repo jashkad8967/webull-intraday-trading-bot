@@ -307,6 +307,8 @@ class TradingStrategy:
             if average_cost > 0 and price >= target:
                 return Decision("PROFIT", "percentage profit reached", target)
             return Decision("HOLD", "position between target and stop", target)
+        if not self.entry_spread_ok(key):
+            return Decision("HOLD", "spread too wide to scalp profitably")
         if trend == "BUY":
             return Decision("BUY", "EMA entry confirmed")
         if self.research_supports_entry(assessment):
@@ -315,6 +317,16 @@ class TradingStrategy:
                 "strong liquid short-horizon research setup",
             )
         return Decision("HOLD", "EMA entry not ready")
+
+    def entry_spread_ok(self, key: str) -> bool:
+        symbol = key.split(":", 1)[-1]
+        spread = self.metrics.get(symbol, {}).get("spread_percent")
+        if spread in (None, ""):
+            return True
+        try:
+            return Decimal(str(spread)) <= self.config.stock_entry_max_spread_percent
+        except Exception:
+            return True
 
     @staticmethod
     def research_supports_entry(assessment: dict | None) -> bool:

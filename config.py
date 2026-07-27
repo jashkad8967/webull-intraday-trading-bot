@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     ema_slow_period: int = Field(default=8, ge=3, le=1000)
     reenter_on_trend: bool = True
     stock_min_net_profit_percent: Decimal = Field(
-        default=Decimal("0.0001"),
+        default=Decimal("0.001"),
         ge=0,
         le=1,
     )
@@ -80,7 +80,12 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("0.10"),
     )
-    stock_stop_loss_percent: Decimal = Field(default=Decimal("0.02"), ge=0, le=1)
+    stock_stop_loss_percent: Decimal = Field(default=Decimal("0.005"), ge=0, le=1)
+    stock_entry_max_spread_percent: Decimal = Field(
+        default=Decimal("0.15"),
+        gt=0,
+        le=Decimal("5"),
+    )
     option_take_profit_price: Decimal = Field(default=Decimal("0.01"), ge=0)
     market_requests_per_minute: int = Field(default=240, ge=1, le=300)
     option_instrument_requests_per_minute: int = Field(default=45, ge=1, le=60)

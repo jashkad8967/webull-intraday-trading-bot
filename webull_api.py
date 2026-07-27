@@ -616,6 +616,9 @@ class WebullAPI:
             return None
         return number if number.is_finite() and number > 0 else None
 
+    def quote_bid(self, quote: dict) -> Decimal | None:
+        return self._quote_decimal(quote, "bid")
+
     @staticmethod
     def quote_price(quote: dict) -> Decimal:
         regular_time = int(quote.get("last_trade_time") or 0)
