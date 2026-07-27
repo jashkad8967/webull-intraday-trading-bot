@@ -115,21 +115,34 @@ The default includes every tradable US stock and ETF:
 STOCK_SYMBOLS=ALL
 MAX_SYMBOLS=0
 STOCK_BATCH_SIZE=100
-STOCK_PRIORITY_FRACTION=0.55
-STOCK_PENNY_FRACTION=0.25
+STOCK_PRIORITY_FRACTION=0.70
+STOCK_PENNY_FRACTION=0.10
 PENNY_STOCK_MAX_PRICE=5.00
+POPULAR_STOCK_SYMBOLS=SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,COIN,PLTR,MSTR
+POPULAR_STOCK_MIN_VOLUME=1000000
+POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
+STOCK_POPULAR_CAPITAL_FRACTION=0.70
+STOCK_PENNY_CAPITAL_FRACTION=0.10
+STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
 ```
 
 The bot downloads the current lists directly from Webull at the start of each
 trading day and keeps each instrument's required `US_STOCK` or `US_ETF`
-category. A static ticker list is intentionally not embedded because listings
-and trading status change. `MAX_SYMBOLS=0` means no cap.
+category. The popular seed list is configurable, and every seed or
+research-discovered ticker is still checked against that current directory.
+`MAX_SYMBOLS=0` means no cap.
 
-Each batch always includes held stocks, then dedicates 60% of its capacity to
-the highest observed activity scores and the rest to rotating discovery. The
-score combines current volume, absolute price change, and intraday or
-extended-hours range. This repeatedly scans liquid, fast-moving stocks without
-starving the rest of the universe.
+Each batch always includes held stocks, then targets 70% popular/liquid names,
+10% stocks below `PENNY_STOCK_MAX_PRICE`, and 20% rotating discovery. The
+popular bucket starts with the configurable seed symbols and adds current
+popular volatile symbols found by research. Non-seed popular candidates need
+at least the configured volume and no more than the configured spread.
+
+Buying power is reserved using the same 70/10/20 split, so penny or discovery
+orders cannot consume the popular-stock allocation first. With the default five
+open positions, the slot limits are three popular, one penny, and one discovery
+position. The activity score combines current volume, absolute price change,
+and intraday or extended-hours range.
 
 If Webull's instrument directory contains a stale or delisted symbol, the bot
 uses the rejected-symbol list returned by Webull, skips those symbols for the
@@ -280,7 +293,8 @@ GROQ_MODEL=groq/compound-mini
 AGENT_CORE_RESEARCH_SECONDS=120
 AGENT_EXTENDED_RESEARCH_SECONDS=622
 AGENT_DAILY_REQUEST_LIMIT=250
-AGENT_MAX_SYMBOLS=3
+AGENT_MAX_SYMBOLS=5
+AGENT_DISCOVERY_MAX_SYMBOLS=10
 AGENT_TIMEOUT_SECONDS=60
 LOSS_CIRCUIT_BREAKER_ENABLED=true
 LOSS_SPREE_POSITION_COUNT=3
@@ -294,9 +308,9 @@ Compound Mini requests per day. During the 9:30 AM–4:00 PM core session, the
 bot allows one call every 120 seconds, allocating up to 195 calls. During the
 4:00–9:30 AM and 4:00–8:00 PM extended sessions, it allows one call every 622
 seconds and uses up to the remaining 55 calls. A hard 250-call daily limit
-applies across both windows. Unused calls are not manufactured when there are
-no symbols to research. The EMA strategy continues making every order decision
-between calls. Groq only adds an attention boost to the activity ranking.
+applies across both windows. A request can still perform broad popular/volatile
+discovery when there are no supplied symbols to assess. Cached results are used
+between calls.
 
 Every research response contains `market_direction` and `market_volatility`.
 Every researched symbol contains `priority`, `quick_trade_score`,
@@ -305,13 +319,16 @@ Every researched symbol contains `priority`, `quick_trade_score`,
 `downside_risk`, and `liquidity_risk`. Missing symbol output is replaced with
 conservative values rather than silently accepted.
 
-Groq values never trigger or block an order. They only affect how frequently a
-symbol returns to the quote/EMA scan. Research prioritizes popular,
-high-volume, volatile, actively changing stocks with liquid, catalyst-backed
-moves that may develop over the next 2 to 30 minutes. It also evaluates the
-supplied live bid/ask gap. A large spread only receives a strong opportunity
-score when current volume, liquidity, catalysts, and price movement suggest
-that the gap is executable rather than stale or illiquid.
+Groq searches for current popular, widely traded volatile stocks and ETFs in
+addition to assessing supplied candidates. Newly discovered symbols are
+accepted only when they also exist in Webull's current tradable universe.
+Research confidence, volatility, catalysts, and quick-trade scores boost the
+symbol's scan priority. A high-confidence, liquid, bullish setup with a
+30-minute-or-shorter horizon can add an entry path. Research never vetoes an
+EMA entry, and missing or negative research does not block technical trading.
+It also evaluates the supplied live bid/ask gap; a wide spread is treated as an
+opportunity only when volume, liquidity, catalysts, and price movement suggest
+it is executable.
 
 ### Loss-spree circuit breaker
 
@@ -507,6 +524,40 @@ Agent Skills is the companion interface for manual or AI-assistant commands.
 The autonomous loop uses its own `.venv` and calls the official SDK directly,
 which avoids starting a new CLI process for every market-data batch.
 
+## 11. Daily context logs
+
+The bot writes important `INFO`, warning, error, research, order, and status
+messages live to:
+
+```text
+logs/YYYY/MM/YYYY-MM-DD.log
+```
+
+It switches files automatically at midnight in `TRADING_TIMEZONE` and adds one
+`DAYEND` summary after the stock session closes. Files are flushed after each
+message, so a process restart does not lose the day's accumulated context.
+Change `LOG_DIRECTORY` to place logs on durable storage.
+
+## 12. Run continuously on Render
+
+The repository includes a Docker image, a Render background-worker Blueprint,
+and GitHub Actions validation. This is a single-worker deployment because two
+simultaneous live instances could submit duplicate orders.
+
+1. Push the repository to GitHub.
+2. In Render, create a new Blueprint and select this repository.
+3. Enter `WEBULL_APP_KEY`, `WEBULL_APP_SECRET`, `ACCOUNT_ID`, and
+   `GROQ_API_KEY` when prompted.
+4. Review the remaining environment variables in the Render dashboard before
+   enabling live trading.
+5. Deploy the Blueprint.
+
+The worker uses a persistent disk at `/var/data` for daily logs and wash-sale
+state. Every push to `main` runs the test workflow; Render deploys the same
+worker only after those checks pass. A disk-backed single worker has a short
+replacement pause during deployment, intentionally avoiding overlap between
+old and new trading processes.
+
 ## Complete configuration example
 
 ```dotenv
@@ -532,9 +583,15 @@ OPTION_MIN_DTE=7
 OPTION_MAX_DTE=45
 MAX_SYMBOLS=0
 STOCK_BATCH_SIZE=100
-STOCK_PRIORITY_FRACTION=0.55
-STOCK_PENNY_FRACTION=0.25
+STOCK_PRIORITY_FRACTION=0.70
+STOCK_PENNY_FRACTION=0.10
 PENNY_STOCK_MAX_PRICE=5.00
+POPULAR_STOCK_SYMBOLS=SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,COIN,PLTR,MSTR
+POPULAR_STOCK_MIN_VOLUME=1000000
+POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
+STOCK_POPULAR_CAPITAL_FRACTION=0.70
+STOCK_PENNY_CAPITAL_FRACTION=0.10
+STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
 OPTION_DISCOVERY_SECONDS=15
@@ -568,7 +625,8 @@ GROQ_MODEL=groq/compound-mini
 AGENT_CORE_RESEARCH_SECONDS=120
 AGENT_EXTENDED_RESEARCH_SECONDS=622
 AGENT_DAILY_REQUEST_LIMIT=250
-AGENT_MAX_SYMBOLS=3
+AGENT_MAX_SYMBOLS=5
+AGENT_DISCOVERY_MAX_SYMBOLS=10
 AGENT_TIMEOUT_SECONDS=60
 LOSS_CIRCUIT_BREAKER_ENABLED=false
 LOSS_SPREE_POSITION_COUNT=3
@@ -588,4 +646,5 @@ WASH_SALE_BLOCK_DAYS=60
 WASH_SALE_STATE_FILE=conf/wash_sale_blocks.json
 STOCK_LIMIT_OFFSET=0.005
 OPTION_LIMIT_OFFSET=0.03
+LOG_DIRECTORY=logs
 ```

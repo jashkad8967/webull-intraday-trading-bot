@@ -1,0 +1,10 @@
+.git
+.github
+.venv
+.webull-skill-venv
+.env
+__pycache__
+conf
+logs
+*.log
+*.pyc

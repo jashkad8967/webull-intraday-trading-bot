@@ -27,9 +27,33 @@ class Settings(BaseSettings):
     option_max_dte: int = Field(default=45, ge=0, le=730)
     max_symbols: int = Field(default=0, ge=0, le=50000)
     stock_batch_size: int = Field(default=100, ge=1, le=100)
-    stock_priority_fraction: float = Field(default=0.55, ge=0, le=0.90)
-    stock_penny_fraction: float = Field(default=0.25, ge=0, le=0.50)
+    stock_priority_fraction: float = Field(default=0.70, ge=0, le=0.90)
+    stock_penny_fraction: float = Field(default=0.10, ge=0, le=0.50)
     penny_stock_max_price: Decimal = Field(default=Decimal("5"), gt=0)
+    popular_stock_symbols: str = (
+        "SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,COIN,PLTR,MSTR"
+    )
+    popular_stock_min_volume: int = Field(default=1_000_000, ge=0)
+    popular_stock_max_spread_percent: Decimal = Field(
+        default=Decimal("0.50"),
+        ge=0,
+        le=Decimal("10"),
+    )
+    stock_popular_capital_fraction: Decimal = Field(
+        default=Decimal("0.70"),
+        ge=0,
+        le=1,
+    )
+    stock_penny_capital_fraction: Decimal = Field(
+        default=Decimal("0.10"),
+        ge=0,
+        le=1,
+    )
+    stock_discovery_capital_fraction: Decimal = Field(
+        default=Decimal("0.20"),
+        ge=0,
+        le=1,
+    )
     option_batch_size: int = Field(default=20, ge=1, le=20)
     option_discovery_per_cycle: int = Field(default=1, ge=1, le=10)
     option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)
@@ -75,7 +99,8 @@ class Settings(BaseSettings):
     agent_core_research_seconds: int = Field(default=120, ge=15, le=3600)
     agent_extended_research_seconds: int = Field(default=622, ge=15, le=3600)
     agent_daily_request_limit: int = Field(default=250, ge=1, le=250)
-    agent_max_symbols: int = Field(default=3, ge=1, le=50)
+    agent_max_symbols: int = Field(default=5, ge=1, le=50)
+    agent_discovery_max_symbols: int = Field(default=10, ge=1, le=25)
     agent_timeout_seconds: int = Field(default=60, ge=5, le=180)
     loss_circuit_breaker_enabled: bool = False
     loss_spree_position_count: int = Field(default=3, ge=2, le=100)
@@ -99,6 +124,7 @@ class Settings(BaseSettings):
         le=Decimal("0.10"),
     )
     option_limit_offset: Decimal = Field(default=Decimal("0.03"), ge=0, le=Decimal("0.25"))
+    log_directory: str = "logs"
 
     def host(self) -> str:
         value = self.webull_api_endpoint.strip()
@@ -129,6 +155,15 @@ class Settings(BaseSettings):
             raise ValueError(
                 "STOCK_PRIORITY_FRACTION + STOCK_PENNY_FRACTION must be <= 0.90"
             )
+        capital_total = (
+            self.stock_popular_capital_fraction
+            + self.stock_penny_capital_fraction
+            + self.stock_discovery_capital_fraction
+        )
+        if capital_total != Decimal("1"):
+            raise ValueError(
+                "Stock capital fractions must add up to exactly 1.0"
+            )
         if not (
             self.session_time(self.market_open_time)
             < self.session_time(self.eod_close_time)
@@ -157,6 +192,43 @@ class Settings(BaseSettings):
 
     def exact_options(self) -> list[str]:
         return [item.strip().upper() for item in self.option_contracts.split(",") if item.strip()]
+
+    def popular_stocks(self) -> list[str]:
+        return [
+            item.strip().upper()
+            for item in self.popular_stock_symbols.split(",")
+            if item.strip()
+        ]
+
+    def stock_capital_fractions(self) -> dict[str, Decimal]:
+        return {
+            "POPULAR": self.stock_popular_capital_fraction,
+            "PENNY": self.stock_penny_capital_fraction,
+            "DISCOVERY": self.stock_discovery_capital_fraction,
+        }
+
+    def stock_bucket_slot_limits(self) -> dict[str, int]:
+        fractions = self.stock_capital_fractions()
+        buckets = list(fractions)
+        limits = {bucket: 0 for bucket in buckets}
+        remaining = self.max_open_positions
+        if remaining >= len(buckets):
+            for bucket in buckets:
+                if fractions[bucket] > 0:
+                    limits[bucket] = 1
+                    remaining -= 1
+        while remaining > 0:
+            bucket = max(
+                buckets,
+                key=lambda item: (
+                    float(fractions[item])
+                    / max(1, limits[item]),
+                    float(fractions[item]),
+                ),
+            )
+            limits[bucket] += 1
+            remaining -= 1
+        return limits
 
     def option_roots(self) -> list[str]:
         return [item.strip().upper() for item in self.option_underlyings.split(",") if item.strip()]

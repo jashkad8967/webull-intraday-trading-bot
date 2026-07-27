@@ -6,3 +6,5 @@ conf/
 __pycache__/
 *.py[cod]
 *.log
+logs/
+tests/.generated_logs/

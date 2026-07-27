@@ -32,11 +32,13 @@ class TradingStrategy:
         self.activity: dict[str, float] = {}
         self.prices: dict[str, Decimal] = {}
         self.metrics: dict[str, dict] = {}
+        self.selection_buckets: dict[str, str] = {}
 
     def clear_market_state(self) -> None:
         self.activity.clear()
         self.prices.clear()
         self.metrics.clear()
+        self.selection_buckets.clear()
 
     @staticmethod
     def rotating_batch(items: list, cursor: int, batch_size: int) -> tuple[list, int]:
@@ -132,11 +134,13 @@ class TradingStrategy:
         cursor: int,
         positions: list[dict],
         assessment_for,
+        research_symbols: set[str] | None = None,
     ) -> tuple[list[str], int]:
         if not symbols:
             return [], 0
         size = min(self.config.stock_batch_size, len(symbols))
         available = set(symbols)
+        research_symbols = (research_symbols or set()) & available
         held = [
             str(item.get("symbol", "")).upper()
             for item in positions
@@ -158,24 +162,58 @@ class TradingStrategy:
             if self.prices.get(symbol, Decimal("Infinity"))
             < self.config.penny_stock_max_price
         ]
-        popular = [
+        liquid_popular = [
             symbol
             for symbol in ranked
             if self.prices.get(symbol, Decimal("0"))
             >= self.config.penny_stock_max_price
+            and self.metrics.get(symbol, {}).get("volume", 0)
+            >= self.config.popular_stock_min_volume
+            and Decimal(
+                str(self.metrics.get(symbol, {}).get("spread_percent", "999"))
+            )
+            <= self.config.popular_stock_max_spread_percent
         ]
+        researched = sorted(
+            research_symbols,
+            key=lambda symbol: self.priority_score(
+                symbol,
+                assessment_for(symbol),
+            ),
+            reverse=True,
+        )
+        popular = list(dict.fromkeys(researched + liquid_popular))
         exploration, cursor = self.rotating_batch(symbols, cursor, size)
         penny_count = int(size * self.config.stock_penny_fraction)
         popular_count = int(size * self.config.stock_priority_fraction)
+        popular_selected = popular[:popular_count]
+        penny_selected = penny[:penny_count]
         selected = list(
             dict.fromkeys(
                 held
-                + penny[:penny_count]
-                + popular[:popular_count]
+                + popular_selected
+                + penny_selected
                 + exploration
             )
         )
-        return selected[:size], cursor
+        selected = selected[:size]
+        self.selection_buckets = {}
+        held_set = set(held)
+        popular_set = set(popular_selected)
+        penny_set = set(penny_selected)
+        for symbol in selected:
+            if symbol in held_set:
+                self.selection_buckets[symbol] = "HELD"
+            elif symbol in popular_set:
+                self.selection_buckets[symbol] = "POPULAR"
+            elif symbol in penny_set:
+                self.selection_buckets[symbol] = "PENNY"
+            else:
+                self.selection_buckets[symbol] = "DISCOVERY"
+        return selected, cursor
+
+    def selection_bucket(self, symbol: str) -> str:
+        return self.selection_buckets.get(symbol, "DISCOVERY")
 
     def research_candidates(
         self,
@@ -252,6 +290,7 @@ class TradingStrategy:
         price: Decimal,
         quantity: int,
         average_cost: Decimal,
+        assessment: dict | None = None,
     ) -> Decision:
         trend = self.trend_signal(key, price)
         if quantity > 0:
@@ -268,9 +307,29 @@ class TradingStrategy:
             if average_cost > 0 and price >= target:
                 return Decision("PROFIT", "percentage profit reached", target)
             return Decision("HOLD", "position between target and stop", target)
-        if trend != "BUY":
-            return Decision("HOLD", "EMA entry not ready")
-        return Decision("BUY", "EMA entry confirmed")
+        if trend == "BUY":
+            return Decision("BUY", "EMA entry confirmed")
+        if self.research_supports_entry(assessment):
+            return Decision(
+                "BUY",
+                "strong liquid short-horizon research setup",
+            )
+        return Decision("HOLD", "EMA entry not ready")
+
+    @staticmethod
+    def research_supports_entry(assessment: dict | None) -> bool:
+        if not assessment:
+            return False
+        return (
+            float(assessment.get("confidence", 0)) >= 0.70
+            and float(assessment.get("quick_trade_score", 0)) >= 0.70
+            and float(assessment.get("symbol_volatility", 0)) >= 0.60
+            and float(assessment.get("expected_move_percent", 0)) > 0
+            and float(assessment.get("catalyst_strength", 0)) > 0
+            and float(assessment.get("liquidity_risk", 1)) <= 0.40
+            and float(assessment.get("downside_risk", 1)) <= 0.50
+            and int(assessment.get("horizon_minutes", 390)) <= 30
+        )
 
     def option_decision(
         self,

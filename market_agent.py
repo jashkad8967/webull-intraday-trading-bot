@@ -1,5 +1,6 @@
 import json
 import queue
+import re
 import threading
 import time
 from datetime import datetime
@@ -23,6 +24,7 @@ class MarketResearchAgent:
         self._work: queue.Queue[dict] = queue.Queue(maxsize=1)
         self._lock = threading.Lock()
         self._assessments: dict[str, dict] = {}
+        self._discoveries: list[dict] = []
         self._last_submitted = 0.0
         self._request_date = None
         self._requests_today = 0
@@ -35,7 +37,7 @@ class MarketResearchAgent:
             config.agent_core_research_seconds,
             config.agent_extended_research_seconds,
             config.agent_daily_request_limit,
-            min(config.agent_max_symbols, 5),
+            min(config.agent_max_symbols, 10),
         )
 
     def _interval_seconds(self) -> int:
@@ -89,6 +91,16 @@ class MarketResearchAgent:
             ):
                 return None
             return dict(result)
+
+    def discoveries(self) -> list[dict]:
+        now = time.monotonic()
+        maximum_age = self._interval_seconds() * 3
+        with self._lock:
+            return [
+                dict(item)
+                for item in self._discoveries
+                if now - item.get("updated_at", 0) <= maximum_age
+            ]
 
     def _worker(self) -> None:
         while True:
@@ -179,6 +191,39 @@ class MarketResearchAgent:
                 "summary": "No assessment returned; conservative defaults used.",
             }
 
+        discoveries = []
+        seen_discoveries = set()
+        raw_discoveries = payload.get("discoveries", [])
+        if isinstance(raw_discoveries, list):
+            for raw in raw_discoveries:
+                if not isinstance(raw, dict):
+                    continue
+                symbol = str(raw.get("symbol", "")).strip().upper()
+                if (
+                    not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", symbol)
+                    or symbol in seen_discoveries
+                ):
+                    continue
+                seen_discoveries.add(symbol)
+                discoveries.append(
+                    {
+                        "symbol": symbol,
+                        "popularity": self._number(
+                            raw.get("popularity"), 0, 1, 0
+                        ),
+                        "symbol_volatility": self._number(
+                            raw.get("symbol_volatility"), 0, 1, 0
+                        ),
+                        "confidence": self._number(
+                            raw.get("confidence"), 0, 1, 0
+                        ),
+                        "reason": self._text(
+                            raw.get("reason"),
+                            "No discovery rationale returned.",
+                        ),
+                    }
+                )
+
         return {
             "market_summary": self._text(
                 payload.get("market_summary"), "No usable market summary."
@@ -190,6 +235,9 @@ class MarketResearchAgent:
                 payload.get("market_volatility"), 0, 1, 1
             ),
             "assessments": [by_symbol[symbol] for symbol in sorted(by_symbol)],
+            "discoveries": discoveries[
+                : self.config.agent_discovery_max_symbols
+            ],
         }
 
     def _research(self, state: dict) -> None:
@@ -203,8 +251,12 @@ class MarketResearchAgent:
             if item.get("symbol")
         }
         prompt = (
-            "Research only the supplied US stock symbols using current credible "
-            "sources. Focus on high-volatility, fast intraday opportunities whose "
+            "Use current credible sources to find popular, widely traded US stocks "
+            "and ETFs showing meaningful current volatility, unusual volume, or a "
+            "credible active catalyst. Put up to "
+            f"{self.config.agent_discovery_max_symbols} such tickers in discoveries. "
+            "Separately assess every supplied symbol. Focus on fast intraday "
+            "opportunities whose "
             "likely move could develop over the next 2 to 30 minutes. Prioritize "
             "stocks that are popular or widely followed, have high or unusual "
             "volume, meaningful intraday or extended-hours volatility, rapid active "
@@ -220,7 +272,11 @@ class MarketResearchAgent:
             "not produce buy, sell, hold, or avoid decisions. Return JSON only. "
             "Top-level fields: "
             "market_summary, market_direction(-1..1), market_volatility(0..1), "
-            "assessments. "
+            "assessments, discoveries. "
+            "Each discovery requires symbol, popularity(0..1), "
+            "symbol_volatility(0..1), confidence(0..1), and reason. Discoveries "
+            "may be outside the supplied symbols, but must be real US-listed "
+            "stocks or ETFs with current evidence. "
             "Return exactly one assessment per symbol with required fields: symbol, "
             "priority(0..1), spread_opportunity(0..1), confidence(0..1), "
             "quick_trade_score(0..1), symbol_volatility(0..1), "
@@ -262,12 +318,22 @@ class MarketResearchAgent:
                 item["market_volatility"] = payload["market_volatility"]
                 item["updated_at"] = now
                 self._assessments[symbol] = item
+            self._discoveries = [
+                {**item, "updated_at": now}
+                for item in payload["discoveries"]
+            ]
         self.log.info(
-            "AGENT  | priority research | direction=%+.2f | volatility=%.2f | researched=%s",
+            "AGENT  | priority research | direction=%+.2f | volatility=%.2f | researched=%s | discoveries=%s",
             payload["market_direction"],
             payload["market_volatility"],
             len(payload["assessments"]),
+            len(payload["discoveries"]),
         )
+        if payload["discoveries"]:
+            self.log.info(
+                "AI     | popular volatile discoveries | %s",
+                ",".join(item["symbol"] for item in payload["discoveries"]),
+            )
         for item in payload["assessments"]:
             self.log.info(
                 "AI     | %-8s | priority=%.2f | quick=%.2f | volatility=%.2f | spread=%.2f | conf=%.2f | sentiment=%+.2f | catalyst=%+.2f | move=%+.2f%%/%sm | downside=%.2f | liquidity=%.2f",

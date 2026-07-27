@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from rich.logging import RichHandler
 
 from config import settings
+from daily_logging import add_daily_file_logging
 from market_agent import MarketResearchAgent
 from strategy import TradingStrategy
 from wash_sale import WashSaleTracker
@@ -80,6 +81,10 @@ class AutoTrader:
         self.entries_paused = False
         self.circuit_breaker_time = 0.0
         self.last_circuit_research = 0.0
+        self.last_day_end_log_date = None
+        self.seed_popular_symbols: set[str] = set()
+        self.agent_popular_symbols: set[str] = set()
+        self.position_buckets: dict[str, str] = {}
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -132,9 +137,13 @@ class AutoTrader:
         self.option_discovery_attempted.clear()
         self.invalid_stock_symbols.clear()
         self.resolved_date = moment.date()
+        available = set(self.stock_symbols)
+        self.seed_popular_symbols = set(self.config.popular_stocks()) & available
+        self.agent_popular_symbols.clear()
         log.info(
-            "READY  | stocks=%s | options=%s | option scan=%s",
+            "READY  | stocks=%s | popular seeds=%s | options=%s | option scan=%s",
             len(self.stock_symbols),
+            len(self.seed_popular_symbols),
             len(self.option_contracts),
             "ON" if self.discover_all_options else "OFF",
         )
@@ -305,6 +314,18 @@ class AutoTrader:
             return None
         return self.market_agent.assessment(symbol)
 
+    def refresh_agent_discoveries(self) -> None:
+        if not self.market_agent:
+            self.agent_popular_symbols.clear()
+            return
+        available = set(self.stock_symbols)
+        discoveries = self.market_agent.discoveries()
+        self.agent_popular_symbols = {
+            str(item.get("symbol", "")).upper()
+            for item in discoveries
+            if str(item.get("symbol", "")).upper() in available
+        }
+
     def submit_agent_research(
         self,
         positions: list[dict],
@@ -314,7 +335,7 @@ class AutoTrader:
     ) -> None:
         if not self.market_agent:
             return
-        research_limit = min(self.config.agent_max_symbols, 5)
+        research_limit = min(self.config.agent_max_symbols, 10)
         held = [
             {
                 "symbol": item.get("symbol"),
@@ -347,8 +368,6 @@ class AutoTrader:
                     self.wash_sales.blocked_until,
                 )
             )
-        if not force and not candidates and not held:
-            return
         self.market_agent.submit(
             {
                 "event": event,
@@ -356,6 +375,7 @@ class AutoTrader:
                 "buying_power": str(buying_power),
                 "positions": held,
                 "entry_candidates": candidates,
+                "discovery_limit": self.config.agent_discovery_max_symbols,
             },
             force=force,
         )
@@ -444,12 +464,49 @@ class AutoTrader:
         buying_power: Decimal,
     ) -> Decimal:
         open_count = self.strategy.open_position_count(positions)
+        self.refresh_agent_discoveries()
         batch, self.stock_cursor = self.strategy.prioritized_stock_batch(
             self.stock_symbols,
             self.stock_cursor,
             positions,
             self.agent_assessment,
+            self.seed_popular_symbols | self.agent_popular_symbols,
         )
+        bucket_remaining = {
+            bucket: buying_power * fraction
+            for bucket, fraction in self.config.stock_capital_fractions().items()
+        }
+        bucket_slot_limits = self.config.stock_bucket_slot_limits()
+        bucket_position_counts = {bucket: 0 for bucket in bucket_slot_limits}
+        known_popular = self.seed_popular_symbols | self.agent_popular_symbols
+        for position in positions:
+            if (
+                position.get("instrument_type") != "EQUITY"
+                or Decimal(str(position.get("quantity", "0"))) == 0
+            ):
+                continue
+            position_symbol = str(position.get("symbol", "")).upper()
+            bucket = self.position_buckets.get(position_symbol)
+            if bucket not in bucket_position_counts:
+                position_price = Decimal(
+                    str(
+                        self.strategy.prices.get(
+                            position_symbol,
+                            position.get("cost_price", "0"),
+                        )
+                    )
+                )
+                if position_symbol in known_popular:
+                    bucket = "POPULAR"
+                elif (
+                    position_price > 0
+                    and position_price < self.config.penny_stock_max_price
+                ):
+                    bucket = "PENNY"
+                else:
+                    bucket = "DISCOVERY"
+                self.position_buckets[position_symbol] = bucket
+            bucket_position_counts[bucket] += 1
         quotes: list[dict] = []
         invalid: set[str] = set()
         grouped: dict[str, list[str]] = {"US_STOCK": [], "US_ETF": []}
@@ -507,6 +564,7 @@ class AutoTrader:
                     price,
                     quantity,
                     cost,
+                    self.agent_assessment(symbol),
                 )
                 if decision.action == "BUY":
                     self.agent_candidates[symbol] = {
@@ -531,14 +589,21 @@ class AutoTrader:
                             )
                         continue
                     self.wash_skip_logged.discard(symbol)
+                    bucket = self.strategy.selection_bucket(symbol)
+                    entry_budget = min(
+                        buying_power,
+                        bucket_remaining.get(bucket, Decimal("0")),
+                    )
                     buy_quantity, buffered_price = (
                         self.strategy.stock_order_quantity(
                             price,
-                            buying_power,
+                            entry_budget,
                         )
                     )
                     if (
                         open_count < self.config.max_open_positions
+                        and bucket_position_counts.get(bucket, 0)
+                        < bucket_slot_limits.get(bucket, 0)
                         and buy_quantity > 0
                         and self.cooldown_ready(key)
                     ):
@@ -553,6 +618,13 @@ class AutoTrader:
                             Decimal("0"),
                             buying_power - buffered_price * buy_quantity,
                         )
+                        bucket_remaining[bucket] = max(
+                            Decimal("0"),
+                            bucket_remaining.get(bucket, Decimal("0"))
+                            - buffered_price * buy_quantity,
+                        )
+                        self.position_buckets[symbol] = bucket
+                        bucket_position_counts[bucket] += 1
                         positions.append(
                             {
                                 "instrument_type": "EQUITY",
@@ -604,6 +676,34 @@ class AutoTrader:
                     continue
                 log.error("STOCK  | %s | %s", symbol, exc)
         return buying_power
+
+    def log_day_end_summary(self, moment: datetime) -> None:
+        if self.last_day_end_log_date == moment.date():
+            return
+        self.last_day_end_log_date = moment.date()
+        try:
+            buying_power = self.api.buying_power()
+            positions = [
+                item
+                for item in self.api.positions()
+                if Decimal(str(item.get("quantity", "0"))) != 0
+            ]
+            log.info(
+                "DAYEND | date=%s | buying_power=$%.2f | positions=%s | working_orders=%s | popular_research=%s",
+                moment.date().isoformat(),
+                buying_power,
+                len(positions),
+                len(self.working_orders),
+                ",".join(
+                    sorted(
+                        self.seed_popular_symbols
+                        | self.agent_popular_symbols
+                    )
+                )
+                or "NONE",
+            )
+        except Exception as exc:
+            log.error("DAYEND | date=%s | summary failed | %s", moment.date(), exc)
 
     def trade_options(
         self,
@@ -785,6 +885,7 @@ class AutoTrader:
                 continue
 
             if moment >= market_close:
+                self.log_day_end_summary(moment)
                 time.sleep(60)
                 continue
 
@@ -863,6 +964,12 @@ def force_close_all() -> None:
 
 if __name__ == "__main__":
     try:
+        runtime_config = settings()
+        add_daily_file_logging(
+            log,
+            runtime_config.log_directory,
+            runtime_config.trading_timezone,
+        )
         if "--close-all" in sys.argv:
             force_close_all()
         else:
