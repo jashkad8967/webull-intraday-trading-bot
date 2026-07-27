@@ -130,6 +130,12 @@ class MarketResearchAgent:
                     "spread_opportunity": self._number(
                         raw.get("spread_opportunity"), 0, 1, 0
                     ),
+                    "quick_trade_score": self._number(
+                        raw.get("quick_trade_score"), 0, 1, 0
+                    ),
+                    "symbol_volatility": self._number(
+                        raw.get("symbol_volatility"), 0, 1, 0
+                    ),
                     "confidence": self._number(
                         raw.get("confidence"), 0, 1, 0
                     ),
@@ -161,6 +167,8 @@ class MarketResearchAgent:
                 "symbol": symbol,
                 "priority": 0,
                 "spread_opportunity": 0,
+                "quick_trade_score": 0,
+                "symbol_volatility": 0,
                 "confidence": 0,
                 "news_sentiment": 0,
                 "catalyst_strength": 0,
@@ -196,9 +204,12 @@ class MarketResearchAgent:
         }
         prompt = (
             "Research only the supplied US stock symbols using current credible "
-            "sources. Prioritize stocks that are popular or widely followed, have "
-            "high or unusual volume, meaningful intraday or extended-hours "
-            "volatility, active price changes, and credible current catalysts. "
+            "sources. Focus on high-volatility, fast intraday opportunities whose "
+            "likely move could develop over the next 2 to 30 minutes. Prioritize "
+            "stocks that are popular or widely followed, have high or unusual "
+            "volume, meaningful intraday or extended-hours volatility, rapid active "
+            "price changes, and credible current catalysts. Distinguish sustained, "
+            "liquid volatility from a single stale print or erratic illiquid jump. "
             "Use the supplied live bid, ask, spread_percent, volume, change_ratio, "
             "and activity_score. Look for spreads that may support buying below the "
             "ask and later exiting higher, but treat very wide spreads with weak "
@@ -212,6 +223,7 @@ class MarketResearchAgent:
             "assessments. "
             "Return exactly one assessment per symbol with required fields: symbol, "
             "priority(0..1), spread_opportunity(0..1), confidence(0..1), "
+            "quick_trade_score(0..1), symbol_volatility(0..1), "
             "news_sentiment(-1..1), "
             "catalyst_strength(-1..1), expected_move_percent(signed), "
             "horizon_minutes(1..390), downside_risk(0..1), liquidity_risk(0..1), "
@@ -258,9 +270,11 @@ class MarketResearchAgent:
         )
         for item in payload["assessments"]:
             self.log.info(
-                "AI     | %-8s | priority=%.2f | spread=%.2f | conf=%.2f | sentiment=%+.2f | catalyst=%+.2f | move=%+.2f%%/%sm | downside=%.2f | liquidity=%.2f",
+                "AI     | %-8s | priority=%.2f | quick=%.2f | volatility=%.2f | spread=%.2f | conf=%.2f | sentiment=%+.2f | catalyst=%+.2f | move=%+.2f%%/%sm | downside=%.2f | liquidity=%.2f",
                 item["symbol"],
                 item["priority"],
+                item["quick_trade_score"],
+                item["symbol_volatility"],
                 item["spread_opportunity"],
                 item["confidence"],
                 item["news_sentiment"],

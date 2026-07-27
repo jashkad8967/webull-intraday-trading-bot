@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     )
     order_requests_per_minute: int = Field(default=480, ge=1, le=600)
     account_refresh_seconds: Decimal = Field(default=Decimal("5"), ge=1, le=60)
+    order_timeout_seconds: int = Field(default=120, ge=15, le=3600)
+    order_monitor_seconds: Decimal = Field(default=Decimal("5"), ge=1, le=60)
 
     agent_enabled: bool = False
     groq_api_key: str = ""

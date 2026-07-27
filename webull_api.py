@@ -450,6 +450,20 @@ class WebullAPI:
             "account",
         )
 
+    @staticmethod
+    def open_order_ids(groups: list[dict]) -> list[str]:
+        order_ids: list[str] = []
+        for group in groups or []:
+            if group.get("client_order_id"):
+                order_ids.append(str(group["client_order_id"]))
+            else:
+                order_ids.extend(
+                    str(order["client_order_id"])
+                    for order in (group.get("orders") or [])
+                    if order.get("client_order_id")
+                )
+        return list(dict.fromkeys(order_ids))
+
     def cancel(self, client_order_id: str) -> None:
         self._call(
             lambda: self.trade.order_v3.cancel_order(
@@ -460,17 +474,7 @@ class WebullAPI:
         )
 
     def cancel_all_orders(self) -> list[str]:
-        order_ids: list[str] = []
-        for group in self.open_orders():
-            if group.get("client_order_id"):
-                order_ids.append(str(group["client_order_id"]))
-            else:
-                order_ids.extend(
-                    str(order["client_order_id"])
-                    for order in group.get("orders", [])
-                    if order.get("client_order_id")
-                )
-        unique = list(dict.fromkeys(order_ids))
+        unique = self.open_order_ids(self.open_orders())
         for order_id in unique:
             try:
                 self.cancel(order_id)

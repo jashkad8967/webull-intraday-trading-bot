@@ -299,17 +299,19 @@ no symbols to research. The EMA strategy continues making every order decision
 between calls. Groq only adds an attention boost to the activity ranking.
 
 Every research response contains `market_direction` and `market_volatility`.
-Every researched symbol contains `priority`, `spread_opportunity`, `confidence`,
-`news_sentiment`, `catalyst_strength`, `expected_move_percent`,
-`horizon_minutes`, `downside_risk`, and `liquidity_risk`. Missing symbol output
-is replaced with conservative values rather than silently accepted.
+Every researched symbol contains `priority`, `quick_trade_score`,
+`symbol_volatility`, `spread_opportunity`, `confidence`, `news_sentiment`,
+`catalyst_strength`, `expected_move_percent`, `horizon_minutes`,
+`downside_risk`, and `liquidity_risk`. Missing symbol output is replaced with
+conservative values rather than silently accepted.
 
 Groq values never trigger or block an order. They only affect how frequently a
 symbol returns to the quote/EMA scan. Research prioritizes popular,
-high-volume, volatile, actively changing stocks and evaluates the supplied live
-bid/ask gap. A large spread only receives a strong opportunity score when
-current volume, liquidity, catalysts, and price movement suggest that the gap
-is executable rather than stale or illiquid.
+high-volume, volatile, actively changing stocks with liquid, catalyst-backed
+moves that may develop over the next 2 to 30 minutes. It also evaluates the
+supplied live bid/ask gap. A large spread only receives a strong opportunity
+score when current volume, liquidity, catalysts, and price movement suggest
+that the gap is executable rather than stale or illiquid.
 
 ### Loss-spree circuit breaker
 
@@ -387,12 +389,17 @@ OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
 STOCK_INSTRUMENT_REQUESTS_PER_30_SECONDS=9
 ACCOUNT_REQUESTS_PER_SECOND=0.8
 ORDER_REQUESTS_PER_MINUTE=480
+ORDER_TIMEOUT_SECONDS=120
+ORDER_MONITOR_SECONDS=5
 ```
 
 The bot maintains an independent timer for each API group, sends stock quotes
 in groups of 100 and option quotes in groups of 20, and retries throttling or
 temporary server errors with backoff. Order submissions are not automatically
-retried because a timed-out order may already have reached the broker.
+retried because a timed-out order may already have reached the broker. It checks
+working orders every five seconds and requests cancellation of any order
+remainder that is still open 120 seconds after submission. Orders already open
+when the bot starts are adopted and timed from when the bot first observes them.
 
 ## 8. Configure daily closeout
 
@@ -549,6 +556,8 @@ OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
 STOCK_INSTRUMENT_REQUESTS_PER_30_SECONDS=9
 ACCOUNT_REQUESTS_PER_SECOND=0.8
 ORDER_REQUESTS_PER_MINUTE=480
+ORDER_TIMEOUT_SECONDS=120
+ORDER_MONITOR_SECONDS=5
 
 AGENT_ENABLED=false
 GROQ_API_KEY=

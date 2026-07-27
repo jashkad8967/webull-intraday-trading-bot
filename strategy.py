@@ -108,6 +108,8 @@ class TradingStrategy:
         spread_opportunity = float(
             assessment.get("spread_opportunity", 0)
         )
+        quick_trade_score = float(assessment.get("quick_trade_score", 0))
+        symbol_volatility = float(assessment.get("symbol_volatility", 0))
         expected_move = min(
             1.0,
             abs(float(assessment.get("expected_move_percent", 0))) / 5.0,
@@ -116,6 +118,8 @@ class TradingStrategy:
         volatility = float(assessment.get("market_volatility", 0))
         return score + 2.0 * confidence * (
             research_priority
+            + 1.5 * quick_trade_score
+            + 1.25 * symbol_volatility
             + spread_opportunity
             + expected_move
             + catalyst

@@ -72,8 +72,10 @@ class AutoTrader:
         self.last_status_log = 0.0
         self.last_option_discovery = 0.0
         self.last_account_refresh = 0.0
+        self.last_order_monitor = 0.0
         self.cached_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
+        self.working_orders: dict[str, dict] = {}
         self.agent_candidates: dict[str, dict] = {}
         self.entries_paused = False
         self.circuit_breaker_time = 0.0
@@ -205,7 +207,14 @@ class AutoTrader:
         action: str,
         limit_price: Decimal | None = None,
     ) -> None:
-        self.last_trade[key] = time.monotonic()
+        submitted_at = time.monotonic()
+        self.last_trade[key] = submitted_at
+        self.working_orders[order_id] = {
+            "submitted_at": submitted_at,
+            "key": key,
+            "action": action,
+            "cancel_requested_at": None,
+        }
         instrument_type, symbol = key.split(":", 1)
         limit_text = (
             f" | limit={limit_price}"
@@ -220,6 +229,65 @@ class AutoTrader:
             limit_text,
             order_id,
         )
+
+    def _release_pending_order(self, order: dict) -> None:
+        key = str(order.get("key") or "")
+        action = str(order.get("action") or "")
+        if action not in {"PROFIT", "STOP"} or ":" not in key:
+            return
+        instrument_type, symbol = key.split(":", 1)
+        if instrument_type == "STOCK":
+            self.pending_stock_exits.discard(symbol)
+        elif instrument_type == "OPTION":
+            self.pending_option_exits.discard(symbol)
+
+    def monitor_working_orders(self) -> None:
+        now = time.monotonic()
+        if (
+            now - self.last_order_monitor
+            < float(self.config.order_monitor_seconds)
+        ):
+            return
+        self.last_order_monitor = now
+        groups = self.api.open_orders()
+        open_ids = set(self.api.open_order_ids(groups))
+
+        for order_id in open_ids:
+            if order_id not in self.working_orders:
+                self.working_orders[order_id] = {
+                    "submitted_at": now,
+                    "key": "",
+                    "action": "UNKNOWN",
+                    "cancel_requested_at": None,
+                }
+                log.info(
+                    "ORDER  | monitoring broker order | id=%s",
+                    order_id,
+                )
+
+        for order_id, order in list(self.working_orders.items()):
+            if order_id not in open_ids:
+                self._release_pending_order(order)
+                del self.working_orders[order_id]
+                self.last_account_refresh = 0.0
+                continue
+
+            age = now - float(order["submitted_at"])
+            if age < float(self.config.order_timeout_seconds):
+                continue
+            last_cancel = order.get("cancel_requested_at")
+            if last_cancel is not None and now - float(last_cancel) < 30:
+                continue
+            try:
+                self.api.cancel(order_id)
+                order["cancel_requested_at"] = now
+                log.warning(
+                    "CANCEL | unfilled after %ss | id=%s",
+                    self.config.order_timeout_seconds,
+                    order_id,
+                )
+            except Exception as exc:
+                log.error("CANCEL | id=%s | %s", order_id, exc)
 
     def account_state(self) -> tuple[Decimal, list[dict]]:
         now = time.monotonic()
@@ -726,6 +794,7 @@ class AutoTrader:
             self.resolve_targets(moment)
             cycle_started = time.monotonic()
             try:
+                self.monitor_working_orders()
                 buying_power, positions = self.account_state()
                 circuit_active = self.handle_portfolio_circuit_breaker(
                     positions,
