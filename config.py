@@ -25,14 +25,15 @@ class Settings(BaseSettings):
     option_type: str = Field(default="BOTH", pattern="^(CALL|PUT|BOTH)$")
     option_min_dte: int = Field(default=7, ge=0, le=730)
     option_max_dte: int = Field(default=45, ge=0, le=730)
-    max_symbols: int = Field(default=0, ge=0, le=50000)
+    max_symbols: int = Field(default=500, ge=0, le=50000)
     stock_universe_page_size: int = Field(default=200, ge=25, le=1000)
     stock_batch_size: int = Field(default=100, ge=1, le=100)
     stock_priority_fraction: float = Field(default=0.70, ge=0, le=0.90)
     stock_penny_fraction: float = Field(default=0.10, ge=0, le=0.50)
     penny_stock_max_price: Decimal = Field(default=Decimal("5"), gt=0)
     popular_stock_symbols: str = (
-        "SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,COIN,PLTR,MSTR"
+        "SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,GOOGL,NFLX,AVGO,"
+        "COIN,PLTR,MSTR,HOOD,SOFI,RIVN,GME,AMC,NIO,BABA,F,SNAP,UBER"
     )
     popular_stock_min_volume: int = Field(default=1_000_000, ge=0)
     popular_stock_max_spread_percent: Decimal = Field(
@@ -190,6 +191,9 @@ class Settings(BaseSettings):
 
     def stocks(self) -> list[str]:
         return [item.strip().upper() for item in self.stock_symbols.split(",") if item.strip()]
+
+    def stock_universe_limit(self) -> int:
+        return self.max_symbols or 500
 
     def exact_options(self) -> list[str]:
         return [item.strip().upper() for item in self.option_contracts.split(",") if item.strip()]

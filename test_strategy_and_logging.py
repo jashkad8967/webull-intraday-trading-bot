@@ -140,6 +140,14 @@ class AllocationAndLoggingTests(unittest.TestCase):
             {"POPULAR": 3, "PENNY": 1, "DISCOVERY": 1},
         )
         self.assertEqual(config.stock_universe_page_size, 200)
+        self.assertEqual(config.stocks(), ["ALL"])
+        self.assertEqual(config.max_symbols, 500)
+        self.assertEqual(config.stock_universe_limit(), 500)
+        self.assertEqual(Settings(max_symbols=0).stock_universe_limit(), 500)
+        self.assertTrue(
+            {"SPY", "QQQ", "NVDA", "TSLA", "AAPL", "GME", "AMC"}
+            <= set(config.popular_stocks())
+        )
 
     def test_log_handler_writes_year_month_and_date_path(self):
         directory = Path("tests/.generated_logs")

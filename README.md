@@ -3,7 +3,7 @@
 This application contains fewer than 15 copyable files and uses Webull's
 official Python SDK against the US production API. It can:
 
-- Download and rotate through Webull's complete tradable US stock and ETF universe.
+- Scan a capped cross-exchange US universe while always including popular stocks.
 - Trade exact OCC option contracts.
 - Progressively discover current ATM calls and puts for every optionable stock.
 - Scan every second, every few minutes, or up to once per hour.
@@ -109,17 +109,18 @@ It will display buying power, positions, and the first configured stock quote.
 
 ## 3. Select stocks
 
-The default includes every tradable US stock and ETF:
+The default takes a capped sample from Webull's broad US stock directory and
+then guarantees that the configured popular stocks and ETFs are included:
 
 ```dotenv
 STOCK_SYMBOLS=ALL
-MAX_SYMBOLS=0
+MAX_SYMBOLS=500
 STOCK_UNIVERSE_PAGE_SIZE=200
 STOCK_BATCH_SIZE=100
 STOCK_PRIORITY_FRACTION=0.70
 STOCK_PENNY_FRACTION=0.10
 PENNY_STOCK_MAX_PRICE=5.00
-POPULAR_STOCK_SYMBOLS=SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,COIN,PLTR,MSTR
+POPULAR_STOCK_SYMBOLS=SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,GOOGL,NFLX,AVGO,COIN,PLTR,MSTR,HOOD,SOFI,RIVN,GME,AMC,NIO,BABA,F,SNAP,UBER
 POPULAR_STOCK_MIN_VOLUME=1000000
 POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
 STOCK_POPULAR_CAPITAL_FRACTION=0.70
@@ -127,12 +128,13 @@ STOCK_PENNY_CAPITAL_FRACTION=0.10
 STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
 ```
 
-The bot downloads the current lists directly from Webull in bounded pages at
-the start of each
-trading day and keeps each instrument's required `US_STOCK` or `US_ETF`
-category. The popular seed list is configurable, and every seed or
-research-discovered ticker is still checked against that current directory.
-`MAX_SYMBOLS=0` means no cap.
+The bot downloads at most `MAX_SYMBOLS` directory entries from Webull in
+bounded pages at the start of each trading day and keeps each instrument's
+required `US_STOCK` or `US_ETF` category. It separately resolves and adds every
+valid configured popular symbol, so those names cannot be lost because of the
+directory cap. Research discoveries are accepted only when they exist in this
+combined universe. For compatibility with existing deployments,
+`MAX_SYMBOLS=0` now also uses the safe 500-symbol cap.
 
 Each batch always includes held stocks, then targets 70% popular/liquid names,
 10% stocks below `PENNY_STOCK_MAX_PRICE`, and 20% rotating discovery. The
@@ -162,9 +164,9 @@ STOCK_SYMBOLS=AAPL,MSFT,NVDA,SPY
 MAX_SYMBOLS=0
 ```
 
-To keep `ALL` but limit it to the first 500 returned tradable symbols, set
-`MAX_SYMBOLS=500`. Webull's listed-equity directory can contain both stocks and
-ETFs. The bot checks rejected snapshot symbols against the other category,
+With `STOCK_SYMBOLS=ALL`, `MAX_SYMBOLS=500` avoids downloading the entire
+15,000+ instrument directory. Webull's listed-equity directory can contain both
+stocks and ETFs. The bot checks rejected snapshot symbols against the other category,
 corrects stock/ETF mismatches, and skips only symbols invalid in both
 categories. Startup prints `LOAD` progress while symbols are downloaded.
 

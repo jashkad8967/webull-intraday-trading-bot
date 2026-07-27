@@ -339,7 +339,7 @@ class WebullAPI:
         from webull.data.common.category import Category
 
         categories: dict[str, str] = {}
-        limit = self.config.max_symbols
+        limit = self.config.stock_universe_limit()
         cursor = None
         safe_page_size = self.config.stock_universe_page_size
         while limit == 0 or len(categories) < limit:

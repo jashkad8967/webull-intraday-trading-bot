@@ -253,7 +253,7 @@ class MarketResearchAgent:
         prompt = (
             "Use current credible sources to find popular, widely traded US stocks "
             "and ETFs showing meaningful current volatility, unusual volume, or a "
-            "credible active catalyst. Put up to "
+            "credible active catalyst. Include major NYSE and Nasdaq names. Put up to "
             f"{self.config.agent_discovery_max_symbols} such tickers in discoveries. "
             "Separately assess every supplied symbol. Focus on fast intraday "
             "opportunities whose "

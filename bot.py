@@ -107,7 +107,7 @@ class AutoTrader:
             return
         requested_stocks = self.config.stocks()
         if requested_stocks == ["ALL"]:
-            limit = self.config.max_symbols or "ALL"
+            limit = self.config.stock_universe_limit()
             log.info("LOAD   | downloading stocks and ETFs | limit=%s", limit)
             self.stock_categories = self.api.stock_universe(
                 lambda category, count, category_limit: log.info(
@@ -117,6 +117,21 @@ class AutoTrader:
                     category_limit or "ALL",
                 )
             )
+            preferred = self.config.popular_stocks()
+            preferred_categories = self.api.stock_categories(preferred)
+            added = 0
+            for symbol in preferred:
+                if (
+                    symbol not in self.stock_categories
+                    and symbol in preferred_categories
+                ):
+                    self.stock_categories[symbol] = preferred_categories[symbol]
+                    added += 1
+            if added:
+                log.info(
+                    "LOAD   | added %s popular symbols outside directory cap",
+                    added,
+                )
             self.stock_symbols = list(self.stock_categories)
         else:
             log.info("LOAD   | resolving %s configured symbols", len(requested_stocks))
