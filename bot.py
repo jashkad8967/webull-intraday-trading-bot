@@ -110,6 +110,56 @@ class AutoTrader:
             tzinfo=self.timezone,
         )
 
+    def filter_by_historical_volatility(self, symbols: list[str]) -> list[str]:
+        if (
+            not self.config.historical_volatility_filter_enabled
+            or not symbols
+        ):
+            return symbols
+        floor = float(self.config.min_historical_volatility_percent)
+        log.info(
+            "VOLFILT | scoring %s symbols | lookback=%sd | floor=%.2f%%",
+            len(symbols),
+            self.config.historical_volatility_days,
+            floor,
+        )
+        try:
+            scores = self.api.historical_volatility(
+                symbols,
+                self.config.historical_volatility_days,
+            )
+        except Exception as exc:
+            log.warning("VOLFILT | disabled this cycle | %s", exc)
+            return symbols
+        covered = [symbol for symbol in symbols if symbol in scores]
+        if len(covered) < max(1, len(symbols) // 2):
+            log.warning(
+                "VOLFILT | insufficient coverage (%s/%s) | keeping full universe",
+                len(covered),
+                len(symbols),
+            )
+            return symbols
+        qualifying = [symbol for symbol in covered if scores[symbol] >= floor]
+        if not qualifying:
+            log.warning(
+                "VOLFILT | no symbols cleared floor | keeping full universe"
+            )
+            return symbols
+        ordered = sorted(
+            qualifying,
+            key=lambda symbol: scores[symbol],
+            reverse=True,
+        )
+        log.info(
+            "VOLFILT | kept %s of %s | top=%s",
+            len(ordered),
+            len(symbols),
+            ",".join(
+                f"{symbol}:{scores[symbol]:.1f}%" for symbol in ordered[:5]
+            ),
+        )
+        return ordered
+
     def resolve_targets(self, moment: datetime) -> None:
         if self.resolved_date == moment.date():
             return
@@ -146,6 +196,16 @@ class AutoTrader:
                     "LOAD   | added %s popular symbols outside directory cap",
                     added,
                 )
+            if self.config.exclude_etfs:
+                etfs = [
+                    symbol
+                    for symbol, category in self.stock_categories.items()
+                    if category == "US_ETF"
+                ]
+                for symbol in etfs:
+                    self.stock_categories.pop(symbol, None)
+                if etfs:
+                    log.info("LOAD   | excluded %s ETFs", len(etfs))
             for symbol in self.invalid_symbols.symbols:
                 self.stock_categories.pop(symbol, None)
             eligible = [
@@ -153,6 +213,7 @@ class AutoTrader:
                 for symbol in self.stock_categories
                 if symbol not in self.invalid_symbols
             ]
+            eligible = self.filter_by_historical_volatility(eligible)
             self.stock_symbols = eligible[:limit]
             self.reserve_symbols = eligible[limit:]
         else:
@@ -171,6 +232,12 @@ class AutoTrader:
             self.stock_categories = self.api.stock_categories(self.stock_symbols)
             for symbol in self.stock_symbols:
                 self.stock_categories.setdefault(symbol, "US_STOCK")
+            if self.config.exclude_etfs:
+                self.stock_symbols = [
+                    symbol
+                    for symbol in self.stock_symbols
+                    if self.stock_categories.get(symbol) != "US_ETF"
+                ]
         self.option_contracts = self.api.resolve_options()
         self.discover_all_options = "ALL" in self.config.option_roots()
         self.strategy.clear_market_state()
@@ -598,6 +665,9 @@ class AutoTrader:
                 )
                 quotes.extend(category_quotes)
                 if category_invalid:
+                    if self.config.exclude_etfs and category == "US_STOCK":
+                        invalid.update(category_invalid)
+                        continue
                     alternate = "US_ETF" if category == "US_STOCK" else "US_STOCK"
                     alternate_quotes, alternate_invalid = (
                         self.api.stock_quotes_resilient(

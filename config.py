@@ -32,8 +32,16 @@ class Settings(BaseSettings):
     stock_priority_fraction: float = Field(default=0.70, ge=0, le=0.90)
     stock_penny_fraction: float = Field(default=0.10, ge=0, le=0.50)
     penny_stock_max_price: Decimal = Field(default=Decimal("5"), gt=0)
+    exclude_etfs: bool = True
+    historical_volatility_filter_enabled: bool = True
+    historical_volatility_days: int = Field(default=20, ge=5, le=120)
+    min_historical_volatility_percent: Decimal = Field(
+        default=Decimal("3"),
+        ge=0,
+        le=100,
+    )
     popular_stock_symbols: str = (
-        "SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,GOOGL,NFLX,AVGO,"
+        "NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,GOOGL,NFLX,AVGO,"
         "COIN,PLTR,MSTR,HOOD,SOFI,RIVN,GME,AMC,NIO,BABA,F,SNAP,UBER"
     )
     popular_stock_min_volume: int = Field(default=1_000_000, ge=0)

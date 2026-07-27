@@ -390,6 +390,85 @@ class WebullAPI:
             cursor = str(next_cursor)
         return categories
 
+    def historical_volatility(
+        self,
+        symbols: list[str],
+        days: int,
+    ) -> dict[str, float]:
+        """Average daily amplitude percent over recent daily bars per symbol.
+
+        Amplitude is (high - low) / close, a robust historical volatility
+        proxy. Parsing is defensive across possible response shapes; symbols
+        without usable data are omitted so callers can decide how to treat
+        missing coverage.
+        """
+        from webull.data.common.category import Category
+        from webull.data.common.timespan import Timespan
+
+        results: dict[str, float] = {}
+        unique = list(dict.fromkeys(symbol.upper() for symbol in symbols))
+        count = str(max(days + 1, 6))
+        for start in range(0, len(unique), 100):
+            batch = unique[start : start + 100]
+            try:
+                page = self._call(
+                    lambda batch=batch: self.data.market_data.get_batch_history_bar(
+                        batch,
+                        Category.US_STOCK.name,
+                        Timespan.D.name,
+                        count,
+                    ),
+                    "market",
+                )
+            except Exception as exc:
+                logging.getLogger("webull-bot").warning(
+                    "VOLFILT | batch history failed | %s", exc
+                )
+                continue
+            for symbol, amplitude in self._parse_amplitudes(page, days).items():
+                results[symbol] = amplitude
+        return results
+
+    @classmethod
+    def _parse_amplitudes(cls, page, days: int) -> dict[str, float]:
+        amplitudes: dict[str, float] = {}
+        for entry in page or []:
+            if not isinstance(entry, dict):
+                continue
+            symbol = str(entry.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            bars = entry.get("bars")
+            if not isinstance(bars, list):
+                candles = entry.get("candles")
+                bars = candles if isinstance(candles, list) else None
+            if bars is None:
+                continue
+            amplitude = cls._average_amplitude(bars, days)
+            if amplitude is not None:
+                amplitudes[symbol] = amplitude
+        return amplitudes
+
+    @staticmethod
+    def _average_amplitude(bars: list, days: int) -> float | None:
+        samples: list[float] = []
+        for bar in bars[:days]:
+            if not isinstance(bar, dict):
+                continue
+            try:
+                high = float(bar.get("high"))
+                low = float(bar.get("low"))
+                close = float(bar.get("close"))
+            except (TypeError, ValueError):
+                continue
+            reference = close if close > 0 else (high + low) / 2
+            if reference <= 0 or high < low:
+                continue
+            samples.append((high - low) / reference * 100.0)
+        if not samples:
+            return None
+        return sum(samples) / len(samples)
+
     def option_contracts(
         self,
         underlying: str | None = None,
