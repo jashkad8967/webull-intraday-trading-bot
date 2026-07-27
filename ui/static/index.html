@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Webull Scalping Bot</title>
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #0b0e14;
+    --panel: #131722;
+    --border: #232838;
+    --text: #e6e9f0;
+    --muted: #8b93a7;
+    --green: #3ddc97;
+    --red: #ff6b6b;
+    --amber: #f5b942;
+    --accent: #5b8cff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6fb;
+      --panel: #ffffff;
+      --border: #dde2ee;
+      --text: #171a22;
+      --muted: #5c6478;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 1.25rem;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 0.9rem; display: flex; align-items: center; gap: 0.6rem; }
+  .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--green); box-shadow: 0 0 0 4px rgba(61,220,151,0.15); }
+  .dot.paused { background: var(--amber); }
+  .badge { font-size: 0.7rem; color: var(--muted); font-weight: 400; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 0.85rem 1rem; }
+  .stat .label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .stat .value { font-size: 1.35rem; font-weight: 600; margin-top: 0.15rem; }
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1rem; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 0.9rem 1rem; overflow-x: auto; }
+  .panel h2 { font-size: 0.85rem; margin: 0 0 0.6rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; white-space: nowrap; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  tr:last-child td { border-bottom: none; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .empty { color: var(--muted); font-size: 0.82rem; padding: 0.5rem 0; }
+  .pill { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 999px; font-size: 0.68rem; border: 1px solid var(--border); color: var(--muted); }
+</style>
+</head>
+<body>
+  <h1><span class="dot" id="live-dot"></span> Webull Scalping Bot <span class="badge" id="mode-badge"></span></h1>
+
+  <div class="grid">
+    <div class="stat"><div class="label">Buying Power</div><div class="value" id="buying-power">—</div></div>
+    <div class="stat"><div class="label">Open Positions</div><div class="value" id="position-count">—</div></div>
+    <div class="stat"><div class="label">Universe</div><div class="value" id="universe">—</div></div>
+    <div class="stat"><div class="label">Last Update</div><div class="value" id="last-update">—</div></div>
+  </div>
+
+  <div class="panels">
+    <div class="panel">
+      <h2>Open Positions</h2>
+      <div id="positions"></div>
+    </div>
+    <div class="panel">
+      <h2>Recent Trades</h2>
+      <div id="trades"></div>
+    </div>
+    <div class="panel">
+      <h2>Watchlist</h2>
+      <div id="watchlist"></div>
+    </div>
+    <div class="panel">
+      <h2>Research Agent</h2>
+      <div id="agent"></div>
+    </div>
+  </div>
+
+<script>
+function fmtMoney(value) {
+  const n = Number(value);
+  if (Number.isNaN(n)) return value ?? "—";
+  return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+function fmtTime(seconds) {
+  if (!seconds) return "—";
+  return new Date(seconds * 1000).toLocaleTimeString();
+}
+function pnlClass(value) {
+  const n = Number(value);
+  return n > 0 ? "pos" : n < 0 ? "neg" : "";
+}
+function table(headers, rows) {
+  if (!rows || rows.length === 0) return '<div class="empty">None right now</div>';
+  const head = headers.map(h => `<th>${h.label}</th>`).join("");
+  const body = rows.map(row => {
+    const cells = headers.map(h => `<td class="${h.cls ? h.cls(row) : ''}">${h.render(row)}</td>`).join("");
+    return `<tr>${cells}</tr>`;
+  }).join("");
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+async function refresh() {
+  const dot = document.getElementById("live-dot");
+  try {
+    const res = await fetch("/api/status", { cache: "no-store" });
+    const data = await res.json();
+
+    if (!data.updated_at) {
+      dot.className = "dot";
+      document.getElementById("last-update").textContent = data.message || "Waiting…";
+      return;
+    }
+    dot.className = "dot " + (data.paused ? "paused" : "live");
+    document.getElementById("mode-badge").textContent = data.mode ? `mode=${data.mode}` + (data.paused ? " · PAUSED" : "") : "";
+    document.getElementById("buying-power").textContent = fmtMoney(data.buying_power);
+    document.getElementById("position-count").textContent = (data.positions || []).length;
+    const universe = data.universe || {};
+    document.getElementById("universe").textContent = `${universe.stocks ?? 0} stocks / ${universe.options ?? 0} options`;
+    document.getElementById("last-update").textContent = fmtTime(data.updated_at);
+
+    document.getElementById("positions").innerHTML = table([
+      { label: "Symbol", render: r => r.symbol },
+      { label: "Type", render: r => r.instrument_type },
+      { label: "Qty", render: r => r.quantity },
+      { label: "Cost", render: r => fmtMoney(r.cost_price) },
+      { label: "Last", render: r => fmtMoney(r.last_price) },
+      { label: "P&L", render: r => fmtMoney(r.unrealized_pnl), cls: r => pnlClass(r.unrealized_pnl) },
+      { label: "Bucket", render: r => `<span class="pill">${r.bucket}</span>` },
+    ], data.positions);
+
+    document.getElementById("trades").innerHTML = table([
+      { label: "Time", render: r => fmtTime(r.time) },
+      { label: "Type", render: r => r.instrument_type },
+      { label: "Action", render: r => r.action },
+      { label: "Symbol", render: r => r.symbol },
+      { label: "Limit", render: r => r.limit_price ? fmtMoney(r.limit_price) : "—" },
+    ], data.recent_trades);
+
+    document.getElementById("watchlist").innerHTML = table([
+      { label: "Symbol", render: r => r.symbol },
+      { label: "Price", render: r => fmtMoney(r.price) },
+      { label: "Bucket", render: r => `<span class="pill">${r.bucket}</span>` },
+      { label: "Vol", render: r => (r.volume ?? "—").toLocaleString ? r.volume.toLocaleString() : r.volume },
+      { label: "Spread%", render: r => r.spread_percent ?? "—" },
+    ], data.watchlist);
+
+    const agent = data.agent;
+    if (!agent) {
+      document.getElementById("agent").innerHTML = '<div class="empty">Research agent disabled</div>';
+    } else {
+      const discoveries = (agent.discoveries || []).map(d => d.symbol).join(", ") || "none yet";
+      const popular = (agent.popular_symbols || []).join(", ") || "none yet";
+      document.getElementById("agent").innerHTML =
+        `<div><strong>Discoveries:</strong> ${discoveries}</div>` +
+        `<div style="margin-top:0.4rem"><strong>Boosted priority:</strong> ${popular}</div>`;
+    }
+  } catch (err) {
+    dot.className = "dot";
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -42,7 +42,8 @@ class Settings(BaseSettings):
     )
     popular_stock_symbols: str = (
         "NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,GOOGL,NFLX,AVGO,"
-        "COIN,PLTR,MSTR,HOOD,SOFI,RIVN,GME,AMC,NIO,BABA,F,SNAP,UBER"
+        "COIN,PLTR,MSTR,HOOD,SOFI,RIVN,GME,AMC,NIO,BABA,F,SNAP,UBER,"
+        "MARA,IONQ,RGTI,QBTS,QUBT,FCX"
     )
     popular_stock_min_volume: int = Field(default=1_000_000, ge=0)
     popular_stock_max_spread_percent: Decimal = Field(
@@ -75,12 +76,19 @@ class Settings(BaseSettings):
     max_order_notional: Decimal = Field(default=Decimal("1000"), gt=0)
 
     poll_seconds: Decimal = Field(default=Decimal("1"), ge=Decimal("1"), le=Decimal("3600"))
-    trade_cooldown_seconds: Decimal = Field(default=Decimal("5"), ge=0, le=Decimal("21600"))
+    trade_cooldown_seconds: Decimal = Field(default=Decimal("30"), ge=0, le=Decimal("21600"))
+    stock_max_trades_per_hour: int = Field(default=8, ge=0, le=1000)
     ema_fast_period: int = Field(default=3, ge=2, le=500)
     ema_slow_period: int = Field(default=8, ge=3, le=1000)
     reenter_on_trend: bool = True
-    stock_min_net_profit_percent: Decimal = Field(
+    reenter_confirmation_polls: int = Field(default=2, ge=1, le=20)
+    vwap_entry_band_percent: Decimal = Field(
         default=Decimal("0.001"),
+        ge=0,
+        le=Decimal("0.05"),
+    )
+    stock_min_net_profit_percent: Decimal = Field(
+        default=Decimal("0.0015"),
         ge=0,
         le=1,
     )
@@ -89,7 +97,18 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("0.10"),
     )
-    stock_stop_loss_percent: Decimal = Field(default=Decimal("0.005"), ge=0, le=1)
+    stock_stop_loss_min_percent: Decimal = Field(default=Decimal("0.0015"), gt=0, le=1)
+    stock_stop_loss_max_percent: Decimal = Field(default=Decimal("0.006"), gt=0, le=1)
+    stock_stop_loss_range_multiplier: Decimal = Field(
+        default=Decimal("0.35"),
+        ge=0,
+        le=Decimal("5"),
+    )
+    stock_target_stop_multiple: Decimal = Field(
+        default=Decimal("1.2"),
+        ge=Decimal("0.5"),
+        le=Decimal("5"),
+    )
     stock_entry_max_spread_percent: Decimal = Field(
         default=Decimal("0.15"),
         gt=0,
@@ -170,6 +189,7 @@ class Settings(BaseSettings):
     )
     option_limit_offset: Decimal = Field(default=Decimal("0.03"), ge=0, le=Decimal("0.25"))
     log_directory: str = "logs"
+    status_file: str = "status.json"
 
     def host(self) -> str:
         value = self.webull_api_endpoint.strip()
@@ -194,6 +214,10 @@ class Settings(BaseSettings):
         self.validate_connection(require_account=True)
         if self.ema_fast_period >= self.ema_slow_period:
             raise ValueError("EMA_FAST_PERIOD must be lower than EMA_SLOW_PERIOD")
+        if self.stock_stop_loss_min_percent > self.stock_stop_loss_max_percent:
+            raise ValueError(
+                "STOCK_STOP_LOSS_MIN_PERCENT must not exceed STOCK_STOP_LOSS_MAX_PERCENT"
+            )
         if self.option_min_dte > self.option_max_dte:
             raise ValueError("OPTION_MIN_DTE must not exceed OPTION_MAX_DTE")
         if self.stock_priority_fraction + self.stock_penny_fraction > 0.90:

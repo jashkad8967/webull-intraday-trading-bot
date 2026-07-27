@@ -1,7 +1,7 @@
 import json
 
-from config import settings
-from webull_api import WebullAPI
+from webull_bot.config import settings
+from webull_bot.webull_api import WebullAPI
 
 
 def main() -> None:

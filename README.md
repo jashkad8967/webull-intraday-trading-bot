@@ -1,42 +1,42 @@
-# Compact Webull production stock and options auto trader
+# Webull production stock and options auto trader
 
-This application contains fewer than 15 copyable files and uses Webull's
-official Python SDK against the US production API. It can:
+This application uses Webull's official Python SDK against the US production
+API, adds a small read-only dashboard, and ships as two containers you can run
+locally or deploy to a free-tier cloud VM. It can:
 
 - Scan a capped cross-exchange US universe while always including popular stocks.
 - Trade exact OCC option contracts.
 - Progressively discover current ATM calls and puts for every optionable stock.
 - Scan every second, every few minutes, or up to once per hour.
-- Buy on EMA crossovers or an active uptrend, target percentage-based profits,
-  enforce percentage stops, and re-enter while the uptrend remains active.
+- Buy on EMA crossovers confirmed by session VWAP, or a re-forming uptrend that
+  has held for a configurable number of polls, target percentage-based profits
+  scaled to a volatility-adaptive stop, and re-enter while the uptrend persists.
+- Cap trades per symbol per hour so a persistent trend doesn't cause overtrading.
 - Stop opening positions at the configured end-of-day time.
 - Cancel working orders and repeatedly close stock positions before 8:00 PM
   New York time.
+- Serve a live dashboard (buying power, positions, recent trades, watchlist,
+  research-agent state) from a second, read-only container.
 
 Webull supports stock market orders. Webull options do not support market
 orders, so option entries and exits use refreshed aggressive limit prices.
 
-## Recreate the application from code
-
-Create one folder on the destination computer and copy the contents of these
-12 files into files with the same names:
+## Repository layout
 
 ```text
-.env.example
-.gitignore
-README.md
-requirements.txt
-setup.ps1
-config.py
-strategy.py
-wash_sale.py
-market_agent.py
-webull_api.py
-connect.py
-bot.py
+src/webull_bot/     trading bot package (config, strategy, execution, agent)
+ui/                 dashboard: FastAPI server + static HTML/JS, own Dockerfile
+deploy/             compose.yaml (bot + dashboard) and deploy/gcp/*.sh
+tests/              unit tests
+Dockerfile          bot image (built from repo root, COPYs src/)
+.env.example        copyable settings template
+setup.ps1           local Windows environment setup
 ```
 
-Do not copy `.venv`, `.webull-skill-venv`, or create `.env` manually. The setup
+## Recreate the application from code
+
+Copy this repository (or the files above) to the destination computer. Do not
+copy `.venv`, `.webull-skill-venv`, or create `.env` manually. The setup
 script recreates both local environments, installs every dependency, and copies
 `.env.example` exactly to `.env`. You then enter your private production Webull
 credentials in `.env`.
@@ -96,13 +96,13 @@ also handles the production token flow when required.
 Get the production Account ID:
 
 ```powershell
-.\.venv\Scripts\python.exe connect.py
+$env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m webull_bot.connect
 ```
 
 Copy the returned `account_id` into `.env`, then run the command again:
 
 ```powershell
-.\.venv\Scripts\python.exe connect.py
+$env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m webull_bot.connect
 ```
 
 It will display buying power, positions, and the first configured stock quote.
@@ -237,22 +237,29 @@ You can use exact contracts and automatic selection together.
 ## 5. Set the trading speed
 
 EMA periods count price samples. With `REENTER_ON_TREND=true`, the bot may buy
-again after a take-profit exit while the fast EMA remains above the slow EMA.
-Actual fills depend on price movement, liquidity, spreads, and the number of
-configured instruments.
+again once an uptrend has held for `REENTER_CONFIRMATION_POLLS` consecutive
+polls after a take-profit exit, provided price is also within
+`VWAP_ENTRY_BAND_PERCENT` of session VWAP. Actual fills depend on price
+movement, liquidity, spreads, and the number of configured instruments.
 
 Fast scanning, allowing multiple instruments to trade in a minute:
 
 ```dotenv
 POLL_SECONDS=1
 ACCOUNT_REFRESH_SECONDS=5
-TRADE_COOLDOWN_SECONDS=5
+TRADE_COOLDOWN_SECONDS=30
+STOCK_MAX_TRADES_PER_HOUR=8
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
-STOCK_MIN_NET_PROFIT_PERCENT=0.0001
+REENTER_CONFIRMATION_POLLS=2
+VWAP_ENTRY_BAND_PERCENT=0.001
+STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_PERCENT=0.02
+STOCK_STOP_LOSS_MIN_PERCENT=0.0015
+STOCK_STOP_LOSS_MAX_PERCENT=0.006
+STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
+STOCK_TARGET_STOP_MULTIPLE=1.2
 OPTION_TAKE_PROFIT_PRICE=0.01
 ```
 
@@ -357,24 +364,38 @@ have a pending exit, and resets its timer whenever a real fill occurs.
 
 Repository responsibilities are intentionally separated:
 
-- `strategy.py`: activity scoring, penny/popular allocation, Groq priority
-  weighting, EMA rules, targets, stops, sizing, and portfolio policy.
-- `bot.py`: session scheduling, account caching, wash-block coordination, and
-  order workflow.
-- `webull_api.py`: Webull authentication, throttling, market data, and order
-  transport.
-- `market_agent.py`: paced, non-blocking Groq research.
-- `wash_sale.py`: persistent repurchase blocks.
+- `src/webull_bot/strategy.py`: activity scoring, penny/popular allocation,
+  Groq priority weighting, EMA + VWAP entry rules, adaptive targets/stops,
+  sizing, and portfolio policy.
+- `src/webull_bot/bot.py`: session scheduling, account caching, wash-block
+  coordination, per-symbol trade-rate capping, and order workflow.
+- `src/webull_bot/webull_api.py`: Webull authentication, throttling, market
+  data, and order transport.
+- `src/webull_bot/market_agent.py`: paced, non-blocking Groq research.
+- `src/webull_bot/wash_sale.py`: persistent repurchase blocks.
+- `src/webull_bot/status.py`: writes the JSON snapshot the dashboard reads.
+- `ui/`: the dashboard's FastAPI server and static page.
 
-For stocks, the default gross target is 0.21% above average cost: a 0.01%
-configured minimum net profit plus a configurable 0.2% allowance for spread,
-fees, and other round-trip costs. This aims to exit just beyond estimated costs
-instead of waiting for a 1% net gain. Actual proceeds can differ because of
-one-cent price increments, spread, slippage, and real broker or regulatory
-charges. The default stop submits an exit at a 2% decline. For options,
-`OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one premium cent
-above average cost, normally $1 per standard 100-share contract before fees.
-A profit or stop order remains subject to its limit being filled.
+**Entries** require an EMA(fast, slow) crossover (or, with
+`REENTER_ON_TREND=true`, a re-forming uptrend that has held for
+`REENTER_CONFIRMATION_POLLS` consecutive polls) *and* the price at or within
+`VWAP_ENTRY_BAND_PERCENT` of the session VWAP — the crossover alone reacts to
+quote noise more than genuine momentum, so VWAP acts as a second, independent
+confirmation.
+
+**Stops** scale with each symbol's own realized range instead of one flat
+percentage: `STOCK_STOP_LOSS_RANGE_MULTIPLIER` times the symbol's
+today's-high/low-vs-price ratio, clamped between
+`STOCK_STOP_LOSS_MIN_PERCENT` and `STOCK_STOP_LOSS_MAX_PERCENT`. A calm
+large-cap gets a tight stop; a wild small-cap gets a wider one.
+
+**Targets** are the larger of (a) `STOCK_MIN_NET_PROFIT_PERCENT` +
+`STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT`, or (b) that same adaptive stop
+percent times `STOCK_TARGET_STOP_MULTIPLE` (default 1.2×) — so reward:risk
+scales with volatility instead of staying fixed while the stop moves. For
+options, `OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one
+premium cent above average cost, normally $1 per standard 100-share contract
+before fees. A profit or stop order remains subject to its limit being filled.
 
 When a stock loss exit is submitted, the symbol is persisted in
 `conf/wash_sale_blocks.json` and blocked from new purchases for 60 calendar
@@ -383,11 +404,21 @@ days. This is a conservative same-symbol control, not a tax determination.
 The end-of-day closeout is the exception: it cancels working profit orders and
 closes remaining positions before market close, which can realize a loss.
 
-With the default five-second cooldown, the code can attempt multiple orders per
-minute across several instruments. With `ALL`, each batch is processed quickly,
-but the complete universe takes multiple cycles. It does not promise a fixed
-trade count: EMA direction, target price movement, fills, API response time,
-open-position limits, and Webull rate limits determine the actual count.
+`STOCK_MAX_TRADES_PER_HOUR` (default 8) caps new entries per symbol per
+rolling hour independent of `TRADE_COOLDOWN_SECONDS` (default 30s), so a
+persistent trend can't turn into unbounded churn on one name. It does not
+promise a fixed trade count: EMA/VWAP confirmation, target price movement,
+fills, API response time, open-position limits, and Webull rate limits
+determine the actual count.
+
+> **Regulatory note:** FINRA's amended Rule 4210 (effective June 2026)
+> replaced the old $25k/3-trades-per-5-business-days Pattern Day Trader
+> threshold with a margin-based framework — verify your account's current
+> treatment with Webull directly, since brokers had up to 18 months to roll
+> out the change. Also re-verify the request-rate numbers in
+> [7. API request pacing](#7-api-request-pacing) against your own app's limits
+> in Webull's OpenAPI Management dashboard before relying on the defaults
+> below.
 
 One cent multiplied by 1,000 completed one-share trades is $10 gross. With 100
 shares, a one-cent favorable move is $1 per completed trade. Net results also
@@ -478,7 +509,7 @@ MARKET_HOLIDAYS=2026-01-01,2026-12-25
 ## 9. Run the bot
 
 ```powershell
-.\.venv\Scripts\python.exe bot.py
+$env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m webull_bot
 ```
 
 Stop it with:
@@ -490,8 +521,20 @@ Ctrl+C
 Force account-wide closeout at any time:
 
 ```powershell
-.\.venv\Scripts\python.exe bot.py --close-all
+$env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m webull_bot --close-all
 ```
+
+Or run both the bot and the dashboard together with Docker Compose (see
+[Dashboard](#dashboard) and [Run continuously on a free Google Cloud VM](#12-run-continuously-on-a-free-google-cloud-vm)
+below):
+
+```bash
+cp .env.example .env   # then fill in your real credentials
+BOT_ENV_FILE="$(pwd)/.env" docker compose -f deploy/compose.yaml up --build
+```
+
+(`BOT_ENV_FILE` must be an absolute path here — Compose resolves a relative
+one against `deploy/`, where the compose file lives, not the repo root.)
 
 This bypasses signals, cancels all working orders, and submits closes for every
 position in `ACCOUNT_ID`, including positions opened outside this bot. It
@@ -523,7 +566,7 @@ desktop application does not grant OpenAPI access.
 3. Open **OpenAPI Advanced Quotes**.
 4. Enable **Nasdaq Basic Non-Display** for US stocks and ETFs.
 5. Enable **OPRA Real-Time Non-Display** to trade options.
-6. Restart `bot.py` after Webull activates the subscriptions.
+6. Restart the bot after Webull activates the subscriptions.
 
 If the stock subscription is missing, the bot prints one `STOP` message and
 exits instead of repeating permanent 401 errors. If stocks work but the OPRA
@@ -556,76 +599,107 @@ It switches files automatically at midnight in `TRADING_TIMEZONE` and adds one
 message, so a process restart does not lose the day's accumulated context.
 Change `LOG_DIRECTORY` to place logs on durable storage.
 
-## 12. Run continuously on Oracle Cloud Always Free
+## Dashboard
 
-The repository includes a multi-architecture Docker image, an Oracle VM
-bootstrap script, a single-container Compose definition, and GitHub Actions
-continuous deployment. Use one VM and one container: simultaneous live bot
-instances could submit duplicate orders.
+A second, read-only container (`ui/`) serves a small live dashboard: buying
+power, open positions, recent trades, the current watchlist, and the research
+agent's latest state, polling a JSON snapshot the bot writes each cycle
+(`STATUS_FILE`, default `status.json`). It has no access to your Webull
+credentials or the trade API — a bug in the dashboard can't affect trading.
+
+Running via `deploy/compose.yaml`, the dashboard is bound to
+`127.0.0.1:8080` on whatever host it runs on (not exposed to the network by
+default). View it by tunneling over SSH:
+
+```bash
+ssh -L 8080:localhost:8080 <user>@<host>
+```
+
+then open <http://localhost:8080> in your browser. To expose it directly
+instead (e.g. for local-only use), change the `ports:` mapping in
+`deploy/compose.yaml` from `127.0.0.1:8080:8080` to `0.0.0.0:8080:8080` and
+open port 8080 in your firewall/security rules.
+
+## 12. Run continuously on a free Google Cloud VM
+
+The repository includes a multi-architecture Docker image for the bot, a
+Dockerfile for the dashboard, a Compose definition covering both, a Compute
+Engine VM bootstrap script, and GitHub Actions continuous deployment. Use one
+VM: simultaneous live bot instances could submit duplicate orders.
 
 ### Create the VM
 
-1. Create an Oracle Cloud Always Free compute instance in your home region.
-2. Select an Always Free-eligible Ubuntu 24.04 image and shape. Ampere A1 works
-   well; one OCPU and 6 GB memory is sufficient for this bot.
-3. Add your SSH public key during creation.
-4. Keep inbound access restricted to SSH port 22 from your own IP. The bot does
-   not require an inbound HTTP port.
+1. Create a Google Cloud account/project if you don't have one (requires a
+   card on file for identity verification; Compute Engine's Always Free tier
+   itself has no recurring charge as long as you stay within it).
+2. In Compute Engine, create an instance in an Always Free-eligible region
+   (`us-west1`, `us-central1`, or `us-east1`) using the `e2-micro` machine
+   type and an **Ubuntu 24.04 LTS** boot disk (not the default Debian image,
+   so the bootstrap script's `apt` packages match).
+3. Under the instance's SSH keys, add the public half of a dedicated
+   deployment keypair (not your personal key) — generate one with
+   `ssh-keygen -t ed25519 -C "webull-bot-deploy" -f webull-bot-deploy`.
+4. In the VPC firewall rules, restrict inbound access to SSH (port 22) from
+   your own IP only. The bot does not require an inbound HTTP port; the
+   dashboard is reached over an SSH tunnel (see [Dashboard](#dashboard)).
 
 ### Bootstrap the VM once
 
-Connect to the VM, clone this repository, and run:
+Connect to the VM (`ssh -i webull-bot-deploy <user>@<external-ip>`), clone
+this repository, and run:
 
 ```bash
 git clone https://github.com/jashkad8967/webull-intraday-trading-bot.git
 cd webull-intraday-trading-bot
-sudo bash deploy/oracle/bootstrap.sh
+sudo bash deploy/gcp/bootstrap.sh
 sudo nano /opt/webull-bot/shared/.env
 ```
 
 Enter `WEBULL_APP_KEY`, `WEBULL_APP_SECRET`, `ACCOUNT_ID`, and `GROQ_API_KEY`
 in that VM-only `.env` file. Review every live-trading setting, save it, then
-log out and reconnect so the `ubuntu` user receives Docker group membership.
-Never commit this file.
+log out and reconnect so your user receives Docker group membership. Never
+commit this file.
 
 The bootstrap creates a persistent Docker volume named `webull-trading-data`.
-Daily logs and wash-sale state survive container replacements and VM reboots.
-They remain on the VM boot storage, but not after deleting the VM and its
-volume. Copy important logs off the VM periodically if you need separate
-recovery.
+Daily logs, wash-sale state, and the dashboard's status feed survive container
+replacements and VM reboots. They remain on the VM boot disk, but not after
+deleting the VM and its volume. Copy important logs off the VM periodically if
+you need separate recovery.
 
 ### Connect GitHub deployment
 
 Add these GitHub Actions repository secrets:
 
 ```text
-OCI_HOST                 VM public IP or hostname
-OCI_USER                 ubuntu
-OCI_SSH_PORT             22
-OCI_SSH_PRIVATE_KEY      matching private deployment key
-OCI_KNOWN_HOSTS          verified VM SSH known_hosts entry
+GCP_HOST                 VM external IP or hostname
+GCP_USER                 your GCE login user
+GCP_SSH_PORT             22
+GCP_SSH_PRIVATE_KEY      the deployment keypair's private half
+GCP_KNOWN_HOSTS          verified VM SSH known_hosts entry
 ```
 
-Before storing `OCI_KNOWN_HOSTS`, verify the VM's ED25519 host-key fingerprint
-against the value shown from `/etc/ssh/ssh_host_ed25519_key.pub` on the Oracle
-console. Do not blindly trust an unverified `ssh-keyscan` result.
+Before storing `GCP_KNOWN_HOSTS`, verify the VM's SSH host-key fingerprint
+shown in the Compute Engine console (or over a console-based connection)
+against what `ssh-keyscan` returns. Do not blindly trust an unverified
+`ssh-keyscan` result.
 
 Finally, add the repository variable:
 
 ```text
-OCI_DEPLOY_ENABLED=true
+GCP_DEPLOY_ENABLED=true
 ```
 
 Run the `Validate trading bot` workflow manually for the first deployment.
 Afterward, each push to `main` runs tests, uploads an exact release archive,
 builds the replacement while the current bot remains active, and then replaces
-the single container. If the new container exits during its startup check, the
+both containers. If the new bot container exits during its startup check, the
 deployment script attempts to restore the previous release.
 
 Useful VM commands:
 
 ```bash
 docker logs --tail 200 -f webull-trading-bot
+docker logs --tail 200 -f webull-trading-dashboard
 docker exec webull-trading-bot find /var/data/logs -type f
 docker exec webull-trading-bot tail -n 200 /var/data/logs/YYYY/MM/YYYY-MM-DD.log
 docker restart webull-trading-bot
@@ -660,7 +734,7 @@ STOCK_BATCH_SIZE=100
 STOCK_PRIORITY_FRACTION=0.70
 STOCK_PENNY_FRACTION=0.10
 PENNY_STOCK_MAX_PRICE=5.00
-POPULAR_STOCK_SYMBOLS=SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,COIN,PLTR,MSTR
+POPULAR_STOCK_SYMBOLS=SPY,QQQ,NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,COIN,PLTR,MSTR,MARA,IONQ,RGTI,QBTS,QUBT,FCX
 POPULAR_STOCK_MIN_VOLUME=1000000
 POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
 STOCK_POPULAR_CAPITAL_FRACTION=0.70
@@ -677,13 +751,19 @@ MAX_ORDER_NOTIONAL=1000
 
 POLL_SECONDS=1
 ACCOUNT_REFRESH_SECONDS=5
-TRADE_COOLDOWN_SECONDS=5
+TRADE_COOLDOWN_SECONDS=30
+STOCK_MAX_TRADES_PER_HOUR=8
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
-STOCK_MIN_NET_PROFIT_PERCENT=0.0001
+REENTER_CONFIRMATION_POLLS=2
+VWAP_ENTRY_BAND_PERCENT=0.001
+STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_PERCENT=0.02
+STOCK_STOP_LOSS_MIN_PERCENT=0.0015
+STOCK_STOP_LOSS_MAX_PERCENT=0.006
+STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
+STOCK_TARGET_STOP_MULTIPLE=1.2
 OPTION_TAKE_PROFIT_PRICE=0.01
 MARKET_REQUESTS_PER_MINUTE=240
 OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
@@ -724,4 +804,5 @@ WASH_SALE_STATE_FILE=conf/wash_sale_blocks.json
 STOCK_LIMIT_OFFSET=0.005
 OPTION_LIMIT_OFFSET=0.03
 LOG_DIRECTORY=logs
+STATUS_FILE=status.json
 ```
