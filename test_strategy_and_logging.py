@@ -28,6 +28,12 @@ class StrategySelectionTests(unittest.TestCase):
             stock_min_net_profit_percent=Decimal("0.0001"),
             stock_estimated_round_trip_cost_percent=Decimal("0.002"),
             stock_stop_loss_percent=Decimal("0.02"),
+            stock_entry_max_spread_percent=Decimal("0.15"),
+            agent_exit_influence_enabled=True,
+            agent_exit_min_confidence=Decimal("0.60"),
+            agent_runner_bias_threshold=Decimal("0.50"),
+            agent_runner_profit_percent=Decimal("0.01"),
+            agent_derisk_bias_threshold=Decimal("-0.50"),
         )
 
     def test_research_popular_names_are_first_without_blocking_discovery(self):

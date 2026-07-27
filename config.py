@@ -117,6 +117,27 @@ class Settings(BaseSettings):
     agent_max_symbols: int = Field(default=5, ge=1, le=50)
     agent_discovery_max_symbols: int = Field(default=10, ge=1, le=25)
     agent_timeout_seconds: int = Field(default=60, ge=5, le=180)
+    agent_exit_influence_enabled: bool = True
+    agent_exit_min_confidence: Decimal = Field(
+        default=Decimal("0.60"),
+        ge=0,
+        le=1,
+    )
+    agent_runner_bias_threshold: Decimal = Field(
+        default=Decimal("0.50"),
+        ge=0,
+        le=1,
+    )
+    agent_runner_profit_percent: Decimal = Field(
+        default=Decimal("0.01"),
+        ge=0,
+        le=Decimal("0.50"),
+    )
+    agent_derisk_bias_threshold: Decimal = Field(
+        default=Decimal("-0.50"),
+        ge=-1,
+        le=0,
+    )
     loss_circuit_breaker_enabled: bool = False
     loss_spree_position_count: int = Field(default=3, ge=2, le=100)
     loss_spree_total_dollars: Decimal = Field(default=Decimal("1"), gt=0)

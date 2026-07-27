@@ -383,12 +383,11 @@ class AutoTrader:
         research_limit = min(self.config.agent_max_symbols, 10)
         held = [
             {
-                "symbol": item.get("symbol"),
+                "symbol": str(item.get("symbol", "")).upper(),
                 "type": item.get("instrument_type"),
-                "quantity": item.get("quantity"),
-                "average_cost": item.get("cost_price"),
-                "unrealized_pnl": str(
-                    self.strategy.position_unrealized_pnl(item)
+                "qty": self._compact_number(item.get("quantity")),
+                "pnl": self._compact_number(
+                    self.strategy.position_unrealized_pnl(item), 2
                 ),
             }
             for item in positions
@@ -416,14 +415,37 @@ class AutoTrader:
         self.market_agent.submit(
             {
                 "event": event,
-                "time": self.now().isoformat(),
-                "buying_power": str(buying_power),
+                "buying_power": self._compact_number(buying_power, 0),
                 "positions": held,
-                "entry_candidates": candidates,
-                "discovery_limit": self.config.agent_discovery_max_symbols,
+                "candidates": [
+                    self._compact_candidate(item) for item in candidates
+                ],
             },
             force=force,
         )
+
+    @staticmethod
+    def _compact_number(value, digits: int | None = None):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0
+        if digits is None:
+            return int(number) if number == int(number) else round(number, 4)
+        rounded = round(number, digits)
+        return int(rounded) if digits == 0 else rounded
+
+    def _compact_candidate(self, item: dict) -> dict:
+        record = {
+            "symbol": str(item.get("symbol", "")).upper(),
+            "price": self._compact_number(item.get("price"), 4),
+            "chg": self._compact_number(item.get("change_ratio"), 4),
+            "vol": self._compact_number(item.get("volume"), 0),
+            "spread": self._compact_number(item.get("spread_percent"), 3),
+        }
+        if item.get("technical_signal"):
+            record["signal"] = item["technical_signal"]
+        return record
 
     def handle_portfolio_circuit_breaker(
         self,

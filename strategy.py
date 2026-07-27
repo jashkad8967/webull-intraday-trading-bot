@@ -294,7 +294,7 @@ class TradingStrategy:
     ) -> Decision:
         trend = self.trend_signal(key, price)
         if quantity > 0:
-            target = average_cost * (
+            base_target = average_cost * (
                 Decimal("1")
                 + self.config.stock_min_net_profit_percent
                 + self.config.stock_estimated_round_trip_cost_percent
@@ -304,8 +304,39 @@ class TradingStrategy:
             )
             if average_cost > 0 and price <= stop:
                 return Decision("LOSS", "percentage stop reached", price)
+            bias = self._exit_bias(assessment)
+            target = base_target
+            if (
+                self.config.agent_exit_influence_enabled
+                and average_cost > 0
+                and bias >= self.config.agent_runner_bias_threshold
+            ):
+                target = max(
+                    base_target,
+                    average_cost * (Decimal("1") + self.config.agent_runner_profit_percent),
+                )
             if average_cost > 0 and price >= target:
-                return Decision("PROFIT", "percentage profit reached", target)
+                reason = (
+                    "agent runner target reached"
+                    if target > base_target
+                    else "percentage profit reached"
+                )
+                return Decision("PROFIT", reason, target)
+            if (
+                self.config.agent_exit_influence_enabled
+                and average_cost > 0
+                and bias <= self.config.agent_derisk_bias_threshold
+            ):
+                breakeven = average_cost * (
+                    Decimal("1")
+                    + self.config.stock_estimated_round_trip_cost_percent
+                )
+                if price >= breakeven:
+                    return Decision(
+                        "PROFIT",
+                        "agent de-risk lock-in on fading catalyst",
+                        breakeven,
+                    )
             return Decision("HOLD", "position between target and stop", target)
         if not self.entry_spread_ok(key):
             return Decision("HOLD", "spread too wide to scalp profitably")
@@ -317,6 +348,18 @@ class TradingStrategy:
                 "strong liquid short-horizon research setup",
             )
         return Decision("HOLD", "EMA entry not ready")
+
+    def _exit_bias(self, assessment: dict | None) -> Decimal:
+        if not assessment:
+            return Decimal("0")
+        try:
+            confidence = Decimal(str(assessment.get("confidence", 0)))
+            bias = Decimal(str(assessment.get("exit_bias", 0)))
+        except Exception:
+            return Decimal("0")
+        if confidence < self.config.agent_exit_min_confidence:
+            return Decimal("0")
+        return max(Decimal("-1"), min(Decimal("1"), bias))
 
     def entry_spread_ok(self, key: str) -> bool:
         symbol = key.split(":", 1)[-1]
