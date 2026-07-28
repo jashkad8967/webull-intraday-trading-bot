@@ -68,6 +68,7 @@ class AutoTrader:
         self.stock_symbols: list[str] = []
         self.reserve_symbols: list[str] = []
         self.stock_categories: dict[str, str] = {}
+        self.stock_market_values: dict[str, float] = {}
         self.invalid_stock_symbols: set[str] = set()
         self.option_contracts: list[dict] = []
         self.pending_stock_exits: set[str] = set()
@@ -173,7 +174,39 @@ class AutoTrader:
         if self.resolved_date == moment.date():
             return
         requested_stocks = self.config.stocks()
-        if requested_stocks == ["ALL"]:
+        if requested_stocks == ["ALL"] and self.config.market_cap_allocation_enabled:
+            limit = self.config.stock_universe_limit()
+            page_size = self.config.stock_universe_page_size
+            log.info(
+                "LOAD   | downloading market-cap-ranked stock universe | "
+                "limit=%s | page=%s",
+                limit,
+                page_size,
+            )
+            universe = self.api.top_active_stocks(limit, page_size)
+            for symbol in self.invalid_symbols.symbols:
+                universe.pop(symbol, None)
+            self.stock_market_values = {
+                symbol: data["market_value"] for symbol, data in universe.items()
+            }
+            self.stock_categories = {symbol: "US_STOCK" for symbol in universe}
+            eligible = self.filter_by_historical_volatility(list(universe))
+            self.stock_symbols = eligible[:limit]
+            self.reserve_symbols = eligible[limit:]
+            large = sum(
+                1
+                for symbol in self.stock_symbols
+                if self.stock_market_values.get(symbol, 0)
+                >= float(self.config.stock_large_cap_min_market_value)
+            )
+            log.info(
+                "LOAD   | market-cap universe ready | large_cap=%s | "
+                "small_cap=%s | total=%s",
+                large,
+                len(self.stock_symbols) - large,
+                len(self.stock_symbols),
+            )
+        elif requested_stocks == ["ALL"]:
             limit = self.config.stock_universe_limit()
             pool = self.config.stock_universe_pool()
             log.info(
@@ -738,13 +771,25 @@ class AutoTrader:
     ) -> Decimal:
         open_count = self.strategy.open_position_count(positions)
         self.refresh_agent_discoveries()
-        batch, self.stock_cursor = self.strategy.prioritized_stock_batch(
-            self.stock_symbols,
-            self.stock_cursor,
-            positions,
-            self.agent_assessment,
-            self.seed_popular_symbols | self.agent_popular_symbols,
-        )
+        if self.config.market_cap_allocation_enabled:
+            batch, self.stock_cursor = self.strategy.prioritized_stock_batch_by_market_cap(
+                self.stock_symbols,
+                self.stock_cursor,
+                positions,
+                self.agent_assessment,
+                self.stock_market_values,
+                self.config.stock_large_cap_min_market_value,
+                self.config.stock_large_cap_capital_fraction,
+                self.seed_popular_symbols | self.agent_popular_symbols,
+            )
+        else:
+            batch, self.stock_cursor = self.strategy.prioritized_stock_batch(
+                self.stock_symbols,
+                self.stock_cursor,
+                positions,
+                self.agent_assessment,
+                self.seed_popular_symbols | self.agent_popular_symbols,
+            )
         bucket_remaining = {
             bucket: buying_power * fraction
             for bucket, fraction in self.config.stock_capital_fractions().items()
@@ -761,23 +806,31 @@ class AutoTrader:
             position_symbol = str(position.get("symbol", "")).upper()
             bucket = self.position_buckets.get(position_symbol)
             if bucket not in bucket_position_counts:
-                position_price = Decimal(
-                    str(
-                        self.strategy.prices.get(
-                            position_symbol,
-                            position.get("cost_price", "0"),
+                if self.config.market_cap_allocation_enabled:
+                    bucket = (
+                        "LARGE_CAP"
+                        if self.stock_market_values.get(position_symbol, 0.0)
+                        >= float(self.config.stock_large_cap_min_market_value)
+                        else "SMALL_CAP"
+                    )
+                else:
+                    position_price = Decimal(
+                        str(
+                            self.strategy.prices.get(
+                                position_symbol,
+                                position.get("cost_price", "0"),
+                            )
                         )
                     )
-                )
-                if position_symbol in known_popular:
-                    bucket = "POPULAR"
-                elif (
-                    position_price > 0
-                    and position_price < self.config.penny_stock_max_price
-                ):
-                    bucket = "PENNY"
-                else:
-                    bucket = "DISCOVERY"
+                    if position_symbol in known_popular:
+                        bucket = "POPULAR"
+                    elif (
+                        position_price > 0
+                        and position_price < self.config.penny_stock_max_price
+                    ):
+                        bucket = "PENNY"
+                    else:
+                        bucket = "DISCOVERY"
                 self.position_buckets[position_symbol] = bucket
             bucket_position_counts[bucket] += 1
         quotes: list[dict] = []

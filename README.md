@@ -170,6 +170,50 @@ stocks and ETFs. The bot checks rejected snapshot symbols against the other cate
 corrects stock/ETF mismatches, and skips only symbols invalid in both
 categories. Startup prints `LOAD` progress while symbols are downloaded.
 
+### Market-cap-tiered universe (large-cap + small-cap volatility split)
+
+Instead of the popular/penny/discovery split above, you can load a stock-only
+universe ranked by market cap straight from Webull's most-active screener and
+allocate capital by cap-size tier:
+
+```dotenv
+STOCK_SYMBOLS=ALL
+MARKET_CAP_ALLOCATION_ENABLED=true
+STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
+STOCK_LARGE_CAP_CAPITAL_FRACTION=0.80
+STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
+MAX_SYMBOLS=750
+STOCK_UNIVERSE_PAGE_SIZE=500
+EXCLUDE_ETFS=true
+HISTORICAL_VOLATILITY_FILTER_ENABLED=true
+MIN_HISTORICAL_VOLATILITY_PERCENT=3
+```
+
+With this enabled, `STOCK_SYMBOLS=ALL` downloads the universe from Webull's
+screener (stocks only, no ETFs) in pages of `STOCK_UNIVERSE_PAGE_SIZE` up to
+`MAX_SYMBOLS` total, ranked by market value, and keeps paging through
+subsequent pages until either the page limit or `MAX_SYMBOLS` is reached. Raise
+`MAX_SYMBOLS` above 500 (e.g. 750-1000) and set `STOCK_UNIVERSE_PAGE_SIZE=500`
+to load more than 500 stocks, 500 per request. Every symbol still has to pass
+the existing `HISTORICAL_VOLATILITY_FILTER_ENABLED` volatility screen, so only
+volatile names are kept regardless of cap size.
+
+Symbols at or above `STOCK_LARGE_CAP_MIN_MARKET_VALUE` are tagged `LARGE_CAP`;
+everything else is `SMALL_CAP`. Buying power is reserved 80/20 between the two
+tiers (configurable via `STOCK_LARGE_CAP_CAPITAL_FRACTION` /
+`STOCK_SMALL_CAP_CAPITAL_FRACTION`, which must sum to 1), and each batch always
+includes held positions first, then the top-ranked large-cap and small-cap
+names by the same activity/research priority score used elsewhere, plus a
+rotating exploration slice. This mode replaces (not adds to) the
+popular/penny/discovery bucketing above — leave
+`MARKET_CAP_ALLOCATION_ENABLED=false` (the default) to keep the original
+behavior.
+
+Webull's screener response field names aren't published in the SDK's type
+stubs, so market value/volume/change/amplitude are parsed defensively; verify
+the `LOAD | market-cap universe ready | large_cap=... | small_cap=...` startup
+log line against your account once deployed to confirm the split looks right.
+
 ## 4. Select options
 
 ### All optionable stocks
@@ -787,6 +831,10 @@ POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
 STOCK_POPULAR_CAPITAL_FRACTION=0.70
 STOCK_PENNY_CAPITAL_FRACTION=0.10
 STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
+MARKET_CAP_ALLOCATION_ENABLED=false
+STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
+STOCK_LARGE_CAP_CAPITAL_FRACTION=0.80
+STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
 OPTION_DISCOVERY_SECONDS=15

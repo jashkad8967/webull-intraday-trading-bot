@@ -66,6 +66,21 @@ class Settings(BaseSettings):
         ge=0,
         le=1,
     )
+    market_cap_allocation_enabled: bool = False
+    stock_large_cap_min_market_value: Decimal = Field(
+        default=Decimal("100000000000"),
+        gt=0,
+    )
+    stock_large_cap_capital_fraction: Decimal = Field(
+        default=Decimal("0.80"),
+        ge=0,
+        le=1,
+    )
+    stock_small_cap_capital_fraction: Decimal = Field(
+        default=Decimal("0.20"),
+        ge=0,
+        le=1,
+    )
     option_batch_size: int = Field(default=20, ge=1, le=20)
     option_discovery_per_cycle: int = Field(default=1, ge=1, le=10)
     option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)
@@ -235,11 +250,7 @@ class Settings(BaseSettings):
             raise ValueError(
                 "STOCK_PRIORITY_FRACTION + STOCK_PENNY_FRACTION must be <= 0.90"
             )
-        capital_total = (
-            self.stock_popular_capital_fraction
-            + self.stock_penny_capital_fraction
-            + self.stock_discovery_capital_fraction
-        )
+        capital_total = sum(self.stock_capital_fractions().values())
         if capital_total != Decimal("1"):
             raise ValueError(
                 "Stock capital fractions must add up to exactly 1.0"
@@ -287,6 +298,11 @@ class Settings(BaseSettings):
         ]
 
     def stock_capital_fractions(self) -> dict[str, Decimal]:
+        if self.market_cap_allocation_enabled:
+            return {
+                "LARGE_CAP": self.stock_large_cap_capital_fraction,
+                "SMALL_CAP": self.stock_small_cap_capital_fraction,
+            }
         return {
             "POPULAR": self.stock_popular_capital_fraction,
             "PENNY": self.stock_penny_capital_fraction,

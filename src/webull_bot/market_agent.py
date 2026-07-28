@@ -118,8 +118,8 @@ class MarketResearchAgent:
                     )
                 elif isinstance(exc, json.JSONDecodeError):
                     self.log.warning(
-                        "AGENT  | research skipped | Groq response was cut "
-                        "off before finishing (hit max_completion_tokens) | %s",
+                        "AGENT  | research skipped | Groq returned invalid "
+                        "JSON (truncated or malformed) | %s",
                         exc,
                     )
                 else:

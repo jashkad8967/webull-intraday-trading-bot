@@ -252,6 +252,78 @@ class TradingStrategy:
                 self.selection_buckets[symbol] = "DISCOVERY"
         return selected, cursor
 
+    def prioritized_stock_batch_by_market_cap(
+        self,
+        symbols: list[str],
+        cursor: int,
+        positions: list[dict],
+        assessment_for,
+        market_values: dict[str, float],
+        large_cap_min_value: Decimal,
+        large_cap_fraction: Decimal,
+        research_symbols: set[str] | None = None,
+    ) -> tuple[list[str], int]:
+        """Same shape as prioritized_stock_batch, but tiers by market cap
+        (LARGE_CAP/SMALL_CAP) instead of price-based penny/popular buckets.
+        """
+        if not symbols:
+            return [], 0
+        size = min(self.config.stock_batch_size, len(symbols))
+        available = set(symbols)
+        research_symbols = (research_symbols or set()) & available
+        held = [
+            str(item.get("symbol", "")).upper()
+            for item in positions
+            if item.get("instrument_type") == "EQUITY"
+            and Decimal(str(item.get("quantity", "0"))) != 0
+            and str(item.get("symbol", "")).upper() in available
+        ]
+        ranked = sorted(
+            (symbol for symbol in self.activity if symbol in available),
+            key=lambda symbol: self.priority_score(symbol, assessment_for(symbol)),
+            reverse=True,
+        )
+        threshold = float(large_cap_min_value)
+        is_large = lambda symbol: market_values.get(symbol, 0.0) >= threshold
+        large_cap = [symbol for symbol in ranked if is_large(symbol)]
+        small_cap = [symbol for symbol in ranked if not is_large(symbol)]
+        researched = sorted(
+            research_symbols,
+            key=lambda symbol: self.priority_score(symbol, assessment_for(symbol)),
+            reverse=True,
+        )
+        large_cap = list(
+            dict.fromkeys([s for s in researched if is_large(s)] + large_cap)
+        )
+        small_cap = list(
+            dict.fromkeys([s for s in researched if not is_large(s)] + small_cap)
+        )
+        exploration, cursor = self.rotating_batch(symbols, cursor, size)
+        large_count = int(size * large_cap_fraction)
+        small_count = size - large_count
+        large_selected = large_cap[:large_count]
+        small_selected = small_cap[:small_count]
+        selected = list(
+            dict.fromkeys(held + large_selected + small_selected + exploration)
+        )
+        selected = selected[:size]
+        self.selection_buckets = {}
+        held_set = set(held)
+        large_set = set(large_selected)
+        small_set = set(small_selected)
+        for symbol in selected:
+            if symbol in held_set:
+                self.selection_buckets[symbol] = "HELD"
+            elif symbol in large_set:
+                self.selection_buckets[symbol] = "LARGE_CAP"
+            elif symbol in small_set:
+                self.selection_buckets[symbol] = "SMALL_CAP"
+            else:
+                self.selection_buckets[symbol] = (
+                    "LARGE_CAP" if is_large(symbol) else "SMALL_CAP"
+                )
+        return selected, cursor
+
     def selection_bucket(self, symbol: str) -> str:
         return self.selection_buckets.get(symbol, "DISCOVERY")
 
