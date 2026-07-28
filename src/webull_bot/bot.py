@@ -106,6 +106,7 @@ class AutoTrader:
         self.daily_loss_breaker_triggered = False
         self.commands = CommandQueue(self.config.command_file)
         self.user_watchlist: set[str] = set()
+        self.gate_rejections: dict[str, int] = defaultdict(int)
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -1048,6 +1049,8 @@ class AutoTrader:
                     cost,
                     self.agent_assessment(symbol),
                 )
+                if decision.action == "HOLD" and quantity == 0:
+                    self.gate_rejections[decision.reason] += 1
                 if decision.action == "BUY":
                     self.agent_candidates[symbol] = {
                         "symbol": symbol,
@@ -1152,18 +1155,19 @@ class AutoTrader:
                         if symbol in self.stop_loss_escalated
                         else self.api.stock_stop_exit_price(quote)
                     )
-                    self.wash_sales.block(symbol, "stop-loss exit submitted")
                     order_id = self.api.place_stock(
                         symbol,
                         "SELL",
                         quantity,
                         limit_price=limit_price,
                     )
+                    self.wash_sales.block(symbol, "stop-loss exit submitted")
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
                     self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl)
             except Exception as exc:
+                self.stop_loss_escalated.discard(symbol)
                 if isinstance(exc, QuoteUnavailableError):
                     continue
                 if "BUYING_POWER_INSUFFICIENT" in str(exc):
@@ -1253,6 +1257,8 @@ class AutoTrader:
                     quantity,
                     cost,
                 )
+                if decision.action == "HOLD" and quantity == 0:
+                    self.gate_rejections[f"micro-scalp: {decision.reason}"] += 1
                 if quantity == 0:
                     self.pending_stock_exits.discard(symbol)
                     self.stop_exit_submitted.pop(symbol, None)
@@ -1331,21 +1337,22 @@ class AutoTrader:
                         if symbol in self.stop_loss_escalated
                         else self.api.stock_stop_exit_price(quote)
                     )
-                    self.wash_sales.block(
-                        symbol,
-                        "micro-scalp stop-loss exit submitted",
-                    )
                     order_id = self.api.place_stock(
                         symbol,
                         "SELL",
                         quantity,
                         limit_price=limit_price,
                     )
+                    self.wash_sales.block(
+                        symbol,
+                        "micro-scalp stop-loss exit submitted",
+                    )
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
                     self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl)
             except Exception as exc:
+                self.stop_loss_escalated.discard(symbol)
                 if isinstance(exc, QuoteUnavailableError):
                     continue
                 if "BUYING_POWER_INSUFFICIENT" in str(exc):
@@ -1478,16 +1485,16 @@ class AutoTrader:
                     and self.cooldown_ready(key)
                 ):
                     limit_price = self.api.option_limit_price(quote, "SELL")
-                    self.wash_sales.block(
-                        contract["underlying_symbol"],
-                        "option stop-loss exit submitted",
-                    )
                     order_id = self.api.place_option(
                         contract,
                         "SELL",
                         quantity,
                         limit_price,
                         "SELL_TO_CLOSE",
+                    )
+                    self.wash_sales.block(
+                        contract["underlying_symbol"],
+                        "option stop-loss exit submitted",
                     )
                     self.pending_option_exits.add(option_symbol)
                     pnl = self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
@@ -1905,15 +1912,31 @@ class AutoTrader:
                 if time.monotonic() - self.last_status_log >= 30:
                     self.last_status_log = time.monotonic()
                     log.info(
-                        "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s | buying power=$%.2f | paused=%s",
+                        "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s | "
+                        "buying power=$%.2f | pnl today=$%.2f | watchlist=%s | paused=%s",
                         min(self.config.stock_batch_size, len(self.stock_symbols)),
                         len(self.stock_symbols),
                         min(self.config.option_batch_size, len(self.option_contracts)),
                         len(self.option_contracts),
                         self.strategy.open_position_count(positions),
                         buying_power,
+                        self.daily_realized_pnl,
+                        len(self.user_watchlist),
                         "YES" if circuit_active else "NO",
                     )
+                    if self.gate_rejections:
+                        top_reasons = sorted(
+                            self.gate_rejections.items(),
+                            key=lambda item: item[1],
+                            reverse=True,
+                        )[:5]
+                        log.info(
+                            "GATES  | entries not yet firing because | %s",
+                            " | ".join(
+                                f"{reason}={count}" for reason, count in top_reasons
+                            ),
+                        )
+                        self.gate_rejections.clear()
             except Exception as exc:
                 if isinstance(exc, MarketDataPermissionError):
                     log.critical("STOP   | %s", exc)

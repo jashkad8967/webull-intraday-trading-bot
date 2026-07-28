@@ -1,6 +1,8 @@
+import json
 import logging
 import shutil
 import sys
+import threading
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
@@ -448,6 +450,90 @@ class MicroScalpIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result, Decimal("5000"))
 
+    def test_failed_stop_resubmission_clears_escalation_instead_of_retrying_forever(self):
+        """Regression test: a stop-loss order that keeps failing (bad
+        request, transient API error, whatever) must not stay in
+        stop_loss_escalated forever - that flag bypasses the normal
+        cooldown entirely, so a persistent failure would otherwise retry on
+        every single poll cycle indefinitely instead of backing off.
+        """
+        from collections import defaultdict, deque
+
+        from webull_bot.bot import AutoTrader
+
+        config = Settings(micro_scalp_enabled=True, micro_scalp_symbols="TSLA")
+        strategy = TradingStrategy(config)
+
+        quote = {"symbol": "TSLA", "bid": "89.00", "ask": "89.20", "price": "89.10"}
+
+        class FailingApi:
+            def stock_quotes_resilient(self, symbols, category):
+                return [quote], set()
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def stock_position(symbol, positions):
+                for item in positions:
+                    if item.get("symbol") == symbol:
+                        return (
+                            Decimal(str(item.get("quantity", "0"))),
+                            Decimal(str(item.get("cost_price", "0"))),
+                        )
+                return Decimal("0"), Decimal("0")
+
+            def stock_limit_price(self, q, side):
+                return Decimal(str(q["bid"]))
+
+            def place_stock(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        wash_sale_calls = []
+        fake_bot = SimpleNamespace(
+            config=config,
+            api=FailingApi(),
+            strategy=strategy,
+            wash_sales=SimpleNamespace(
+                blocked_until=lambda symbol: None,
+                block=lambda symbol, reason: wash_sale_calls.append((symbol, reason)),
+            ),
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_trade={},
+            trade_times=defaultdict(deque),
+            pending_stock_exits=set(),
+            stop_exit_submitted={},
+            stop_loss_escalated={"TSLA"},
+            position_buckets={},
+            working_orders={},
+            daily_realized_pnl=Decimal("0"),
+            daily_realized_loss=Decimal("0"),
+        )
+        for name in (
+            "cooldown_ready",
+            "rate_capped",
+            "record_trade",
+            "record_realized_exit",
+            "stop_ready_to_submit",
+            "trade_micro_scalp",
+        ):
+            setattr(fake_bot, name, getattr(AutoTrader, name).__get__(fake_bot))
+
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TSLA",
+                "quantity": "3",
+                "cost_price": "100.00",
+            }
+        ]
+        fake_bot.trade_micro_scalp(positions, Decimal("10000"))
+
+        self.assertNotIn("TSLA", fake_bot.stop_loss_escalated)
+        self.assertNotIn("TSLA", fake_bot.pending_stock_exits)
+        self.assertEqual(wash_sale_calls, [])
+
 
 class BotOvertradingCapTests(unittest.TestCase):
     def test_rate_capped_blocks_after_configured_trades_per_hour(self):
@@ -548,6 +634,69 @@ class ResearchDiscoveryTests(unittest.TestCase):
         # No client configured; a real call here would raise AttributeError,
         # proving the empty-state, no-discovery retry short-circuits first.
         agent._research({"positions": [], "candidates": []}, include_discovery=False)
+
+    def test_empty_assessments_with_discovery_retries_assessment_only(self):
+        """Regression test: an agentic model can spend its whole completion
+        budget on the discovery web search and return {} for assessments -
+        this must retry once without discovery instead of just falling back
+        to conservative defaults on the first empty response.
+        """
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250,
+            agent_discovery_max_symbols=5,
+            groq_model="groq/compound-mini",
+        )
+        agent.log = logging.getLogger("test-agent")
+        agent._requests_today = 0
+        agent._assessments = {}
+        agent._discoveries = []
+        agent._lock = threading.Lock()
+
+        calls = []
+
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+
+        def fake_create(**kwargs):
+            prompt = kwargs["messages"][1]["content"]
+            calls.append(prompt)
+            if len(calls) == 1:
+                return FakeResponse("{}")
+            return FakeResponse(
+                json.dumps(
+                    {
+                        "market_direction": 0.2,
+                        "market_volatility": 0.5,
+                        "assessments": [
+                            {"symbol": "NVDA", "priority": 0.8, "confidence": 0.7}
+                        ],
+                    }
+                )
+            )
+
+        agent.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=fake_create)
+            )
+        )
+
+        agent._research({"positions": [{"symbol": "NVDA"}], "candidates": []})
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("TASK A discoveries", calls[0])
+        self.assertNotIn("TASK A discoveries", calls[1])
+        self.assertIn("NVDA", agent._assessments)
+        self.assertEqual(agent._assessments["NVDA"]["priority"], 0.8)
 
     def test_discoveries_are_normalized_for_later_broker_validation(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)

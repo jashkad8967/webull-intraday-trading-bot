@@ -22,6 +22,79 @@ containers you can run locally or deploy to a free-tier cloud VM. It can:
 Webull supports stock market orders. Webull options do not support market
 orders, so option entries and exits use refreshed aggressive limit prices.
 
+## Strategy overview
+
+The bot runs two independent entry strategies side by side, on top of a
+shared universe-selection and risk-management layer. Nothing below replaced
+anything - each piece was added alongside what already existed, and every
+layer stays fully configurable/optional.
+
+**1. Universe selection.** `STOCK_SYMBOLS=ALL` builds the tradeable pool one
+of two ways: the classic mode (a capped cross-exchange directory scan) or
+`MARKET_CAP_ALLOCATION_ENABLED` (Webull's screener, tiered into LARGE_CAP/
+SMALL_CAP buckets). Either way, the pool is topped up with today's actual
+top gainers (`TOP_GAINERS_LIMIT`) so real current movers are included, not
+just high-volume names, and any symbol you've explicitly listed in
+`POPULAR_STOCK_SYMBOLS` is reinstated even if the historical-volatility
+filter would have dropped it - your trusted names never silently disappear.
+
+**2. Trend-following core.** The main scan buys on an EMA(fast,slow)
+crossover, gated by session VWAP support and an extension check (don't chase
+a name already sitting at today's high), with `REENTER_CONFIRMATION_POLLS`
+consecutive confirming polls required before re-entering after an exit, to
+cut whipsaw. Batch priority - which symbols get scanned in a given cycle -
+favors two things beyond raw activity: research-agent-boosted candidates,
+and symbols that have repeatedly flipped direction today
+(`STOCK_OSCILLATION_WEIGHT`), since a choppy, frequently-reversing mover
+keeps producing fresh scalp setups while a name that made one move and
+stalled doesn't.
+
+**3. Micro-scalp layer.** A handful of extremely liquid single stocks
+(`MICRO_SCALP_SYMBOLS`, e.g. TSLA/NVDA) tick by a few cents constantly
+without ever forming a clean trend - the EMA core structurally can't act on
+that. `MICRO_SCALP_ENABLED` runs a second, fully independent decision path
+for exactly those symbols: buy a small dip below a rolling reference price,
+sell a small fixed-cents bounce. It has its own capital slice
+(`MICRO_SCALP_CAPITAL_FRACTION`) and position cap, and those symbols are
+excluded from the trend-following scan so the two paths never fight over
+managing the same position.
+
+**4. Sizing.** Entries size to whole shares by default, capped by
+`MAX_ORDER_NOTIONAL` and the active bucket's capital allocation. When a
+bucket's remaining budget can't afford even one whole share,
+`FRACTIONAL_SHARES_ENABLED` falls back to a fractional MARKET order (Webull
+requires quantity in (0, 1] and a $5 minimum for these) instead of skipping
+the entry.
+
+**5. Research agent (optional, advisory only).** A Groq-based web-research
+pass biases priority ranking and exit timing - it never gates an entry that
+the technical signals already support, and a missing/degraded agent just
+means less-informed prioritization, not a stopped bot. It's resilient to the
+underlying model's own quirks: oversized-request retries, malformed/
+truncated JSON handling, and a retry-without-discovery fallback for when an
+agentic model spends its whole completion budget on web search and returns
+an empty assessment.
+
+**6. Safety rails**, all independent of which entry strategy opened a
+position: wash-sale blocking (stocks and options, including from a manual
+dashboard sell at a loss), a simultaneous-unrealized-loss circuit breaker, a
+daily realized-loss circuit breaker, stop-loss escalation for a stuck exit
+(with automatic backoff if the escalated resubmission itself fails, instead
+of retrying every single poll forever), a stall breaker that unsticks
+capital that hasn't filled in a while, and crash-safe universe loading (a
+screener hiccup logs a warning and falls back to the prior universe instead
+of taking the whole process down).
+
+**7. Manual overrides.** The dashboard's Close All, per-position Sell, and
+watchlist-add all route through a narrow shared command file rather than
+giving the dashboard direct Webull access - see [Dashboard](#dashboard).
+
+**8. Observability.** Every 30 seconds the log emits a `SCAN` summary
+(universe size, positions, buying power, today's P&L, watchlist size) and,
+when entries aren't firing, a `GATES` line showing the top reasons why (e.g.
+`price below session VWAP=40 | EMA entry not ready=112`) - so a quiet period
+reads as "here's what's blocking entries," not silence.
+
 ## Repository layout
 
 ```text

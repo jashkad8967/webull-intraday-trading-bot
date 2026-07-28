@@ -1072,8 +1072,6 @@ class WebullAPI:
                     and average_cost > 0
                     and market_price > average_cost
                 )
-                if loss_exit and loss_callback:
-                    loss_callback(position["symbol"], "loss closeout submitted")
                 limit_price = self.stock_limit_price(quote, side)
                 fractional = abs(quantity) != abs(quantity).to_integral_value()
                 submitted.append(
@@ -1085,6 +1083,8 @@ class WebullAPI:
                         fractional=fractional,
                     )
                 )
+                if loss_exit and loss_callback:
+                    loss_callback(position["symbol"], "loss closeout submitted")
             elif position.get("instrument_type") == "OPTION":
                 contract = self.contract_from_position(position)
                 if not contract:
@@ -1107,11 +1107,6 @@ class WebullAPI:
                     and average_cost > 0
                     and market_price > average_cost
                 )
-                if loss_exit and loss_callback:
-                    loss_callback(
-                        contract["underlying_symbol"],
-                        "option loss closeout submitted",
-                    )
                 limit_price = self.option_limit_price(quote, side)
                 submitted.append(
                     self.place_option(
@@ -1122,4 +1117,9 @@ class WebullAPI:
                         intent,
                     )
                 )
+                if loss_exit and loss_callback:
+                    loss_callback(
+                        contract["underlying_symbol"],
+                        "option loss closeout submitted",
+                    )
         return submitted
