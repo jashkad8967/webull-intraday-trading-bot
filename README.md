@@ -243,6 +243,53 @@ stubs, so market value/volume/change/amplitude are parsed defensively; verify
 the `LOAD | market-cap universe ready | large_cap=... | small_cap=...` startup
 log line against your account once deployed to confirm the split looks right.
 
+### Micro-scalp mode (fixed-cents mean reversion on always-ticking stocks)
+
+Everything above is trend-following: it waits for an EMA crossover, which
+requires the price to actually be trending, not just bouncing around. A
+handful of extremely liquid single stocks (TSLA, NVDA, etc.) tick almost
+every second by a few cents without ever forming a clean trend - the
+opportunity there is buying a small dip and selling the bounce back, not
+catching a move. Micro-scalp mode is a second, independent decision path
+built for exactly that:
+
+```dotenv
+MICRO_SCALP_ENABLED=true
+MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
+MICRO_SCALP_CAPITAL_FRACTION=0.20
+MICRO_SCALP_MAX_POSITIONS=3
+MICRO_SCALP_DIP_CENTS=0.05
+MICRO_SCALP_TARGET_CENTS=0.06
+MICRO_SCALP_STOP_CENTS=0.10
+MICRO_SCALP_REFERENCE_WINDOW=20
+```
+
+For each symbol in `MICRO_SCALP_SYMBOLS`, the bot keeps a rolling average of
+the last `MICRO_SCALP_REFERENCE_WINDOW` quote prices - the level it's "just
+been trading around," not a trend direction. It buys when price dips at
+least `MICRO_SCALP_DIP_CENTS` below that average (and the spread still
+passes `STOCK_ENTRY_MAX_SPREAD_PERCENT`), then exits at
+`+MICRO_SCALP_TARGET_CENTS` on a bounce or `-MICRO_SCALP_STOP_CENTS` if the
+dip keeps falling - fixed cents, not percentages, since "a few cents" on a
+$400 stock is a much smaller move than the bot's normal percentage-based
+stop/target bands are tuned for.
+
+This runs as a fully separate path from the main universe scan: it has its
+own capital reservation (`MICRO_SCALP_CAPITAL_FRACTION`, taken as a slice of
+buying power before the normal bucket split runs) and its own position cap
+(`MICRO_SCALP_MAX_POSITIONS`, still bounded by the overall
+`MAX_OPEN_POSITIONS`). Symbols in `MICRO_SCALP_SYMBOLS` are automatically
+excluded from the main EMA-based scan (logged as `LOAD | excluded N
+micro-scalp symbols from the main universe scan`), so the two decision paths
+never end up managing the same position with conflicting rules. It still
+goes through the same order placement, wash-sale blocking, stop escalation,
+and cooldown/rate-cap machinery as every other stock trade - only the
+entry/exit decision itself is different.
+
+Keep the symbol list short and genuinely liquid - this is a high-turnover
+mode by design (small, frequent wins), so slippage and spread on a thin
+name will eat the edge faster than the target captures it.
+
 ## 4. Select options
 
 ### All optionable stocks
@@ -894,6 +941,14 @@ MARKET_CAP_ALLOCATION_ENABLED=false
 STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
 STOCK_LARGE_CAP_CAPITAL_FRACTION=0.80
 STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
+MICRO_SCALP_ENABLED=false
+MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
+MICRO_SCALP_CAPITAL_FRACTION=0.20
+MICRO_SCALP_MAX_POSITIONS=3
+MICRO_SCALP_DIP_CENTS=0.05
+MICRO_SCALP_TARGET_CENTS=0.06
+MICRO_SCALP_STOP_CENTS=0.10
+MICRO_SCALP_REFERENCE_WINDOW=20
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
 OPTION_DISCOVERY_SECONDS=15

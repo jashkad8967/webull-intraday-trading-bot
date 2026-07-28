@@ -36,6 +36,9 @@ class TradingStrategy:
         self.trend_streak: dict[str, int] = {}
         self.vwap_state: dict[str, dict] = {}
         self.crossover_counts: dict[str, int] = defaultdict(int)
+        self.micro_scalp_reference: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=config.micro_scalp_reference_window)
+        )
 
     def clear_market_state(self) -> None:
         self.activity.clear()
@@ -44,6 +47,7 @@ class TradingStrategy:
         self.selection_buckets.clear()
         self.vwap_state.clear()
         self.crossover_counts.clear()
+        self.micro_scalp_reference.clear()
 
     @staticmethod
     def rotating_batch(items: list, cursor: int, batch_size: int) -> tuple[list, int]:
@@ -108,6 +112,47 @@ class TradingStrategy:
             "activity_score": activity,
         }
         self._update_vwap(symbol, price, volume)
+        self.micro_scalp_reference[symbol].append(float(price))
+
+    def micro_scalp_reference_price(self, symbol: str) -> Decimal | None:
+        """A short rolling average of recent quote prices - the "just been
+        trading around here" level a dip-buy measures itself against, not a
+        trend signal.
+        """
+        window = self.micro_scalp_reference.get(symbol)
+        if not window:
+            return None
+        return Decimal(str(sum(window) / len(window)))
+
+    def micro_scalp_decision(
+        self,
+        key: str,
+        price: Decimal,
+        quantity: int,
+        average_cost: Decimal,
+    ) -> Decision:
+        """A fixed-cents mean-reversion scalp for a small list of always-
+        ticking, ultra-liquid symbols: buy a small dip below the recent
+        average and take a small fixed profit on the bounce back, instead of
+        requiring an EMA trend agreement that rarely holds tick-to-tick.
+        """
+        symbol = key.split(":", 1)[-1]
+        if quantity > 0:
+            target = average_cost + self.config.micro_scalp_target_cents
+            stop = average_cost - self.config.micro_scalp_stop_cents
+            if price <= stop:
+                return Decision("LOSS", "micro-scalp stop reached", price)
+            if price >= target:
+                return Decision("PROFIT", "micro-scalp target reached", target)
+            return Decision("HOLD", "micro-scalp waiting for bounce", target)
+        if not self.entry_spread_ok(key):
+            return Decision("HOLD", "spread too wide to scalp profitably")
+        reference = self.micro_scalp_reference_price(symbol)
+        if reference is None:
+            return Decision("HOLD", "insufficient reference history")
+        if price <= reference - self.config.micro_scalp_dip_cents:
+            return Decision("BUY", "micro-scalp dip entry")
+        return Decision("HOLD", "no qualifying dip yet")
 
     def _update_vwap(self, symbol: str, price: Decimal, volume: float) -> None:
         state = self.vwap_state.get(symbol)

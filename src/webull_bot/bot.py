@@ -193,6 +193,26 @@ class AutoTrader:
             filtered = list(dict.fromkeys(reinstated + filtered))
         return filtered
 
+    def exclude_micro_scalp_symbols(
+        self,
+        symbols: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Micro-scalp symbols are managed by trade_micro_scalp()'s
+        fixed-cents mean-reversion logic - they must not also be selected
+        into the percentage-based main universe scan, or the two decision
+        functions would fight over the same position.
+        """
+        if not self.config.micro_scalp_enabled:
+            return symbols, []
+        micro_scalp_symbols = set(self.config.micro_scalp_symbol_list())
+        if not micro_scalp_symbols:
+            return symbols, []
+        excluded = [symbol for symbol in symbols if symbol in micro_scalp_symbols]
+        if not excluded:
+            return symbols, []
+        remaining = [symbol for symbol in symbols if symbol not in micro_scalp_symbols]
+        return remaining, excluded
+
     def safe_top_gainers(self, limit: int, page_size: int) -> dict[str, dict]:
         """top_gainers() hits a live Webull endpoint during the once-daily
         universe rebuild; a screener hiccup here must never be allowed to
@@ -369,6 +389,19 @@ class AutoTrader:
                     for symbol in self.stock_symbols
                     if self.stock_categories.get(symbol) != "US_ETF"
                 ]
+        self.stock_symbols, excluded = self.exclude_micro_scalp_symbols(
+            self.stock_symbols
+        )
+        self.reserve_symbols, _ = self.exclude_micro_scalp_symbols(
+            self.reserve_symbols
+        )
+        if excluded:
+            log.info(
+                "LOAD   | excluded %s micro-scalp symbols from the main "
+                "universe scan (managed separately) | %s",
+                len(excluded),
+                ",".join(excluded),
+            )
         self.option_contracts = self.api.resolve_options()
         self.discover_all_options = "ALL" in self.config.option_roots()
         self.strategy.clear_market_state()
@@ -1132,6 +1165,149 @@ class AutoTrader:
         except Exception as exc:
             log.error("DAYEND | date=%s | summary failed | %s", moment.date(), exc)
 
+    def trade_micro_scalp(
+        self,
+        positions: list[dict],
+        buying_power: Decimal,
+    ) -> Decimal:
+        """Fixed-cents mean-reversion scalping on a small, curated list of
+        always-ticking, ultra-liquid symbols (MICRO_SCALP_SYMBOLS) - kept
+        fully separate from the bucketed universe scan, with its own
+        dedicated capital slice and position cap, so it doesn't compete with
+        or get starved by the broader stock selection.
+        """
+        symbols = self.config.micro_scalp_symbol_list()
+        if not self.config.micro_scalp_enabled or not symbols:
+            return buying_power
+        try:
+            quotes, invalid = self.api.stock_quotes_resilient(symbols, "US_STOCK")
+        except Exception as exc:
+            log.error("MSCALP | quote batch failed | %s", exc)
+            return buying_power
+        if invalid:
+            log.warning(
+                "MSCALP | invalid symbols skipped | %s",
+                ",".join(sorted(invalid)),
+            )
+        quote_by_symbol = {
+            str(quote.get("symbol", "")).upper(): quote for quote in quotes
+        }
+        open_count = self.strategy.open_position_count(positions)
+        held_count = sum(
+            1
+            for symbol in symbols
+            if self.api.stock_position(symbol, positions)[0] > 0
+        )
+        capital_budget = buying_power * self.config.micro_scalp_capital_fraction
+        for symbol in symbols:
+            quote = quote_by_symbol.get(symbol)
+            if not quote:
+                continue
+            try:
+                price = self.api.quote_price(quote)
+                self.strategy.update_stock_snapshot(quote, price)
+                quantity, cost = self.api.stock_position(symbol, positions)
+                key = f"STOCK:{symbol}"
+                decision = self.strategy.micro_scalp_decision(
+                    key,
+                    price,
+                    quantity,
+                    cost,
+                )
+                if quantity == 0:
+                    self.pending_stock_exits.discard(symbol)
+                    self.stop_exit_submitted.pop(symbol, None)
+                    self.stop_loss_escalated.discard(symbol)
+                if decision.action == "BUY" and quantity == 0:
+                    blocked_until = self.wash_sales.blocked_until(symbol)
+                    if blocked_until:
+                        continue
+                    entry_budget = min(buying_power, capital_budget)
+                    buy_quantity, buffered_price = (
+                        self.strategy.stock_order_quantity(price, entry_budget)
+                    )
+                    if (
+                        open_count < self.config.max_open_positions
+                        and held_count < self.config.micro_scalp_max_positions
+                        and buy_quantity > 0
+                        and self.cooldown_ready(key)
+                        and not self.rate_capped(key)
+                    ):
+                        order_id = self.api.place_stock(
+                            symbol,
+                            "BUY",
+                            buy_quantity,
+                            limit_price=self.api.stock_limit_price(quote, "BUY"),
+                        )
+                        self.record_trade(key, order_id, "BUY")
+                        buying_power = max(
+                            Decimal("0"),
+                            buying_power - buffered_price * buy_quantity,
+                        )
+                        capital_budget = max(
+                            Decimal("0"),
+                            capital_budget - buffered_price * buy_quantity,
+                        )
+                        self.position_buckets[symbol] = "MICRO_SCALP"
+                        positions.append(
+                            {
+                                "instrument_type": "EQUITY",
+                                "symbol": symbol,
+                                "quantity": str(buy_quantity),
+                            }
+                        )
+                        open_count += 1
+                        held_count += 1
+                if (
+                    decision.action == "PROFIT"
+                    and symbol not in self.pending_stock_exits
+                    and self.cooldown_ready(key)
+                ):
+                    target = decision.target_price
+                    if target is None:
+                        continue
+                    order_id = self.api.place_stock(
+                        symbol,
+                        "SELL",
+                        quantity,
+                        limit_price=target,
+                    )
+                    self.pending_stock_exits.add(symbol)
+                    self.record_realized_exit(cost, target, quantity)
+                    self.record_trade(key, order_id, "PROFIT", target)
+                if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
+                    limit_price = (
+                        self.api.stock_limit_price(quote, "SELL")
+                        if symbol in self.stop_loss_escalated
+                        else self.api.stock_stop_exit_price(quote)
+                    )
+                    self.wash_sales.block(
+                        symbol,
+                        "micro-scalp stop-loss exit submitted",
+                    )
+                    order_id = self.api.place_stock(
+                        symbol,
+                        "SELL",
+                        quantity,
+                        limit_price=limit_price,
+                    )
+                    self.pending_stock_exits.add(symbol)
+                    self.stop_exit_submitted[symbol] = time.monotonic()
+                    self.record_realized_exit(cost, limit_price, quantity)
+                    self.record_trade(key, order_id, "STOP", limit_price)
+            except Exception as exc:
+                if isinstance(exc, QuoteUnavailableError):
+                    continue
+                if "BUYING_POWER_INSUFFICIENT" in str(exc):
+                    buying_power = Decimal("0")
+                    log.warning(
+                        "FUNDS  | %s | micro-scalp buy skipped | insufficient buying power",
+                        symbol,
+                    )
+                    continue
+                log.error("MSCALP | %s | %s", symbol, exc)
+        return buying_power
+
     def trade_options(
         self,
         positions: list[dict],
@@ -1526,6 +1702,7 @@ class AutoTrader:
                 if not circuit_active:
                     circuit_active = self.handle_daily_loss_breaker()
                 if not circuit_active:
+                    buying_power = self.trade_micro_scalp(positions, buying_power)
                     buying_power = self.trade_stocks(positions, buying_power)
                     if option_open <= moment < option_closeout:
                         self.discover_option_contracts()

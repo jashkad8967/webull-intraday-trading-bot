@@ -82,6 +82,18 @@ class Settings(BaseSettings):
         le=1,
     )
     top_gainers_limit: int = Field(default=200, ge=0, le=5000)
+    micro_scalp_enabled: bool = False
+    micro_scalp_symbols: str = "TSLA,NVDA,AMD,COIN,PLTR,MSTR"
+    micro_scalp_capital_fraction: Decimal = Field(
+        default=Decimal("0.20"),
+        ge=0,
+        le=1,
+    )
+    micro_scalp_max_positions: int = Field(default=3, ge=1, le=50)
+    micro_scalp_dip_cents: Decimal = Field(default=Decimal("0.05"), gt=0)
+    micro_scalp_target_cents: Decimal = Field(default=Decimal("0.06"), gt=0)
+    micro_scalp_stop_cents: Decimal = Field(default=Decimal("0.10"), gt=0)
+    micro_scalp_reference_window: int = Field(default=20, ge=3, le=200)
     option_batch_size: int = Field(default=20, ge=1, le=20)
     option_discovery_per_cycle: int = Field(default=1, ge=1, le=10)
     option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)
@@ -300,6 +312,13 @@ class Settings(BaseSettings):
         return [
             item.strip().upper()
             for item in self.popular_stock_symbols.split(",")
+            if item.strip()
+        ]
+
+    def micro_scalp_symbol_list(self) -> list[str]:
+        return [
+            item.strip().upper()
+            for item in self.micro_scalp_symbols.split(",")
             if item.strip()
         ]
 
