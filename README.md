@@ -1,8 +1,8 @@
 # Webull production stock and options auto trader
 
 This application uses Webull's official Python SDK against the US production
-API, adds a small read-only dashboard, and ships as two containers you can run
-locally or deploy to a free-tier cloud VM. It can:
+API, adds a small dashboard with manual override controls, and ships as two
+containers you can run locally or deploy to a free-tier cloud VM. It can:
 
 - Scan a capped cross-exchange US universe while always including popular stocks.
 - Trade exact OCC option contracts.
@@ -15,8 +15,9 @@ locally or deploy to a free-tier cloud VM. It can:
 - Stop opening positions at the configured end-of-day time.
 - Cancel working orders and repeatedly close stock positions before 8:00 PM
   New York time.
-- Serve a live dashboard (buying power, positions, recent trades, watchlist,
-  research-agent state) from a second, read-only container.
+- Serve a live dashboard (buying power, positions with buy price and P&L,
+  recent trades with realized P&L, watchlist, research-agent state) from a
+  second container, with Close All / manual Sell / add-to-watchlist actions.
 
 Webull supports stock market orders. Webull options do not support market
 orders, so option entries and exits use refreshed aggressive limit prices.
@@ -830,11 +831,27 @@ Change `LOG_DIRECTORY` to place logs on durable storage.
 
 ## Dashboard
 
-A second, read-only container (`ui/`) serves a small live dashboard: buying
-power, open positions, recent trades, the current watchlist, and the research
-agent's latest state, polling a JSON snapshot the bot writes each cycle
-(`STATUS_FILE`, default `status.json`). It has no access to your Webull
-credentials or the trade API — a bug in the dashboard can't affect trading.
+A second container (`ui/`) serves a small live dashboard: buying power, open
+positions (with buy price and live unrealized P&L), recent trades (with
+price and realized P&L on each exit), the current watchlist, and the
+research agent's latest state, polling a JSON snapshot the bot writes each
+cycle (`STATUS_FILE`, default `status.json`). It has no access to your
+Webull credentials or the trade API, and its mount of that status/log data
+is read-only — a display bug in the dashboard can't corrupt the bot's own
+state.
+
+The dashboard can also request three actions: **Close All** (cancels every
+working order and closes every open position, stocks and options alike),
+**Sell** on any individual position, and adding a symbol to the watchlist.
+These don't give the dashboard trading access directly - clicking a button
+writes a small request to a separate, dedicated shared file
+(`COMMAND_FILE`, a distinct Docker volume the dashboard can only read/write
+that one file in) that the trader process reads once per cycle and executes
+through its own already-safe order-placement, wash-sale, and
+position-tracking code, the same as every automatic exit. A request is
+picked up on the bot's next cycle, not instantly - `POLL_SECONDS` is the
+worst-case delay. Close All and Sell both ask for a JavaScript confirmation
+before sending the request, since they submit real orders on your account.
 
 Running via `deploy/compose.yaml`, the dashboard is bound to
 `127.0.0.1:8080` on whatever host it runs on (not exposed to the network by

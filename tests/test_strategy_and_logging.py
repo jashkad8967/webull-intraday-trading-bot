@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+from webull_bot.commands import CommandQueue
 from webull_bot.config import Settings
 from webull_bot.daily_logging import DatedDailyFileHandler
 from webull_bot.market_agent import MarketResearchAgent
@@ -1142,6 +1143,127 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
 
         self.assertEqual(set(result), {"OLD1", "OLD2"})
         self.assertEqual(result["OLD1"]["market_value"], 1e11)
+
+
+class DashboardCommandTests(unittest.TestCase):
+    def test_command_queue_round_trip(self):
+        path = Path("tests/.generated_commands/commands.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            queue = CommandQueue(str(path))
+            self.assertEqual(queue.pop_all(), [])
+            command_id = queue.enqueue("close_all")
+            self.assertTrue(command_id)
+            popped = queue.pop_all()
+            self.assertEqual(len(popped), 1)
+            self.assertEqual(popped[0]["type"], "close_all")
+            self.assertEqual(popped[0]["id"], command_id)
+            self.assertEqual(queue.pop_all(), [])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_command_queue_accumulates_multiple_commands(self):
+        path = Path("tests/.generated_commands/commands2.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            queue = CommandQueue(str(path))
+            queue.enqueue("sell", symbol="TSLA", instrument_type="EQUITY")
+            queue.enqueue("watchlist_add", symbol="AAPL")
+            popped = queue.pop_all()
+            self.assertEqual([c["type"] for c in popped], ["sell", "watchlist_add"])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_process_ui_commands_dispatches_close_all(self):
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+        fake_bot = SimpleNamespace(
+            commands=SimpleNamespace(pop_all=lambda: [{"type": "close_all"}]),
+            close_instruments=lambda types: calls.append(types),
+        )
+        process = AutoTrader.process_ui_commands.__get__(fake_bot)
+        process([])
+
+        self.assertEqual(calls, [{"EQUITY", "OPTION"}])
+
+    def test_process_ui_commands_survives_unknown_type_and_handler_error(self):
+        from webull_bot.bot import AutoTrader
+
+        def boom(command, positions):
+            raise RuntimeError("boom")
+
+        fake_bot = SimpleNamespace(
+            commands=SimpleNamespace(
+                pop_all=lambda: [{"type": "unknown"}, {"type": "sell"}]
+            ),
+            _manual_sell=boom,
+        )
+        process = AutoTrader.process_ui_commands.__get__(fake_bot)
+        process([])  # must not raise despite the unknown type and handler error
+
+    def test_manual_sell_closes_equity_position_and_records_pnl(self):
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+        recorded_pnl = []
+
+        fake_bot = SimpleNamespace(
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+            api=SimpleNamespace(
+                stock_quote=lambda symbol: {"bid": "99.00", "ask": "99.20"},
+                stock_limit_price=lambda quote, side: Decimal("99.00"),
+                place_stock=lambda symbol, side, quantity, limit_price=None, fractional=False: (
+                    placed.append((symbol, side, quantity, fractional)) or "order-1"
+                ),
+            ),
+            wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
+        )
+        fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: (
+            recorded_pnl.append((cost, price, qty)) or (price - cost) * qty * multiplier
+        )
+        fake_bot.record_trade = lambda *a, **k: None
+        manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TSLA",
+                "quantity": "3",
+                "cost_price": "100.00",
+            }
+        ]
+        manual_sell({"symbol": "TSLA", "instrument_type": "EQUITY"}, positions)
+
+        self.assertEqual(placed, [("TSLA", "SELL", Decimal("3"), False)])
+        self.assertIn("TSLA", fake_bot.pending_stock_exits)
+        self.assertEqual(recorded_pnl, [(Decimal("100.00"), Decimal("99.00"), Decimal("3"))])
+
+    def test_manual_sell_skips_when_no_matching_position(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(pending_stock_exits=set(), pending_option_exits=set())
+        manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
+
+        manual_sell({"symbol": "TSLA", "instrument_type": "EQUITY"}, [])
+
+    def test_add_to_watchlist_resolves_category_and_appends_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            user_watchlist=set(),
+            stock_categories={},
+            stock_symbols=["AAPL"],
+            api=SimpleNamespace(stock_categories=lambda symbols: {"TSLA": "US_STOCK"}),
+        )
+        add = AutoTrader.add_to_watchlist.__get__(fake_bot)
+
+        add("tsla")
+
+        self.assertIn("TSLA", fake_bot.user_watchlist)
+        self.assertEqual(fake_bot.stock_categories.get("TSLA"), "US_STOCK")
+        self.assertIn("TSLA", fake_bot.stock_symbols)
 
 
 if __name__ == "__main__":

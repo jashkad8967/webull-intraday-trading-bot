@@ -236,6 +236,7 @@ class Settings(BaseSettings):
     option_limit_offset: Decimal = Field(default=Decimal("0.03"), ge=0, le=Decimal("0.25"))
     log_directory: str = "logs"
     status_file: str = "status.json"
+    command_file: str = "commands.json"
 
     def host(self) -> str:
         value = self.webull_api_endpoint.strip()

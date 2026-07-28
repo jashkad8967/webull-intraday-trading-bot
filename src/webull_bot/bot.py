@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from rich.logging import RichHandler
 
+from webull_bot.commands import CommandQueue
 from webull_bot.config import settings
 from webull_bot.daily_logging import add_daily_file_logging
 from webull_bot.invalid_symbols import InvalidSymbolTracker
@@ -103,6 +104,8 @@ class AutoTrader:
         self.daily_realized_loss = Decimal("0")
         self.daily_realized_pnl = Decimal("0")
         self.daily_loss_breaker_triggered = False
+        self.commands = CommandQueue(self.config.command_file)
+        self.user_watchlist: set[str] = set()
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -402,6 +405,28 @@ class AutoTrader:
                 len(excluded),
                 ",".join(excluded),
             )
+        missing_watchlist = [
+            symbol for symbol in self.user_watchlist if symbol not in self.stock_symbols
+        ]
+        if missing_watchlist:
+            for symbol in missing_watchlist:
+                if symbol not in self.stock_categories:
+                    try:
+                        categories = self.api.stock_categories([symbol])
+                    except Exception as exc:
+                        log.error(
+                            "LOAD   | watchlist category lookup failed | %-8s | %s",
+                            symbol,
+                            exc,
+                        )
+                        categories = {}
+                    self.stock_categories[symbol] = categories.get(symbol, "US_STOCK")
+            self.stock_symbols.extend(missing_watchlist)
+            log.info(
+                "LOAD   | reinstated %s user-watchlist symbols | %s",
+                len(missing_watchlist),
+                ",".join(missing_watchlist),
+            )
         self.option_contracts = self.api.resolve_options()
         self.discover_all_options = "ALL" in self.config.option_roots()
         self.strategy.clear_market_state()
@@ -513,6 +538,7 @@ class AutoTrader:
         order_id: str,
         action: str,
         limit_price: Decimal | None = None,
+        pnl: Decimal | None = None,
     ) -> None:
         submitted_at = time.monotonic()
         self.last_trade[key] = submitted_at
@@ -524,7 +550,7 @@ class AutoTrader:
             "cancel_requested_at": None,
         }
         instrument_type, symbol = key.split(":", 1)
-        self.status.record_trade(instrument_type, symbol, action, limit_price, order_id)
+        self.status.record_trade(instrument_type, symbol, action, limit_price, order_id, pnl)
         limit_text = (
             f" | limit={limit_price}"
             if limit_price is not None
@@ -815,19 +841,21 @@ class AutoTrader:
         self,
         average_cost: Decimal,
         exit_price: Decimal,
-        quantity: int,
+        quantity: Decimal,
         multiplier: int = 1,
-    ) -> None:
+    ) -> Decimal:
         """Track today's realized P&L from a submitted exit's limit price.
 
         This is an estimate (actual fill price can differ slightly), which
         is fine for a dashboard total and the daily-loss circuit breaker -
         both care about the running picture, not cent-perfect accounting.
+        Returns the estimated pnl so callers can show it on the trade log.
         """
         pnl = (exit_price - average_cost) * quantity * multiplier
         self.daily_realized_pnl += pnl
         if pnl < 0:
             self.daily_realized_loss += -pnl
+        return pnl
 
     def escalate_stalled_stop_losses(self) -> None:
         """Cancel and re-flag a stop-loss for a more aggressive re-quote if
@@ -902,7 +930,7 @@ class AutoTrader:
                 self.stock_market_values,
                 self.config.stock_large_cap_min_market_value,
                 self.config.stock_large_cap_capital_fraction,
-                self.seed_popular_symbols | self.agent_popular_symbols,
+                self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist,
             )
         else:
             batch, self.stock_cursor = self.strategy.prioritized_stock_batch(
@@ -910,7 +938,7 @@ class AutoTrader:
                 self.stock_cursor,
                 positions,
                 self.agent_assessment,
-                self.seed_popular_symbols | self.agent_popular_symbols,
+                self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist,
             )
         bucket_remaining = {
             bucket: buying_power * fraction
@@ -918,7 +946,7 @@ class AutoTrader:
         }
         bucket_slot_limits = self.config.stock_bucket_slot_limits()
         bucket_position_counts = {bucket: 0 for bucket in bucket_slot_limits}
-        known_popular = self.seed_popular_symbols | self.agent_popular_symbols
+        known_popular = self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist
         for position in positions:
             if (
                 position.get("instrument_type") != "EQUITY"
@@ -1116,8 +1144,8 @@ class AutoTrader:
                         limit_price=target,
                     )
                     self.pending_stock_exits.add(symbol)
-                    self.record_realized_exit(cost, target, quantity)
-                    self.record_trade(key, order_id, "PROFIT", target)
+                    pnl = self.record_realized_exit(cost, target, quantity)
+                    self.record_trade(key, order_id, "PROFIT", target, pnl=pnl)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
@@ -1133,8 +1161,8 @@ class AutoTrader:
                     )
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
-                    self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(key, order_id, "STOP", limit_price)
+                    pnl = self.record_realized_exit(cost, limit_price, quantity)
+                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl)
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
                     continue
@@ -1295,8 +1323,8 @@ class AutoTrader:
                         limit_price=target,
                     )
                     self.pending_stock_exits.add(symbol)
-                    self.record_realized_exit(cost, target, quantity)
-                    self.record_trade(key, order_id, "PROFIT", target)
+                    pnl = self.record_realized_exit(cost, target, quantity)
+                    self.record_trade(key, order_id, "PROFIT", target, pnl=pnl)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
@@ -1315,8 +1343,8 @@ class AutoTrader:
                     )
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
-                    self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(key, order_id, "STOP", limit_price)
+                    pnl = self.record_realized_exit(cost, limit_price, quantity)
+                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl)
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
                     continue
@@ -1442,8 +1470,8 @@ class AutoTrader:
                         "SELL_TO_CLOSE",
                     )
                     self.pending_option_exits.add(option_symbol)
-                    self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
-                    self.record_trade(key, order_id, "PROFIT", limit_price)
+                    pnl = self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
+                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
                 if (
                     decision.action == "LOSS"
                     and option_symbol not in self.pending_option_exits
@@ -1462,8 +1490,8 @@ class AutoTrader:
                         "SELL_TO_CLOSE",
                     )
                     self.pending_option_exits.add(option_symbol)
-                    self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
-                    self.record_trade(key, order_id, "STOP", limit_price)
+                    pnl = self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
+                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl)
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
                     continue
@@ -1530,8 +1558,8 @@ class AutoTrader:
                         fractional=quantity != quantity.to_integral_value(),
                     )
                     self.pending_stock_exits.add(symbol)
-                    self.record_realized_exit(average_cost, sell_price, quantity)
-                    self.record_trade(key, order_id, "PROFIT", sell_price)
+                    pnl = self.record_realized_exit(average_cost, sell_price, quantity)
+                    self.record_trade(key, order_id, "PROFIT", sell_price, pnl=pnl)
                     boosted += 1
                 elif instrument_type == "OPTION" and options_active:
                     if symbol in self.pending_option_exits:
@@ -1557,8 +1585,8 @@ class AutoTrader:
                         "SELL_TO_CLOSE",
                     )
                     self.pending_option_exits.add(symbol)
-                    self.record_realized_exit(average_cost, sell_price, quantity, multiplier=100)
-                    self.record_trade(key, order_id, "PROFIT", sell_price)
+                    pnl = self.record_realized_exit(average_cost, sell_price, quantity, multiplier=100)
+                    self.record_trade(key, order_id, "PROFIT", sell_price, pnl=pnl)
                     boosted += 1
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
@@ -1636,6 +1664,7 @@ class AutoTrader:
             option_count=len(self.option_contracts),
             realized_pnl_today=self.daily_realized_pnl,
             unrealized_pnl_total=unrealized_total,
+            user_watchlist=sorted(self.user_watchlist),
         )
 
     def close_instruments(self, instrument_types: set[str]) -> bool:
@@ -1665,6 +1694,140 @@ class AutoTrader:
         except Exception as exc:
             log.error("CLOSE  | failed | %s", exc)
             return False
+
+    def process_ui_commands(self, positions: list[dict]) -> None:
+        """Executes dashboard-initiated actions (close all, sell one
+        position, add a watchlist symbol). The dashboard has no Webull
+        credentials or API access of its own - it can only enqueue a
+        request, which is executed here through the same order-placement,
+        wash-sale, and position-tracking code every other exit uses. Runs
+        before the circuit-breaker gate so a manual risk-reducing action is
+        never blocked by a paused/halted state.
+        """
+        try:
+            commands = self.commands.pop_all()
+        except Exception as exc:
+            log.error("CMD    | queue read failed | %s", exc)
+            return
+        for command in commands:
+            command_type = command.get("type")
+            try:
+                if command_type == "close_all":
+                    self.close_instruments({"EQUITY", "OPTION"})
+                    log.warning("CMD    | manual close-all executed from dashboard")
+                elif command_type == "sell":
+                    self._manual_sell(command, positions)
+                elif command_type == "watchlist_add":
+                    self.add_to_watchlist(command.get("symbol", ""))
+                else:
+                    log.warning("CMD    | unknown command type=%s", command_type)
+            except Exception as exc:
+                log.error("CMD    | %s failed | %s", command_type, exc)
+
+    def _manual_sell(self, command: dict, positions: list[dict]) -> None:
+        symbol = str(command.get("symbol", "")).upper()
+        instrument_type = command.get("instrument_type", "EQUITY")
+        if not symbol:
+            return
+        position = next(
+            (
+                item
+                for item in positions
+                if item.get("instrument_type") == instrument_type
+                and str(item.get("symbol", "")).upper() == symbol
+            ),
+            None,
+        )
+        if not position:
+            log.info(
+                "CMD    | manual sell skipped | %-8s | no matching open position",
+                symbol,
+            )
+            return
+        quantity = Decimal(str(position.get("quantity", "0")))
+        cost = Decimal(str(position.get("cost_price", "0")))
+        if quantity <= 0:
+            return
+        if instrument_type == "EQUITY":
+            if symbol in self.pending_stock_exits:
+                log.info(
+                    "CMD    | manual sell skipped | %-8s | exit already pending",
+                    symbol,
+                )
+                return
+            quote = self.api.stock_quote(symbol)
+            sell_price = self.api.stock_limit_price(quote, "SELL")
+            order_id = self.api.place_stock(
+                symbol,
+                "SELL",
+                quantity,
+                limit_price=sell_price,
+                fractional=quantity != quantity.to_integral_value(),
+            )
+            self.pending_stock_exits.add(symbol)
+            pnl = self.record_realized_exit(cost, sell_price, quantity)
+            self.record_trade(f"STOCK:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl)
+            if pnl < 0:
+                self.wash_sales.block(symbol, "manual sell at a loss")
+        elif instrument_type == "OPTION":
+            if symbol in self.pending_option_exits:
+                log.info(
+                    "CMD    | manual sell skipped | %-8s | exit already pending",
+                    symbol,
+                )
+                return
+            contract = self.api.contract_from_position(position)
+            if not contract:
+                log.error(
+                    "CMD    | manual sell failed | %-8s | could not resolve option contract",
+                    symbol,
+                )
+                return
+            quote = self.api.option_quote(contract["symbol"])
+            sell_price = self.api.option_limit_price(quote, "SELL")
+            order_id = self.api.place_option(
+                contract,
+                "SELL",
+                quantity,
+                sell_price,
+                "SELL_TO_CLOSE",
+            )
+            self.pending_option_exits.add(symbol)
+            pnl = self.record_realized_exit(cost, sell_price, quantity, multiplier=100)
+            self.record_trade(f"OPTION:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl)
+            if pnl < 0:
+                self.wash_sales.block(
+                    contract["underlying_symbol"],
+                    "manual option sell at a loss",
+                )
+        else:
+            return
+        log.warning(
+            "CMD    | manual sell executed | %-8s (%s) | qty=%s",
+            symbol,
+            instrument_type,
+            quantity,
+        )
+
+    def add_to_watchlist(self, symbol: str) -> None:
+        symbol = str(symbol).upper().strip()
+        if not symbol:
+            return
+        self.user_watchlist.add(symbol)
+        if symbol not in self.stock_categories:
+            try:
+                categories = self.api.stock_categories([symbol])
+            except Exception as exc:
+                log.error(
+                    "CMD    | watchlist category lookup failed | %-8s | %s",
+                    symbol,
+                    exc,
+                )
+                categories = {}
+            self.stock_categories[symbol] = categories.get(symbol, "US_STOCK")
+        if symbol not in self.stock_symbols:
+            self.stock_symbols.append(symbol)
+        log.warning("CMD    | added %-8s to watchlist from dashboard", symbol)
 
     def run(self) -> None:
         log.info(
@@ -1718,6 +1881,7 @@ class AutoTrader:
                 self.monitor_working_orders()
                 self.escalate_stalled_stop_losses()
                 buying_power, positions = self.account_state()
+                self.process_ui_commands(positions)
                 circuit_active = self.handle_portfolio_circuit_breaker(
                     positions,
                     buying_power,
