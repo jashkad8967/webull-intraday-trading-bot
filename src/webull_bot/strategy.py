@@ -217,19 +217,25 @@ class TradingStrategy:
             reverse=True,
         )
         popular = list(dict.fromkeys(researched + liquid_popular))
-        exploration, cursor = self.rotating_batch(symbols, cursor, size)
         penny_count = int(size * self.config.stock_penny_fraction)
         popular_count = int(size * self.config.stock_priority_fraction)
         popular_selected = popular[:popular_count]
         penny_selected = penny[:penny_count]
-        selected = list(
-            dict.fromkeys(
-                held
-                + popular_selected
-                + penny_selected
-                + exploration
-            )
+        # Reserve a guaranteed slice of every batch for fresh exploration so
+        # the scanner keeps paging the whole universe instead of re-scanning
+        # the same top-ranked names each cycle.
+        explore_floor = max(1, size - popular_count - penny_count)
+        priority = list(dict.fromkeys(held + popular_selected + penny_selected))
+        priority = priority[: size - explore_floor]
+        # Request exactly the open exploration slots and advance the cursor by
+        # only what was consumed, so no symbol is skipped between cycles.
+        exploration_slots = max(0, size - len(priority))
+        exploration, cursor = self.rotating_batch(
+            symbols,
+            cursor,
+            exploration_slots,
         )
+        selected = list(dict.fromkeys(priority + exploration))
         selected = selected[:size]
         self.selection_buckets = {}
         held_set = set(held)
