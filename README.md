@@ -281,7 +281,12 @@ EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 ```
 
-`POLL_SECONDS` accepts values from 1 through 3600.
+`POLL_SECONDS` accepts values from 0.25 through 3600. Going below 1s mainly
+tightens the outer loop's own sleep — actual request cadence to Webull is
+still separately capped by `MARKET_REQUESTS_PER_MINUTE` and the other
+per-group throttles in [7. API request pacing](#7-api-request-pacing), so a
+value below roughly `60 / MARKET_REQUESTS_PER_MINUTE` seconds mostly means
+the loop spends more time waiting on those throttles instead of sleeping.
 
 The loop uses a start-to-start cadence: time spent processing is subtracted
 from `POLL_SECONDS` instead of adding another full sleep afterward. Account

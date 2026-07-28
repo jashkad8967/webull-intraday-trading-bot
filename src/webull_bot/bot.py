@@ -823,8 +823,8 @@ class AutoTrader:
                     and symbol not in self.pending_stock_exits
                     and self.cooldown_ready(key)
                 ):
-                    limit_price = self.api.stock_limit_price(quote, "SELL")
-                    self.wash_sales.block(symbol, "2% stop-loss exit submitted")
+                    limit_price = self.api.stock_stop_exit_price(quote)
+                    self.wash_sales.block(symbol, "stop-loss exit submitted")
                     order_id = self.api.place_stock(
                         symbol,
                         "SELL",

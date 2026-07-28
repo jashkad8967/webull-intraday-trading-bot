@@ -10,7 +10,7 @@ from webull_bot.config import Settings
 from webull_bot.daily_logging import DatedDailyFileHandler
 from webull_bot.market_agent import MarketResearchAgent
 from webull_bot.strategy import TradingStrategy
-from webull_bot.webull_api import WebullAPI
+from webull_bot.webull_api import QuoteUnavailableError, WebullAPI
 
 
 class StrategyConfigMixin:
@@ -283,6 +283,18 @@ class AllocationAndLoggingTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "important context\n")
         finally:
             shutil.rmtree(directory, ignore_errors=True)
+
+
+class StopExitPricingTests(unittest.TestCase):
+    def test_stop_exit_uses_bid_ask_midpoint_not_aggressive_crossing(self):
+        api = WebullAPI.__new__(WebullAPI)
+        quote = {"bid": "99.00", "ask": "99.20"}
+        self.assertEqual(api.stock_stop_exit_price(quote), Decimal("99.10"))
+
+    def test_stop_exit_requires_valid_spread(self):
+        api = WebullAPI.__new__(WebullAPI)
+        with self.assertRaises(QuoteUnavailableError):
+            api.stock_stop_exit_price({"bid": "0", "ask": "99.20"})
 
 
 class PayloadSizingTests(unittest.TestCase):

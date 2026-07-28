@@ -75,7 +75,9 @@ class Settings(BaseSettings):
     max_open_positions: int = Field(default=5, ge=1)
     max_order_notional: Decimal = Field(default=Decimal("1000"), gt=0)
 
-    poll_seconds: Decimal = Field(default=Decimal("1"), ge=Decimal("1"), le=Decimal("3600"))
+    poll_seconds: Decimal = Field(
+        default=Decimal("1"), ge=Decimal("0.25"), le=Decimal("3600")
+    )
     trade_cooldown_seconds: Decimal = Field(default=Decimal("30"), ge=0, le=Decimal("21600"))
     stock_max_trades_per_hour: int = Field(default=8, ge=0, le=1000)
     ema_fast_period: int = Field(default=3, ge=2, le=500)
