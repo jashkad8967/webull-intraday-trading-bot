@@ -13,9 +13,11 @@ services:
       WASH_SALE_STATE_FILE: /var/data/conf/wash_sale_blocks.json
       INVALID_SYMBOL_STATE_FILE: /var/data/conf/invalid_symbols.json
       STATUS_FILE: /var/data/status.json
+      COMMAND_FILE: /var/commands/commands.json
       TZ: America/New_York
     volumes:
       - trading-data:/var/data
+      - command-data:/var/commands
     stop_grace_period: 30s
     logging:
       driver: json-file
@@ -34,9 +36,11 @@ services:
       STATUS_FILE: /var/data/status.json
       LOG_DIRECTORY: /var/data/logs
       TRADING_TIMEZONE: America/New_York
+      COMMAND_FILE: /var/commands/commands.json
       TZ: America/New_York
     volumes:
       - trading-data:/var/data:ro
+      - command-data:/var/commands
     ports:
       # Loopback-only by default: view it with
       # `ssh -L 8080:localhost:8080 <user>@<host>` and open localhost:8080.
@@ -54,3 +58,5 @@ services:
 volumes:
   trading-data:
     name: webull-trading-data
+  command-data:
+    name: webull-trading-commands

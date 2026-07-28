@@ -1,8 +1,8 @@
 # Webull production stock and options auto trader
 
 This application uses Webull's official Python SDK against the US production
-API, adds a small read-only dashboard, and ships as two containers you can run
-locally or deploy to a free-tier cloud VM. It can:
+API, adds a small dashboard with manual override controls, and ships as two
+containers you can run locally or deploy to a free-tier cloud VM. It can:
 
 - Scan a capped cross-exchange US universe while always including popular stocks.
 - Trade exact OCC option contracts.
@@ -15,8 +15,9 @@ locally or deploy to a free-tier cloud VM. It can:
 - Stop opening positions at the configured end-of-day time.
 - Cancel working orders and repeatedly close stock positions before 8:00 PM
   New York time.
-- Serve a live dashboard (buying power, positions, recent trades, watchlist,
-  research-agent state) from a second, read-only container.
+- Serve a live dashboard (buying power, positions with buy price and P&L,
+  recent trades with realized P&L, watchlist, research-agent state) from a
+  second container, with Close All / manual Sell / add-to-watchlist actions.
 
 Webull supports stock market orders. Webull options do not support market
 orders, so option entries and exits use refreshed aggressive limit prices.
@@ -126,15 +127,28 @@ POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
 STOCK_POPULAR_CAPITAL_FRACTION=0.70
 STOCK_PENNY_CAPITAL_FRACTION=0.10
 STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
+TOP_GAINERS_LIMIT=200
 ```
 
 The bot downloads at most `MAX_SYMBOLS` directory entries from Webull in
 bounded pages at the start of each trading day and keeps each instrument's
 required `US_STOCK` or `US_ETF` category. It separately resolves and adds every
 valid configured popular symbol, so those names cannot be lost because of the
-directory cap. Research discoveries are accepted only when they exist in this
-combined universe. For compatibility with existing deployments,
-`MAX_SYMBOLS=0` now also uses the safe 500-symbol cap.
+directory cap. It also merges in `TOP_GAINERS_LIMIT` symbols from Webull's
+today's-top-gainers screener (ranked by actual price change, not just volume),
+so stocks that are genuinely trending up right now are part of the universe
+too - not only whatever happens to be most heavily traded. Research
+discoveries are accepted only when they exist in this combined universe. For
+compatibility with existing deployments, `MAX_SYMBOLS=0` now also uses the
+safe 500-symbol cap.
+
+`HISTORICAL_VOLATILITY_FILTER_ENABLED` can still drop a configured popular
+symbol if its recent amplitude sits under `MIN_HISTORICAL_VOLATILITY_PERCENT`
+(common for calmer large-caps) - the bot reinstates any such symbol that was
+actually present in the downloaded universe, logging
+`LOAD | reinstated N popular symbols the volatility filter would have
+dropped`, so a name you explicitly configured never silently disappears from
+trading just because of a volatility score.
 
 Each batch always includes held stocks, then targets 70% popular/liquid names,
 10% stocks below `PENNY_STOCK_MAX_PRICE`, and 20% rotating discovery. The
@@ -187,16 +201,32 @@ STOCK_UNIVERSE_PAGE_SIZE=500
 EXCLUDE_ETFS=true
 HISTORICAL_VOLATILITY_FILTER_ENABLED=true
 MIN_HISTORICAL_VOLATILITY_PERCENT=3
+TOP_GAINERS_LIMIT=200
 ```
 
 With this enabled, `STOCK_SYMBOLS=ALL` downloads the universe from Webull's
-screener (stocks only, no ETFs) in pages of `STOCK_UNIVERSE_PAGE_SIZE` up to
-`MAX_SYMBOLS` total, ranked by market value, and keeps paging through
-subsequent pages until either the page limit or `MAX_SYMBOLS` is reached. Raise
-`MAX_SYMBOLS` above 500 (e.g. 750-1000) and set `STOCK_UNIVERSE_PAGE_SIZE=500`
-to load more than 500 stocks, 500 per request. Every symbol still has to pass
-the existing `HISTORICAL_VOLATILITY_FILTER_ENABLED` volatility screen, so only
-volatile names are kept regardless of cap size.
+most-active screener (stocks only, no ETFs) in pages of
+`STOCK_UNIVERSE_PAGE_SIZE` up to `MAX_SYMBOLS` total, ranked by market value,
+and keeps paging through subsequent pages until either the page limit or
+`MAX_SYMBOLS` is reached. It then merges in `TOP_GAINERS_LIMIT` symbols from
+Webull's today's-top-gainers screener (ranked by actual price change) that
+weren't already in the most-active list, so stocks that are genuinely up big
+today are part of the selectable universe even if they aren't among the
+highest-volume names. Raise `MAX_SYMBOLS` above 500 (e.g. 750-1000) and set
+`STOCK_UNIVERSE_PAGE_SIZE=500` to load more than 500 stocks, 500 per request.
+
+Every symbol still has to pass the existing
+`HISTORICAL_VOLATILITY_FILTER_ENABLED` volatility screen, so only volatile
+names are kept regardless of cap size - except any symbol you've explicitly
+listed in `POPULAR_STOCK_SYMBOLS` that was present in the downloaded universe
+but got cut by that filter (common for well-known large-caps with calmer
+historical amplitude): the bot reinstates it, logging `LOAD | reinstated N
+popular symbols the volatility filter would have dropped`. This is also why
+you should always see your explicitly configured names trading somewhere in
+the universe - if one is missing entirely, check the startup log for `LOAD |
+popular symbols not found in screener universe (skipped)`, which means Webull's
+screener response didn't include that symbol at all that day (rare for a
+liquid name, but not impossible).
 
 Symbols at or above `STOCK_LARGE_CAP_MIN_MARKET_VALUE` are tagged `LARGE_CAP`;
 everything else is `SMALL_CAP`. Buying power is reserved 80/20 between the two
@@ -213,6 +243,86 @@ Webull's screener response field names aren't published in the SDK's type
 stubs, so market value/volume/change/amplitude are parsed defensively; verify
 the `LOAD | market-cap universe ready | large_cap=... | small_cap=...` startup
 log line against your account once deployed to confirm the split looks right.
+
+### Micro-scalp mode (fixed-cents mean reversion on always-ticking stocks)
+
+Everything above is trend-following: it waits for an EMA crossover, which
+requires the price to actually be trending, not just bouncing around. A
+handful of extremely liquid single stocks (TSLA, NVDA, etc.) tick almost
+every second by a few cents without ever forming a clean trend - the
+opportunity there is buying a small dip and selling the bounce back, not
+catching a move. Micro-scalp mode is a second, independent decision path
+built for exactly that:
+
+```dotenv
+MICRO_SCALP_ENABLED=true
+MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
+MICRO_SCALP_CAPITAL_FRACTION=0.20
+MICRO_SCALP_MAX_POSITIONS=3
+MICRO_SCALP_DIP_CENTS=0.05
+MICRO_SCALP_TARGET_CENTS=0.06
+MICRO_SCALP_STOP_CENTS=0.10
+MICRO_SCALP_REFERENCE_WINDOW=20
+```
+
+For each symbol in `MICRO_SCALP_SYMBOLS`, the bot keeps a rolling average of
+the last `MICRO_SCALP_REFERENCE_WINDOW` quote prices - the level it's "just
+been trading around," not a trend direction. It buys when price dips at
+least `MICRO_SCALP_DIP_CENTS` below that average (and the spread still
+passes `STOCK_ENTRY_MAX_SPREAD_PERCENT`), then exits at
+`+MICRO_SCALP_TARGET_CENTS` on a bounce or `-MICRO_SCALP_STOP_CENTS` if the
+dip keeps falling - fixed cents, not percentages, since "a few cents" on a
+$400 stock is a much smaller move than the bot's normal percentage-based
+stop/target bands are tuned for.
+
+This runs as a fully separate path from the main universe scan: it has its
+own capital reservation (`MICRO_SCALP_CAPITAL_FRACTION`, taken as a slice of
+buying power before the normal bucket split runs) and its own position cap
+(`MICRO_SCALP_MAX_POSITIONS`, still bounded by the overall
+`MAX_OPEN_POSITIONS`). Symbols in `MICRO_SCALP_SYMBOLS` are automatically
+excluded from the main EMA-based scan (logged as `LOAD | excluded N
+micro-scalp symbols from the main universe scan`), so the two decision paths
+never end up managing the same position with conflicting rules. It still
+goes through the same order placement, wash-sale blocking, stop escalation,
+and cooldown/rate-cap machinery as every other stock trade - only the
+entry/exit decision itself is different.
+
+Keep the symbol list short and genuinely liquid - this is a high-turnover
+mode by design (small, frequent wins), so slippage and spread on a thin
+name will eat the edge faster than the target captures it.
+
+### Fractional shares
+
+A capital bucket (or micro-scalp's dedicated slice) can easily be too small
+to afford one whole share of an expensive stock - `STOCK_QUANTITY` shares at
+that price simply won't fit the budget, and the entry is skipped. Enabling
+this lets the bot fall back to a fractional-share order instead of skipping:
+
+```dotenv
+FRACTIONAL_SHARES_ENABLED=true
+FRACTIONAL_SHARES_MIN_NOTIONAL=5
+```
+
+Webull only supports fractional share trading as a **MARKET** order during
+**core** trading hours - never `LIMIT`, never extended hours - so whenever a
+fractional order is placed, the bot forces `order_type=MARKET` and
+`support_trading_session=CORE` regardless of the usual limit-price logic,
+and the order value must clear `FRACTIONAL_SHARES_MIN_NOTIONAL` (Webull's
+own minimum is $5). The fallback only engages when the normal whole-share
+sizing comes up empty - if you can afford a whole share, that's still what
+gets bought.
+
+Because it's a market order, the fill price isn't guaranteed the way a
+limit order's is - on the main stock strategy this is a minor, occasional
+edge case, but if you also enable fractional shares under `MICRO_SCALP_*`,
+be aware that a market-order fill a cent or two off from the intended entry
+eats directly into a strategy that's already targeting only a few cents of
+edge per trade.
+
+Fractional positions are tracked and closed out exactly like whole-share
+ones (including by the EOD closeout and stall breaker) - Webull's account
+position quantity is read as a decimal everywhere it matters, not truncated
+to a whole number.
 
 ## 4. Select options
 
@@ -721,11 +831,43 @@ Change `LOG_DIRECTORY` to place logs on durable storage.
 
 ## Dashboard
 
-A second, read-only container (`ui/`) serves a small live dashboard: buying
-power, open positions, recent trades, the current watchlist, and the research
-agent's latest state, polling a JSON snapshot the bot writes each cycle
-(`STATUS_FILE`, default `status.json`). It has no access to your Webull
-credentials or the trade API — a bug in the dashboard can't affect trading.
+A second container (`ui/`) serves a small live dashboard: buying power, open
+positions (with buy price and live unrealized P&L), recent trades (with
+price and realized P&L on each exit), the current watchlist, and the
+research agent's latest state, polling a JSON snapshot the bot writes each
+cycle (`STATUS_FILE`, default `status.json`). It has no access to your
+Webull credentials or the trade API, and its mount of that status/log data
+is read-only — a display bug in the dashboard can't corrupt the bot's own
+state.
+
+The dashboard can also request three actions: **Close All** (cancels every
+working order and closes every open position, stocks and options alike),
+**Sell** on any individual position, and adding a symbol to the watchlist.
+These don't give the dashboard trading access directly - clicking a button
+writes a small request to a separate, dedicated shared file
+(`COMMAND_FILE`, a distinct Docker volume the dashboard can only read/write
+that one file in) that the trader process reads once per cycle and executes
+through its own already-safe order-placement, wash-sale, and
+position-tracking code, the same as every automatic exit. A request is
+picked up on the bot's next cycle, not instantly - `POLL_SECONDS` is the
+worst-case delay. Close All and Sell both ask for a JavaScript confirmation
+before sending the request, since they submit real orders on your account.
+
+The trader and dashboard run as different non-root container users sharing
+that one volume, so both Dockerfiles pre-create `/var/commands` world-writable
+before either user is dropped into place. If you already ran
+`docker compose up` once *before* pulling this fix, Docker will have
+initialized that volume with the old, broken permissions - a plain restart
+won't pick up the corrected ones (Docker only applies an image's directory
+permissions to a named volume the first time it's used). If you see
+`CMD | queue read failed | [Errno 13] Permission denied` in the trader's
+logs, remove and let it recreate:
+
+```bash
+docker compose -f deploy/compose.yaml -p webull-bot down
+docker volume rm webull-trading-commands
+docker compose -f deploy/compose.yaml -p webull-bot up -d
+```
 
 Running via `deploy/compose.yaml`, the dashboard is bound to
 `127.0.0.1:8080` on whatever host it runs on (not exposed to the network by
@@ -860,10 +1002,21 @@ POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
 STOCK_POPULAR_CAPITAL_FRACTION=0.70
 STOCK_PENNY_CAPITAL_FRACTION=0.10
 STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
+TOP_GAINERS_LIMIT=200
 MARKET_CAP_ALLOCATION_ENABLED=false
 STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
 STOCK_LARGE_CAP_CAPITAL_FRACTION=0.80
 STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
+MICRO_SCALP_ENABLED=false
+MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
+MICRO_SCALP_CAPITAL_FRACTION=0.20
+MICRO_SCALP_MAX_POSITIONS=3
+MICRO_SCALP_DIP_CENTS=0.05
+MICRO_SCALP_TARGET_CENTS=0.06
+MICRO_SCALP_STOP_CENTS=0.10
+MICRO_SCALP_REFERENCE_WINDOW=20
+FRACTIONAL_SHARES_ENABLED=false
+FRACTIONAL_SHARES_MIN_NOTIONAL=5
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
 OPTION_DISCOVERY_SECONDS=15

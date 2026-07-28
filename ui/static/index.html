@@ -68,6 +68,34 @@
     word-break: break-word;
   }
   .panel.wide { grid-column: 1 / -1; }
+  .btn {
+    font: inherit;
+    font-size: 0.75rem;
+    padding: 0.3rem 0.6rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.danger { color: var(--red); border-color: var(--red); }
+  .btn.danger:hover { background: rgba(255,107,107,0.1); }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.6rem; gap: 0.6rem; }
+  .action-msg { font-size: 0.75rem; color: var(--muted); }
+  .watchlist-add { display: flex; gap: 0.4rem; margin-bottom: 0.6rem; }
+  .watchlist-add input {
+    flex: 1;
+    font: inherit;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+  }
+  .tags { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.6rem; }
 </style>
 </head>
 <body>
@@ -83,15 +111,25 @@
 
   <div class="panels">
     <div class="panel">
-      <h2>Open Positions</h2>
+      <div class="toolbar">
+        <h2 style="margin:0">Open Positions</h2>
+        <button class="btn danger" id="close-all-btn" onclick="closeAll()">Close All</button>
+      </div>
+      <div class="action-msg" id="positions-msg"></div>
       <div id="positions"></div>
     </div>
     <div class="panel">
-      <h2>Recent Trades (Buy / Sell Price)</h2>
+      <h2>Recent Trades (Buy / Sell Price / P&amp;L)</h2>
       <div id="trades"></div>
     </div>
     <div class="panel">
       <h2>Watchlist</h2>
+      <div class="watchlist-add">
+        <input type="text" id="watchlist-input" placeholder="Add symbol (e.g. AAPL)" onkeydown="if(event.key==='Enter') addToWatchlist()">
+        <button class="btn" onclick="addToWatchlist()">Add</button>
+      </div>
+      <div class="action-msg" id="watchlist-msg"></div>
+      <div id="user-watchlist" class="tags"></div>
       <div id="watchlist"></div>
     </div>
     <div class="panel">
@@ -159,6 +197,7 @@ async function refresh() {
       { label: "Last", render: r => fmtMoney(r.last_price) },
       { label: "P&L", render: r => fmtMoney(r.unrealized_pnl), cls: r => pnlClass(r.unrealized_pnl) },
       { label: "Bucket", render: r => `<span class="pill">${r.bucket}</span>` },
+      { label: "", render: r => `<button class="btn danger" onclick="sellPosition('${r.symbol}','${r.instrument_type}')">Sell</button>` },
     ], data.positions);
 
     document.getElementById("trades").innerHTML = table([
@@ -167,7 +206,13 @@ async function refresh() {
       { label: "Action", render: r => r.action },
       { label: "Symbol", render: r => r.symbol },
       { label: "Price", render: r => r.limit_price ? fmtMoney(r.limit_price) : "—" },
+      { label: "P&L", render: r => r.pnl ? fmtMoney(r.pnl) : "—", cls: r => r.pnl ? pnlClass(r.pnl) : "" },
     ], data.recent_trades);
+
+    const userWatchlist = data.user_watchlist || [];
+    document.getElementById("user-watchlist").innerHTML = userWatchlist.length
+      ? userWatchlist.map(symbol => `<span class="pill">${symbol}</span>`).join("")
+      : '<div class="empty">No pinned symbols yet</div>';
 
     document.getElementById("watchlist").innerHTML = table([
       { label: "Symbol", render: r => r.symbol },
@@ -190,6 +235,58 @@ async function refresh() {
   } catch (err) {
     dot.className = "dot";
   }
+}
+
+async function postAction(url, body, msgEl, busyLabel, doneLabel) {
+  const el = document.getElementById(msgEl);
+  el.textContent = busyLabel;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const data = await res.json();
+    if (res.ok && data.queued) {
+      el.textContent = doneLabel;
+    } else {
+      el.textContent = data.error || "Request failed.";
+    }
+  } catch (err) {
+    el.textContent = "Request failed - is the bot running?";
+  }
+  setTimeout(() => { el.textContent = ""; }, 5000);
+  refresh();
+}
+
+function closeAll() {
+  if (!confirm("Close ALL open positions (stocks and options) right now?")) return;
+  postAction("/api/close-all", {}, "positions-msg", "Closing all positions…", "Close-all requested - the bot will act on its next cycle.");
+}
+
+function sellPosition(symbol, instrumentType) {
+  if (!confirm(`Sell your entire ${symbol} position now?`)) return;
+  postAction(
+    "/api/sell",
+    { symbol, instrument_type: instrumentType },
+    "positions-msg",
+    `Selling ${symbol}…`,
+    `Sell requested for ${symbol} - the bot will act on its next cycle.`,
+  );
+}
+
+function addToWatchlist() {
+  const input = document.getElementById("watchlist-input");
+  const symbol = (input.value || "").trim().toUpperCase();
+  if (!symbol) return;
+  postAction(
+    "/api/watchlist",
+    { symbol },
+    "watchlist-msg",
+    `Adding ${symbol}…`,
+    `${symbol} queued to join the watchlist on the bot's next cycle.`,
+  );
+  input.value = "";
 }
 
 async function refreshLogs() {

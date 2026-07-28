@@ -9,8 +9,9 @@ WORKDIR /app
 
 RUN addgroup --system trader \
     && adduser --system --ingroup trader trader \
-    && mkdir -p /var/data/logs /var/data/conf \
-    && chown -R trader:trader /app /var/data
+    && mkdir -p /var/data/logs /var/data/conf /var/commands \
+    && chown -R trader:trader /app /var/data \
+    && chmod 1777 /var/commands
 
 COPY requirements.txt .
 RUN pip install --upgrade pip \

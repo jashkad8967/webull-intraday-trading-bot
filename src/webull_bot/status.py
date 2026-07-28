@@ -19,6 +19,7 @@ class StatusWriter:
         action: str,
         limit_price: Decimal | None,
         order_id: str,
+        pnl: Decimal | None = None,
     ) -> None:
         self.trades.appendleft(
             {
@@ -28,6 +29,7 @@ class StatusWriter:
                 "action": action,
                 "limit_price": str(limit_price) if limit_price is not None else None,
                 "order_id": order_id,
+                "pnl": str(pnl) if pnl is not None else None,
             }
         )
 
@@ -44,6 +46,7 @@ class StatusWriter:
         option_count: int,
         realized_pnl_today: Decimal = Decimal("0"),
         unrealized_pnl_total: Decimal = Decimal("0"),
+        user_watchlist: list[str] | None = None,
     ) -> None:
         payload = {
             "updated_at": time.time(),
@@ -52,6 +55,7 @@ class StatusWriter:
             "buying_power": str(buying_power),
             "positions": positions,
             "watchlist": watchlist,
+            "user_watchlist": user_watchlist or [],
             "agent": agent_summary,
             "universe": {"stocks": stock_count, "options": option_count},
             "recent_trades": list(self.trades),

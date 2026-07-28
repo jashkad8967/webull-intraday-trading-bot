@@ -398,23 +398,13 @@ class WebullAPI:
             return 0.0
         return value if value == value and value not in (float("inf"), float("-inf")) else 0.0
 
-    def top_active_stocks(
-        self,
-        total_limit: int,
-        page_size: int,
-        rank_type: str = "VOLUME",
-        sort_by: str = "MARKET_VALUE",
-    ) -> dict[str, dict]:
-        """Page through Webull's most-active screener for a large, market-cap-
-        tagged stock universe (no ETFs - the screener's US_STOCK category is
-        stocks only).
+    def _page_screener(self, fetch_page, total_limit: int, page_size: int) -> dict[str, dict]:
+        """Shared pagination/parsing for Webull screener endpoints.
 
-        The SDK doesn't publish a typed response model for this endpoint, so
+        The SDK doesn't publish a typed response model for these endpoints, so
         the page-of-results and has-more-pages fields are read defensively
         across the field names Webull's own docs/SDK docstrings reference.
         """
-        from webull.data.common.category import Category
-
         results: dict[str, dict] = {}
         page_index = 1
         while len(results) < total_limit:
@@ -422,14 +412,7 @@ class WebullAPI:
             requested_size = min(page_size, remaining)
             response = self._call(
                 lambda page_index=page_index, requested_size=requested_size: (
-                    self.data.screener.get_most_active(
-                        category=Category.US_STOCK.name,
-                        rank_type=rank_type,
-                        sort_by=sort_by,
-                        direction="DESC",
-                        page_index=page_index,
-                        page_size=requested_size,
-                    )
+                    fetch_page(page_index, requested_size)
                 ),
                 "market",
             )
@@ -463,6 +446,57 @@ class WebullAPI:
                 break
             page_index += 1
         return results
+
+    def top_active_stocks(
+        self,
+        total_limit: int,
+        page_size: int,
+        rank_type: str = "VOLUME",
+        sort_by: str = "MARKET_VALUE",
+    ) -> dict[str, dict]:
+        """Page through Webull's most-active screener for a large, market-cap-
+        tagged stock universe (no ETFs - the screener's US_STOCK category is
+        stocks only).
+        """
+        from webull.data.common.category import Category
+
+        return self._page_screener(
+            lambda page_index, requested_size: self.data.screener.get_most_active(
+                category=Category.US_STOCK.name,
+                rank_type=rank_type,
+                sort_by=sort_by,
+                direction="DESC",
+                page_index=page_index,
+                page_size=requested_size,
+            ),
+            total_limit,
+            page_size,
+        )
+
+    def top_gainers(
+        self,
+        total_limit: int,
+        page_size: int,
+        rank_type: str = "DAY_1",
+    ) -> dict[str, dict]:
+        """Page through Webull's gainers screener (stocks up the most today by
+        price change), so the selection universe includes actual current
+        uptrends/momentum names rather than only high-volume names.
+        """
+        from webull.data.common.category import Category
+
+        return self._page_screener(
+            lambda page_index, requested_size: self.data.screener.get_gainers_losers(
+                rank_type=rank_type,
+                category=Category.US_STOCK.name,
+                sort_by="CHANGE_RATIO",
+                direction="DESC",
+                page_index=page_index,
+                page_size=requested_size,
+            ),
+            total_limit,
+            page_size,
+        )
 
     def historical_volatility(
         self,
@@ -722,9 +756,15 @@ class WebullAPI:
         self,
         symbol: str,
         side: str,
-        quantity: int,
+        quantity: int | Decimal,
         limit_price: Decimal | None = None,
+        fractional: bool = False,
     ) -> str:
+        """fractional=True places a fixed-quantity MARKET order for a
+        quantity in (0, 1] - Webull only supports fractional share trading
+        as a MARKET order during core hours, never LIMIT and never extended
+        hours, so those overrides are forced regardless of limit_price.
+        """
         client_order_id = uuid4().hex
         order = {
             "combo_type": "NORMAL",
@@ -732,14 +772,14 @@ class WebullAPI:
             "symbol": symbol,
             "instrument_type": "EQUITY",
             "market": "US",
-            "order_type": "LIMIT" if limit_price is not None else "MARKET",
+            "order_type": "MARKET" if fractional or limit_price is None else "LIMIT",
             "quantity": str(quantity),
-            "support_trading_session": "ALL",
+            "support_trading_session": "CORE" if fractional else "ALL",
             "side": side,
             "time_in_force": "DAY",
             "entrust_type": "QTY",
         }
-        if limit_price is not None:
+        if limit_price is not None and not fractional:
             order["limit_price"] = str(
                 limit_price.quantize(Decimal("0.01"), rounding=ROUND_UP)
             )
@@ -930,7 +970,11 @@ class WebullAPI:
         return total
 
     @staticmethod
-    def stock_position(symbol: str, positions: list[dict]) -> tuple[int, Decimal]:
+    def stock_position(symbol: str, positions: list[dict]) -> tuple[Decimal, Decimal]:
+        """Quantity is a Decimal, not an int - a fractional-share position
+        (e.g. 0.5) would otherwise truncate to 0 here and become invisible
+        to every decision/exit/closeout path that checks this quantity.
+        """
         match = next(
             (
                 item
@@ -941,9 +985,9 @@ class WebullAPI:
             None,
         )
         if not match:
-            return 0, Decimal("0")
+            return Decimal("0"), Decimal("0")
         return (
-            int(Decimal(str(match.get("quantity", "0")))),
+            Decimal(str(match.get("quantity", "0"))),
             Decimal(str(match.get("cost_price", "0"))),
         )
 
@@ -1011,7 +1055,7 @@ class WebullAPI:
         self.cancel_all_orders()
         submitted: list[str] = []
         for position in positions:
-            quantity = int(Decimal(str(position.get("quantity", "0"))))
+            quantity = Decimal(str(position.get("quantity", "0")))
             if not quantity:
                 continue
             if position.get("instrument_type") == "EQUITY":
@@ -1031,12 +1075,14 @@ class WebullAPI:
                 if loss_exit and loss_callback:
                     loss_callback(position["symbol"], "loss closeout submitted")
                 limit_price = self.stock_limit_price(quote, side)
+                fractional = abs(quantity) != abs(quantity).to_integral_value()
                 submitted.append(
                     self.place_stock(
                         position["symbol"],
                         side,
                         abs(quantity),
                         limit_price,
+                        fractional=fractional,
                     )
                 )
             elif position.get("instrument_type") == "OPTION":

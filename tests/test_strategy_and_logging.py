@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+from webull_bot.commands import CommandQueue
 from webull_bot.config import Settings
 from webull_bot.daily_logging import DatedDailyFileHandler
 from webull_bot.market_agent import MarketResearchAgent
@@ -24,6 +25,10 @@ class StrategyConfigMixin:
             stock_priority_fraction=0.6,
             stock_penny_fraction=0.2,
             stock_oscillation_weight=Decimal("0.5"),
+            micro_scalp_reference_window=20,
+            micro_scalp_dip_cents=Decimal("0.05"),
+            micro_scalp_target_cents=Decimal("0.06"),
+            micro_scalp_stop_cents=Decimal("0.10"),
             penny_stock_max_price=Decimal("5"),
             popular_stock_min_volume=1_000_000,
             popular_stock_max_spread_percent=Decimal("0.50"),
@@ -237,6 +242,78 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(decision.action, "HOLD")
 
+    def test_micro_scalp_reference_price_is_none_without_data(self):
+        strategy = TradingStrategy(self.config())
+        self.assertIsNone(strategy.micro_scalp_reference_price("TSLA"))
+
+    def test_micro_scalp_decision_buys_a_small_dip_below_reference(self):
+        strategy = TradingStrategy(self.config())
+        for _ in range(5):
+            strategy.update_stock_snapshot(
+                {"symbol": "TSLA", "bid": "99.99", "ask": "100.01"},
+                Decimal("100.00"),
+            )
+        strategy.update_stock_snapshot(
+            {"symbol": "TSLA", "bid": "99.89", "ask": "99.91"},
+            Decimal("99.90"),
+        )
+        decision = strategy.micro_scalp_decision(
+            "STOCK:TSLA",
+            Decimal("99.90"),
+            0,
+            Decimal("0"),
+        )
+        self.assertEqual(decision.action, "BUY")
+
+    def test_micro_scalp_decision_holds_without_a_qualifying_dip(self):
+        strategy = TradingStrategy(self.config())
+        for _ in range(5):
+            strategy.update_stock_snapshot(
+                {"symbol": "TSLA", "bid": "99.99", "ask": "100.01"},
+                Decimal("100.00"),
+            )
+        strategy.update_stock_snapshot(
+            {"symbol": "TSLA", "bid": "99.97", "ask": "99.99"},
+            Decimal("99.98"),
+        )
+        decision = strategy.micro_scalp_decision(
+            "STOCK:TSLA",
+            Decimal("99.98"),
+            0,
+            Decimal("0"),
+        )
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_micro_scalp_decision_takes_profit_on_the_bounce(self):
+        strategy = TradingStrategy(self.config())
+        decision = strategy.micro_scalp_decision(
+            "STOCK:TSLA",
+            Decimal("100.07"),
+            10,
+            Decimal("100.00"),
+        )
+        self.assertEqual(decision.action, "PROFIT")
+
+    def test_micro_scalp_decision_cuts_loss_if_dip_keeps_falling(self):
+        strategy = TradingStrategy(self.config())
+        decision = strategy.micro_scalp_decision(
+            "STOCK:TSLA",
+            Decimal("99.85"),
+            10,
+            Decimal("100.00"),
+        )
+        self.assertEqual(decision.action, "LOSS")
+
+    def test_clear_market_state_resets_micro_scalp_reference(self):
+        strategy = TradingStrategy(self.config())
+        strategy.update_stock_snapshot(
+            {"symbol": "TSLA", "bid": "99.99", "ask": "100.01"},
+            Decimal("100.00"),
+        )
+        self.assertIsNotNone(strategy.micro_scalp_reference_price("TSLA"))
+        strategy.clear_market_state()
+        self.assertIsNone(strategy.micro_scalp_reference_price("TSLA"))
+
 
 class StopLossEscalationTests(unittest.TestCase):
     def test_escalated_stop_bypasses_cooldown_after_cancel(self):
@@ -270,6 +347,106 @@ class StopLossEscalationTests(unittest.TestCase):
         )
         ready = AutoTrader.stop_ready_to_submit.__get__(fake_bot)
         self.assertFalse(ready("STOCK:X", "X"))
+
+
+class MicroScalpIntegrationTests(unittest.TestCase):
+    def test_trade_micro_scalp_buys_a_qualifying_dip_end_to_end(self):
+        from collections import defaultdict, deque
+
+        from webull_bot.bot import AutoTrader
+
+        config = Settings(
+            micro_scalp_enabled=True,
+            micro_scalp_symbols="TSLA",
+            micro_scalp_dip_cents=Decimal("0.05"),
+            micro_scalp_capital_fraction=Decimal("1.0"),
+            micro_scalp_max_positions=1,
+            max_open_positions=5,
+            trade_cooldown_seconds=Decimal("0"),
+            stock_max_trades_per_hour=10,
+        )
+        strategy = TradingStrategy(config)
+        for _ in range(5):
+            strategy.update_stock_snapshot(
+                {"symbol": "TSLA", "bid": "99.99", "ask": "100.01"},
+                Decimal("100.00"),
+            )
+
+        quote = {"symbol": "TSLA", "bid": "99.89", "ask": "99.91", "price": "99.90"}
+
+        class FakeApi:
+            def __init__(self):
+                self.placed = []
+
+            def stock_quotes_resilient(self, symbols, category):
+                return [quote], set()
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def stock_position(symbol, positions):
+                for item in positions:
+                    if item.get("symbol") == symbol:
+                        return (
+                            int(item.get("quantity", 0)),
+                            Decimal(str(item.get("cost_price", "0"))),
+                        )
+                return 0, Decimal("0")
+
+            def stock_limit_price(self, q, side):
+                return Decimal(str(q["ask"] if side == "BUY" else q["bid"]))
+
+            def place_stock(self, symbol, side, quantity, limit_price=None, fractional=False):
+                self.placed.append((symbol, side, quantity, limit_price))
+                return "order-1"
+
+        api = FakeApi()
+        fake_bot = SimpleNamespace(
+            config=config,
+            api=api,
+            strategy=strategy,
+            wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_trade={},
+            trade_times=defaultdict(deque),
+            pending_stock_exits=set(),
+            stop_exit_submitted={},
+            stop_loss_escalated=set(),
+            position_buckets={},
+            working_orders={},
+        )
+        for name in (
+            "cooldown_ready",
+            "rate_capped",
+            "record_trade",
+            "record_realized_exit",
+            "stop_ready_to_submit",
+            "trade_micro_scalp",
+        ):
+            setattr(fake_bot, name, getattr(AutoTrader, name).__get__(fake_bot))
+
+        positions: list[dict] = []
+        buying_power = Decimal("10000")
+        result = fake_bot.trade_micro_scalp(positions, buying_power)
+
+        self.assertEqual(len(api.placed), 1)
+        self.assertEqual(api.placed[0][:2], ("TSLA", "BUY"))
+        self.assertTrue(any(p["symbol"] == "TSLA" for p in positions))
+        self.assertLess(result, buying_power)
+        self.assertEqual(fake_bot.position_buckets.get("TSLA"), "MICRO_SCALP")
+
+    def test_trade_micro_scalp_disabled_returns_buying_power_unchanged(self):
+        from webull_bot.bot import AutoTrader
+
+        config = Settings(micro_scalp_enabled=False)
+        fake_bot = SimpleNamespace(config=config)
+        trade_micro_scalp = AutoTrader.trade_micro_scalp.__get__(fake_bot)
+
+        result = trade_micro_scalp([], Decimal("5000"))
+
+        self.assertEqual(result, Decimal("5000"))
 
 
 class BotOvertradingCapTests(unittest.TestCase):
@@ -445,6 +622,106 @@ class AllocationAndLoggingTests(unittest.TestCase):
             shutil.rmtree(directory, ignore_errors=True)
 
 
+class FractionalSharesTests(StrategyConfigMixin, unittest.TestCase):
+    def test_fractional_stock_quantity_sizes_to_available_budget(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity = strategy.fractional_stock_quantity(Decimal("400.00"), Decimal("50.00"))
+
+        self.assertEqual(quantity, Decimal("0.1250"))
+
+    def test_fractional_stock_quantity_caps_at_one_share(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity = strategy.fractional_stock_quantity(Decimal("10.00"), Decimal("5000.00"))
+
+        self.assertEqual(quantity, Decimal("1"))
+
+    def test_fractional_stock_quantity_returns_zero_below_minimum_notional(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity = strategy.fractional_stock_quantity(Decimal("400.00"), Decimal("3.00"))
+
+        self.assertEqual(quantity, Decimal("0"))
+
+    def test_place_stock_fractional_forces_market_core_and_omits_limit(self):
+        api = WebullAPI.__new__(WebullAPI)
+        captured = []
+
+        def fake_call(callback, group, retry=True):
+            return callback()
+
+        def fake_place_order(account_id, orders):
+            captured.extend(orders)
+            return None
+
+        api._call = fake_call
+        api.trade = SimpleNamespace(
+            order_v3=SimpleNamespace(place_order=fake_place_order)
+        )
+        api.config = SimpleNamespace(account_id="acct-1")
+
+        api.place_stock(
+            "TSLA",
+            "BUY",
+            Decimal("0.5"),
+            limit_price=Decimal("250.00"),
+            fractional=True,
+        )
+
+        self.assertEqual(len(captured), 1)
+        order = captured[0]
+        self.assertEqual(order["order_type"], "MARKET")
+        self.assertEqual(order["support_trading_session"], "CORE")
+        self.assertEqual(order["quantity"], "0.5")
+        self.assertNotIn("limit_price", order)
+
+    def test_place_stock_whole_share_unaffected_by_fractional_param(self):
+        api = WebullAPI.__new__(WebullAPI)
+        captured = []
+
+        def fake_call(callback, group, retry=True):
+            return callback()
+
+        def fake_place_order(account_id, orders):
+            captured.extend(orders)
+            return None
+
+        api._call = fake_call
+        api.trade = SimpleNamespace(
+            order_v3=SimpleNamespace(place_order=fake_place_order)
+        )
+        api.config = SimpleNamespace(account_id="acct-1")
+
+        api.place_stock("TSLA", "BUY", 3, limit_price=Decimal("250.00"))
+
+        order = captured[0]
+        self.assertEqual(order["order_type"], "LIMIT")
+        self.assertEqual(order["support_trading_session"], "ALL")
+        self.assertEqual(order["limit_price"], "250.00")
+
+    def test_stock_position_reports_fractional_quantity_without_truncation(self):
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TSLA",
+                "quantity": "0.5",
+                "cost_price": "250.00",
+            }
+        ]
+
+        quantity, cost = WebullAPI.stock_position("TSLA", positions)
+
+        self.assertEqual(quantity, Decimal("0.5"))
+        self.assertEqual(cost, Decimal("250.00"))
+
+
 class StopExitPricingTests(unittest.TestCase):
     def test_stop_exit_uses_bid_ask_midpoint_not_aggressive_crossing(self):
         api = WebullAPI.__new__(WebullAPI)
@@ -485,6 +762,34 @@ class StopExitPricingTests(unittest.TestCase):
         )
         self.assertEqual(submitted, ["order-123"])
         self.assertEqual(losses, [("AAPL", "option loss closeout submitted")])
+
+    def test_close_all_positions_does_not_skip_a_fractional_equity_position(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.positions = lambda: [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TSLA",
+                "quantity": "0.5",
+                "cost_price": "250.00",
+            }
+        ]
+        api.cancel_all_orders = lambda: []
+        api.stock_quote = lambda symbol: {"bid": "255.00", "ask": "255.20"}
+        api.quote_price = staticmethod(lambda quote: Decimal("255.10"))
+        api.stock_limit_price = lambda quote, side: Decimal("255.00")
+
+        placed = []
+
+        def fake_place_stock(symbol, side, quantity, limit_price=None, fractional=False):
+            placed.append((symbol, side, quantity, fractional))
+            return "order-456"
+
+        api.place_stock = fake_place_stock
+
+        submitted = api.close_all_positions()
+
+        self.assertEqual(submitted, ["order-456"])
+        self.assertEqual(placed, [("TSLA", "SELL", Decimal("0.5"), True)])
 
 
 class PayloadSizingTests(unittest.TestCase):
@@ -711,6 +1016,254 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
 
         self.assertIn("SMALL1", batch)
         self.assertEqual(strategy.selection_bucket("SMALL1"), "HELD")
+
+    def test_top_gainers_pages_using_change_ratio_screener(self):
+        api = WebullAPI.__new__(WebullAPI)
+        fake_category = SimpleNamespace(US_STOCK=SimpleNamespace(name="US_STOCK"))
+        calls = []
+
+        def fake_call(callback, group):
+            calls.append(group)
+            return callback()
+
+        def fake_get_gainers_losers(**kwargs):
+            self.assertEqual(kwargs["sort_by"], "CHANGE_RATIO")
+            self.assertEqual(kwargs["direction"], "DESC")
+            if kwargs["page_index"] == 1:
+                return [{"symbol": "mover1", "market_value": "5e9", "change_ratio": "12.5"}]
+            return []
+
+        api._call = fake_call
+        api.data = SimpleNamespace(
+            screener=SimpleNamespace(get_gainers_losers=fake_get_gainers_losers)
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"webull.data.common.category": SimpleNamespace(Category=fake_category)},
+        ):
+            gainers = api.top_gainers(total_limit=10, page_size=5)
+
+        self.assertEqual(set(gainers), {"MOVER1"})
+        self.assertEqual(gainers["MOVER1"]["change_ratio"], 12.5)
+        self.assertTrue(all(call == "market" for call in calls))
+
+    def test_filter_with_popular_reinstated_keeps_configured_names(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            popular_stocks=lambda: ["AAPL", "MSFT"],
+        )
+        # Simulate the volatility filter dropping the two well-known,
+        # lower-amplitude names while keeping an obscure volatile one.
+        fake_bot.filter_by_historical_volatility = lambda candidates: [
+            symbol for symbol in candidates if symbol not in ("AAPL", "MSFT")
+        ]
+        reinstate = AutoTrader.filter_with_popular_reinstated.__get__(fake_bot)
+
+        result = reinstate(["AAPL", "MSFT", "OBSCUREVOL", "OBSCUREFLAT"])
+
+        self.assertEqual(
+            result,
+            ["AAPL", "MSFT", "OBSCUREVOL", "OBSCUREFLAT"],
+        )
+
+    def test_filter_with_popular_reinstated_does_not_add_unavailable_symbols(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            popular_stocks=lambda: ["NOTINUNIVERSE"],
+        )
+        fake_bot.filter_by_historical_volatility = lambda candidates: list(candidates)
+        reinstate = AutoTrader.filter_with_popular_reinstated.__get__(fake_bot)
+
+        result = reinstate(["ONE", "TWO"])
+
+        self.assertEqual(result, ["ONE", "TWO"])
+
+    def test_exclude_micro_scalp_symbols_removes_only_configured_names(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            micro_scalp_enabled=True,
+            micro_scalp_symbol_list=lambda: ["TSLA", "NVDA"],
+        )
+        exclude = AutoTrader.exclude_micro_scalp_symbols.__get__(fake_bot)
+
+        remaining, excluded = exclude(["TSLA", "AAPL", "NVDA", "MSFT"])
+
+        self.assertEqual(remaining, ["AAPL", "MSFT"])
+        self.assertEqual(excluded, ["TSLA", "NVDA"])
+
+    def test_exclude_micro_scalp_symbols_noop_when_disabled(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            micro_scalp_enabled=False,
+            micro_scalp_symbol_list=lambda: ["TSLA"],
+        )
+        exclude = AutoTrader.exclude_micro_scalp_symbols.__get__(fake_bot)
+
+        remaining, excluded = exclude(["TSLA", "AAPL"])
+
+        self.assertEqual(remaining, ["TSLA", "AAPL"])
+        self.assertEqual(excluded, [])
+
+    def test_safe_top_gainers_survives_screener_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("Webull API error 500: boom")
+
+        fake_bot.api = SimpleNamespace(top_gainers=boom)
+        safe_call = AutoTrader.safe_top_gainers.__get__(fake_bot)
+
+        self.assertEqual(safe_call(100, 50), {})
+
+    def test_safe_top_active_stocks_falls_back_to_prior_universe_on_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("Webull API error 503: boom")
+
+        fake_bot.api = SimpleNamespace(top_active_stocks=boom)
+        fake_bot.stock_symbols = ["OLD1", "OLD2"]
+        fake_bot.stock_market_values = {"OLD1": 1e11, "OLD2": 2e8}
+        safe_call = AutoTrader.safe_top_active_stocks.__get__(fake_bot)
+
+        result = safe_call(500, 200)
+
+        self.assertEqual(set(result), {"OLD1", "OLD2"})
+        self.assertEqual(result["OLD1"]["market_value"], 1e11)
+
+
+class DashboardCommandTests(unittest.TestCase):
+    def test_command_queue_round_trip(self):
+        path = Path("tests/.generated_commands/commands.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            queue = CommandQueue(str(path))
+            self.assertEqual(queue.pop_all(), [])
+            command_id = queue.enqueue("close_all")
+            self.assertTrue(command_id)
+            popped = queue.pop_all()
+            self.assertEqual(len(popped), 1)
+            self.assertEqual(popped[0]["type"], "close_all")
+            self.assertEqual(popped[0]["id"], command_id)
+            self.assertEqual(queue.pop_all(), [])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_command_queue_accumulates_multiple_commands(self):
+        path = Path("tests/.generated_commands/commands2.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            queue = CommandQueue(str(path))
+            queue.enqueue("sell", symbol="TSLA", instrument_type="EQUITY")
+            queue.enqueue("watchlist_add", symbol="AAPL")
+            popped = queue.pop_all()
+            self.assertEqual([c["type"] for c in popped], ["sell", "watchlist_add"])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_process_ui_commands_dispatches_close_all(self):
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+        fake_bot = SimpleNamespace(
+            commands=SimpleNamespace(pop_all=lambda: [{"type": "close_all"}]),
+            close_instruments=lambda types: calls.append(types),
+        )
+        process = AutoTrader.process_ui_commands.__get__(fake_bot)
+        process([])
+
+        self.assertEqual(calls, [{"EQUITY", "OPTION"}])
+
+    def test_process_ui_commands_survives_unknown_type_and_handler_error(self):
+        from webull_bot.bot import AutoTrader
+
+        def boom(command, positions):
+            raise RuntimeError("boom")
+
+        fake_bot = SimpleNamespace(
+            commands=SimpleNamespace(
+                pop_all=lambda: [{"type": "unknown"}, {"type": "sell"}]
+            ),
+            _manual_sell=boom,
+        )
+        process = AutoTrader.process_ui_commands.__get__(fake_bot)
+        process([])  # must not raise despite the unknown type and handler error
+
+    def test_manual_sell_closes_equity_position_and_records_pnl(self):
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+        recorded_pnl = []
+
+        fake_bot = SimpleNamespace(
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+            api=SimpleNamespace(
+                stock_quote=lambda symbol: {"bid": "99.00", "ask": "99.20"},
+                stock_limit_price=lambda quote, side: Decimal("99.00"),
+                place_stock=lambda symbol, side, quantity, limit_price=None, fractional=False: (
+                    placed.append((symbol, side, quantity, fractional)) or "order-1"
+                ),
+            ),
+            wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
+        )
+        fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: (
+            recorded_pnl.append((cost, price, qty)) or (price - cost) * qty * multiplier
+        )
+        fake_bot.record_trade = lambda *a, **k: None
+        manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TSLA",
+                "quantity": "3",
+                "cost_price": "100.00",
+            }
+        ]
+        manual_sell({"symbol": "TSLA", "instrument_type": "EQUITY"}, positions)
+
+        self.assertEqual(placed, [("TSLA", "SELL", Decimal("3"), False)])
+        self.assertIn("TSLA", fake_bot.pending_stock_exits)
+        self.assertEqual(recorded_pnl, [(Decimal("100.00"), Decimal("99.00"), Decimal("3"))])
+
+    def test_manual_sell_skips_when_no_matching_position(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(pending_stock_exits=set(), pending_option_exits=set())
+        manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
+
+        manual_sell({"symbol": "TSLA", "instrument_type": "EQUITY"}, [])
+
+    def test_add_to_watchlist_resolves_category_and_appends_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            user_watchlist=set(),
+            stock_categories={},
+            stock_symbols=["AAPL"],
+            api=SimpleNamespace(stock_categories=lambda symbols: {"TSLA": "US_STOCK"}),
+        )
+        add = AutoTrader.add_to_watchlist.__get__(fake_bot)
+
+        add("tsla")
+
+        self.assertIn("TSLA", fake_bot.user_watchlist)
+        self.assertEqual(fake_bot.stock_categories.get("TSLA"), "US_STOCK")
+        self.assertIn("TSLA", fake_bot.stock_symbols)
 
 
 if __name__ == "__main__":
