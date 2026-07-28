@@ -629,6 +629,17 @@ class TradingStrategy:
             else Decision("HOLD", "EMA entry not ready")
         )
 
+    @staticmethod
+    def minimum_lot_size(price: Decimal) -> int:
+        """Webull rejects any order under 100 shares outright for stocks
+        priced $0.10-$0.999 (OAUTH_OPENAPI_CANT_TRADE_FOR_PRICE_BETWEEN_
+        0099_AND_0999) - a plain per-order STOCK_QUANTITY of 1 would fail
+        every single time in that band, not just occasionally.
+        """
+        if Decimal("0.10") <= price <= Decimal("0.999"):
+            return 100
+        return 1
+
     def stock_order_quantity(
         self,
         price: Decimal,
@@ -645,10 +656,15 @@ class TradingStrategy:
                 rounding=ROUND_DOWN
             )
         )
-        return (
-            min(self.config.stock_quantity, affordable, notional_limit),
-            buffered_price,
-        )
+        quantity = min(self.config.stock_quantity, affordable, notional_limit)
+        min_lot = self.minimum_lot_size(price)
+        if quantity < min_lot:
+            quantity = (
+                min_lot
+                if min_lot <= affordable and min_lot <= notional_limit
+                else 0
+            )
+        return quantity, buffered_price
 
     def fractional_stock_quantity(
         self,
@@ -660,8 +676,12 @@ class TradingStrategy:
         must clear a minimum order value, so this returns Decimal("0") -
         meaning "skip, don't place a fractional order" - whenever either
         constraint can't be met, rather than rounding into an invalid order.
+
+        A stock priced $0.10-$0.999 needs a 100-share minimum order size
+        (see minimum_lot_size) that no fractional order (always <= 1 share)
+        can ever satisfy, so fractional sizing is skipped entirely there.
         """
-        if price <= 0:
+        if price <= 0 or self.minimum_lot_size(price) > 1:
             return Decimal("0")
         min_notional = self.config.fractional_shares_min_notional
         affordable_notional = min(buying_power, price)

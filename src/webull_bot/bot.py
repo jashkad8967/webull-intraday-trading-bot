@@ -107,6 +107,7 @@ class AutoTrader:
         self.commands = CommandQueue(self.config.command_file)
         self.user_watchlist: set[str] = set()
         self.gate_rejections: dict[str, int] = defaultdict(int)
+        self.broker_conflict_symbols: set[str] = set()
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -443,6 +444,12 @@ class AutoTrader:
         self.daily_realized_loss = Decimal("0")
         self.daily_realized_pnl = Decimal("0")
         self.daily_loss_breaker_triggered = False
+        if self.broker_conflict_symbols:
+            log.info(
+                "CONFLICT | daily reset | resuming automated action on | %s",
+                ",".join(sorted(self.broker_conflict_symbols)),
+            )
+        self.broker_conflict_symbols.clear()
         log.info(
             "READY  | stocks=%s | popular seeds=%s | options=%s | option scan=%s",
             len(self.stock_symbols),
@@ -522,6 +529,34 @@ class AutoTrader:
         if symbol in self.pending_stock_exits:
             return False
         return symbol in self.stop_loss_escalated or self.cooldown_ready(key)
+
+    @staticmethod
+    def is_broker_position_conflict(exc: Exception) -> bool:
+        """True for Webull's "this order would reverse an existing
+        position" rejection - a sign our local view of the position is out
+        of sync with the broker's (a stale quantity, a partially-filled
+        order, or account state from outside the bot). No amount of
+        retrying with the same (wrong) assumption will fix this - it needs
+        the account state to actually resolve, so the caller should stop
+        hammering the symbol instead of just backing off and trying again.
+        """
+        return "REVERSE" in str(exc).upper()
+
+    def handle_broker_conflict(self, symbol: str, exc: Exception) -> None:
+        self.broker_conflict_symbols.add(symbol)
+        self.pending_stock_exits.discard(symbol)
+        self.pending_option_exits.discard(symbol)
+        self.stop_exit_submitted.pop(symbol, None)
+        self.stop_loss_escalated.discard(symbol)
+        log.error(
+            "CONFLICT | %-8s | broker rejected order as a position reverse "
+            "- our view of this position doesn't match the account. Pausing "
+            "automated action on it for the rest of the day; check the "
+            "Webull app for a stuck order or unexpected position on %s. | %s",
+            symbol,
+            symbol,
+            exc,
+        )
 
     def rate_capped(self, key: str) -> bool:
         limit = self.config.stock_max_trades_per_hour
@@ -1034,6 +1069,8 @@ class AutoTrader:
             str(quote.get("symbol", "")).upper(): quote for quote in quotes
         }
         for symbol in batch:
+            if symbol in self.broker_conflict_symbols:
+                continue
             try:
                 quote = quote_by_symbol.get(symbol)
                 if not quote:
@@ -1170,6 +1207,9 @@ class AutoTrader:
                 self.stop_loss_escalated.discard(symbol)
                 if isinstance(exc, QuoteUnavailableError):
                     continue
+                if self.is_broker_position_conflict(exc):
+                    self.handle_broker_conflict(symbol, exc)
+                    continue
                 if "BUYING_POWER_INSUFFICIENT" in str(exc):
                     buying_power = Decimal("0")
                     log.warning(
@@ -1243,6 +1283,8 @@ class AutoTrader:
         )
         capital_budget = buying_power * self.config.micro_scalp_capital_fraction
         for symbol in symbols:
+            if symbol in self.broker_conflict_symbols:
+                continue
             quote = quote_by_symbol.get(symbol)
             if not quote:
                 continue
@@ -1355,6 +1397,9 @@ class AutoTrader:
                 self.stop_loss_escalated.discard(symbol)
                 if isinstance(exc, QuoteUnavailableError):
                     continue
+                if self.is_broker_position_conflict(exc):
+                    self.handle_broker_conflict(symbol, exc)
+                    continue
                 if "BUYING_POWER_INSUFFICIENT" in str(exc):
                     buying_power = Decimal("0")
                     log.warning(
@@ -1397,6 +1442,8 @@ class AutoTrader:
         for contract in batch:
             option_symbol = contract["symbol"]
             key = f"OPTION:{option_symbol}"
+            if option_symbol in self.broker_conflict_symbols:
+                continue
             try:
                 quote = quote_by_symbol.get(option_symbol)
                 if not quote:
@@ -1501,6 +1548,9 @@ class AutoTrader:
                     self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl)
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
+                    continue
+                if self.is_broker_position_conflict(exc):
+                    self.handle_broker_conflict(option_symbol, exc)
                     continue
                 if "BUYING_POWER_INSUFFICIENT" in str(exc):
                     buying_power = Decimal("0")
