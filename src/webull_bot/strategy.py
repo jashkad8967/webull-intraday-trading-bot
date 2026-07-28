@@ -33,12 +33,15 @@ class TradingStrategy:
         self.prices: dict[str, Decimal] = {}
         self.metrics: dict[str, dict] = {}
         self.selection_buckets: dict[str, str] = {}
+        self.trend_streak: dict[str, int] = {}
+        self.vwap_state: dict[str, dict] = {}
 
     def clear_market_state(self) -> None:
         self.activity.clear()
         self.prices.clear()
         self.metrics.clear()
         self.selection_buckets.clear()
+        self.vwap_state.clear()
 
     @staticmethod
     def rotating_batch(items: list, cursor: int, batch_size: int) -> tuple[list, int]:
@@ -98,8 +101,38 @@ class TradingStrategy:
             "bid": bid,
             "ask": ask,
             "spread_percent": round(spread_percent, 4),
+            "range_ratio": round(max(0.0, range_ratio), 4),
             "activity_score": activity,
         }
+        self._update_vwap(symbol, price, volume)
+
+    def _update_vwap(self, symbol: str, price: Decimal, volume: float) -> None:
+        state = self.vwap_state.get(symbol)
+        if state is None:
+            self.vwap_state[symbol] = {
+                "cum_pv": 0.0,
+                "cum_vol": 0.0,
+                "last_volume": volume,
+            }
+            return
+        delta = max(0.0, volume - state["last_volume"])
+        if delta > 0:
+            state["cum_pv"] += float(price) * delta
+            state["cum_vol"] += delta
+        state["last_volume"] = volume
+
+    def vwap(self, symbol: str) -> Decimal | None:
+        state = self.vwap_state.get(symbol)
+        if not state or state["cum_vol"] <= 0:
+            return None
+        return Decimal(str(state["cum_pv"] / state["cum_vol"]))
+
+    def vwap_supports_entry(self, symbol: str, price: Decimal) -> bool:
+        vwap = self.vwap(symbol)
+        if vwap is None:
+            return True
+        band = Decimal("1") - self.config.vwap_entry_band_percent
+        return price >= vwap * band
 
     def priority_score(self, symbol: str, assessment: dict | None) -> float:
         score = self.activity.get(symbol, 0.0)
@@ -267,6 +300,7 @@ class TradingStrategy:
         slow = self.config.ema_slow_period
         fast = self.config.ema_fast_period
         if len(values) < slow + 1:
+            self.trend_streak[key] = 0
             return "HOLD"
         series = list(values)
         previous = series[:-1]
@@ -278,11 +312,27 @@ class TradingStrategy:
             series[-slow:],
             slow,
         )
-        if old_spread <= 0 < new_spread:
+        if new_spread <= 0:
+            self.trend_streak[key] = 0
+            return "HOLD"
+        if old_spread <= 0:
+            self.trend_streak[key] = 0
             return "BUY"
-        if self.config.reenter_on_trend and new_spread > 0:
+        self.trend_streak[key] = self.trend_streak.get(key, 0) + 1
+        if (
+            self.config.reenter_on_trend
+            and self.trend_streak[key] >= self.config.reenter_confirmation_polls
+        ):
             return "BUY"
         return "HOLD"
+
+    def adaptive_stop_percent(self, symbol: str) -> Decimal:
+        range_ratio = Decimal(str(self.metrics.get(symbol, {}).get("range_ratio", 0)))
+        scaled = range_ratio * self.config.stock_stop_loss_range_multiplier
+        return max(
+            self.config.stock_stop_loss_min_percent,
+            min(self.config.stock_stop_loss_max_percent, scaled),
+        )
 
     def stock_decision(
         self,
@@ -293,15 +343,16 @@ class TradingStrategy:
         assessment: dict | None = None,
     ) -> Decision:
         trend = self.trend_signal(key, price)
+        symbol = key.split(":", 1)[-1]
         if quantity > 0:
-            base_target = average_cost * (
-                Decimal("1")
-                + self.config.stock_min_net_profit_percent
-                + self.config.stock_estimated_round_trip_cost_percent
+            stop_percent = self.adaptive_stop_percent(symbol)
+            target_percent = max(
+                self.config.stock_min_net_profit_percent
+                + self.config.stock_estimated_round_trip_cost_percent,
+                stop_percent * self.config.stock_target_stop_multiple,
             )
-            stop = average_cost * (
-                Decimal("1") - self.config.stock_stop_loss_percent
-            )
+            base_target = average_cost * (Decimal("1") + target_percent)
+            stop = average_cost * (Decimal("1") - stop_percent)
             if average_cost > 0 and price <= stop:
                 return Decision("LOSS", "percentage stop reached", price)
             bias = self._exit_bias(assessment)
@@ -340,6 +391,8 @@ class TradingStrategy:
             return Decision("HOLD", "position between target and stop", target)
         if not self.entry_spread_ok(key):
             return Decision("HOLD", "spread too wide to scalp profitably")
+        if not self.vwap_supports_entry(symbol, price):
+            return Decision("HOLD", "price below session VWAP")
         if trend == "BUY":
             return Decision("BUY", "EMA entry confirmed")
         if self.research_supports_entry(assessment):

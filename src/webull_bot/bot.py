@@ -1,19 +1,20 @@
 import logging
-import sys
 import time
+from collections import defaultdict, deque
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
 from rich.logging import RichHandler
 
-from config import settings
-from daily_logging import add_daily_file_logging
-from invalid_symbols import InvalidSymbolTracker
-from market_agent import MarketResearchAgent
-from strategy import TradingStrategy
-from wash_sale import WashSaleTracker
-from webull_api import (
+from webull_bot.config import settings
+from webull_bot.daily_logging import add_daily_file_logging
+from webull_bot.invalid_symbols import InvalidSymbolTracker
+from webull_bot.market_agent import MarketResearchAgent
+from webull_bot.status import StatusWriter
+from webull_bot.strategy import TradingStrategy
+from webull_bot.wash_sale import WashSaleTracker
+from webull_bot.webull_api import (
     MarketDataPermissionError,
     QuoteUnavailableError,
     WebullAPI,
@@ -61,6 +62,9 @@ class AutoTrader:
         )
         self.wash_skip_logged: set[str] = set()
         self.last_trade: dict[str, float] = {}
+        self.trade_times: dict[str, deque] = defaultdict(deque)
+        self.status = StatusWriter(self.config.status_file)
+        self.last_status_write = 0.0
         self.stock_symbols: list[str] = []
         self.reserve_symbols: list[str] = []
         self.stock_categories: dict[str, str] = {}
@@ -319,6 +323,16 @@ class AutoTrader:
         elapsed = time.monotonic() - self.last_trade.get(key, float("-inf"))
         return elapsed >= float(self.config.trade_cooldown_seconds)
 
+    def rate_capped(self, key: str) -> bool:
+        limit = self.config.stock_max_trades_per_hour
+        if limit <= 0:
+            return False
+        now = time.monotonic()
+        times = self.trade_times[key]
+        while times and now - times[0] > 3600.0:
+            times.popleft()
+        return len(times) >= limit
+
     def record_trade(
         self,
         key: str,
@@ -328,6 +342,7 @@ class AutoTrader:
     ) -> None:
         submitted_at = time.monotonic()
         self.last_trade[key] = submitted_at
+        self.trade_times[key].append(submitted_at)
         self.working_orders[order_id] = {
             "submitted_at": submitted_at,
             "key": key,
@@ -335,6 +350,7 @@ class AutoTrader:
             "cancel_requested_at": None,
         }
         instrument_type, symbol = key.split(":", 1)
+        self.status.record_trade(instrument_type, symbol, action, limit_price, order_id)
         limit_text = (
             f" | limit={limit_price}"
             if limit_price is not None
@@ -758,6 +774,7 @@ class AutoTrader:
                         < bucket_slot_limits.get(bucket, 0)
                         and buy_quantity > 0
                         and self.cooldown_ready(key)
+                        and not self.rate_capped(key)
                     ):
                         order_id = self.api.place_stock(
                             symbol,
@@ -915,6 +932,7 @@ class AutoTrader:
                         open_count < self.config.max_open_positions
                         and buy_quantity > 0
                         and self.cooldown_ready(key)
+                        and not self.rate_capped(key)
                     ):
                         order_id = self.api.place_option(
                             contract,
@@ -975,6 +993,12 @@ class AutoTrader:
         positions: list[dict],
         options_active: bool,
     ) -> None:
+        """Free capital stuck in a stalled position at breakeven-plus-a-penny.
+
+        This is capital hygiene, not a turnover target: it never sells at a
+        loss and only fires when nothing has filled for a while, so a
+        position isn't held indefinitely waiting on a stalled quote.
+        """
         if not self.config.stall_breaker_enabled:
             return
         now = time.monotonic()
@@ -1055,6 +1079,66 @@ class AutoTrader:
                 self.config.stall_breaker_seconds,
                 boosted,
             )
+
+    def write_status_snapshot(
+        self,
+        positions: list[dict],
+        buying_power: Decimal,
+        paused: bool,
+    ) -> None:
+        if time.monotonic() - self.last_status_write < 2.0:
+            return
+        self.last_status_write = time.monotonic()
+        position_rows = []
+        for position in positions:
+            quantity = Decimal(str(position.get("quantity", "0")))
+            if quantity == 0:
+                continue
+            symbol = str(position.get("symbol", "")).upper()
+            position_rows.append(
+                {
+                    "symbol": symbol,
+                    "instrument_type": position.get("instrument_type"),
+                    "quantity": str(quantity),
+                    "cost_price": str(position.get("cost_price", "0")),
+                    "last_price": str(
+                        self.strategy.prices.get(symbol, position.get("cost_price", "0"))
+                    ),
+                    "unrealized_pnl": str(self.strategy.position_unrealized_pnl(position)),
+                    "bucket": self.position_buckets.get(symbol, "DISCOVERY"),
+                }
+            )
+        watchlist = sorted(
+            self.strategy.activity,
+            key=lambda symbol: self.strategy.activity[symbol],
+            reverse=True,
+        )[:10]
+        watchlist_rows = [
+            {
+                "symbol": symbol,
+                "price": str(self.strategy.prices.get(symbol, "0")),
+                "bucket": self.strategy.selection_bucket(symbol),
+                **self.strategy.metrics.get(symbol, {}),
+            }
+            for symbol in watchlist
+        ]
+        agent_summary = None
+        if self.market_agent:
+            agent_summary = {
+                "enabled": True,
+                "discoveries": self.market_agent.discoveries(),
+                "popular_symbols": sorted(self.agent_popular_symbols),
+            }
+        self.status.write(
+            mode=self.config.mode,
+            buying_power=buying_power,
+            positions=position_rows,
+            watchlist=watchlist_rows,
+            agent_summary=agent_summary,
+            paused=paused,
+            stock_count=len(self.stock_symbols),
+            option_count=len(self.option_contracts),
+        )
 
     def close_instruments(self, instrument_types: set[str]) -> bool:
         now = time.monotonic()
@@ -1151,6 +1235,7 @@ class AutoTrader:
                     self.cached_buying_power = buying_power
                     self.cached_positions = [dict(item) for item in positions]
                     self.submit_agent_research(positions, buying_power)
+                self.write_status_snapshot(positions, buying_power, circuit_active)
                 if time.monotonic() - self.last_status_log >= 30:
                     self.last_status_log = time.monotonic()
                     log.info(
@@ -1202,19 +1287,3 @@ def force_close_all() -> None:
         len(submitted),
         len(remaining),
     )
-
-
-if __name__ == "__main__":
-    try:
-        runtime_config = settings()
-        add_daily_file_logging(
-            log,
-            runtime_config.log_directory,
-            runtime_config.trading_timezone,
-        )
-        if "--close-all" in sys.argv:
-            force_close_all()
-        else:
-            AutoTrader().run()
-    except KeyboardInterrupt:
-        log.info("STOPPED")

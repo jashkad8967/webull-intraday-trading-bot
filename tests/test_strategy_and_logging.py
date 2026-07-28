@@ -6,14 +6,14 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
-from config import Settings
-from daily_logging import DatedDailyFileHandler
-from market_agent import MarketResearchAgent
-from strategy import TradingStrategy
-from webull_api import WebullAPI
+from webull_bot.config import Settings
+from webull_bot.daily_logging import DatedDailyFileHandler
+from webull_bot.market_agent import MarketResearchAgent
+from webull_bot.strategy import TradingStrategy
+from webull_bot.webull_api import WebullAPI
 
 
-class StrategySelectionTests(unittest.TestCase):
+class StrategyConfigMixin:
     def config(self):
         return SimpleNamespace(
             ema_fast_period=3,
@@ -25,9 +25,14 @@ class StrategySelectionTests(unittest.TestCase):
             popular_stock_min_volume=1_000_000,
             popular_stock_max_spread_percent=Decimal("0.50"),
             reenter_on_trend=True,
+            reenter_confirmation_polls=2,
+            vwap_entry_band_percent=Decimal("0.001"),
             stock_min_net_profit_percent=Decimal("0.0001"),
             stock_estimated_round_trip_cost_percent=Decimal("0.002"),
-            stock_stop_loss_percent=Decimal("0.02"),
+            stock_stop_loss_min_percent=Decimal("0.0015"),
+            stock_stop_loss_max_percent=Decimal("0.02"),
+            stock_stop_loss_range_multiplier=Decimal("0.35"),
+            stock_target_stop_multiple=Decimal("1.2"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             agent_exit_influence_enabled=True,
             agent_exit_min_confidence=Decimal("0.60"),
@@ -36,6 +41,8 @@ class StrategySelectionTests(unittest.TestCase):
             agent_derisk_bias_threshold=Decimal("-0.50"),
         )
 
+
+class StrategySelectionTests(StrategyConfigMixin, unittest.TestCase):
     def test_research_popular_names_are_first_without_blocking_discovery(self):
         strategy = TradingStrategy(self.config())
         symbols = ["NVDA", "CHEAP", "OTHER", "NEXT", "LAST"]
@@ -98,6 +105,8 @@ class StrategySelectionTests(unittest.TestCase):
             Decimal("9.9"),
             Decimal("10.2"),
             Decimal("10.5"),
+            Decimal("10.8"),
+            Decimal("11.1"),
         ]
         decisions = [
             strategy.stock_decision(
@@ -110,6 +119,95 @@ class StrategySelectionTests(unittest.TestCase):
             for price in prices
         ]
         self.assertIn("BUY", [item.action for item in decisions])
+
+
+class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
+    def test_vwap_gate_blocks_entry_below_session_vwap(self):
+        strategy = TradingStrategy(self.config())
+        strategy.update_stock_snapshot(
+            {"symbol": "VWAPTEST", "volume": "1000", "price": "10"},
+            Decimal("10"),
+        )
+        strategy.update_stock_snapshot(
+            {"symbol": "VWAPTEST", "volume": "2000", "price": "12"},
+            Decimal("12"),
+        )
+        self.assertEqual(strategy.vwap("VWAPTEST"), Decimal("12"))
+        self.assertFalse(strategy.vwap_supports_entry("VWAPTEST", Decimal("9")))
+        self.assertTrue(strategy.vwap_supports_entry("VWAPTEST", Decimal("12")))
+
+    def test_vwap_gate_does_not_block_entry_without_data(self):
+        strategy = TradingStrategy(self.config())
+        self.assertTrue(strategy.vwap_supports_entry("UNSEEN", Decimal("5")))
+
+    def test_adaptive_stop_percent_is_clamped_between_configured_bounds(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["CALM"] = {"range_ratio": 0.001}
+        strategy.metrics["WILD"] = {"range_ratio": 0.10}
+        self.assertEqual(strategy.adaptive_stop_percent("CALM"), Decimal("0.0015"))
+        self.assertEqual(strategy.adaptive_stop_percent("WILD"), Decimal("0.02"))
+
+    def test_reentry_requires_confirmation_polls_after_initial_crossover(self):
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:REENTRY"
+        downtrend = [10, 9.9, 9.8, 9.7, 9.6, 9.5, 9.4, 9.3, 9.2]
+        for price in downtrend:
+            strategy.trend_signal(key, Decimal(str(price)))
+
+        self.assertEqual(strategy.trend_signal(key, Decimal("9.6")), "HOLD")
+        self.assertEqual(strategy.trend_signal(key, Decimal("9.7")), "BUY")
+        # A fresh crossover fires instantly, but the very next poll of a
+        # still-forming uptrend should not immediately re-fire.
+        self.assertEqual(strategy.trend_signal(key, Decimal("9.9")), "HOLD")
+        # Once the uptrend has held for the configured confirmation polls,
+        # re-entry is allowed again.
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.2")), "BUY")
+
+    def test_stop_and_target_scale_with_adaptive_stop_percent(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["WILD"] = {"range_ratio": 0.10}
+        decision = strategy.stock_decision(
+            "STOCK:WILD",
+            Decimal("97.9"),
+            10,
+            Decimal("100"),
+            None,
+        )
+        self.assertEqual(decision.action, "LOSS")
+
+
+class BotOvertradingCapTests(unittest.TestCase):
+    def test_rate_capped_blocks_after_configured_trades_per_hour(self):
+        from collections import defaultdict, deque
+
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(stock_max_trades_per_hour=2),
+            trade_times=defaultdict(deque),
+        )
+        rate_capped = AutoTrader.rate_capped.__get__(fake_bot)
+        key = "STOCK:CAPPED"
+        self.assertFalse(rate_capped(key))
+        fake_bot.trade_times[key].append(0.0)
+        self.assertFalse(rate_capped(key))
+        fake_bot.trade_times[key].append(0.0)
+        self.assertTrue(rate_capped(key))
+
+    def test_rate_cap_disabled_when_limit_is_zero(self):
+        from collections import defaultdict, deque
+
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(stock_max_trades_per_hour=0),
+            trade_times=defaultdict(deque),
+        )
+        rate_capped = AutoTrader.rate_capped.__get__(fake_bot)
+        key = "STOCK:UNCAPPED"
+        for _ in range(50):
+            fake_bot.trade_times[key].append(0.0)
+        self.assertFalse(rate_capped(key))
 
 
 class ResearchDiscoveryTests(unittest.TestCase):

@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from uuid import uuid4
 
-from config import Settings
+from webull_bot.config import Settings
 
 
 class MarketDataPermissionError(RuntimeError):

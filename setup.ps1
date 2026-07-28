@@ -104,9 +104,11 @@ if (-not (Test-Path -LiteralPath ".env")) {
     Copy-Item -LiteralPath ".env.example" -Destination ".env"
 }
 
+$env:PYTHONPATH = Join-Path $PSScriptRoot "src"
+
 Write-Host ""
 Write-Host "Setup complete."
 Write-Host "1. Edit .env and add the Webull credentials and GROQ_API_KEY."
 Write-Host "2. If 2FA is enabled: .\.webull-skill-venv\Scripts\webull-skill.exe auth"
-Write-Host "3. Run: .\.venv\Scripts\python.exe connect.py"
-Write-Host "4. Run: .\.venv\Scripts\python.exe bot.py"
+Write-Host "3. Run: `$env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m webull_bot.connect"
+Write-Host "4. Run: `$env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m webull_bot"

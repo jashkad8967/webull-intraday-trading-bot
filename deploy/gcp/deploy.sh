@@ -33,7 +33,7 @@ mkdir -p "${RELEASE_DIR}"
 tar -xzf "${ARCHIVE}" -C "${RELEASE_DIR}"
 
 if [[ ! -f "${RELEASE_DIR}/Dockerfile" ]] \
-  || [[ ! -f "${RELEASE_DIR}/compose.oracle.yaml" ]]; then
+  || [[ ! -f "${RELEASE_DIR}/deploy/compose.yaml" ]]; then
   echo "Release is missing Docker deployment files." >&2
   exit 1
 fi
@@ -45,15 +45,15 @@ fi
 
 cd "${RELEASE_DIR}"
 export BOT_IMAGE_TAG="${REVISION}"
-docker compose -f compose.oracle.yaml -p webull-bot build
+docker compose -f deploy/compose.yaml -p webull-bot build
 
-if ! docker compose -f compose.oracle.yaml -p webull-bot up -d --remove-orphans; then
+if ! docker compose -f deploy/compose.yaml -p webull-bot up -d --remove-orphans; then
   echo "New container failed to start; attempting rollback." >&2
   if [[ -n "${PREVIOUS_REVISION}" ]] \
     && [[ -d "${DEPLOY_ROOT}/releases/${PREVIOUS_REVISION}" ]]; then
     cd "${DEPLOY_ROOT}/releases/${PREVIOUS_REVISION}"
     export BOT_IMAGE_TAG="${PREVIOUS_REVISION}"
-    docker compose -f compose.oracle.yaml -p webull-bot up -d --remove-orphans
+    docker compose -f deploy/compose.yaml -p webull-bot up -d --remove-orphans
   fi
   exit 1
 fi
@@ -65,7 +65,7 @@ if [[ "$(docker inspect --format '{{.State.Running}}' webull-trading-bot 2>/dev/
     && [[ -d "${DEPLOY_ROOT}/releases/${PREVIOUS_REVISION}" ]]; then
     cd "${DEPLOY_ROOT}/releases/${PREVIOUS_REVISION}"
     export BOT_IMAGE_TAG="${PREVIOUS_REVISION}"
-    docker compose -f compose.oracle.yaml -p webull-bot up -d --remove-orphans
+    docker compose -f deploy/compose.yaml -p webull-bot up -d --remove-orphans
   fi
   exit 1
 fi
@@ -74,7 +74,7 @@ ln -sfn "${RELEASE_DIR}" "${DEPLOY_ROOT}/current.next"
 mv -Tf "${DEPLOY_ROOT}/current.next" "${DEPLOY_ROOT}/current"
 
 install -m 0750 \
-  "${RELEASE_DIR}/deploy/oracle/deploy.sh" \
+  "${RELEASE_DIR}/deploy/gcp/deploy.sh" \
   "${DEPLOY_ROOT}/bin/deploy.next"
 mv -f "${DEPLOY_ROOT}/bin/deploy.next" "${DEPLOY_ROOT}/bin/deploy"
 
