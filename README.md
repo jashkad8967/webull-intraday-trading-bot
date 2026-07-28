@@ -81,9 +81,17 @@ dashboard sell at a loss), a simultaneous-unrealized-loss circuit breaker, a
 daily realized-loss circuit breaker, stop-loss escalation for a stuck exit
 (with automatic backoff if the escalated resubmission itself fails, instead
 of retrying every single poll forever), a stall breaker that unsticks
-capital that hasn't filled in a while, and crash-safe universe loading (a
+capital that hasn't filled in a while, crash-safe universe loading (a
 screener hiccup logs a warning and falls back to the prior universe instead
-of taking the whole process down).
+of taking the whole process down), automatic order sizing up to Webull's
+100-share minimum lot for stocks priced $0.10-$0.999 (an order under that
+is rejected outright, not just slower to fill), and broker-conflict
+handling: if Webull rejects an order because its account state disagrees
+with the bot's local view of a position (e.g. `..._REVERSE_OPTION`), that
+symbol is blacklisted from further automated action for the rest of the
+day (logged under `CONFLICT`) instead of retrying an order that can't
+succeed - check the Webull app for a stuck order or unexpected position on
+that symbol.
 
 **7. Manual overrides.** The dashboard's Close All, per-position Sell, and
 watchlist-add all route through a narrow shared command file rather than

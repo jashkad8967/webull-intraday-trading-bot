@@ -418,6 +418,7 @@ class MicroScalpIntegrationTests(unittest.TestCase):
             stop_loss_escalated=set(),
             position_buckets={},
             working_orders={},
+            broker_conflict_symbols=set(),
         )
         for name in (
             "cooldown_ready",
@@ -449,6 +450,42 @@ class MicroScalpIntegrationTests(unittest.TestCase):
         result = trade_micro_scalp([], Decimal("5000"))
 
         self.assertEqual(result, Decimal("5000"))
+
+    def test_trade_micro_scalp_skips_symbols_in_broker_conflict(self):
+        """A symbol Webull has already rejected as a position conflict must
+        not get any decision/order attempts - no quote snapshot, no BUY/
+        SELL - until the conflict is manually resolved (or the day resets).
+        Position bookkeeping (held_count) still sees it, which is fine.
+        """
+        from webull_bot.bot import AutoTrader
+
+        config = Settings(micro_scalp_enabled=True, micro_scalp_symbols="TSLA")
+
+        class UntouchableApi:
+            def stock_quotes_resilient(self, symbols, category):
+                return [{"symbol": "TSLA", "bid": "89.00", "ask": "89.20"}], set()
+
+            @staticmethod
+            def stock_position(symbol, positions):
+                return Decimal("0"), Decimal("0")
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("must not evaluate a conflicted symbol")
+
+        fake_bot = SimpleNamespace(
+            config=config,
+            api=UntouchableApi(),
+            strategy=SimpleNamespace(
+                update_stock_snapshot=forbidden,
+                open_position_count=TradingStrategy.open_position_count,
+            ),
+            broker_conflict_symbols={"TSLA"},
+        )
+        trade_micro_scalp = AutoTrader.trade_micro_scalp.__get__(fake_bot)
+
+        result = trade_micro_scalp([], Decimal("10000"))
+
+        self.assertEqual(result, Decimal("10000"))
 
     def test_failed_stop_resubmission_clears_escalation_instead_of_retrying_forever(self):
         """Regression test: a stop-loss order that keeps failing (bad
@@ -503,13 +540,16 @@ class MicroScalpIntegrationTests(unittest.TestCase):
             last_trade={},
             trade_times=defaultdict(deque),
             pending_stock_exits=set(),
+            pending_option_exits=set(),
             stop_exit_submitted={},
             stop_loss_escalated={"TSLA"},
             position_buckets={},
             working_orders={},
             daily_realized_pnl=Decimal("0"),
             daily_realized_loss=Decimal("0"),
+            broker_conflict_symbols=set(),
         )
+        fake_bot.is_broker_position_conflict = AutoTrader.is_broker_position_conflict
         for name in (
             "cooldown_ready",
             "rate_capped",
@@ -517,6 +557,7 @@ class MicroScalpIntegrationTests(unittest.TestCase):
             "record_realized_exit",
             "stop_ready_to_submit",
             "trade_micro_scalp",
+            "handle_broker_conflict",
         ):
             setattr(fake_bot, name, getattr(AutoTrader, name).__get__(fake_bot))
 
@@ -796,6 +837,41 @@ class FractionalSharesTests(StrategyConfigMixin, unittest.TestCase):
         strategy = TradingStrategy(config)
 
         quantity = strategy.fractional_stock_quantity(Decimal("400.00"), Decimal("3.00"))
+
+        self.assertEqual(quantity, Decimal("0"))
+
+    def test_minimum_lot_size_requires_100_shares_between_10_cents_and_a_dollar(self):
+        self.assertEqual(TradingStrategy.minimum_lot_size(Decimal("0.05")), 1)
+        self.assertEqual(TradingStrategy.minimum_lot_size(Decimal("0.10")), 100)
+        self.assertEqual(TradingStrategy.minimum_lot_size(Decimal("0.50")), 100)
+        self.assertEqual(TradingStrategy.minimum_lot_size(Decimal("0.999")), 100)
+        self.assertEqual(TradingStrategy.minimum_lot_size(Decimal("1.00")), 1)
+        self.assertEqual(TradingStrategy.minimum_lot_size(Decimal("50.00")), 1)
+
+    def test_stock_order_quantity_rounds_up_to_100_when_affordable(self):
+        config = SimpleNamespace(stock_quantity=1, max_order_notional=Decimal("1000"))
+        strategy = TradingStrategy.__new__(TradingStrategy)
+        strategy.config = config
+
+        quantity, _ = strategy.stock_order_quantity(Decimal("0.50"), Decimal("100"))
+
+        self.assertEqual(quantity, 100)
+
+    def test_stock_order_quantity_skips_penny_stock_when_100_shares_unaffordable(self):
+        config = SimpleNamespace(stock_quantity=1, max_order_notional=Decimal("1000"))
+        strategy = TradingStrategy.__new__(TradingStrategy)
+        strategy.config = config
+
+        quantity, _ = strategy.stock_order_quantity(Decimal("0.50"), Decimal("10"))
+
+        self.assertEqual(quantity, 0)
+
+    def test_fractional_stock_quantity_skips_the_100_share_minimum_price_band(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity = strategy.fractional_stock_quantity(Decimal("0.50"), Decimal("1000"))
 
         self.assertEqual(quantity, Decimal("0"))
 
@@ -1292,6 +1368,44 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
 
         self.assertEqual(set(result), {"OLD1", "OLD2"})
         self.assertEqual(result["OLD1"]["market_value"], 1e11)
+
+
+class BrokerConflictTests(unittest.TestCase):
+    def test_is_broker_position_conflict_matches_reverse_rejection(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertTrue(
+            AutoTrader.is_broker_position_conflict(
+                RuntimeError(
+                    "HTTP Status: 417, Code: "
+                    "OAUTH_OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION, Msg: "
+                    "This order cannot be entered because it will reverse "
+                    "an existing position."
+                )
+            )
+        )
+        self.assertFalse(
+            AutoTrader.is_broker_position_conflict(RuntimeError("timeout"))
+        )
+
+    def test_handle_broker_conflict_clears_tracking_and_blacklists_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            broker_conflict_symbols=set(),
+            pending_stock_exits={"ASHR"},
+            pending_option_exits=set(),
+            stop_exit_submitted={"ASHR": 123.0},
+            stop_loss_escalated={"ASHR"},
+        )
+        handle = AutoTrader.handle_broker_conflict.__get__(fake_bot)
+
+        handle("ASHR", RuntimeError("reverse position"))
+
+        self.assertIn("ASHR", fake_bot.broker_conflict_symbols)
+        self.assertNotIn("ASHR", fake_bot.pending_stock_exits)
+        self.assertNotIn("ASHR", fake_bot.stop_exit_submitted)
+        self.assertNotIn("ASHR", fake_bot.stop_loss_escalated)
 
 
 class DashboardCommandTests(unittest.TestCase):
