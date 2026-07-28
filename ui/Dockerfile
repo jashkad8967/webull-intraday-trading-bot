@@ -7,7 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN addgroup --system dashboard \
-    && adduser --system --ingroup dashboard dashboard
+    && adduser --system --ingroup dashboard dashboard \
+    && mkdir -p /var/commands \
+    && chmod 1777 /var/commands
 
 COPY requirements.txt .
 RUN pip install --upgrade pip \

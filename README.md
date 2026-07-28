@@ -853,6 +853,22 @@ picked up on the bot's next cycle, not instantly - `POLL_SECONDS` is the
 worst-case delay. Close All and Sell both ask for a JavaScript confirmation
 before sending the request, since they submit real orders on your account.
 
+The trader and dashboard run as different non-root container users sharing
+that one volume, so both Dockerfiles pre-create `/var/commands` world-writable
+before either user is dropped into place. If you already ran
+`docker compose up` once *before* pulling this fix, Docker will have
+initialized that volume with the old, broken permissions - a plain restart
+won't pick up the corrected ones (Docker only applies an image's directory
+permissions to a named volume the first time it's used). If you see
+`CMD | queue read failed | [Errno 13] Permission denied` in the trader's
+logs, remove and let it recreate:
+
+```bash
+docker compose -f deploy/compose.yaml -p webull-bot down
+docker volume rm webull-trading-commands
+docker compose -f deploy/compose.yaml -p webull-bot up -d
+```
+
 Running via `deploy/compose.yaml`, the dashboard is bound to
 `127.0.0.1:8080` on whatever host it runs on (not exposed to the network by
 default). View it by tunneling over SSH:
