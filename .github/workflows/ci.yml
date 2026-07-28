@@ -22,7 +22,7 @@ jobs:
       - run: python -m compileall -q src tests ui
       - run: PYTHONPATH=src python -m unittest discover -v -s tests
       - run: bash -n deploy/gcp/bootstrap.sh deploy/gcp/deploy.sh
-      - run: BOT_ENV_FILE=.env.example BOT_IMAGE_TAG=ci docker compose -f deploy/compose.yaml config
+      - run: BOT_ENV_FILE="$GITHUB_WORKSPACE/.env.example" BOT_IMAGE_TAG=ci docker compose -f deploy/compose.yaml config
       - run: docker build --tag webull-intraday-trading-bot:ci .
       - run: docker build --tag webull-trading-dashboard:ci ui
 
