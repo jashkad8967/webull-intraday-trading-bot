@@ -1,4 +1,9 @@
 .env
+*.pem
+*.key
+*.key.pub
+id_rsa*
+id_ed25519*
 .venv/
 .webull-skill-venv/
 conf/
