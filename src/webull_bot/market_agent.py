@@ -357,7 +357,7 @@ class MarketResearchAgent:
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
-            max_completion_tokens=4000,
+            max_completion_tokens=8000,
             search_settings={
                 "include_domains": [
                     "finance.yahoo.com",
@@ -373,7 +373,7 @@ class MarketResearchAgent:
             },
         )
         content = response.choices[0].message.content
-        payload = self._normalize(json.loads(content), expected_symbols)
+        payload = self._normalize(self._parse_response(content), expected_symbols)
         now = time.monotonic()
         with self._lock:
             for item in payload["assessments"]:

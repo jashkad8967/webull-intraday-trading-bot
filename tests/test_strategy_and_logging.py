@@ -211,6 +211,11 @@ class BotOvertradingCapTests(unittest.TestCase):
 
 
 class ResearchDiscoveryTests(unittest.TestCase):
+    def test_empty_or_truncated_completion_does_not_raise(self):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        self.assertEqual(agent._parse_response(""), {})
+        self.assertEqual(agent._parse_response(None), {})
+
     def test_discoveries_are_normalized_for_later_broker_validation(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(agent_discovery_max_symbols=2)
