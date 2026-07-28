@@ -398,23 +398,13 @@ class WebullAPI:
             return 0.0
         return value if value == value and value not in (float("inf"), float("-inf")) else 0.0
 
-    def top_active_stocks(
-        self,
-        total_limit: int,
-        page_size: int,
-        rank_type: str = "VOLUME",
-        sort_by: str = "MARKET_VALUE",
-    ) -> dict[str, dict]:
-        """Page through Webull's most-active screener for a large, market-cap-
-        tagged stock universe (no ETFs - the screener's US_STOCK category is
-        stocks only).
+    def _page_screener(self, fetch_page, total_limit: int, page_size: int) -> dict[str, dict]:
+        """Shared pagination/parsing for Webull screener endpoints.
 
-        The SDK doesn't publish a typed response model for this endpoint, so
+        The SDK doesn't publish a typed response model for these endpoints, so
         the page-of-results and has-more-pages fields are read defensively
         across the field names Webull's own docs/SDK docstrings reference.
         """
-        from webull.data.common.category import Category
-
         results: dict[str, dict] = {}
         page_index = 1
         while len(results) < total_limit:
@@ -422,14 +412,7 @@ class WebullAPI:
             requested_size = min(page_size, remaining)
             response = self._call(
                 lambda page_index=page_index, requested_size=requested_size: (
-                    self.data.screener.get_most_active(
-                        category=Category.US_STOCK.name,
-                        rank_type=rank_type,
-                        sort_by=sort_by,
-                        direction="DESC",
-                        page_index=page_index,
-                        page_size=requested_size,
-                    )
+                    fetch_page(page_index, requested_size)
                 ),
                 "market",
             )
@@ -463,6 +446,57 @@ class WebullAPI:
                 break
             page_index += 1
         return results
+
+    def top_active_stocks(
+        self,
+        total_limit: int,
+        page_size: int,
+        rank_type: str = "VOLUME",
+        sort_by: str = "MARKET_VALUE",
+    ) -> dict[str, dict]:
+        """Page through Webull's most-active screener for a large, market-cap-
+        tagged stock universe (no ETFs - the screener's US_STOCK category is
+        stocks only).
+        """
+        from webull.data.common.category import Category
+
+        return self._page_screener(
+            lambda page_index, requested_size: self.data.screener.get_most_active(
+                category=Category.US_STOCK.name,
+                rank_type=rank_type,
+                sort_by=sort_by,
+                direction="DESC",
+                page_index=page_index,
+                page_size=requested_size,
+            ),
+            total_limit,
+            page_size,
+        )
+
+    def top_gainers(
+        self,
+        total_limit: int,
+        page_size: int,
+        rank_type: str = "DAY_1",
+    ) -> dict[str, dict]:
+        """Page through Webull's gainers screener (stocks up the most today by
+        price change), so the selection universe includes actual current
+        uptrends/momentum names rather than only high-volume names.
+        """
+        from webull.data.common.category import Category
+
+        return self._page_screener(
+            lambda page_index, requested_size: self.data.screener.get_gainers_losers(
+                rank_type=rank_type,
+                category=Category.US_STOCK.name,
+                sort_by="CHANGE_RATIO",
+                direction="DESC",
+                page_index=page_index,
+                page_size=requested_size,
+            ),
+            total_limit,
+            page_size,
+        )
 
     def historical_volatility(
         self,

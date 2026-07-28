@@ -81,6 +81,7 @@ class Settings(BaseSettings):
         ge=0,
         le=1,
     )
+    top_gainers_limit: int = Field(default=200, ge=0, le=5000)
     option_batch_size: int = Field(default=20, ge=1, le=20)
     option_discovery_per_cycle: int = Field(default=1, ge=1, le=10)
     option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)

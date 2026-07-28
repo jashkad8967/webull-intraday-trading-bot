@@ -170,6 +170,29 @@ class AutoTrader:
         )
         return ordered
 
+    def filter_with_popular_reinstated(self, candidates: list[str]) -> list[str]:
+        """Volatility-filter candidates, then re-add any configured popular
+        symbol the filter cut - so well-known names aren't silently dropped
+        just because their historical amplitude sits under the floor.
+        """
+        filtered = self.filter_by_historical_volatility(candidates)
+        available = set(candidates)
+        kept = set(filtered)
+        reinstated = [
+            symbol
+            for symbol in self.config.popular_stocks()
+            if symbol in available and symbol not in kept
+        ]
+        if reinstated:
+            log.info(
+                "LOAD   | reinstated %s popular symbols the volatility filter "
+                "would have dropped | %s",
+                len(reinstated),
+                ",".join(reinstated),
+            )
+            filtered = list(dict.fromkeys(reinstated + filtered))
+        return filtered
+
     def resolve_targets(self, moment: datetime) -> None:
         if self.resolved_date == moment.date():
             return
@@ -184,13 +207,37 @@ class AutoTrader:
                 page_size,
             )
             universe = self.api.top_active_stocks(limit, page_size)
+            if self.config.top_gainers_limit > 0:
+                gainers = self.api.top_gainers(
+                    self.config.top_gainers_limit,
+                    page_size,
+                )
+                added = sum(1 for symbol in gainers if symbol not in universe)
+                for symbol, data in gainers.items():
+                    universe.setdefault(symbol, data)
+                if added:
+                    log.info(
+                        "LOAD   | merged %s top-gainer symbols into universe",
+                        added,
+                    )
             for symbol in self.invalid_symbols.symbols:
                 universe.pop(symbol, None)
+            missing_popular = [
+                symbol
+                for symbol in self.config.popular_stocks()
+                if symbol not in universe
+            ]
+            if missing_popular:
+                log.warning(
+                    "LOAD   | popular symbols not found in screener universe "
+                    "(skipped) | %s",
+                    ",".join(missing_popular),
+                )
             self.stock_market_values = {
                 symbol: data["market_value"] for symbol, data in universe.items()
             }
             self.stock_categories = {symbol: "US_STOCK" for symbol in universe}
-            eligible = self.filter_by_historical_volatility(list(universe))
+            eligible = self.filter_with_popular_reinstated(list(universe))
             self.stock_symbols = eligible[:limit]
             self.reserve_symbols = eligible[limit:]
             large = sum(
@@ -238,6 +285,21 @@ class AutoTrader:
                     "LOAD   | added %s popular symbols outside directory cap",
                     added,
                 )
+            if self.config.top_gainers_limit > 0:
+                gainers = self.api.top_gainers(
+                    self.config.top_gainers_limit,
+                    self.config.stock_universe_page_size,
+                )
+                gainers_added = 0
+                for symbol in gainers:
+                    if symbol not in self.stock_categories:
+                        self.stock_categories[symbol] = "US_STOCK"
+                        gainers_added += 1
+                if gainers_added:
+                    log.info(
+                        "LOAD   | added %s top-gainer symbols outside directory cap",
+                        gainers_added,
+                    )
             if self.config.exclude_etfs:
                 etfs = [
                     symbol
@@ -255,7 +317,7 @@ class AutoTrader:
                 for symbol in self.stock_categories
                 if symbol not in self.invalid_symbols
             ]
-            eligible = self.filter_by_historical_volatility(eligible)
+            eligible = self.filter_with_popular_reinstated(eligible)
             self.stock_symbols = eligible[:limit]
             self.reserve_symbols = eligible[limit:]
         else:

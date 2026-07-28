@@ -712,6 +712,72 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         self.assertIn("SMALL1", batch)
         self.assertEqual(strategy.selection_bucket("SMALL1"), "HELD")
 
+    def test_top_gainers_pages_using_change_ratio_screener(self):
+        api = WebullAPI.__new__(WebullAPI)
+        fake_category = SimpleNamespace(US_STOCK=SimpleNamespace(name="US_STOCK"))
+        calls = []
+
+        def fake_call(callback, group):
+            calls.append(group)
+            return callback()
+
+        def fake_get_gainers_losers(**kwargs):
+            self.assertEqual(kwargs["sort_by"], "CHANGE_RATIO")
+            self.assertEqual(kwargs["direction"], "DESC")
+            if kwargs["page_index"] == 1:
+                return [{"symbol": "mover1", "market_value": "5e9", "change_ratio": "12.5"}]
+            return []
+
+        api._call = fake_call
+        api.data = SimpleNamespace(
+            screener=SimpleNamespace(get_gainers_losers=fake_get_gainers_losers)
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"webull.data.common.category": SimpleNamespace(Category=fake_category)},
+        ):
+            gainers = api.top_gainers(total_limit=10, page_size=5)
+
+        self.assertEqual(set(gainers), {"MOVER1"})
+        self.assertEqual(gainers["MOVER1"]["change_ratio"], 12.5)
+        self.assertTrue(all(call == "market" for call in calls))
+
+    def test_filter_with_popular_reinstated_keeps_configured_names(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            popular_stocks=lambda: ["AAPL", "MSFT"],
+        )
+        # Simulate the volatility filter dropping the two well-known,
+        # lower-amplitude names while keeping an obscure volatile one.
+        fake_bot.filter_by_historical_volatility = lambda candidates: [
+            symbol for symbol in candidates if symbol not in ("AAPL", "MSFT")
+        ]
+        reinstate = AutoTrader.filter_with_popular_reinstated.__get__(fake_bot)
+
+        result = reinstate(["AAPL", "MSFT", "OBSCUREVOL", "OBSCUREFLAT"])
+
+        self.assertEqual(
+            result,
+            ["AAPL", "MSFT", "OBSCUREVOL", "OBSCUREFLAT"],
+        )
+
+    def test_filter_with_popular_reinstated_does_not_add_unavailable_symbols(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            popular_stocks=lambda: ["NOTINUNIVERSE"],
+        )
+        fake_bot.filter_by_historical_volatility = lambda candidates: list(candidates)
+        reinstate = AutoTrader.filter_with_popular_reinstated.__get__(fake_bot)
+
+        result = reinstate(["ONE", "TWO"])
+
+        self.assertEqual(result, ["ONE", "TWO"])
+
 
 if __name__ == "__main__":
     unittest.main()

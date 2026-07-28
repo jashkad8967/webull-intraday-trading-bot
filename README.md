@@ -126,15 +126,28 @@ POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
 STOCK_POPULAR_CAPITAL_FRACTION=0.70
 STOCK_PENNY_CAPITAL_FRACTION=0.10
 STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
+TOP_GAINERS_LIMIT=200
 ```
 
 The bot downloads at most `MAX_SYMBOLS` directory entries from Webull in
 bounded pages at the start of each trading day and keeps each instrument's
 required `US_STOCK` or `US_ETF` category. It separately resolves and adds every
 valid configured popular symbol, so those names cannot be lost because of the
-directory cap. Research discoveries are accepted only when they exist in this
-combined universe. For compatibility with existing deployments,
-`MAX_SYMBOLS=0` now also uses the safe 500-symbol cap.
+directory cap. It also merges in `TOP_GAINERS_LIMIT` symbols from Webull's
+today's-top-gainers screener (ranked by actual price change, not just volume),
+so stocks that are genuinely trending up right now are part of the universe
+too - not only whatever happens to be most heavily traded. Research
+discoveries are accepted only when they exist in this combined universe. For
+compatibility with existing deployments, `MAX_SYMBOLS=0` now also uses the
+safe 500-symbol cap.
+
+`HISTORICAL_VOLATILITY_FILTER_ENABLED` can still drop a configured popular
+symbol if its recent amplitude sits under `MIN_HISTORICAL_VOLATILITY_PERCENT`
+(common for calmer large-caps) - the bot reinstates any such symbol that was
+actually present in the downloaded universe, logging
+`LOAD | reinstated N popular symbols the volatility filter would have
+dropped`, so a name you explicitly configured never silently disappears from
+trading just because of a volatility score.
 
 Each batch always includes held stocks, then targets 70% popular/liquid names,
 10% stocks below `PENNY_STOCK_MAX_PRICE`, and 20% rotating discovery. The
@@ -187,16 +200,32 @@ STOCK_UNIVERSE_PAGE_SIZE=500
 EXCLUDE_ETFS=true
 HISTORICAL_VOLATILITY_FILTER_ENABLED=true
 MIN_HISTORICAL_VOLATILITY_PERCENT=3
+TOP_GAINERS_LIMIT=200
 ```
 
 With this enabled, `STOCK_SYMBOLS=ALL` downloads the universe from Webull's
-screener (stocks only, no ETFs) in pages of `STOCK_UNIVERSE_PAGE_SIZE` up to
-`MAX_SYMBOLS` total, ranked by market value, and keeps paging through
-subsequent pages until either the page limit or `MAX_SYMBOLS` is reached. Raise
-`MAX_SYMBOLS` above 500 (e.g. 750-1000) and set `STOCK_UNIVERSE_PAGE_SIZE=500`
-to load more than 500 stocks, 500 per request. Every symbol still has to pass
-the existing `HISTORICAL_VOLATILITY_FILTER_ENABLED` volatility screen, so only
-volatile names are kept regardless of cap size.
+most-active screener (stocks only, no ETFs) in pages of
+`STOCK_UNIVERSE_PAGE_SIZE` up to `MAX_SYMBOLS` total, ranked by market value,
+and keeps paging through subsequent pages until either the page limit or
+`MAX_SYMBOLS` is reached. It then merges in `TOP_GAINERS_LIMIT` symbols from
+Webull's today's-top-gainers screener (ranked by actual price change) that
+weren't already in the most-active list, so stocks that are genuinely up big
+today are part of the selectable universe even if they aren't among the
+highest-volume names. Raise `MAX_SYMBOLS` above 500 (e.g. 750-1000) and set
+`STOCK_UNIVERSE_PAGE_SIZE=500` to load more than 500 stocks, 500 per request.
+
+Every symbol still has to pass the existing
+`HISTORICAL_VOLATILITY_FILTER_ENABLED` volatility screen, so only volatile
+names are kept regardless of cap size - except any symbol you've explicitly
+listed in `POPULAR_STOCK_SYMBOLS` that was present in the downloaded universe
+but got cut by that filter (common for well-known large-caps with calmer
+historical amplitude): the bot reinstates it, logging `LOAD | reinstated N
+popular symbols the volatility filter would have dropped`. This is also why
+you should always see your explicitly configured names trading somewhere in
+the universe - if one is missing entirely, check the startup log for `LOAD |
+popular symbols not found in screener universe (skipped)`, which means Webull's
+screener response didn't include that symbol at all that day (rare for a
+liquid name, but not impossible).
 
 Symbols at or above `STOCK_LARGE_CAP_MIN_MARKET_VALUE` are tagged `LARGE_CAP`;
 everything else is `SMALL_CAP`. Buying power is reserved 80/20 between the two
@@ -860,6 +889,7 @@ POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
 STOCK_POPULAR_CAPITAL_FRACTION=0.70
 STOCK_PENNY_CAPITAL_FRACTION=0.10
 STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
+TOP_GAINERS_LIMIT=200
 MARKET_CAP_ALLOCATION_ENABLED=false
 STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
 STOCK_LARGE_CAP_CAPITAL_FRACTION=0.80
