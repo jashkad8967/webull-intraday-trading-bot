@@ -359,7 +359,7 @@ class MarketResearchAgent:
                     {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
-                max_completion_tokens=3000,
+                max_completion_tokens=4096,
                 search_settings={
                     "include_domains": [
                         "finance.yahoo.com",
@@ -389,6 +389,18 @@ class MarketResearchAgent:
         parsed = self._parse_response(content)
         raw_assessments = parsed.get("assessments") if isinstance(parsed, dict) else None
         if expected_symbols and not raw_assessments:
+            if include_discovery:
+                # An agentic/tool-using model can spend its whole completion
+                # budget on the discovery web search, leaving nothing for the
+                # (more important) per-symbol assessments - drop discovery
+                # and retry once, the same way an oversized-request 413 does.
+                self.log.warning(
+                    "AGENT  | model returned no assessments with discovery "
+                    "enabled | retrying assessment-only this cycle | raw=%s",
+                    json.dumps(parsed, separators=(",", ":"))[:300],
+                )
+                self._research(state, include_discovery=False)
+                return
             self.log.warning(
                 "AGENT  | model returned no real assessments for %s "
                 "requested symbols; falling back to conservative defaults | "
