@@ -133,11 +133,6 @@ class MarketResearchAgent:
             return default
 
     @staticmethod
-    def _text(value, default: str) -> str:
-        text = str(value or "").strip()
-        return text[:500] if text else default
-
-    @staticmethod
     def _extract_json_object(content: str) -> str | None:
         depth = 0
         start = None
@@ -231,9 +226,6 @@ class MarketResearchAgent:
                     "exit_bias": self._number(
                         raw.get("exit_bias"), -1, 1, 0
                     ),
-                    "summary": self._text(
-                        raw.get("summary"), "No usable research summary."
-                    ),
                 }
 
         for symbol in expected_symbols - by_symbol.keys():
@@ -251,7 +243,6 @@ class MarketResearchAgent:
                 "downside_risk": 1,
                 "liquidity_risk": 1,
                 "exit_bias": 0,
-                "summary": "No assessment returned; conservative defaults used.",
             }
 
         discoveries = []
@@ -280,17 +271,10 @@ class MarketResearchAgent:
                         "confidence": self._number(
                             raw.get("confidence"), 0, 1, 0
                         ),
-                        "reason": self._text(
-                            raw.get("reason"),
-                            "No discovery rationale returned.",
-                        ),
                     }
                 )
 
         return {
-            "market_summary": self._text(
-                payload.get("market_summary"), "No usable market summary."
-            ),
             "market_direction": self._number(
                 payload.get("market_direction"), -1, 1, 0
             ),
@@ -337,23 +321,21 @@ class MarketResearchAgent:
             "TASK B assessments: assess every symbol in STATE. Use its price, "
             "chg (change ratio), vol (volume), spread. Reward repeatable, "
             "liquid movement; penalize wide spreads, thin volume, stale quotes.\n"
+            "Numeric fields only, no free text anywhere in the response.\n"
             "JSON fields: market_direction(-1..1), market_volatility(0..1), "
             "assessments[], discoveries[].\n"
             "discovery: symbol, popularity(0..1), symbol_volatility(0..1), "
-            "confidence(0..1), reason.\n"
+            "confidence(0..1).\n"
             "assessment (one per STATE symbol): symbol, priority(0..1), "
             "spread_opportunity(0..1), confidence(0..1), quick_trade_score(0..1), "
             "symbol_volatility(0..1), news_sentiment(-1..1), "
             "catalyst_strength(-1..1), expected_move_percent(signed), "
             "horizon_minutes(1..390), downside_risk(0..1), liquidity_risk(0..1), "
-            "exit_bias(-1..1), summary (10 words max). exit_bias guides "
-            "holders: negative to de-risk/exit now (fading catalyst, rising "
-            "halt/dilution/reversal risk), positive when a fresh strong "
-            "catalyst supports holding for a larger move; 0 when neutral. "
-            "Never omit fields; use neutral values with low confidence when "
-            "evidence is thin. Keep every text field (summary, reason) to "
-            "10 words or fewer - numeric fields only, no explanations "
-            "beyond that.\nSTATE:"
+            "exit_bias(-1..1). exit_bias guides holders: negative to "
+            "de-risk/exit now (fading catalyst, rising halt/dilution/reversal "
+            "risk), positive when a fresh strong catalyst supports holding for "
+            "a larger move; 0 when neutral. Never omit fields; use neutral "
+            "values with low confidence when evidence is thin.\nSTATE:"
             + json.dumps(state, separators=(",", ":"), default=str)
         )
         self.log.info(
@@ -377,7 +359,7 @@ class MarketResearchAgent:
                     {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
-                max_completion_tokens=8000,
+                max_completion_tokens=3000,
                 search_settings={
                     "include_domains": [
                         "finance.yahoo.com",
@@ -404,7 +386,17 @@ class MarketResearchAgent:
                 return
             raise
         content = response.choices[0].message.content
-        payload = self._normalize(self._parse_response(content), expected_symbols)
+        parsed = self._parse_response(content)
+        raw_assessments = parsed.get("assessments") if isinstance(parsed, dict) else None
+        if expected_symbols and not raw_assessments:
+            self.log.warning(
+                "AGENT  | model returned no real assessments for %s "
+                "requested symbols; falling back to conservative defaults | "
+                "raw=%s",
+                len(expected_symbols),
+                json.dumps(parsed, separators=(",", ":"))[:300],
+            )
+        payload = self._normalize(parsed, expected_symbols)
         now = time.monotonic()
         with self._lock:
             for item in payload["assessments"]:

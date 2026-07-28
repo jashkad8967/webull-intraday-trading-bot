@@ -976,6 +976,22 @@ class WebullAPI:
                 side = "SELL" if quantity > 0 else "BUY"
                 intent = "SELL_TO_CLOSE" if quantity > 0 else "BUY_TO_CLOSE"
                 quote = self.option_quote(contract["symbol"])
+                average_cost = Decimal(str(position.get("cost_price") or "0"))
+                market_price = self.quote_price(quote)
+                loss_exit = (
+                    quantity > 0
+                    and average_cost > 0
+                    and market_price < average_cost
+                ) or (
+                    quantity < 0
+                    and average_cost > 0
+                    and market_price > average_cost
+                )
+                if loss_exit and loss_callback:
+                    loss_callback(
+                        contract["underlying_symbol"],
+                        "option loss closeout submitted",
+                    )
                 limit_price = self.option_limit_price(quote, side)
                 submitted.append(
                     self.place_option(

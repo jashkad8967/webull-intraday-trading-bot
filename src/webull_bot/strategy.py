@@ -472,6 +472,11 @@ class TradingStrategy:
         trend = self.trend_signal(key, price)
         if quantity > 0:
             target = average_cost + self.config.option_take_profit_price
+            stop = average_cost * (
+                Decimal("1") - self.config.option_stop_loss_percent
+            )
+            if average_cost > 0 and price <= stop:
+                return Decision("LOSS", "option percentage stop reached", price)
             if average_cost > 0 and price >= target:
                 return Decision("PROFIT", "option profit target reached", target)
             return Decision("HOLD", "option waiting for profit", target)

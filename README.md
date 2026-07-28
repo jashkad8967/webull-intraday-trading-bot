@@ -262,6 +262,7 @@ STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 OPTION_TAKE_PROFIT_PRICE=0.01
+OPTION_STOP_LOSS_PERCENT=0.50
 ```
 
 `STOCK_ENTRY_MAX_EXTENSION_PERCENT` blocks a fresh entry when price is
@@ -320,7 +321,7 @@ AGENT_CORE_RESEARCH_SECONDS=120
 AGENT_EXTENDED_RESEARCH_SECONDS=622
 AGENT_DAILY_REQUEST_LIMIT=250
 AGENT_MAX_SYMBOLS=5
-AGENT_DISCOVERY_MAX_SYMBOLS=10
+AGENT_DISCOVERY_MAX_SYMBOLS=5
 AGENT_TIMEOUT_SECONDS=60
 LOSS_CIRCUIT_BREAKER_ENABLED=true
 LOSS_SPREE_POSITION_COUNT=3
@@ -359,12 +360,34 @@ it is executable.
 ### Loss-spree circuit breaker
 
 The optional portfolio circuit breaker liquidates all positions when at least
-`LOSS_SPREE_POSITION_COUNT` positions are losing and their combined loss
-reaches `LOSS_SPREE_TOTAL_DOLLARS`.
+`LOSS_SPREE_POSITION_COUNT` positions are losing *at the same time* and their
+combined unrealized loss reaches `LOSS_SPREE_TOTAL_DOLLARS`.
 
 After liquidation, entries remain paused for at least
 `LOSS_REEVALUATION_SECONDS`. This rule is deterministic and does not wait for
 Groq.
+
+### Daily loss circuit breaker
+
+The loss-spree breaker above only looks at positions losing *simultaneously*
+right now — a string of small stop-losses taken one at a time, each below
+that threshold, never trips it. `DAILY_LOSS_CIRCUIT_BREAKER_ENABLED` (default
+`false`) adds a second, independent check: once the running total of
+realized stop-loss exits for the day reaches `DAILY_MAX_LOSS_DOLLARS`
+(estimated from each exit's submitted price, not the eventual fill), the bot
+liquidates everything and halts new entries for the rest of the trading day —
+it does not auto-resume like the loss-spree breaker does. Set
+`DAILY_MAX_LOSS_DOLLARS` to a figure that makes sense for your account size;
+it has no safe universal default.
+
+### Stop-loss escalation
+
+Stop-loss exits price at the bid/ask midpoint rather than crossing the
+spread, trading a slightly slower fill for a better price. If that order
+hasn't filled within `STOP_LOSS_ESCALATE_SECONDS` (15s default), it's
+cancelled and resubmitted at an aggressive, spread-crossing price instead —
+a stop that never fills while price keeps falling defeats the entire point
+of having one.
 
 ### Stall breaker
 
@@ -408,11 +431,21 @@ percent times `STOCK_TARGET_STOP_MULTIPLE` (default 1.2×) — so reward:risk
 scales with volatility instead of staying fixed while the stop moves. For
 options, `OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one
 premium cent above average cost, normally $1 per standard 100-share contract
-before fees. A profit or stop order remains subject to its limit being filled.
+before fees. Options also stop out at `OPTION_STOP_LOSS_PERCENT` (50% of
+premium by default) — unlike stocks, there was previously no automatic loss
+cut on an option position at all, so a losing contract could only be closed
+by the end-of-day sweep. A profit or stop order remains subject to its limit
+being filled.
 
-When a stock loss exit is submitted, the symbol is persisted in
-`conf/wash_sale_blocks.json` and blocked from new purchases for 60 calendar
-days. This is a conservative same-symbol control, not a tax determination.
+When a stock *or option* loss exit is submitted (options block by their
+underlying symbol), it's persisted in `conf/wash_sale_blocks.json` and
+blocked from new purchases — of the stock or a new option on it — for 60
+calendar days, well past the 30-day IRS wash-sale window. This is a
+conservative same-underlying control, not a tax determination: it has no
+visibility into manual trades, other accounts, or IRAs, and it doesn't
+attempt the "substantially identical security" analysis for deep-ITM options
+that real tax software would. It only guards against the bot's own trading
+creating a wash sale.
 
 The end-of-day closeout is the exception: it cancels working profit orders and
 closes remaining positions before market close, which can realize a loss.
@@ -470,6 +503,7 @@ ACCOUNT_REQUESTS_PER_SECOND=0.8
 ORDER_REQUESTS_PER_MINUTE=480
 ORDER_TIMEOUT_SECONDS=120
 ORDER_MONITOR_SECONDS=5
+STOP_LOSS_ESCALATE_SECONDS=15
 STALL_BREAKER_ENABLED=true
 STALL_BREAKER_SECONDS=120
 STALL_BREAKER_MIN_PROFIT=0.01
@@ -779,6 +813,7 @@ STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 OPTION_TAKE_PROFIT_PRICE=0.01
+OPTION_STOP_LOSS_PERCENT=0.50
 MARKET_REQUESTS_PER_MINUTE=240
 OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
 STOCK_INSTRUMENT_REQUESTS_PER_30_SECONDS=9
@@ -786,6 +821,7 @@ ACCOUNT_REQUESTS_PER_SECOND=0.8
 ORDER_REQUESTS_PER_MINUTE=480
 ORDER_TIMEOUT_SECONDS=120
 ORDER_MONITOR_SECONDS=5
+STOP_LOSS_ESCALATE_SECONDS=15
 STALL_BREAKER_ENABLED=true
 STALL_BREAKER_SECONDS=120
 STALL_BREAKER_MIN_PROFIT=0.01
@@ -797,12 +833,14 @@ AGENT_CORE_RESEARCH_SECONDS=120
 AGENT_EXTENDED_RESEARCH_SECONDS=622
 AGENT_DAILY_REQUEST_LIMIT=250
 AGENT_MAX_SYMBOLS=5
-AGENT_DISCOVERY_MAX_SYMBOLS=10
+AGENT_DISCOVERY_MAX_SYMBOLS=5
 AGENT_TIMEOUT_SECONDS=60
 LOSS_CIRCUIT_BREAKER_ENABLED=false
 LOSS_SPREE_POSITION_COUNT=3
 LOSS_SPREE_TOTAL_DOLLARS=1.00
 LOSS_REEVALUATION_SECONDS=120
+DAILY_LOSS_CIRCUIT_BREAKER_ENABLED=false
+DAILY_MAX_LOSS_DOLLARS=50
 
 TRADING_TIMEZONE=America/New_York
 MARKET_OPEN_TIME=04:00

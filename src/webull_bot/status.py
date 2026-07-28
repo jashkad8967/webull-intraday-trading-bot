@@ -42,6 +42,8 @@ class StatusWriter:
         paused: bool,
         stock_count: int,
         option_count: int,
+        realized_pnl_today: Decimal = Decimal("0"),
+        unrealized_pnl_total: Decimal = Decimal("0"),
     ) -> None:
         payload = {
             "updated_at": time.time(),
@@ -53,6 +55,11 @@ class StatusWriter:
             "agent": agent_summary,
             "universe": {"stocks": stock_count, "options": option_count},
             "recent_trades": list(self.trades),
+            "pnl_today": {
+                "realized": str(realized_pnl_today),
+                "unrealized": str(unrealized_pnl_total),
+                "total": str(realized_pnl_today + unrealized_pnl_total),
+            },
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")

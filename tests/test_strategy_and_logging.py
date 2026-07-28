@@ -1,6 +1,7 @@
 import logging
 import shutil
 import unittest
+import unittest.mock
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -35,6 +36,8 @@ class StrategyConfigMixin:
             stock_target_stop_multiple=Decimal("1.2"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
+            option_take_profit_price=Decimal("0.01"),
+            option_stop_loss_percent=Decimal("0.50"),
             agent_exit_influence_enabled=True,
             agent_exit_min_confidence=Decimal("0.60"),
             agent_runner_bias_threshold=Decimal("0.50"),
@@ -186,6 +189,60 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(decision.action, "LOSS")
 
+    def test_option_decision_cuts_loss_before_it_reaches_zero(self):
+        strategy = TradingStrategy(self.config())
+        decision = strategy.option_decision(
+            "OPTION:TEST260101C00100000",
+            Decimal("0.40"),
+            5,
+            Decimal("1.00"),
+        )
+        self.assertEqual(decision.action, "LOSS")
+
+    def test_option_decision_holds_above_stop_and_below_target(self):
+        strategy = TradingStrategy(self.config())
+        decision = strategy.option_decision(
+            "OPTION:TEST260101C00100000",
+            Decimal("0.90"),
+            5,
+            Decimal("1.00"),
+        )
+        self.assertEqual(decision.action, "HOLD")
+
+
+class StopLossEscalationTests(unittest.TestCase):
+    def test_escalated_stop_bypasses_cooldown_after_cancel(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(trade_cooldown_seconds=Decimal("30")),
+            last_trade={"STOCK:X": 0.0},
+            pending_stock_exits=set(),
+            stop_loss_escalated=set(),
+        )
+        fake_bot.cooldown_ready = AutoTrader.cooldown_ready.__get__(fake_bot)
+        ready = AutoTrader.stop_ready_to_submit.__get__(fake_bot)
+        # Not yet escalated and cooldown hasn't elapsed: must wait.
+        with unittest.mock.patch("time.monotonic", return_value=10.0):
+            self.assertFalse(ready("STOCK:X", "X"))
+        # Escalated: resubmit immediately even though the cooldown clock
+        # (timed from the original, now-cancelled order) hasn't elapsed.
+        fake_bot.stop_loss_escalated.add("X")
+        with unittest.mock.patch("time.monotonic", return_value=10.0):
+            self.assertTrue(ready("STOCK:X", "X"))
+
+    def test_pending_exit_always_blocks_regardless_of_escalation(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(trade_cooldown_seconds=Decimal("30")),
+            last_trade={},
+            pending_stock_exits={"X"},
+            stop_loss_escalated={"X"},
+        )
+        ready = AutoTrader.stop_ready_to_submit.__get__(fake_bot)
+        self.assertFalse(ready("STOCK:X", "X"))
+
 
 class BotOvertradingCapTests(unittest.TestCase):
     def test_rate_capped_blocks_after_configured_trades_per_hour(self):
@@ -220,6 +277,58 @@ class BotOvertradingCapTests(unittest.TestCase):
             fake_bot.trade_times[key].append(0.0)
         self.assertFalse(rate_capped(key))
 
+    def test_record_realized_exit_tracks_pnl_and_loss_separately(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            daily_realized_pnl=Decimal("0"),
+            daily_realized_loss=Decimal("0"),
+        )
+        record = AutoTrader.record_realized_exit.__get__(fake_bot)
+        record(Decimal("100"), Decimal("101"), 10)
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("10"))
+        self.assertEqual(fake_bot.daily_realized_loss, Decimal("0"))
+        record(Decimal("50"), Decimal("49"), 5)
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("5"))
+        self.assertEqual(fake_bot.daily_realized_loss, Decimal("5"))
+
+    def test_daily_loss_breaker_triggers_once_threshold_is_reached(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                daily_loss_circuit_breaker_enabled=True,
+                daily_max_loss_dollars=Decimal("50"),
+            ),
+            daily_loss_breaker_triggered=False,
+            daily_realized_loss=Decimal("10"),
+            api=SimpleNamespace(close_all_positions=lambda loss_callback=None: []),
+            wash_sales=SimpleNamespace(block=lambda *a, **k: None),
+            last_account_refresh=0.0,
+        )
+        handle = AutoTrader.handle_daily_loss_breaker.__get__(fake_bot)
+        self.assertFalse(handle())
+        fake_bot.daily_realized_loss = Decimal("60")
+        self.assertTrue(handle())
+        self.assertTrue(fake_bot.daily_loss_breaker_triggered)
+        # Stays tripped even if realized loss is later read as lower.
+        fake_bot.daily_realized_loss = Decimal("0")
+        self.assertTrue(handle())
+
+    def test_daily_loss_breaker_disabled_by_default_behavior(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                daily_loss_circuit_breaker_enabled=False,
+                daily_max_loss_dollars=Decimal("50"),
+            ),
+            daily_loss_breaker_triggered=False,
+            daily_realized_loss=Decimal("999"),
+        )
+        handle = AutoTrader.handle_daily_loss_breaker.__get__(fake_bot)
+        self.assertFalse(handle())
+
 
 class ResearchDiscoveryTests(unittest.TestCase):
     def test_empty_or_truncated_completion_does_not_raise(self):
@@ -246,7 +355,6 @@ class ResearchDiscoveryTests(unittest.TestCase):
                         "popularity": 2,
                         "symbol_volatility": 0.8,
                         "confidence": 0.9,
-                        "reason": "Current volume and catalyst",
                     },
                     {"symbol": "not a ticker"},
                 ]
@@ -319,6 +427,36 @@ class StopExitPricingTests(unittest.TestCase):
         api = WebullAPI.__new__(WebullAPI)
         with self.assertRaises(QuoteUnavailableError):
             api.stock_stop_exit_price({"bid": "0", "ask": "99.20"})
+
+    def test_close_all_positions_flags_option_losses_for_wash_sale(self):
+        api = WebullAPI.__new__(WebullAPI)
+        contract = {
+            "symbol": "AAPL260101C00200000",
+            "underlying_symbol": "AAPL",
+            "strike_price": "200",
+            "expiration_date": "2026-01-01",
+            "option_type": "CALL",
+        }
+        api.positions = lambda: [
+            {
+                "instrument_type": "OPTION",
+                "symbol": "AAPL260101C00200000",
+                "quantity": "2",
+                "cost_price": "5.00",
+            }
+        ]
+        api.cancel_all_orders = lambda: []
+        api.contract_from_position = lambda position: contract
+        api.option_quote = lambda symbol: {"bid": "3.00", "ask": "3.20", "price": "3.10"}
+        api.option_limit_price = lambda quote, side: Decimal("3.00")
+        api.place_option = lambda *a, **k: "order-123"
+
+        losses = []
+        submitted = api.close_all_positions(
+            loss_callback=lambda symbol, reason: losses.append((symbol, reason))
+        )
+        self.assertEqual(submitted, ["order-123"])
+        self.assertEqual(losses, [("AAPL", "option loss closeout submitted")])
 
 
 class PayloadSizingTests(unittest.TestCase):

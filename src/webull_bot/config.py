@@ -122,6 +122,10 @@ class Settings(BaseSettings):
         le=Decimal("0.20"),
     )
     option_take_profit_price: Decimal = Field(default=Decimal("0.01"), ge=0)
+    option_stop_loss_percent: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    stop_loss_escalate_seconds: int = Field(default=15, ge=5, le=120)
+    daily_loss_circuit_breaker_enabled: bool = False
+    daily_max_loss_dollars: Decimal = Field(default=Decimal("50"), gt=0)
     market_requests_per_minute: int = Field(default=240, ge=1, le=300)
     option_instrument_requests_per_minute: int = Field(default=45, ge=1, le=60)
     stock_instrument_requests_per_30_seconds: int = Field(default=9, ge=1, le=10)
