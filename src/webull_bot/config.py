@@ -142,7 +142,7 @@ class Settings(BaseSettings):
     agent_extended_research_seconds: int = Field(default=622, ge=15, le=3600)
     agent_daily_request_limit: int = Field(default=250, ge=1, le=250)
     agent_max_symbols: int = Field(default=5, ge=1, le=50)
-    agent_discovery_max_symbols: int = Field(default=10, ge=1, le=25)
+    agent_discovery_max_symbols: int = Field(default=5, ge=1, le=25)
     agent_timeout_seconds: int = Field(default=60, ge=5, le=180)
     agent_exit_influence_enabled: bool = True
     agent_exit_min_confidence: Decimal = Field(
