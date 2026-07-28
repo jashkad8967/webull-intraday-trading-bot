@@ -54,6 +54,20 @@
   .neg { color: var(--red); }
   .empty { color: var(--muted); font-size: 0.82rem; padding: 0.5rem 0; }
   .pill { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 999px; font-size: 0.68rem; border: 1px solid var(--border); color: var(--muted); }
+  .logs {
+    background: #0a0d13;
+    color: #c9d1d9;
+    border-radius: 8px;
+    padding: 0.6rem 0.75rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+    line-height: 1.45;
+    max-height: 22rem;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .panel.wide { grid-column: 1 / -1; }
 </style>
 </head>
 <body>
@@ -61,6 +75,7 @@
 
   <div class="grid">
     <div class="stat"><div class="label">Buying Power</div><div class="value" id="buying-power">—</div></div>
+    <div class="stat"><div class="label">P&L Today</div><div class="value" id="pnl-today">—</div></div>
     <div class="stat"><div class="label">Open Positions</div><div class="value" id="position-count">—</div></div>
     <div class="stat"><div class="label">Universe</div><div class="value" id="universe">—</div></div>
     <div class="stat"><div class="label">Last Update</div><div class="value" id="last-update">—</div></div>
@@ -72,7 +87,7 @@
       <div id="positions"></div>
     </div>
     <div class="panel">
-      <h2>Recent Trades</h2>
+      <h2>Recent Trades (Buy / Sell Price)</h2>
       <div id="trades"></div>
     </div>
     <div class="panel">
@@ -82,6 +97,10 @@
     <div class="panel">
       <h2>Research Agent</h2>
       <div id="agent"></div>
+    </div>
+    <div class="panel wide">
+      <h2>Live Logs</h2>
+      <div class="logs" id="logs"></div>
     </div>
   </div>
 
@@ -123,6 +142,10 @@ async function refresh() {
     dot.className = "dot " + (data.paused ? "paused" : "live");
     document.getElementById("mode-badge").textContent = data.mode ? `mode=${data.mode}` + (data.paused ? " · PAUSED" : "") : "";
     document.getElementById("buying-power").textContent = fmtMoney(data.buying_power);
+    const pnl = data.pnl_today || {};
+    const pnlEl = document.getElementById("pnl-today");
+    pnlEl.textContent = fmtMoney(pnl.total ?? 0);
+    pnlEl.className = "value " + pnlClass(pnl.total ?? 0);
     document.getElementById("position-count").textContent = (data.positions || []).length;
     const universe = data.universe || {};
     document.getElementById("universe").textContent = `${universe.stocks ?? 0} stocks / ${universe.options ?? 0} options`;
@@ -143,7 +166,7 @@ async function refresh() {
       { label: "Type", render: r => r.instrument_type },
       { label: "Action", render: r => r.action },
       { label: "Symbol", render: r => r.symbol },
-      { label: "Limit", render: r => r.limit_price ? fmtMoney(r.limit_price) : "—" },
+      { label: "Price", render: r => r.limit_price ? fmtMoney(r.limit_price) : "—" },
     ], data.recent_trades);
 
     document.getElementById("watchlist").innerHTML = table([
@@ -169,8 +192,24 @@ async function refresh() {
   }
 }
 
+async function refreshLogs() {
+  const box = document.getElementById("logs");
+  const stickToBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+  try {
+    const res = await fetch("/api/logs?lines=300", { cache: "no-store" });
+    const data = await res.json();
+    const lines = data.lines || [];
+    box.textContent = lines.length ? lines.join("\n") : "Waiting for log output…";
+    if (stickToBottom) box.scrollTop = box.scrollHeight;
+  } catch (err) {
+    // leave whatever was last shown
+  }
+}
+
 refresh();
+refreshLogs();
 setInterval(refresh, 2000);
+setInterval(refreshLogs, 3000);
 </script>
 </body>
 </html>

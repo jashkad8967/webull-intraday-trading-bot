@@ -703,6 +703,27 @@ class WebullAPI:
             rounding=ROUND_UP,
         )
 
+    def stock_stop_exit_price(self, quote: dict) -> Decimal:
+        """Midpoint sell limit for a stop-loss exit.
+
+        Deliberately gentler than stock_limit_price's SELL side (which
+        crosses below the bid to guarantee a fill for closeouts): a
+        stop-loss should cap the loss precisely rather than chase an
+        immediate fill, since overshooting the bid on a fast-moving or
+        thin quote is what turns a bounded stop into a much larger loss.
+        """
+        bid = self._quote_decimal(quote, "bid")
+        ask = self._quote_decimal(quote, "ask")
+        if not bid or not ask or bid > ask:
+            raise QuoteUnavailableError(
+                "stock quote has no valid bid/ask spread for a stop exit"
+            )
+        price = (bid + ask) / 2
+        return max(Decimal("0.01"), price).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_DOWN,
+        )
+
     def option_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.option_limit_offset
         if side == "BUY":
@@ -955,6 +976,22 @@ class WebullAPI:
                 side = "SELL" if quantity > 0 else "BUY"
                 intent = "SELL_TO_CLOSE" if quantity > 0 else "BUY_TO_CLOSE"
                 quote = self.option_quote(contract["symbol"])
+                average_cost = Decimal(str(position.get("cost_price") or "0"))
+                market_price = self.quote_price(quote)
+                loss_exit = (
+                    quantity > 0
+                    and average_cost > 0
+                    and market_price < average_cost
+                ) or (
+                    quantity < 0
+                    and average_cost > 0
+                    and market_price > average_cost
+                )
+                if loss_exit and loss_callback:
+                    loss_callback(
+                        contract["underlying_symbol"],
+                        "option loss closeout submitted",
+                    )
                 limit_price = self.option_limit_price(quote, side)
                 submitted.append(
                     self.place_option(

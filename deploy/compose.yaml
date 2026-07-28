@@ -32,6 +32,8 @@ services:
     restart: unless-stopped
     environment:
       STATUS_FILE: /var/data/status.json
+      LOG_DIRECTORY: /var/data/logs
+      TRADING_TIMEZONE: America/New_York
       TZ: America/New_York
     volumes:
       - trading-data:/var/data:ro

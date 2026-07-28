@@ -75,7 +75,9 @@ class Settings(BaseSettings):
     max_open_positions: int = Field(default=5, ge=1)
     max_order_notional: Decimal = Field(default=Decimal("1000"), gt=0)
 
-    poll_seconds: Decimal = Field(default=Decimal("1"), ge=Decimal("1"), le=Decimal("3600"))
+    poll_seconds: Decimal = Field(
+        default=Decimal("1"), ge=Decimal("0.25"), le=Decimal("3600")
+    )
     trade_cooldown_seconds: Decimal = Field(default=Decimal("30"), ge=0, le=Decimal("21600"))
     stock_max_trades_per_hour: int = Field(default=8, ge=0, le=1000)
     ema_fast_period: int = Field(default=3, ge=2, le=500)
@@ -114,7 +116,16 @@ class Settings(BaseSettings):
         gt=0,
         le=Decimal("5"),
     )
+    stock_entry_max_extension_percent: Decimal = Field(
+        default=Decimal("0.01"),
+        ge=0,
+        le=Decimal("0.20"),
+    )
     option_take_profit_price: Decimal = Field(default=Decimal("0.01"), ge=0)
+    option_stop_loss_percent: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    stop_loss_escalate_seconds: int = Field(default=15, ge=5, le=120)
+    daily_loss_circuit_breaker_enabled: bool = False
+    daily_max_loss_dollars: Decimal = Field(default=Decimal("50"), gt=0)
     market_requests_per_minute: int = Field(default=240, ge=1, le=300)
     option_instrument_requests_per_minute: int = Field(default=45, ge=1, le=60)
     stock_instrument_requests_per_30_seconds: int = Field(default=9, ge=1, le=10)
@@ -142,7 +153,7 @@ class Settings(BaseSettings):
     agent_extended_research_seconds: int = Field(default=622, ge=15, le=3600)
     agent_daily_request_limit: int = Field(default=250, ge=1, le=250)
     agent_max_symbols: int = Field(default=5, ge=1, le=50)
-    agent_discovery_max_symbols: int = Field(default=10, ge=1, le=25)
+    agent_discovery_max_symbols: int = Field(default=5, ge=1, le=25)
     agent_timeout_seconds: int = Field(default=60, ge=5, le=180)
     agent_exit_influence_enabled: bool = True
     agent_exit_min_confidence: Decimal = Field(

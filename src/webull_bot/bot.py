@@ -97,6 +97,11 @@ class AutoTrader:
         self.seed_popular_symbols: set[str] = set()
         self.agent_popular_symbols: set[str] = set()
         self.position_buckets: dict[str, str] = {}
+        self.stop_exit_submitted: dict[str, float] = {}
+        self.stop_loss_escalated: set[str] = set()
+        self.daily_realized_loss = Decimal("0")
+        self.daily_realized_pnl = Decimal("0")
+        self.daily_loss_breaker_triggered = False
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -254,6 +259,9 @@ class AutoTrader:
         available = set(self.stock_symbols)
         self.seed_popular_symbols = set(self.config.popular_stocks()) & available
         self.agent_popular_symbols.clear()
+        self.daily_realized_loss = Decimal("0")
+        self.daily_realized_pnl = Decimal("0")
+        self.daily_loss_breaker_triggered = False
         log.info(
             "READY  | stocks=%s | popular seeds=%s | options=%s | option scan=%s",
             len(self.stock_symbols),
@@ -322,6 +330,17 @@ class AutoTrader:
     def cooldown_ready(self, key: str) -> bool:
         elapsed = time.monotonic() - self.last_trade.get(key, float("-inf"))
         return elapsed >= float(self.config.trade_cooldown_seconds)
+
+    def stop_ready_to_submit(self, key: str, symbol: str) -> bool:
+        """An escalated stop must resubmit immediately after its cancel, not
+        wait out the normal trade cooldown - that cooldown was timed from
+        the original (now-cancelled) submission, so honoring it here would
+        leave the position with no working stop order for several more
+        seconds while price keeps moving against it.
+        """
+        if symbol in self.pending_stock_exits:
+            return False
+        return symbol in self.stop_loss_escalated or self.cooldown_ready(key)
 
     def rate_capped(self, key: str) -> bool:
         limit = self.config.stock_max_trades_per_hour
@@ -608,6 +627,98 @@ class AutoTrader:
         )
         return True
 
+    def handle_daily_loss_breaker(self) -> bool:
+        """Halt entries for the rest of the day once realized stop-loss
+        exits alone (not counting the expected EOD closeout) add up past
+        DAILY_MAX_LOSS_DOLLARS. The per-position stop already bounds any
+        single loss; this bounds how many of those a bad day can rack up
+        before the bot stops opening new positions.
+        """
+        if not self.config.daily_loss_circuit_breaker_enabled:
+            return False
+        if self.daily_loss_breaker_triggered:
+            return True
+        if self.daily_realized_loss < self.config.daily_max_loss_dollars:
+            return False
+        log.critical(
+            "CIRCUIT | DAILY LOSS LIMIT | realized=$%.2f >= limit=$%.2f | "
+            "halting new entries for the rest of the trading day",
+            self.daily_realized_loss,
+            self.config.daily_max_loss_dollars,
+        )
+        submitted = self.api.close_all_positions(loss_callback=self.wash_sales.block)
+        log.warning(
+            "CIRCUIT | close orders submitted=%s | entries halted until "
+            "tomorrow's session",
+            len(submitted),
+        )
+        self.daily_loss_breaker_triggered = True
+        self.last_account_refresh = 0.0
+        return True
+
+    def record_realized_exit(
+        self,
+        average_cost: Decimal,
+        exit_price: Decimal,
+        quantity: int,
+        multiplier: int = 1,
+    ) -> None:
+        """Track today's realized P&L from a submitted exit's limit price.
+
+        This is an estimate (actual fill price can differ slightly), which
+        is fine for a dashboard total and the daily-loss circuit breaker -
+        both care about the running picture, not cent-perfect accounting.
+        """
+        pnl = (exit_price - average_cost) * quantity * multiplier
+        self.daily_realized_pnl += pnl
+        if pnl < 0:
+            self.daily_realized_loss += -pnl
+
+    def escalate_stalled_stop_losses(self) -> None:
+        """Cancel and re-flag a stop-loss for a more aggressive re-quote if
+        its gentler midpoint/aggressive-but-passive price hasn't filled
+        quickly - a stop sitting unfilled while price keeps falling turns a
+        bounded loss into an unbounded one.
+        """
+        threshold = float(self.config.stop_loss_escalate_seconds)
+        now = time.monotonic()
+        for symbol, submitted_at in list(self.stop_exit_submitted.items()):
+            key = f"STOCK:{symbol}"
+            if symbol not in self.pending_stock_exits:
+                self.stop_exit_submitted.pop(symbol, None)
+                self.stop_loss_escalated.discard(symbol)
+                continue
+            if now - submitted_at < threshold:
+                continue
+            order_id = next(
+                (
+                    oid
+                    for oid, order in self.working_orders.items()
+                    if order.get("key") == key and order.get("action") == "STOP"
+                ),
+                None,
+            )
+            if order_id:
+                try:
+                    self.api.cancel(order_id)
+                except Exception as exc:
+                    log.error(
+                        "STOP   | %s | escalation cancel failed | %s",
+                        symbol,
+                        exc,
+                    )
+                    continue
+                self.working_orders.pop(order_id, None)
+            self.stop_loss_escalated.add(symbol)
+            self.pending_stock_exits.discard(symbol)
+            self.stop_exit_submitted.pop(symbol, None)
+            log.warning(
+                "STOP   | %s | midpoint exit unfilled after %ss | escalating "
+                "to an aggressive crossing price",
+                symbol,
+                threshold,
+            )
+
     def backfill_stock_symbols(self, count: int) -> int:
         active = set(self.stock_symbols)
         added = 0
@@ -744,6 +855,8 @@ class AutoTrader:
                     }
                 if quantity == 0:
                     self.pending_stock_exits.discard(symbol)
+                    self.stop_exit_submitted.pop(symbol, None)
+                    self.stop_loss_escalated.discard(symbol)
                 if decision.action == "BUY" and quantity == 0:
                     blocked_until = self.wash_sales.blocked_until(symbol)
                     if blocked_until:
@@ -817,14 +930,15 @@ class AutoTrader:
                         limit_price=target,
                     )
                     self.pending_stock_exits.add(symbol)
+                    self.record_realized_exit(cost, target, quantity)
                     self.record_trade(key, order_id, "PROFIT", target)
-                if (
-                    decision.action == "LOSS"
-                    and symbol not in self.pending_stock_exits
-                    and self.cooldown_ready(key)
-                ):
-                    limit_price = self.api.stock_limit_price(quote, "SELL")
-                    self.wash_sales.block(symbol, "2% stop-loss exit submitted")
+                if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
+                    limit_price = (
+                        self.api.stock_limit_price(quote, "SELL")
+                        if symbol in self.stop_loss_escalated
+                        else self.api.stock_stop_exit_price(quote)
+                    )
+                    self.wash_sales.block(symbol, "stop-loss exit submitted")
                     order_id = self.api.place_stock(
                         symbol,
                         "SELL",
@@ -832,6 +946,8 @@ class AutoTrader:
                         limit_price=limit_price,
                     )
                     self.pending_stock_exits.add(symbol)
+                    self.stop_exit_submitted[symbol] = time.monotonic()
+                    self.record_realized_exit(cost, limit_price, quantity)
                     self.record_trade(key, order_id, "STOP", limit_price)
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
@@ -921,6 +1037,18 @@ class AutoTrader:
                 if quantity == 0:
                     self.pending_option_exits.discard(option_symbol)
                 if decision.action == "BUY" and quantity == 0:
+                    underlying = contract["underlying_symbol"]
+                    blocked_until = self.wash_sales.blocked_until(underlying)
+                    if blocked_until:
+                        if underlying not in self.wash_skip_logged:
+                            self.wash_skip_logged.add(underlying)
+                            log.info(
+                                "WASH   | %-8s | option entry blocked until %s",
+                                underlying,
+                                blocked_until.strftime("%Y-%m-%d"),
+                            )
+                        continue
+                    self.wash_skip_logged.discard(underlying)
                     limit_price = self.api.option_limit_price(quote, "BUY")
                     buy_quantity, contract_cost = (
                         self.strategy.option_order_quantity(
@@ -974,7 +1102,28 @@ class AutoTrader:
                         "SELL_TO_CLOSE",
                     )
                     self.pending_option_exits.add(option_symbol)
+                    self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
                     self.record_trade(key, order_id, "PROFIT", limit_price)
+                if (
+                    decision.action == "LOSS"
+                    and option_symbol not in self.pending_option_exits
+                    and self.cooldown_ready(key)
+                ):
+                    limit_price = self.api.option_limit_price(quote, "SELL")
+                    self.wash_sales.block(
+                        contract["underlying_symbol"],
+                        "option stop-loss exit submitted",
+                    )
+                    order_id = self.api.place_option(
+                        contract,
+                        "SELL",
+                        quantity,
+                        limit_price,
+                        "SELL_TO_CLOSE",
+                    )
+                    self.pending_option_exits.add(option_symbol)
+                    self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
+                    self.record_trade(key, order_id, "STOP", limit_price)
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
                     continue
@@ -1040,6 +1189,7 @@ class AutoTrader:
                         limit_price=sell_price,
                     )
                     self.pending_stock_exits.add(symbol)
+                    self.record_realized_exit(average_cost, sell_price, quantity)
                     self.record_trade(key, order_id, "PROFIT", sell_price)
                     boosted += 1
                 elif instrument_type == "OPTION" and options_active:
@@ -1066,6 +1216,7 @@ class AutoTrader:
                         "SELL_TO_CLOSE",
                     )
                     self.pending_option_exits.add(symbol)
+                    self.record_realized_exit(average_cost, sell_price, quantity, multiplier=100)
                     self.record_trade(key, order_id, "PROFIT", sell_price)
                     boosted += 1
             except Exception as exc:
@@ -1129,6 +1280,10 @@ class AutoTrader:
                 "discoveries": self.market_agent.discoveries(),
                 "popular_symbols": sorted(self.agent_popular_symbols),
             }
+        unrealized_total = sum(
+            (Decimal(row["unrealized_pnl"]) for row in position_rows),
+            Decimal("0"),
+        )
         self.status.write(
             mode=self.config.mode,
             buying_power=buying_power,
@@ -1138,6 +1293,8 @@ class AutoTrader:
             paused=paused,
             stock_count=len(self.stock_symbols),
             option_count=len(self.option_contracts),
+            realized_pnl_today=self.daily_realized_pnl,
+            unrealized_pnl_total=unrealized_total,
         )
 
     def close_instruments(self, instrument_types: set[str]) -> bool:
@@ -1218,11 +1375,14 @@ class AutoTrader:
             cycle_started = time.monotonic()
             try:
                 self.monitor_working_orders()
+                self.escalate_stalled_stop_losses()
                 buying_power, positions = self.account_state()
                 circuit_active = self.handle_portfolio_circuit_breaker(
                     positions,
                     buying_power,
                 )
+                if not circuit_active:
+                    circuit_active = self.handle_daily_loss_breaker()
                 if not circuit_active:
                     buying_power = self.trade_stocks(positions, buying_power)
                     if option_open <= moment < option_closeout:
