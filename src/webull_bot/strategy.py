@@ -227,14 +227,19 @@ class TradingStrategy:
         explore_floor = max(1, size - popular_count - penny_count)
         priority = list(dict.fromkeys(held + popular_selected + penny_selected))
         priority = priority[: size - explore_floor]
-        # Request exactly the open exploration slots and advance the cursor by
-        # only what was consumed, so no symbol is skipped between cycles.
+        # Request exactly the open exploration slots, skipping symbols already
+        # in the priority slice so exploration always keeps paging forward
+        # through fresh names instead of re-picking (and then discarding)
+        # names the priority slice already covered.
         exploration_slots = max(0, size - len(priority))
-        exploration, cursor = self.rotating_batch(
-            symbols,
-            cursor,
-            exploration_slots,
-        )
+        priority_set = set(priority)
+        exploration: list[str] = []
+        attempts = 0
+        while len(exploration) < exploration_slots and attempts < len(symbols):
+            probe, cursor = self.rotating_batch(symbols, cursor, 1)
+            attempts += 1
+            if probe and probe[0] not in priority_set:
+                exploration.append(probe[0])
         selected = list(dict.fromkeys(priority + exploration))
         selected = selected[:size]
         self.selection_buckets = {}
