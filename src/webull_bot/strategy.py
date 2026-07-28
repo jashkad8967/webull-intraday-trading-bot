@@ -102,6 +102,7 @@ class TradingStrategy:
             "ask": ask,
             "spread_percent": round(spread_percent, 4),
             "range_ratio": round(max(0.0, range_ratio), 4),
+            "high": high,
             "activity_score": activity,
         }
         self._update_vwap(symbol, price, volume)
@@ -393,6 +394,8 @@ class TradingStrategy:
             return Decision("HOLD", "spread too wide to scalp profitably")
         if not self.vwap_supports_entry(symbol, price):
             return Decision("HOLD", "price below session VWAP")
+        if not self.entry_extension_ok(symbol, price):
+            return Decision("HOLD", "price already extended near today's high")
         if trend == "BUY":
             return Decision("BUY", "EMA entry confirmed")
         if self.research_supports_entry(assessment):
@@ -423,6 +426,26 @@ class TradingStrategy:
             return Decimal(str(spread)) <= self.config.stock_entry_max_spread_percent
         except Exception:
             return True
+
+    def entry_extension_ok(self, symbol: str, price: Decimal) -> bool:
+        """Block chasing a name that's already sitting at today's high.
+
+        A crossover that only confirms once price is already at the peak
+        of a fast spike is buying the top, not the move - require some
+        room below today's high before allowing a fresh entry.
+        """
+        high = self.metrics.get(symbol, {}).get("high")
+        if not high:
+            return True
+        try:
+            high_decimal = Decimal(str(high))
+        except Exception:
+            return True
+        if high_decimal <= 0:
+            return True
+        return price <= high_decimal * (
+            Decimal("1") - self.config.stock_entry_max_extension_percent
+        )
 
     @staticmethod
     def research_supports_entry(assessment: dict | None) -> bool:

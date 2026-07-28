@@ -34,6 +34,7 @@ class StrategyConfigMixin:
             stock_stop_loss_range_multiplier=Decimal("0.35"),
             stock_target_stop_multiple=Decimal("1.2"),
             stock_entry_max_spread_percent=Decimal("0.15"),
+            stock_entry_max_extension_percent=Decimal("0.01"),
             agent_exit_influence_enabled=True,
             agent_exit_min_confidence=Decimal("0.60"),
             agent_runner_bias_threshold=Decimal("0.50"),
@@ -139,6 +140,16 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_vwap_gate_does_not_block_entry_without_data(self):
         strategy = TradingStrategy(self.config())
         self.assertTrue(strategy.vwap_supports_entry("UNSEEN", Decimal("5")))
+
+    def test_extension_gate_blocks_entry_right_at_todays_high(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["SPIKED"] = {"high": 100.0}
+        self.assertFalse(strategy.entry_extension_ok("SPIKED", Decimal("99.5")))
+        self.assertTrue(strategy.entry_extension_ok("SPIKED", Decimal("98.0")))
+
+    def test_extension_gate_does_not_block_entry_without_data(self):
+        strategy = TradingStrategy(self.config())
+        self.assertTrue(strategy.entry_extension_ok("UNSEEN", Decimal("50")))
 
     def test_adaptive_stop_percent_is_clamped_between_configured_bounds(self):
         strategy = TradingStrategy(self.config())

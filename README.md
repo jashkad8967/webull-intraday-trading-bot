@@ -260,8 +260,16 @@ STOCK_STOP_LOSS_MIN_PERCENT=0.0015
 STOCK_STOP_LOSS_MAX_PERCENT=0.006
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
+STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 OPTION_TAKE_PROFIT_PRICE=0.01
 ```
+
+`STOCK_ENTRY_MAX_EXTENSION_PERCENT` blocks a fresh entry when price is
+already within that percent of today's high — an EMA/VWAP crossover only
+confirms after part of a move has already happened, so without this, the
+bot can end up buying right as a fast spike exhausts and reverses, hitting
+the stop shortly after. Raise it to allow chasing further-extended moves;
+set it to `0` to disable the check entirely.
 
 Medium cadence:
 
@@ -769,6 +777,7 @@ STOCK_STOP_LOSS_MIN_PERCENT=0.0015
 STOCK_STOP_LOSS_MAX_PERCENT=0.006
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
+STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 OPTION_TAKE_PROFIT_PRICE=0.01
 MARKET_REQUESTS_PER_MINUTE=240
 OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45

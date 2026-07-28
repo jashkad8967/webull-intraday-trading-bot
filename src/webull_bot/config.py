@@ -116,6 +116,11 @@ class Settings(BaseSettings):
         gt=0,
         le=Decimal("5"),
     )
+    stock_entry_max_extension_percent: Decimal = Field(
+        default=Decimal("0.01"),
+        ge=0,
+        le=Decimal("0.20"),
+    )
     option_take_profit_price: Decimal = Field(default=Decimal("0.01"), ge=0)
     market_requests_per_minute: int = Field(default=240, ge=1, le=300)
     option_instrument_requests_per_minute: int = Field(default=45, ge=1, le=60)
