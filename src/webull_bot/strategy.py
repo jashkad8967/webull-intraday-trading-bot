@@ -35,6 +35,7 @@ class TradingStrategy:
         self.selection_buckets: dict[str, str] = {}
         self.trend_streak: dict[str, int] = {}
         self.vwap_state: dict[str, dict] = {}
+        self.crossover_counts: dict[str, int] = defaultdict(int)
 
     def clear_market_state(self) -> None:
         self.activity.clear()
@@ -42,6 +43,7 @@ class TradingStrategy:
         self.metrics.clear()
         self.selection_buckets.clear()
         self.vwap_state.clear()
+        self.crossover_counts.clear()
 
     @staticmethod
     def rotating_batch(items: list, cursor: int, batch_size: int) -> tuple[list, int]:
@@ -137,6 +139,12 @@ class TradingStrategy:
 
     def priority_score(self, symbol: str, assessment: dict | None) -> float:
         score = self.activity.get(symbol, 0.0)
+        # Reward symbols with a recurring back-and-forth pattern today (a
+        # capped count of EMA direction flips) so the scanner keeps favoring
+        # stocks that repeatedly create fresh scalp setups over ones that
+        # already made their one move for the day.
+        oscillation = min(20, self.crossover_counts.get(symbol, 0))
+        score += oscillation * float(self.config.stock_oscillation_weight)
         if not assessment:
             return score
         confidence = float(assessment.get("confidence", 0))
@@ -396,6 +404,13 @@ class TradingStrategy:
             series[-slow:],
             slow,
         )
+        if (old_spread > 0) != (new_spread > 0):
+            # A stock that keeps flipping direction is exactly the kind of
+            # choppy, mean-reverting mover that produces repeated small
+            # scalps in a session - track it so priority_score can favor it
+            # over a name that only trended once and went flat.
+            symbol = key.split(":", 1)[-1]
+            self.crossover_counts[symbol] += 1
         if new_spread <= 0:
             self.trend_streak[key] = 0
             return "HOLD"

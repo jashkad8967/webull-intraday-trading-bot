@@ -291,8 +291,8 @@ Fast scanning, allowing multiple instruments to trade in a minute:
 ```dotenv
 POLL_SECONDS=1
 ACCOUNT_REFRESH_SECONDS=5
-TRADE_COOLDOWN_SECONDS=30
-STOCK_MAX_TRADES_PER_HOUR=8
+TRADE_COOLDOWN_SECONDS=15
+STOCK_MAX_TRADES_PER_HOUR=12
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
@@ -305,6 +305,7 @@ STOCK_STOP_LOSS_MAX_PERCENT=0.006
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
+STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PRICE=0.01
 OPTION_STOP_LOSS_PERCENT=0.50
 ```
@@ -315,6 +316,34 @@ confirms after part of a move has already happened, so without this, the
 bot can end up buying right as a fast spike exhausts and reverses, hitting
 the stop shortly after. Raise it to allow chasing further-extended moves;
 set it to `0` to disable the check entirely.
+
+### Trade cadence and favoring recurring movers
+
+Every stock's profit target scales with its own adaptive stop
+(`STOCK_TARGET_STOP_MULTIPLE` × the stop distance from
+`STOCK_STOP_LOSS_MIN/MAX_PERCENT`), so exits are already sized to be small
+and quick rather than holding out for a big move. Two settings control how
+often the bot is willing to re-enter the same symbol:
+`TRADE_COOLDOWN_SECONDS` (minimum gap between orders on one symbol) and
+`STOCK_MAX_TRADES_PER_HOUR` (a per-symbol ceiling on top of the cooldown).
+Lowering the cooldown and raising the hourly cap makes each individual
+symbol tradeable more often; the VWAP gate, extension gate, and
+`REENTER_CONFIRMATION_POLLS` still have to agree before any of those
+re-entries actually fire, so cadence goes up without giving up the
+whipsaw protection those gates were added for.
+
+Some stocks genuinely move back and forth many times in a session instead
+of trending once and going flat — those are the ones that keep producing
+fresh small scalps all day. The strategy tracks, per symbol, how many times
+today its EMA(fast)/EMA(slow) spread has flipped sign (an
+`old_spread`/`new_spread` crossing either direction), and adds
+`STOCK_OSCILLATION_WEIGHT` per flip (capped at 20) to that symbol's ranking
+score used for batch selection and research-candidate ordering. A choppy,
+frequently-reversing mover therefore keeps climbing toward the front of the
+queue as the day goes on, while a stock that made one move and stalled
+falls back toward the rotating-exploration slice. Raise
+`STOCK_OSCILLATION_WEIGHT` to lean harder into repeat movers, or set it to
+`0` to rank purely on the existing volume/price-move/range activity score.
 
 Medium cadence:
 
@@ -494,8 +523,8 @@ creating a wash sale.
 The end-of-day closeout is the exception: it cancels working profit orders and
 closes remaining positions before market close, which can realize a loss.
 
-`STOCK_MAX_TRADES_PER_HOUR` (default 8) caps new entries per symbol per
-rolling hour independent of `TRADE_COOLDOWN_SECONDS` (default 30s), so a
+`STOCK_MAX_TRADES_PER_HOUR` (default 12) caps new entries per symbol per
+rolling hour independent of `TRADE_COOLDOWN_SECONDS` (default 15s), so a
 persistent trend can't turn into unbounded churn on one name. It does not
 promise a fixed trade count: EMA/VWAP confirmation, target price movement,
 fills, API response time, open-position limits, and Webull rate limits
@@ -846,8 +875,8 @@ MAX_ORDER_NOTIONAL=1000
 
 POLL_SECONDS=1
 ACCOUNT_REFRESH_SECONDS=5
-TRADE_COOLDOWN_SECONDS=30
-STOCK_MAX_TRADES_PER_HOUR=8
+TRADE_COOLDOWN_SECONDS=15
+STOCK_MAX_TRADES_PER_HOUR=12
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
@@ -860,6 +889,7 @@ STOCK_STOP_LOSS_MAX_PERCENT=0.006
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
+STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PRICE=0.01
 OPTION_STOP_LOSS_PERCENT=0.50
 MARKET_REQUESTS_PER_MINUTE=240

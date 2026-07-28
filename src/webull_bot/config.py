@@ -93,8 +93,13 @@ class Settings(BaseSettings):
     poll_seconds: Decimal = Field(
         default=Decimal("1"), ge=Decimal("0.25"), le=Decimal("3600")
     )
-    trade_cooldown_seconds: Decimal = Field(default=Decimal("30"), ge=0, le=Decimal("21600"))
-    stock_max_trades_per_hour: int = Field(default=8, ge=0, le=1000)
+    trade_cooldown_seconds: Decimal = Field(default=Decimal("15"), ge=0, le=Decimal("21600"))
+    stock_max_trades_per_hour: int = Field(default=12, ge=0, le=1000)
+    stock_oscillation_weight: Decimal = Field(
+        default=Decimal("0.5"),
+        ge=0,
+        le=Decimal("5"),
+    )
     ema_fast_period: int = Field(default=3, ge=2, le=500)
     ema_slow_period: int = Field(default=8, ge=3, le=1000)
     reenter_on_trend: bool = True

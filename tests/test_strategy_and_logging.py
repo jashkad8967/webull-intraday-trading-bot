@@ -23,6 +23,7 @@ class StrategyConfigMixin:
             stock_batch_size=5,
             stock_priority_fraction=0.6,
             stock_penny_fraction=0.2,
+            stock_oscillation_weight=Decimal("0.5"),
             penny_stock_max_price=Decimal("5"),
             popular_stock_min_volume=1_000_000,
             popular_stock_max_spread_percent=Decimal("0.50"),
@@ -177,6 +178,32 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         # Once the uptrend has held for the configured confirmation polls,
         # re-entry is allowed again.
         self.assertEqual(strategy.trend_signal(key, Decimal("10.2")), "BUY")
+
+    def test_recurring_crossovers_boost_priority_score(self):
+        strategy = TradingStrategy(self.config())
+        choppy = [10, 9.8, 9.6, 9.8, 10, 9.8, 9.6, 9.8, 10, 9.8, 9.6, 9.8, 10, 9.8, 9.6]
+        for price in choppy:
+            strategy.trend_signal("STOCK:CHOP", Decimal(str(price)))
+        smooth = [Decimal("10") + Decimal(str(i)) * Decimal("0.1") for i in range(15)]
+        for price in smooth:
+            strategy.trend_signal("STOCK:SMOOTH", price)
+
+        self.assertGreater(strategy.crossover_counts["CHOP"], strategy.crossover_counts["SMOOTH"])
+
+        strategy.activity["CHOP"] = 5.0
+        strategy.activity["SMOOTH"] = 5.0
+        self.assertGreater(
+            strategy.priority_score("CHOP", None),
+            strategy.priority_score("SMOOTH", None),
+        )
+
+    def test_clear_market_state_resets_crossover_counts(self):
+        strategy = TradingStrategy(self.config())
+        for price in [10, 9.8, 9.6, 9.8, 10, 9.8, 9.6, 9.8, 10, 9.8]:
+            strategy.trend_signal("STOCK:CHOP", Decimal(str(price)))
+        self.assertGreater(strategy.crossover_counts["CHOP"], 0)
+        strategy.clear_market_state()
+        self.assertEqual(strategy.crossover_counts["CHOP"], 0)
 
     def test_stop_and_target_scale_with_adaptive_stop_percent(self):
         strategy = TradingStrategy(self.config())
