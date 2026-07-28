@@ -193,6 +193,33 @@ class AutoTrader:
             filtered = list(dict.fromkeys(reinstated + filtered))
         return filtered
 
+    def safe_top_gainers(self, limit: int, page_size: int) -> dict[str, dict]:
+        """top_gainers() hits a live Webull endpoint during the once-daily
+        universe rebuild; a screener hiccup here must never be allowed to
+        crash the whole trading loop, so failures are logged and treated as
+        "no gainers this cycle" instead of propagating.
+        """
+        try:
+            return self.api.top_gainers(limit, page_size)
+        except Exception as exc:
+            log.warning("LOAD   | top-gainers screener failed this cycle | %s", exc)
+            return {}
+
+    def safe_top_active_stocks(self, limit: int, page_size: int) -> dict[str, dict]:
+        """Same reasoning as safe_top_gainers: a most-active screener failure
+        must not crash the daily universe rebuild. Falls back to the prior
+        cycle's stock list (if any) instead of an empty universe.
+        """
+        try:
+            return self.api.top_active_stocks(limit, page_size)
+        except Exception as exc:
+            log.warning(
+                "LOAD   | most-active screener failed this cycle | %s | "
+                "keeping prior universe",
+                exc,
+            )
+            return {symbol: {"market_value": self.stock_market_values.get(symbol, 0.0)} for symbol in self.stock_symbols}
+
     def resolve_targets(self, moment: datetime) -> None:
         if self.resolved_date == moment.date():
             return
@@ -206,9 +233,9 @@ class AutoTrader:
                 limit,
                 page_size,
             )
-            universe = self.api.top_active_stocks(limit, page_size)
+            universe = self.safe_top_active_stocks(limit, page_size)
             if self.config.top_gainers_limit > 0:
-                gainers = self.api.top_gainers(
+                gainers = self.safe_top_gainers(
                     self.config.top_gainers_limit,
                     page_size,
                 )
@@ -286,7 +313,7 @@ class AutoTrader:
                     added,
                 )
             if self.config.top_gainers_limit > 0:
-                gainers = self.api.top_gainers(
+                gainers = self.safe_top_gainers(
                     self.config.top_gainers_limit,
                     self.config.stock_universe_page_size,
                 )
@@ -1486,9 +1513,9 @@ class AutoTrader:
             if option_closeout <= moment < option_close:
                 self.close_instruments({"OPTION"})
 
-            self.resolve_targets(moment)
             cycle_started = time.monotonic()
             try:
+                self.resolve_targets(moment)
                 self.monitor_working_orders()
                 self.escalate_stalled_stop_losses()
                 buying_power, positions = self.account_state()

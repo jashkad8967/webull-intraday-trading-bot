@@ -778,6 +778,37 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
 
         self.assertEqual(result, ["ONE", "TWO"])
 
+    def test_safe_top_gainers_survives_screener_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("Webull API error 500: boom")
+
+        fake_bot.api = SimpleNamespace(top_gainers=boom)
+        safe_call = AutoTrader.safe_top_gainers.__get__(fake_bot)
+
+        self.assertEqual(safe_call(100, 50), {})
+
+    def test_safe_top_active_stocks_falls_back_to_prior_universe_on_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("Webull API error 503: boom")
+
+        fake_bot.api = SimpleNamespace(top_active_stocks=boom)
+        fake_bot.stock_symbols = ["OLD1", "OLD2"]
+        fake_bot.stock_market_values = {"OLD1": 1e11, "OLD2": 2e8}
+        safe_call = AutoTrader.safe_top_active_stocks.__get__(fake_bot)
+
+        result = safe_call(500, 200)
+
+        self.assertEqual(set(result), {"OLD1", "OLD2"})
+        self.assertEqual(result["OLD1"]["market_value"], 1e11)
+
 
 if __name__ == "__main__":
     unittest.main()
