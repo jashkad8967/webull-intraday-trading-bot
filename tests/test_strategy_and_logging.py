@@ -397,7 +397,7 @@ class MicroScalpIntegrationTests(unittest.TestCase):
             def stock_limit_price(self, q, side):
                 return Decimal(str(q["ask"] if side == "BUY" else q["bid"]))
 
-            def place_stock(self, symbol, side, quantity, limit_price=None):
+            def place_stock(self, symbol, side, quantity, limit_price=None, fractional=False):
                 self.placed.append((symbol, side, quantity, limit_price))
                 return "order-1"
 
@@ -621,6 +621,106 @@ class AllocationAndLoggingTests(unittest.TestCase):
             shutil.rmtree(directory, ignore_errors=True)
 
 
+class FractionalSharesTests(StrategyConfigMixin, unittest.TestCase):
+    def test_fractional_stock_quantity_sizes_to_available_budget(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity = strategy.fractional_stock_quantity(Decimal("400.00"), Decimal("50.00"))
+
+        self.assertEqual(quantity, Decimal("0.1250"))
+
+    def test_fractional_stock_quantity_caps_at_one_share(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity = strategy.fractional_stock_quantity(Decimal("10.00"), Decimal("5000.00"))
+
+        self.assertEqual(quantity, Decimal("1"))
+
+    def test_fractional_stock_quantity_returns_zero_below_minimum_notional(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity = strategy.fractional_stock_quantity(Decimal("400.00"), Decimal("3.00"))
+
+        self.assertEqual(quantity, Decimal("0"))
+
+    def test_place_stock_fractional_forces_market_core_and_omits_limit(self):
+        api = WebullAPI.__new__(WebullAPI)
+        captured = []
+
+        def fake_call(callback, group, retry=True):
+            return callback()
+
+        def fake_place_order(account_id, orders):
+            captured.extend(orders)
+            return None
+
+        api._call = fake_call
+        api.trade = SimpleNamespace(
+            order_v3=SimpleNamespace(place_order=fake_place_order)
+        )
+        api.config = SimpleNamespace(account_id="acct-1")
+
+        api.place_stock(
+            "TSLA",
+            "BUY",
+            Decimal("0.5"),
+            limit_price=Decimal("250.00"),
+            fractional=True,
+        )
+
+        self.assertEqual(len(captured), 1)
+        order = captured[0]
+        self.assertEqual(order["order_type"], "MARKET")
+        self.assertEqual(order["support_trading_session"], "CORE")
+        self.assertEqual(order["quantity"], "0.5")
+        self.assertNotIn("limit_price", order)
+
+    def test_place_stock_whole_share_unaffected_by_fractional_param(self):
+        api = WebullAPI.__new__(WebullAPI)
+        captured = []
+
+        def fake_call(callback, group, retry=True):
+            return callback()
+
+        def fake_place_order(account_id, orders):
+            captured.extend(orders)
+            return None
+
+        api._call = fake_call
+        api.trade = SimpleNamespace(
+            order_v3=SimpleNamespace(place_order=fake_place_order)
+        )
+        api.config = SimpleNamespace(account_id="acct-1")
+
+        api.place_stock("TSLA", "BUY", 3, limit_price=Decimal("250.00"))
+
+        order = captured[0]
+        self.assertEqual(order["order_type"], "LIMIT")
+        self.assertEqual(order["support_trading_session"], "ALL")
+        self.assertEqual(order["limit_price"], "250.00")
+
+    def test_stock_position_reports_fractional_quantity_without_truncation(self):
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TSLA",
+                "quantity": "0.5",
+                "cost_price": "250.00",
+            }
+        ]
+
+        quantity, cost = WebullAPI.stock_position("TSLA", positions)
+
+        self.assertEqual(quantity, Decimal("0.5"))
+        self.assertEqual(cost, Decimal("250.00"))
+
+
 class StopExitPricingTests(unittest.TestCase):
     def test_stop_exit_uses_bid_ask_midpoint_not_aggressive_crossing(self):
         api = WebullAPI.__new__(WebullAPI)
@@ -661,6 +761,34 @@ class StopExitPricingTests(unittest.TestCase):
         )
         self.assertEqual(submitted, ["order-123"])
         self.assertEqual(losses, [("AAPL", "option loss closeout submitted")])
+
+    def test_close_all_positions_does_not_skip_a_fractional_equity_position(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.positions = lambda: [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TSLA",
+                "quantity": "0.5",
+                "cost_price": "250.00",
+            }
+        ]
+        api.cancel_all_orders = lambda: []
+        api.stock_quote = lambda symbol: {"bid": "255.00", "ask": "255.20"}
+        api.quote_price = staticmethod(lambda quote: Decimal("255.10"))
+        api.stock_limit_price = lambda quote, side: Decimal("255.00")
+
+        placed = []
+
+        def fake_place_stock(symbol, side, quantity, limit_price=None, fractional=False):
+            placed.append((symbol, side, quantity, fractional))
+            return "order-456"
+
+        api.place_stock = fake_place_stock
+
+        submitted = api.close_all_positions()
+
+        self.assertEqual(submitted, ["order-456"])
+        self.assertEqual(placed, [("TSLA", "SELL", Decimal("0.5"), True)])
 
 
 class PayloadSizingTests(unittest.TestCase):

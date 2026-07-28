@@ -756,9 +756,15 @@ class WebullAPI:
         self,
         symbol: str,
         side: str,
-        quantity: int,
+        quantity: int | Decimal,
         limit_price: Decimal | None = None,
+        fractional: bool = False,
     ) -> str:
+        """fractional=True places a fixed-quantity MARKET order for a
+        quantity in (0, 1] - Webull only supports fractional share trading
+        as a MARKET order during core hours, never LIMIT and never extended
+        hours, so those overrides are forced regardless of limit_price.
+        """
         client_order_id = uuid4().hex
         order = {
             "combo_type": "NORMAL",
@@ -766,14 +772,14 @@ class WebullAPI:
             "symbol": symbol,
             "instrument_type": "EQUITY",
             "market": "US",
-            "order_type": "LIMIT" if limit_price is not None else "MARKET",
+            "order_type": "MARKET" if fractional or limit_price is None else "LIMIT",
             "quantity": str(quantity),
-            "support_trading_session": "ALL",
+            "support_trading_session": "CORE" if fractional else "ALL",
             "side": side,
             "time_in_force": "DAY",
             "entrust_type": "QTY",
         }
-        if limit_price is not None:
+        if limit_price is not None and not fractional:
             order["limit_price"] = str(
                 limit_price.quantize(Decimal("0.01"), rounding=ROUND_UP)
             )
@@ -964,7 +970,11 @@ class WebullAPI:
         return total
 
     @staticmethod
-    def stock_position(symbol: str, positions: list[dict]) -> tuple[int, Decimal]:
+    def stock_position(symbol: str, positions: list[dict]) -> tuple[Decimal, Decimal]:
+        """Quantity is a Decimal, not an int - a fractional-share position
+        (e.g. 0.5) would otherwise truncate to 0 here and become invisible
+        to every decision/exit/closeout path that checks this quantity.
+        """
         match = next(
             (
                 item
@@ -975,9 +985,9 @@ class WebullAPI:
             None,
         )
         if not match:
-            return 0, Decimal("0")
+            return Decimal("0"), Decimal("0")
         return (
-            int(Decimal(str(match.get("quantity", "0")))),
+            Decimal(str(match.get("quantity", "0"))),
             Decimal(str(match.get("cost_price", "0"))),
         )
 
@@ -1045,7 +1055,7 @@ class WebullAPI:
         self.cancel_all_orders()
         submitted: list[str] = []
         for position in positions:
-            quantity = int(Decimal(str(position.get("quantity", "0"))))
+            quantity = Decimal(str(position.get("quantity", "0")))
             if not quantity:
                 continue
             if position.get("instrument_type") == "EQUITY":
@@ -1065,12 +1075,14 @@ class WebullAPI:
                 if loss_exit and loss_callback:
                     loss_callback(position["symbol"], "loss closeout submitted")
                 limit_price = self.stock_limit_price(quote, side)
+                fractional = abs(quantity) != abs(quantity).to_integral_value()
                 submitted.append(
                     self.place_stock(
                         position["symbol"],
                         side,
                         abs(quantity),
                         limit_price,
+                        fractional=fractional,
                     )
                 )
             elif position.get("instrument_type") == "OPTION":

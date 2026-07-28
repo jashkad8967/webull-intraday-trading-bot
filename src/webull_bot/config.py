@@ -94,6 +94,8 @@ class Settings(BaseSettings):
     micro_scalp_target_cents: Decimal = Field(default=Decimal("0.06"), gt=0)
     micro_scalp_stop_cents: Decimal = Field(default=Decimal("0.10"), gt=0)
     micro_scalp_reference_window: int = Field(default=20, ge=3, le=200)
+    fractional_shares_enabled: bool = False
+    fractional_shares_min_notional: Decimal = Field(default=Decimal("5"), ge=Decimal("5"))
     option_batch_size: int = Field(default=20, ge=1, le=20)
     option_discovery_per_cycle: int = Field(default=1, ge=1, le=10)
     option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)

@@ -290,6 +290,39 @@ Keep the symbol list short and genuinely liquid - this is a high-turnover
 mode by design (small, frequent wins), so slippage and spread on a thin
 name will eat the edge faster than the target captures it.
 
+### Fractional shares
+
+A capital bucket (or micro-scalp's dedicated slice) can easily be too small
+to afford one whole share of an expensive stock - `STOCK_QUANTITY` shares at
+that price simply won't fit the budget, and the entry is skipped. Enabling
+this lets the bot fall back to a fractional-share order instead of skipping:
+
+```dotenv
+FRACTIONAL_SHARES_ENABLED=true
+FRACTIONAL_SHARES_MIN_NOTIONAL=5
+```
+
+Webull only supports fractional share trading as a **MARKET** order during
+**core** trading hours - never `LIMIT`, never extended hours - so whenever a
+fractional order is placed, the bot forces `order_type=MARKET` and
+`support_trading_session=CORE` regardless of the usual limit-price logic,
+and the order value must clear `FRACTIONAL_SHARES_MIN_NOTIONAL` (Webull's
+own minimum is $5). The fallback only engages when the normal whole-share
+sizing comes up empty - if you can afford a whole share, that's still what
+gets bought.
+
+Because it's a market order, the fill price isn't guaranteed the way a
+limit order's is - on the main stock strategy this is a minor, occasional
+edge case, but if you also enable fractional shares under `MICRO_SCALP_*`,
+be aware that a market-order fill a cent or two off from the intended entry
+eats directly into a strategy that's already targeting only a few cents of
+edge per trade.
+
+Fractional positions are tracked and closed out exactly like whole-share
+ones (including by the EOD closeout and stall breaker) - Webull's account
+position quantity is read as a decimal everywhere it matters, not truncated
+to a whole number.
+
 ## 4. Select options
 
 ### All optionable stocks
@@ -949,6 +982,8 @@ MICRO_SCALP_DIP_CENTS=0.05
 MICRO_SCALP_TARGET_CENTS=0.06
 MICRO_SCALP_STOP_CENTS=0.10
 MICRO_SCALP_REFERENCE_WINDOW=20
+FRACTIONAL_SHARES_ENABLED=false
+FRACTIONAL_SHARES_MIN_NOTIONAL=5
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
 OPTION_DISCOVERY_SECONDS=15

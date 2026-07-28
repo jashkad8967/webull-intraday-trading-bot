@@ -1056,6 +1056,16 @@ class AutoTrader:
                             entry_budget,
                         )
                     )
+                    fractional = False
+                    if buy_quantity == 0 and self.config.fractional_shares_enabled:
+                        fractional_quantity = self.strategy.fractional_stock_quantity(
+                            price,
+                            entry_budget,
+                        )
+                        if fractional_quantity > 0:
+                            buy_quantity = fractional_quantity
+                            buffered_price = price * Decimal("1.03")
+                            fractional = True
                     if (
                         open_count < self.config.max_open_positions
                         and bucket_position_counts.get(bucket, 0)
@@ -1069,6 +1079,7 @@ class AutoTrader:
                             "BUY",
                             buy_quantity,
                             limit_price=self.api.stock_limit_price(quote, "BUY"),
+                            fractional=fractional,
                         )
                         self.record_trade(key, order_id, "BUY")
                         buying_power = max(
@@ -1226,6 +1237,16 @@ class AutoTrader:
                     buy_quantity, buffered_price = (
                         self.strategy.stock_order_quantity(price, entry_budget)
                     )
+                    fractional = False
+                    if buy_quantity == 0 and self.config.fractional_shares_enabled:
+                        fractional_quantity = self.strategy.fractional_stock_quantity(
+                            price,
+                            entry_budget,
+                        )
+                        if fractional_quantity > 0:
+                            buy_quantity = fractional_quantity
+                            buffered_price = price * Decimal("1.03")
+                            fractional = True
                     if (
                         open_count < self.config.max_open_positions
                         and held_count < self.config.micro_scalp_max_positions
@@ -1238,6 +1259,7 @@ class AutoTrader:
                             "BUY",
                             buy_quantity,
                             limit_price=self.api.stock_limit_price(quote, "BUY"),
+                            fractional=fractional,
                         )
                         self.record_trade(key, order_id, "BUY")
                         buying_power = max(
@@ -1478,7 +1500,7 @@ class AutoTrader:
         min_profit = self.config.stall_breaker_min_profit
         boosted = 0
         for position in positions:
-            quantity = int(Decimal(str(position.get("quantity", "0"))))
+            quantity = Decimal(str(position.get("quantity", "0")))
             if quantity <= 0:
                 continue
             average_cost = Decimal(str(position.get("cost_price") or "0"))
@@ -1505,6 +1527,7 @@ class AutoTrader:
                         "SELL",
                         quantity,
                         limit_price=sell_price,
+                        fractional=quantity != quantity.to_integral_value(),
                     )
                     self.pending_stock_exits.add(symbol)
                     self.record_realized_exit(average_cost, sell_price, quantity)

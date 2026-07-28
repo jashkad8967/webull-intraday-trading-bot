@@ -650,6 +650,32 @@ class TradingStrategy:
             buffered_price,
         )
 
+    def fractional_stock_quantity(
+        self,
+        price: Decimal,
+        buying_power: Decimal,
+    ) -> Decimal:
+        """Fallback sizing for when buying_power can't afford even one whole
+        share: Webull's fractional orders are quantity-capped to (0, 1] and
+        must clear a minimum order value, so this returns Decimal("0") -
+        meaning "skip, don't place a fractional order" - whenever either
+        constraint can't be met, rather than rounding into an invalid order.
+        """
+        if price <= 0:
+            return Decimal("0")
+        min_notional = self.config.fractional_shares_min_notional
+        affordable_notional = min(buying_power, price)
+        if affordable_notional < min_notional:
+            return Decimal("0")
+        quantity = (affordable_notional / price).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_DOWN,
+        )
+        quantity = min(quantity, Decimal("1"))
+        if quantity <= 0 or quantity * price < min_notional:
+            return Decimal("0")
+        return quantity
+
     def option_order_quantity(
         self,
         limit_price: Decimal,
