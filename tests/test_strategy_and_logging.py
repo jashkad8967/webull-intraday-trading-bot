@@ -1,5 +1,6 @@
 import logging
 import shutil
+import sys
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ class StrategyConfigMixin:
             stock_batch_size=5,
             stock_priority_fraction=0.6,
             stock_penny_fraction=0.2,
+            stock_oscillation_weight=Decimal("0.5"),
             penny_stock_max_price=Decimal("5"),
             popular_stock_min_volume=1_000_000,
             popular_stock_max_spread_percent=Decimal("0.50"),
@@ -176,6 +178,32 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         # Once the uptrend has held for the configured confirmation polls,
         # re-entry is allowed again.
         self.assertEqual(strategy.trend_signal(key, Decimal("10.2")), "BUY")
+
+    def test_recurring_crossovers_boost_priority_score(self):
+        strategy = TradingStrategy(self.config())
+        choppy = [10, 9.8, 9.6, 9.8, 10, 9.8, 9.6, 9.8, 10, 9.8, 9.6, 9.8, 10, 9.8, 9.6]
+        for price in choppy:
+            strategy.trend_signal("STOCK:CHOP", Decimal(str(price)))
+        smooth = [Decimal("10") + Decimal(str(i)) * Decimal("0.1") for i in range(15)]
+        for price in smooth:
+            strategy.trend_signal("STOCK:SMOOTH", price)
+
+        self.assertGreater(strategy.crossover_counts["CHOP"], strategy.crossover_counts["SMOOTH"])
+
+        strategy.activity["CHOP"] = 5.0
+        strategy.activity["SMOOTH"] = 5.0
+        self.assertGreater(
+            strategy.priority_score("CHOP", None),
+            strategy.priority_score("SMOOTH", None),
+        )
+
+    def test_clear_market_state_resets_crossover_counts(self):
+        strategy = TradingStrategy(self.config())
+        for price in [10, 9.8, 9.6, 9.8, 10, 9.8, 9.6, 9.8, 10, 9.8]:
+            strategy.trend_signal("STOCK:CHOP", Decimal(str(price)))
+        self.assertGreater(strategy.crossover_counts["CHOP"], 0)
+        strategy.clear_market_state()
+        self.assertEqual(strategy.crossover_counts["CHOP"], 0)
 
     def test_stop_and_target_scale_with_adaptive_stop_percent(self):
         strategy = TradingStrategy(self.config())
@@ -518,6 +546,171 @@ class HistoricalVolatilityTests(unittest.TestCase):
         ]
         self.assertAlmostEqual(WebullAPI._average_amplitude(bars, days=20), 40.0)
         self.assertIsNone(WebullAPI._average_amplitude([], days=20))
+
+
+class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
+    def test_default_market_cap_allocation_is_off_and_configurable(self):
+        config = Settings()
+        self.assertFalse(config.market_cap_allocation_enabled)
+        self.assertEqual(
+            config.stock_capital_fractions(),
+            {
+                "POPULAR": Decimal("0.70"),
+                "PENNY": Decimal("0.10"),
+                "DISCOVERY": Decimal("0.20"),
+            },
+        )
+
+        cap_config = Settings(market_cap_allocation_enabled=True)
+        self.assertEqual(
+            cap_config.stock_capital_fractions(),
+            {"LARGE_CAP": Decimal("0.80"), "SMALL_CAP": Decimal("0.20")},
+        )
+        self.assertEqual(
+            sum(cap_config.stock_capital_fractions().values()),
+            Decimal("1.00"),
+        )
+        self.assertEqual(
+            cap_config.stock_bucket_slot_limits(),
+            {"LARGE_CAP": 4, "SMALL_CAP": 1},
+        )
+
+    def test_screener_number_handles_bad_and_nonfinite_values(self):
+        self.assertEqual(
+            WebullAPI._screener_number({"market_value": "1.5e11"}, "market_value"),
+            1.5e11,
+        )
+        self.assertEqual(
+            WebullAPI._screener_number({"market_value": "nope"}, "market_value"),
+            0.0,
+        )
+        self.assertEqual(
+            WebullAPI._screener_number({}, "market_value"),
+            0.0,
+        )
+        self.assertEqual(
+            WebullAPI._screener_number({"volume": "inf"}, "volume"),
+            0.0,
+        )
+
+    def test_top_active_stocks_pages_until_limit_or_data_runs_out(self):
+        api = WebullAPI.__new__(WebullAPI)
+        fake_category = SimpleNamespace(
+            US_STOCK=SimpleNamespace(name="US_STOCK"),
+        )
+        pages = {
+            1: [
+                {"symbol": "big1", "market_value": "2e11", "volume": "1000"},
+                {"symbol": "big2", "market_value": "1.5e11", "volume": "900"},
+            ],
+            2: [
+                {"symbol": "small1", "market_value": "5e8", "volume": "500"},
+            ],
+        }
+        calls = []
+
+        def fake_call(callback, group):
+            calls.append(group)
+            return callback()
+
+        def fake_get_most_active(**kwargs):
+            return pages.get(kwargs["page_index"], [])
+
+        api._call = fake_call
+        api.data = SimpleNamespace(
+            screener=SimpleNamespace(get_most_active=fake_get_most_active)
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"webull.data.common.category": SimpleNamespace(Category=fake_category)},
+        ):
+            universe = api.top_active_stocks(total_limit=10, page_size=2)
+
+        self.assertEqual(set(universe), {"BIG1", "BIG2", "SMALL1"})
+        self.assertEqual(universe["BIG1"]["market_value"], 2e11)
+        self.assertEqual(universe["SMALL1"]["market_value"], 5e8)
+        self.assertTrue(all(call == "market" for call in calls))
+
+    def test_top_active_stocks_stops_at_requested_limit(self):
+        api = WebullAPI.__new__(WebullAPI)
+        fake_category = SimpleNamespace(
+            US_STOCK=SimpleNamespace(name="US_STOCK"),
+        )
+
+        def fake_call(callback, group):
+            return callback()
+
+        def fake_get_most_active(**kwargs):
+            size = kwargs["page_size"]
+            index = kwargs["page_index"]
+            return [
+                {"symbol": f"s{index}-{i}", "market_value": "1e9"}
+                for i in range(size)
+            ]
+
+        api._call = fake_call
+        api.data = SimpleNamespace(
+            screener=SimpleNamespace(get_most_active=fake_get_most_active)
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"webull.data.common.category": SimpleNamespace(Category=fake_category)},
+        ):
+            universe = api.top_active_stocks(total_limit=5, page_size=2)
+
+        self.assertEqual(len(universe), 5)
+
+    def test_prioritized_stock_batch_by_market_cap_tiers_by_threshold(self):
+        strategy = TradingStrategy(self.config())
+        symbols = ["BIG1", "BIG2", "SMALL1", "SMALL2", "SMALL3"]
+        strategy.activity.update(
+            {"BIG1": 50, "BIG2": 40, "SMALL1": 30, "SMALL2": 20, "SMALL3": 10}
+        )
+        market_values = {
+            "BIG1": 2e11,
+            "BIG2": 1.5e11,
+            "SMALL1": 5e8,
+            "SMALL2": 3e8,
+            "SMALL3": 1e8,
+        }
+
+        batch, _ = strategy.prioritized_stock_batch_by_market_cap(
+            symbols,
+            0,
+            [],
+            lambda symbol: None,
+            market_values,
+            Decimal("100000000000"),
+            Decimal("0.80"),
+        )
+
+        self.assertIn("BIG1", batch)
+        self.assertEqual(strategy.selection_bucket("BIG1"), "LARGE_CAP")
+        self.assertEqual(strategy.selection_bucket("SMALL1"), "SMALL_CAP")
+
+    def test_prioritized_stock_batch_by_market_cap_marks_held_positions(self):
+        strategy = TradingStrategy(self.config())
+        symbols = ["BIG1", "SMALL1", "SMALL2"]
+        strategy.activity.update({"BIG1": 10, "SMALL1": 5, "SMALL2": 1})
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "SMALL1", "quantity": "10"}
+        ]
+        market_values = {"BIG1": 2e11, "SMALL1": 5e8, "SMALL2": 3e8}
+
+        batch, _ = strategy.prioritized_stock_batch_by_market_cap(
+            symbols,
+            0,
+            positions,
+            lambda symbol: None,
+            market_values,
+            Decimal("100000000000"),
+            Decimal("0.80"),
+        )
+
+        self.assertIn("SMALL1", batch)
+        self.assertEqual(strategy.selection_bucket("SMALL1"), "HELD")
 
 
 if __name__ == "__main__":

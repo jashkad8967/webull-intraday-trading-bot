@@ -170,6 +170,50 @@ stocks and ETFs. The bot checks rejected snapshot symbols against the other cate
 corrects stock/ETF mismatches, and skips only symbols invalid in both
 categories. Startup prints `LOAD` progress while symbols are downloaded.
 
+### Market-cap-tiered universe (large-cap + small-cap volatility split)
+
+Instead of the popular/penny/discovery split above, you can load a stock-only
+universe ranked by market cap straight from Webull's most-active screener and
+allocate capital by cap-size tier:
+
+```dotenv
+STOCK_SYMBOLS=ALL
+MARKET_CAP_ALLOCATION_ENABLED=true
+STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
+STOCK_LARGE_CAP_CAPITAL_FRACTION=0.80
+STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
+MAX_SYMBOLS=750
+STOCK_UNIVERSE_PAGE_SIZE=500
+EXCLUDE_ETFS=true
+HISTORICAL_VOLATILITY_FILTER_ENABLED=true
+MIN_HISTORICAL_VOLATILITY_PERCENT=3
+```
+
+With this enabled, `STOCK_SYMBOLS=ALL` downloads the universe from Webull's
+screener (stocks only, no ETFs) in pages of `STOCK_UNIVERSE_PAGE_SIZE` up to
+`MAX_SYMBOLS` total, ranked by market value, and keeps paging through
+subsequent pages until either the page limit or `MAX_SYMBOLS` is reached. Raise
+`MAX_SYMBOLS` above 500 (e.g. 750-1000) and set `STOCK_UNIVERSE_PAGE_SIZE=500`
+to load more than 500 stocks, 500 per request. Every symbol still has to pass
+the existing `HISTORICAL_VOLATILITY_FILTER_ENABLED` volatility screen, so only
+volatile names are kept regardless of cap size.
+
+Symbols at or above `STOCK_LARGE_CAP_MIN_MARKET_VALUE` are tagged `LARGE_CAP`;
+everything else is `SMALL_CAP`. Buying power is reserved 80/20 between the two
+tiers (configurable via `STOCK_LARGE_CAP_CAPITAL_FRACTION` /
+`STOCK_SMALL_CAP_CAPITAL_FRACTION`, which must sum to 1), and each batch always
+includes held positions first, then the top-ranked large-cap and small-cap
+names by the same activity/research priority score used elsewhere, plus a
+rotating exploration slice. This mode replaces (not adds to) the
+popular/penny/discovery bucketing above — leave
+`MARKET_CAP_ALLOCATION_ENABLED=false` (the default) to keep the original
+behavior.
+
+Webull's screener response field names aren't published in the SDK's type
+stubs, so market value/volume/change/amplitude are parsed defensively; verify
+the `LOAD | market-cap universe ready | large_cap=... | small_cap=...` startup
+log line against your account once deployed to confirm the split looks right.
+
 ## 4. Select options
 
 ### All optionable stocks
@@ -247,8 +291,8 @@ Fast scanning, allowing multiple instruments to trade in a minute:
 ```dotenv
 POLL_SECONDS=1
 ACCOUNT_REFRESH_SECONDS=5
-TRADE_COOLDOWN_SECONDS=30
-STOCK_MAX_TRADES_PER_HOUR=8
+TRADE_COOLDOWN_SECONDS=15
+STOCK_MAX_TRADES_PER_HOUR=12
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
@@ -261,6 +305,7 @@ STOCK_STOP_LOSS_MAX_PERCENT=0.006
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
+STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PRICE=0.01
 OPTION_STOP_LOSS_PERCENT=0.50
 ```
@@ -271,6 +316,34 @@ confirms after part of a move has already happened, so without this, the
 bot can end up buying right as a fast spike exhausts and reverses, hitting
 the stop shortly after. Raise it to allow chasing further-extended moves;
 set it to `0` to disable the check entirely.
+
+### Trade cadence and favoring recurring movers
+
+Every stock's profit target scales with its own adaptive stop
+(`STOCK_TARGET_STOP_MULTIPLE` × the stop distance from
+`STOCK_STOP_LOSS_MIN/MAX_PERCENT`), so exits are already sized to be small
+and quick rather than holding out for a big move. Two settings control how
+often the bot is willing to re-enter the same symbol:
+`TRADE_COOLDOWN_SECONDS` (minimum gap between orders on one symbol) and
+`STOCK_MAX_TRADES_PER_HOUR` (a per-symbol ceiling on top of the cooldown).
+Lowering the cooldown and raising the hourly cap makes each individual
+symbol tradeable more often; the VWAP gate, extension gate, and
+`REENTER_CONFIRMATION_POLLS` still have to agree before any of those
+re-entries actually fire, so cadence goes up without giving up the
+whipsaw protection those gates were added for.
+
+Some stocks genuinely move back and forth many times in a session instead
+of trending once and going flat — those are the ones that keep producing
+fresh small scalps all day. The strategy tracks, per symbol, how many times
+today its EMA(fast)/EMA(slow) spread has flipped sign (an
+`old_spread`/`new_spread` crossing either direction), and adds
+`STOCK_OSCILLATION_WEIGHT` per flip (capped at 20) to that symbol's ranking
+score used for batch selection and research-candidate ordering. A choppy,
+frequently-reversing mover therefore keeps climbing toward the front of the
+queue as the day goes on, while a stock that made one move and stalled
+falls back toward the rotating-exploration slice. Raise
+`STOCK_OSCILLATION_WEIGHT` to lean harder into repeat movers, or set it to
+`0` to rank purely on the existing volume/price-move/range activity score.
 
 Medium cadence:
 
@@ -450,8 +523,8 @@ creating a wash sale.
 The end-of-day closeout is the exception: it cancels working profit orders and
 closes remaining positions before market close, which can realize a loss.
 
-`STOCK_MAX_TRADES_PER_HOUR` (default 8) caps new entries per symbol per
-rolling hour independent of `TRADE_COOLDOWN_SECONDS` (default 30s), so a
+`STOCK_MAX_TRADES_PER_HOUR` (default 12) caps new entries per symbol per
+rolling hour independent of `TRADE_COOLDOWN_SECONDS` (default 15s), so a
 persistent trend can't turn into unbounded churn on one name. It does not
 promise a fixed trade count: EMA/VWAP confirmation, target price movement,
 fills, API response time, open-position limits, and Webull rate limits
@@ -787,6 +860,10 @@ POPULAR_STOCK_MAX_SPREAD_PERCENT=0.50
 STOCK_POPULAR_CAPITAL_FRACTION=0.70
 STOCK_PENNY_CAPITAL_FRACTION=0.10
 STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
+MARKET_CAP_ALLOCATION_ENABLED=false
+STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
+STOCK_LARGE_CAP_CAPITAL_FRACTION=0.80
+STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
 OPTION_BATCH_SIZE=20
 OPTION_DISCOVERY_PER_CYCLE=1
 OPTION_DISCOVERY_SECONDS=15
@@ -798,8 +875,8 @@ MAX_ORDER_NOTIONAL=1000
 
 POLL_SECONDS=1
 ACCOUNT_REFRESH_SECONDS=5
-TRADE_COOLDOWN_SECONDS=30
-STOCK_MAX_TRADES_PER_HOUR=8
+TRADE_COOLDOWN_SECONDS=15
+STOCK_MAX_TRADES_PER_HOUR=12
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
@@ -812,6 +889,7 @@ STOCK_STOP_LOSS_MAX_PERCENT=0.006
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
+STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PRICE=0.01
 OPTION_STOP_LOSS_PERCENT=0.50
 MARKET_REQUESTS_PER_MINUTE=240

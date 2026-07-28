@@ -35,6 +35,7 @@ class TradingStrategy:
         self.selection_buckets: dict[str, str] = {}
         self.trend_streak: dict[str, int] = {}
         self.vwap_state: dict[str, dict] = {}
+        self.crossover_counts: dict[str, int] = defaultdict(int)
 
     def clear_market_state(self) -> None:
         self.activity.clear()
@@ -42,6 +43,7 @@ class TradingStrategy:
         self.metrics.clear()
         self.selection_buckets.clear()
         self.vwap_state.clear()
+        self.crossover_counts.clear()
 
     @staticmethod
     def rotating_batch(items: list, cursor: int, batch_size: int) -> tuple[list, int]:
@@ -137,6 +139,12 @@ class TradingStrategy:
 
     def priority_score(self, symbol: str, assessment: dict | None) -> float:
         score = self.activity.get(symbol, 0.0)
+        # Reward symbols with a recurring back-and-forth pattern today (a
+        # capped count of EMA direction flips) so the scanner keeps favoring
+        # stocks that repeatedly create fresh scalp setups over ones that
+        # already made their one move for the day.
+        oscillation = min(20, self.crossover_counts.get(symbol, 0))
+        score += oscillation * float(self.config.stock_oscillation_weight)
         if not assessment:
             return score
         confidence = float(assessment.get("confidence", 0))
@@ -217,19 +225,30 @@ class TradingStrategy:
             reverse=True,
         )
         popular = list(dict.fromkeys(researched + liquid_popular))
-        exploration, cursor = self.rotating_batch(symbols, cursor, size)
         penny_count = int(size * self.config.stock_penny_fraction)
         popular_count = int(size * self.config.stock_priority_fraction)
         popular_selected = popular[:popular_count]
         penny_selected = penny[:penny_count]
-        selected = list(
-            dict.fromkeys(
-                held
-                + popular_selected
-                + penny_selected
-                + exploration
-            )
-        )
+        # Reserve a guaranteed slice of every batch for fresh exploration so
+        # the scanner keeps paging the whole universe instead of re-scanning
+        # the same top-ranked names each cycle.
+        explore_floor = max(1, size - popular_count - penny_count)
+        priority = list(dict.fromkeys(held + popular_selected + penny_selected))
+        priority = priority[: size - explore_floor]
+        # Request exactly the open exploration slots, skipping symbols already
+        # in the priority slice so exploration always keeps paging forward
+        # through fresh names instead of re-picking (and then discarding)
+        # names the priority slice already covered.
+        exploration_slots = max(0, size - len(priority))
+        priority_set = set(priority)
+        exploration: list[str] = []
+        attempts = 0
+        while len(exploration) < exploration_slots and attempts < len(symbols):
+            probe, cursor = self.rotating_batch(symbols, cursor, 1)
+            attempts += 1
+            if probe and probe[0] not in priority_set:
+                exploration.append(probe[0])
+        selected = list(dict.fromkeys(priority + exploration))
         selected = selected[:size]
         self.selection_buckets = {}
         held_set = set(held)
@@ -244,6 +263,78 @@ class TradingStrategy:
                 self.selection_buckets[symbol] = "PENNY"
             else:
                 self.selection_buckets[symbol] = "DISCOVERY"
+        return selected, cursor
+
+    def prioritized_stock_batch_by_market_cap(
+        self,
+        symbols: list[str],
+        cursor: int,
+        positions: list[dict],
+        assessment_for,
+        market_values: dict[str, float],
+        large_cap_min_value: Decimal,
+        large_cap_fraction: Decimal,
+        research_symbols: set[str] | None = None,
+    ) -> tuple[list[str], int]:
+        """Same shape as prioritized_stock_batch, but tiers by market cap
+        (LARGE_CAP/SMALL_CAP) instead of price-based penny/popular buckets.
+        """
+        if not symbols:
+            return [], 0
+        size = min(self.config.stock_batch_size, len(symbols))
+        available = set(symbols)
+        research_symbols = (research_symbols or set()) & available
+        held = [
+            str(item.get("symbol", "")).upper()
+            for item in positions
+            if item.get("instrument_type") == "EQUITY"
+            and Decimal(str(item.get("quantity", "0"))) != 0
+            and str(item.get("symbol", "")).upper() in available
+        ]
+        ranked = sorted(
+            (symbol for symbol in self.activity if symbol in available),
+            key=lambda symbol: self.priority_score(symbol, assessment_for(symbol)),
+            reverse=True,
+        )
+        threshold = float(large_cap_min_value)
+        is_large = lambda symbol: market_values.get(symbol, 0.0) >= threshold
+        large_cap = [symbol for symbol in ranked if is_large(symbol)]
+        small_cap = [symbol for symbol in ranked if not is_large(symbol)]
+        researched = sorted(
+            research_symbols,
+            key=lambda symbol: self.priority_score(symbol, assessment_for(symbol)),
+            reverse=True,
+        )
+        large_cap = list(
+            dict.fromkeys([s for s in researched if is_large(s)] + large_cap)
+        )
+        small_cap = list(
+            dict.fromkeys([s for s in researched if not is_large(s)] + small_cap)
+        )
+        exploration, cursor = self.rotating_batch(symbols, cursor, size)
+        large_count = int(size * large_cap_fraction)
+        small_count = size - large_count
+        large_selected = large_cap[:large_count]
+        small_selected = small_cap[:small_count]
+        selected = list(
+            dict.fromkeys(held + large_selected + small_selected + exploration)
+        )
+        selected = selected[:size]
+        self.selection_buckets = {}
+        held_set = set(held)
+        large_set = set(large_selected)
+        small_set = set(small_selected)
+        for symbol in selected:
+            if symbol in held_set:
+                self.selection_buckets[symbol] = "HELD"
+            elif symbol in large_set:
+                self.selection_buckets[symbol] = "LARGE_CAP"
+            elif symbol in small_set:
+                self.selection_buckets[symbol] = "SMALL_CAP"
+            else:
+                self.selection_buckets[symbol] = (
+                    "LARGE_CAP" if is_large(symbol) else "SMALL_CAP"
+                )
         return selected, cursor
 
     def selection_bucket(self, symbol: str) -> str:
@@ -313,6 +404,13 @@ class TradingStrategy:
             series[-slow:],
             slow,
         )
+        if (old_spread > 0) != (new_spread > 0):
+            # A stock that keeps flipping direction is exactly the kind of
+            # choppy, mean-reverting mover that produces repeated small
+            # scalps in a session - track it so priority_score can favor it
+            # over a name that only trended once and went flat.
+            symbol = key.split(":", 1)[-1]
+            self.crossover_counts[symbol] += 1
         if new_spread <= 0:
             self.trend_streak[key] = 0
             return "HOLD"
