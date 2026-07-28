@@ -357,6 +357,20 @@ class MarketResearchAgent:
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
+            max_completion_tokens=4000,
+            search_settings={
+                "include_domains": [
+                    "finance.yahoo.com",
+                    "marketwatch.com",
+                    "cnbc.com",
+                    "reuters.com",
+                    "bloomberg.com",
+                    "benzinga.com",
+                    "stocktwits.com",
+                    "investing.com",
+                ],
+                "exclude_domains": ["wikipedia.org"],
+            },
         )
         content = response.choices[0].message.content
         payload = self._normalize(json.loads(content), expected_symbols)
