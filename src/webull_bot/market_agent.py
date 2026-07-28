@@ -116,6 +116,12 @@ class MarketResearchAgent:
                         "this keeps happening | %s",
                         exc,
                     )
+                elif isinstance(exc, json.JSONDecodeError):
+                    self.log.warning(
+                        "AGENT  | research skipped | Groq response was cut "
+                        "off before finishing (hit max_completion_tokens) | %s",
+                        exc,
+                    )
                 else:
                     self.log.warning("AGENT  | research failed | %s", exc)
 
@@ -340,11 +346,14 @@ class MarketResearchAgent:
             "symbol_volatility(0..1), news_sentiment(-1..1), "
             "catalyst_strength(-1..1), expected_move_percent(signed), "
             "horizon_minutes(1..390), downside_risk(0..1), liquidity_risk(0..1), "
-            "exit_bias(-1..1), summary. exit_bias guides holders: negative to "
-            "de-risk/exit now (fading catalyst, rising halt/dilution/reversal "
-            "risk), positive when a fresh strong catalyst supports holding for a "
-            "larger move; 0 when neutral. Never omit fields; use neutral values "
-            "with low confidence when evidence is thin.\nSTATE:"
+            "exit_bias(-1..1), summary (10 words max). exit_bias guides "
+            "holders: negative to de-risk/exit now (fading catalyst, rising "
+            "halt/dilution/reversal risk), positive when a fresh strong "
+            "catalyst supports holding for a larger move; 0 when neutral. "
+            "Never omit fields; use neutral values with low confidence when "
+            "evidence is thin. Keep every text field (summary, reason) to "
+            "10 words or fewer - numeric fields only, no explanations "
+            "beyond that.\nSTATE:"
             + json.dumps(state, separators=(",", ":"), default=str)
         )
         self.log.info(
