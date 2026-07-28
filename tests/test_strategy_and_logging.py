@@ -216,6 +216,14 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual(agent._parse_response(""), {})
         self.assertEqual(agent._parse_response(None), {})
 
+    def test_discovery_retry_skips_when_nothing_left_to_assess(self):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(agent_daily_request_limit=250)
+        agent._requests_today = 0
+        # No client configured; a real call here would raise AttributeError,
+        # proving the empty-state, no-discovery retry short-circuits first.
+        agent._research({"positions": [], "candidates": []}, include_discovery=False)
+
     def test_discoveries_are_normalized_for_later_broker_validation(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(agent_discovery_max_symbols=2)
