@@ -873,6 +873,9 @@ class WebullAPI:
     def quote_bid(self, quote: dict) -> Decimal | None:
         return self._quote_decimal(quote, "bid")
 
+    def quote_ask(self, quote: dict) -> Decimal | None:
+        return self._quote_decimal(quote, "ask")
+
     @staticmethod
     def quote_price(quote: dict) -> Decimal:
         regular_time = int(quote.get("last_trade_time") or 0)

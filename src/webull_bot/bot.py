@@ -87,6 +87,7 @@ class AutoTrader:
         self.last_option_discovery = 0.0
         self.last_account_refresh = 0.0
         self.last_order_monitor = 0.0
+        self.last_reprice = 0.0
         self.last_fill_time = time.monotonic()
         self.last_stall_boost = 0.0
         self.cached_buying_power = Decimal("0")
@@ -585,6 +586,7 @@ class AutoTrader:
             "key": key,
             "action": action,
             "cancel_requested_at": None,
+            "limit_price": limit_price,
         }
         instrument_type, symbol = key.split(":", 1)
         self.status.record_trade(instrument_type, symbol, action, limit_price, order_id, pnl)
@@ -662,6 +664,73 @@ class AutoTrader:
                 )
             except Exception as exc:
                 log.error("CANCEL | id=%s | %s", order_id, exc)
+
+    def reprice_resting_exits(self, positions: list[dict]) -> None:
+        """Continuously re-quote resting stock PROFIT/STOP sell orders to
+        track the current ask - the top of the spread - for as long as they
+        stay unfilled and unescalated ("keep modifying to stay in the spread
+        until sold"). Once a symbol is escalated, this stops chasing the ask
+        for it and leaves resubmission to the normal escalation path.
+
+        This cancels and replaces the working order *directly* - it does
+        not touch pending_stock_exits or stop_exit_submitted, and does not
+        call record_trade/record_realized_exit again. Those already ran
+        once at the original PROFIT/LOSS submission; calling them again
+        here on every re-quote would record the same realized P&L multiple
+        times for one logical exit. Leaving stop_exit_submitted's original
+        timestamp untouched is equally deliberate: escalate_stalled_stop_
+        losses depends on that original time to force a guaranteed-fill
+        aggressive price after STOP_LOSS_ESCALATE_SECONDS regardless of how
+        many times the resting order was re-quoted in between - resetting
+        it here would let a stop-loss chase the ask indefinitely while a
+        loss keeps growing.
+        """
+        now = time.monotonic()
+        if now - self.last_reprice < float(self.config.order_monitor_seconds):
+            return
+        self.last_reprice = now
+        for order_id, order in list(self.working_orders.items()):
+            action = order.get("action")
+            key = str(order.get("key") or "")
+            if action not in ("PROFIT", "STOP") or not key.startswith("STOCK:"):
+                continue
+            if order.get("cancel_requested_at") is not None:
+                continue
+            symbol = key.split(":", 1)[1]
+            if symbol in self.stop_loss_escalated:
+                continue
+            try:
+                quote = self.api.stock_quote(symbol)
+                ask = self.api.quote_ask(quote)
+                if ask is None or ask == order.get("limit_price"):
+                    continue
+                quantity, _cost = self.api.stock_position(symbol, positions)
+                if quantity <= 0:
+                    continue
+                self.api.cancel(order_id)
+                new_order_id = self.api.place_stock(
+                    symbol,
+                    "SELL",
+                    quantity,
+                    limit_price=ask,
+                )
+                self.working_orders.pop(order_id, None)
+                self.working_orders[new_order_id] = {
+                    "submitted_at": now,
+                    "key": key,
+                    "action": action,
+                    "cancel_requested_at": None,
+                    "limit_price": ask,
+                }
+                log.info(
+                    "REPRICE| %-8s | %-6s | ask=%s | id=%s",
+                    symbol,
+                    action,
+                    ask,
+                    new_order_id,
+                )
+            except Exception as exc:
+                log.error("REPRICE| %s | %s", symbol, exc)
 
     def account_state(self) -> tuple[Decimal, list[dict]]:
         now = time.monotonic()
@@ -965,6 +1034,7 @@ class AutoTrader:
         positions: list[dict],
         buying_power: Decimal,
         opening_grace_active: bool = False,
+        core_session_active: bool = False,
     ) -> Decimal:
         open_count = self.strategy.open_position_count(positions)
         self.refresh_agent_discoveries()
@@ -1130,14 +1200,35 @@ class AutoTrader:
                         buying_power,
                         bucket_remaining.get(bucket, Decimal("0")),
                     )
-                    buy_quantity, buffered_price = (
-                        self.strategy.stock_order_quantity(
-                            price,
-                            entry_budget,
-                        )
-                    )
                     fractional = False
-                    if buy_quantity == 0 and self.config.fractional_shares_enabled:
+                    if (
+                        core_session_active
+                        and self.config.stock_core_session_position_fraction > 0
+                    ):
+                        target_notional = min(
+                            buying_power
+                            * self.config.stock_core_session_position_fraction,
+                            entry_budget,
+                            self.config.max_order_notional,
+                        )
+                        buy_quantity, buffered_price = (
+                            self.strategy.dollar_stock_quantity(
+                                price, target_notional
+                            )
+                        )
+                        fractional = buy_quantity > 0
+                    else:
+                        buy_quantity, buffered_price = (
+                            self.strategy.stock_order_quantity(
+                                price,
+                                entry_budget,
+                            )
+                        )
+                    if (
+                        buy_quantity == 0
+                        and self.config.fractional_shares_enabled
+                        and core_session_active
+                    ):
                         fractional_quantity = self.strategy.fractional_stock_quantity(
                             price,
                             entry_budget,
@@ -1189,10 +1280,11 @@ class AutoTrader:
                     target = decision.target_price
                     if target is None:
                         continue
+                    ask = self.api.quote_ask(quote)
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
                         if symbol in self.stop_loss_escalated
-                        else target
+                        else (ask or target)
                     )
                     order_id = self.api.place_stock(
                         symbol,
@@ -1205,10 +1297,11 @@ class AutoTrader:
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
                     self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
+                    ask = self.api.quote_ask(quote)
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
                         if symbol in self.stop_loss_escalated
-                        else self.api.stock_stop_exit_price(quote)
+                        else (ask or self.api.stock_stop_exit_price(quote))
                     )
                     order_id = self.api.place_stock(
                         symbol,
@@ -1382,10 +1475,11 @@ class AutoTrader:
                     target = decision.target_price
                     if target is None:
                         continue
+                    ask = self.api.quote_ask(quote)
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
                         if symbol in self.stop_loss_escalated
-                        else target
+                        else (ask or target)
                     )
                     order_id = self.api.place_stock(
                         symbol,
@@ -1398,10 +1492,11 @@ class AutoTrader:
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
                     self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
+                    ask = self.api.quote_ask(quote)
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
                         if symbol in self.stop_loss_escalated
-                        else self.api.stock_stop_exit_price(quote)
+                        else (ask or self.api.stock_stop_exit_price(quote))
                     )
                     order_id = self.api.place_stock(
                         symbol,
@@ -1687,7 +1782,7 @@ class AutoTrader:
         buying_power: Decimal,
         paused: bool,
     ) -> None:
-        if time.monotonic() - self.last_status_write < 2.0:
+        if time.monotonic() - self.last_status_write < float(self.config.poll_seconds):
             return
         self.last_status_write = time.monotonic()
         position_rows = []
@@ -1959,6 +2054,7 @@ class AutoTrader:
             opening_grace_active = option_open <= moment < option_open + timedelta(
                 minutes=self.config.opening_grace_minutes
             )
+            core_session_active = option_open <= moment < option_close
             if opening_grace_active and self.opening_grace_logged_date != moment.date():
                 self.opening_grace_logged_date = moment.date()
                 log.info(
@@ -1973,6 +2069,7 @@ class AutoTrader:
             try:
                 self.resolve_targets(moment)
                 self.monitor_working_orders()
+                self.reprice_resting_exits(self.cached_positions)
                 self.escalate_stalled_stop_losses()
                 buying_power, positions = self.account_state()
                 self.process_ui_commands(positions)
@@ -1985,7 +2082,10 @@ class AutoTrader:
                 if not circuit_active:
                     buying_power = self.trade_micro_scalp(positions, buying_power)
                     buying_power = self.trade_stocks(
-                        positions, buying_power, opening_grace_active
+                        positions,
+                        buying_power,
+                        opening_grace_active,
+                        core_session_active,
                     )
                     if option_open <= moment < option_closeout:
                         self.discover_option_contracts()
