@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from webull_bot.commands import CommandQueue
 from webull_bot.config import Settings
 from webull_bot.daily_logging import DatedDailyFileHandler
+from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.market_agent import MarketResearchAgent
 from webull_bot.status import StatusWriter
 from webull_bot.strategy import TradingStrategy
@@ -474,6 +475,7 @@ class StopLossEscalationTests(unittest.TestCase):
             broker_conflict_symbols=set(),
             daily_realized_pnl=Decimal("0"),
             daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
         )
         fake_bot.is_broker_position_conflict = AutoTrader.is_broker_position_conflict
         fake_bot.is_fractional_trading_not_enabled = (
@@ -1016,6 +1018,7 @@ class BotOvertradingCapTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             daily_realized_pnl=Decimal("0"),
             daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
         )
         record = AutoTrader.record_realized_exit.__get__(fake_bot)
         record(Decimal("100"), Decimal("101"), 10)
@@ -1957,6 +1960,73 @@ class StatusWriterTests(unittest.TestCase):
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
+    def test_recorded_trade_history_survives_a_new_statuswriter_instance(self):
+        status_path = Path("tests/.generated_status/status3.json")
+        state_path = Path("tests/.generated_status/trade_history3.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path), state_file=str(state_path))
+            writer.record_trade(
+                "STOCK",
+                "TSLA",
+                "PROFIT",
+                Decimal("101.00"),
+                "order-1",
+                pnl=Decimal("5.00"),
+                entry_price=Decimal("96.00"),
+            )
+
+            # A fresh instance (simulating a restart) pointed at the same
+            # state file must rehydrate the trade instead of starting empty.
+            restarted = StatusWriter(str(status_path), state_file=str(state_path))
+            self.assertEqual(len(restarted.trades), 1)
+            self.assertEqual(restarted.trades[0]["symbol"], "TSLA")
+            self.assertEqual(restarted.trades[0]["entry_price"], "96.00")
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
+    def test_statuswriter_without_state_file_starts_empty_and_does_not_persist(self):
+        status_path = Path("tests/.generated_status/status4.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path))
+            writer.record_trade("STOCK", "TSLA", "BUY", Decimal("100.00"), "order-1")
+            self.assertEqual(len(writer.trades), 1)
+            self.assertIsNone(writer.state_path)
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
+    def test_recorded_exit_trade_includes_entry_price(self):
+        status_path = Path("tests/.generated_status/status5.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path))
+            writer.record_trade(
+                "STOCK",
+                "TSLA",
+                "STOP",
+                Decimal("95.00"),
+                "order-1",
+                pnl=Decimal("-5.00"),
+                entry_price=Decimal("100.00"),
+            )
+            trade = writer.trades[0]
+            self.assertEqual(trade["entry_price"], "100.00")
+            self.assertEqual(trade["limit_price"], "95.00")
+            self.assertEqual(trade["pnl"], "-5.00")
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
+    def test_recorded_entry_trade_has_no_entry_price(self):
+        status_path = Path("tests/.generated_status/status6.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path))
+            writer.record_trade("STOCK", "TSLA", "BUY", Decimal("100.00"), "order-1")
+            self.assertIsNone(writer.trades[0]["entry_price"])
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
 
 class DashboardCommandTests(unittest.TestCase):
     def test_command_queue_round_trip(self):
@@ -2401,6 +2471,90 @@ class WashSaleTrackerTests(unittest.TestCase):
             nearer_future = tracker.blocked_until("TSLA")
 
             self.assertLess(nearer_future, far_future)
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+
+class DailyPnlTrackerTests(unittest.TestCase):
+    def _tracker(self, path):
+        return DailyPnlTracker(str(path), timezone.utc, logging.getLogger("test-daily-pnl"))
+
+    def test_fresh_file_starts_at_zero(self):
+        path = Path("tests/.generated_daily_pnl/fresh.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path)
+            self.assertEqual(tracker.realized_pnl, Decimal("0"))
+            self.assertEqual(tracker.realized_loss, Decimal("0"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_record_then_new_instance_loads_the_same_totals(self):
+        path = Path("tests/.generated_daily_pnl/roundtrip.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path)
+            tracker.record(Decimal("42.50"), Decimal("10.00"))
+
+            reloaded = self._tracker(path)
+            self.assertEqual(reloaded.realized_pnl, Decimal("42.50"))
+            self.assertEqual(reloaded.realized_loss, Decimal("10.00"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_stale_date_does_not_carry_over_to_a_new_day(self):
+        path = Path("tests/.generated_daily_pnl/stale.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+            path.write_text(
+                json.dumps(
+                    {
+                        "date": yesterday,
+                        "realized_pnl": "500.00",
+                        "realized_loss": "50.00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            tracker = self._tracker(path)
+
+            self.assertEqual(tracker.realized_pnl, Decimal("0"))
+            self.assertEqual(tracker.realized_loss, Decimal("0"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_reset_zeroes_and_persists(self):
+        path = Path("tests/.generated_daily_pnl/reset.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path)
+            tracker.record(Decimal("30.00"), Decimal("5.00"))
+
+            tracker.reset()
+
+            self.assertEqual(tracker.realized_pnl, Decimal("0"))
+            self.assertEqual(tracker.realized_loss, Decimal("0"))
+            reloaded = self._tracker(path)
+            self.assertEqual(reloaded.realized_pnl, Decimal("0"))
+            self.assertEqual(reloaded.realized_loss, Decimal("0"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_corrupt_file_logs_warning_and_starts_fresh(self):
+        path = Path("tests/.generated_daily_pnl/corrupt.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("not json", encoding="utf-8")
+
+            with self.assertLogs("test-daily-pnl", level="WARNING"):
+                tracker = self._tracker(path)
+
+            self.assertEqual(tracker.realized_pnl, Decimal("0"))
+            self.assertEqual(tracker.realized_loss, Decimal("0"))
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
