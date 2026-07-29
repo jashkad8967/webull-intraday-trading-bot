@@ -104,7 +104,7 @@ class Settings(BaseSettings):
         ge=0,
         le=1,
     )
-    micro_scalp_max_positions: int = Field(default=3, ge=1, le=50)
+    micro_scalp_max_positions: int = Field(default=5, ge=1, le=50)
     micro_scalp_dip_cents: Decimal = Field(default=Decimal("0.05"), gt=0)
     micro_scalp_target_cents: Decimal = Field(default=Decimal("0.06"), gt=0)
     micro_scalp_stop_cents: Decimal = Field(default=Decimal("0.10"), gt=0)
@@ -117,7 +117,7 @@ class Settings(BaseSettings):
 
     stock_quantity: int = Field(default=1, ge=1)
     option_quantity: int = Field(default=1, ge=1)
-    max_open_positions: int = Field(default=5, ge=1)
+    max_open_positions: int = Field(default=20, ge=1)
     max_order_notional: Decimal = Field(default=Decimal("1000"), gt=0)
 
     poll_seconds: Decimal = Field(
@@ -178,7 +178,7 @@ class Settings(BaseSettings):
     # deliberately (not gt=0): 0 is the escape hatch back to fixed-quantity
     # sizing all day, same pattern as OPENING_GRACE_MINUTES=0.
     stock_core_session_position_fraction: Decimal = Field(
-        default=Decimal("0.10"),
+        default=Decimal("0.15"),
         ge=0,
         le=1,
     )

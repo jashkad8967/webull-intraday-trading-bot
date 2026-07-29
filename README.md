@@ -343,7 +343,7 @@ built for exactly that:
 MICRO_SCALP_ENABLED=true
 MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
 MICRO_SCALP_CAPITAL_FRACTION=0.20
-MICRO_SCALP_MAX_POSITIONS=3
+MICRO_SCALP_MAX_POSITIONS=5
 MICRO_SCALP_DIP_CENTS=0.05
 MICRO_SCALP_TARGET_CENTS=0.06
 MICRO_SCALP_STOP_CENTS=0.10
@@ -420,7 +420,7 @@ at one share the way the fallback above is. This is the primary
 core-session sizing method, not a last resort:
 
 ```dotenv
-STOCK_CORE_SESSION_POSITION_FRACTION=0.10
+STOCK_CORE_SESSION_POSITION_FRACTION=0.15
 ```
 
 Outside core hours (pre-market/after-hours), entries always fall back to the
@@ -829,7 +829,7 @@ that may apply, and orders that do not fill.
 ```dotenv
 STOCK_QUANTITY=1
 OPTION_QUANTITY=1
-MAX_OPEN_POSITIONS=5
+MAX_OPEN_POSITIONS=20
 MAX_ORDER_NOTIONAL=1000
 ```
 
@@ -842,6 +842,23 @@ largest affordable whole-share quantity. Option quantities are similarly
 reduced using the submitted limit price. Remaining buying power is reserved
 locally as each order is submitted so later orders in the same cycle cannot
 reuse it.
+
+**Capital deployment.** `MAX_OPEN_POSITIONS` is the shared cap on concurrent
+open positions across stocks, options, and micro-scalp combined - it drives
+`stock_bucket_slot_limits()`'s proportional split across the POPULAR/PENNY/
+DISCOVERY (or LARGE_CAP/SMALL_CAP) buckets. Because each core-session entry
+sizes itself as `STOCK_CORE_SESSION_POSITION_FRACTION` of *remaining* buying
+power (not the original total), filling every slot at a low position cap
+still leaves a real chunk of capital idle - e.g. ten sequential 10%-of-
+remaining entries only deploy about two-thirds of the original buying power,
+even completely full. Raising `MAX_OPEN_POSITIONS` (and/or the per-trade
+fraction) closes that gap without changing what actually triggers an entry -
+it's still purely signal-driven (EMA/VWAP/spread/extension all still have to
+agree); this only changes how much of the account gets committed once a
+signal does fire, and how many can run at once. More concurrent positions
+also means more simultaneous market exposure if the broader market moves
+against the bot all at once, so treat this as a real risk dial, not a free
+optimization.
 
 ## 7. API request pacing
 
@@ -1221,7 +1238,7 @@ STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
 MICRO_SCALP_ENABLED=false
 MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
 MICRO_SCALP_CAPITAL_FRACTION=0.20
-MICRO_SCALP_MAX_POSITIONS=3
+MICRO_SCALP_MAX_POSITIONS=5
 MICRO_SCALP_DIP_CENTS=0.05
 MICRO_SCALP_TARGET_CENTS=0.06
 MICRO_SCALP_STOP_CENTS=0.10
@@ -1234,7 +1251,7 @@ OPTION_DISCOVERY_SECONDS=15
 
 STOCK_QUANTITY=1
 OPTION_QUANTITY=1
-MAX_OPEN_POSITIONS=5
+MAX_OPEN_POSITIONS=20
 MAX_ORDER_NOTIONAL=1000
 
 POLL_SECONDS=0.25

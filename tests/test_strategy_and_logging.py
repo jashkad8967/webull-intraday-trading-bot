@@ -1123,7 +1123,7 @@ class AllocationAndLoggingTests(unittest.TestCase):
         )
         self.assertEqual(
             config.stock_bucket_slot_limits(),
-            {"POPULAR": 3, "PENNY": 1, "DISCOVERY": 1},
+            {"POPULAR": 14, "PENNY": 2, "DISCOVERY": 4},
         )
         self.assertEqual(config.stock_universe_page_size, 200)
         self.assertEqual(config.stocks(), ["ALL"])
@@ -1519,7 +1519,7 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(
             cap_config.stock_bucket_slot_limits(),
-            {"LARGE_CAP": 4, "SMALL_CAP": 1},
+            {"LARGE_CAP": 16, "SMALL_CAP": 4},
         )
 
     def test_screener_number_handles_bad_and_nonfinite_values(self):
