@@ -1850,19 +1850,16 @@ class AutoTrader:
                     "bucket": self.position_buckets.get(symbol, "DISCOVERY"),
                 }
             )
-        watchlist = sorted(
-            self.strategy.activity,
-            key=lambda symbol: self.strategy.activity[symbol],
-            reverse=True,
-        )[:10]
+        held_symbols = {row["symbol"] for row in position_rows}
         watchlist_rows = [
             {
                 "symbol": symbol,
                 "price": str(self.strategy.prices.get(symbol, "0")),
                 "bucket": self.strategy.selection_bucket(symbol),
+                "has_position": symbol in held_symbols,
                 **self.strategy.metrics.get(symbol, {}),
             }
-            for symbol in watchlist
+            for symbol in sorted(self.user_watchlist)
         ]
         agent_summary = None
         if self.market_agent:
@@ -1938,21 +1935,25 @@ class AutoTrader:
     def process_ui_commands(
         self,
         positions: list[dict],
+        buying_power: Decimal = Decimal("0"),
         core_session_active: bool = False,
-    ) -> None:
+    ) -> Decimal:
         """Executes dashboard-initiated actions (close all, sell one
-        position, add a watchlist symbol). The dashboard has no Webull
-        credentials or API access of its own - it can only enqueue a
-        request, which is executed here through the same order-placement,
-        wash-sale, and position-tracking code every other exit uses. Runs
-        before the circuit-breaker gate so a manual risk-reducing action is
-        never blocked by a paused/halted state.
+        position, buy one symbol, cancel one pending order, add a watchlist
+        symbol). The dashboard has no Webull credentials or API access of
+        its own - it can only enqueue a request, which is executed here
+        through the same order-placement, wash-sale, and position-tracking
+        code every other entry/exit uses. Runs before the circuit-breaker
+        gate so a manual risk-reducing action (Sell, Cancel, Close All) is
+        never blocked by a paused/halted state - a manual Buy still is,
+        naturally, since handle_portfolio_circuit_breaker/handle_daily_loss_
+        breaker only gate the automatic entry paths that run after this.
         """
         try:
             commands = self.commands.pop_all()
         except Exception as exc:
             log.error("CMD    | queue read failed | %s", exc)
-            return
+            return buying_power
         for command in commands:
             command_type = command.get("type")
             try:
@@ -1961,6 +1962,10 @@ class AutoTrader:
                     log.warning("CMD    | manual close-all executed from dashboard")
                 elif command_type == "sell":
                     self._manual_sell(command, positions, core_session_active)
+                elif command_type == "buy":
+                    buying_power = self._manual_buy(
+                        command, positions, buying_power, core_session_active
+                    )
                 elif command_type == "watchlist_add":
                     self.add_to_watchlist(command.get("symbol", ""))
                 elif command_type == "cancel_order":
@@ -1969,6 +1974,7 @@ class AutoTrader:
                     log.warning("CMD    | unknown command type=%s", command_type)
             except Exception as exc:
                 log.error("CMD    | %s failed | %s", command_type, exc)
+        return buying_power
 
     def _manual_cancel_order(self, command: dict) -> None:
         order_id = str(command.get("order_id", "")).strip()
@@ -2116,6 +2122,117 @@ class AutoTrader:
             quantity,
         )
 
+    def _manual_buy(
+        self,
+        command: dict,
+        positions: list[dict],
+        buying_power: Decimal,
+        core_session_active: bool = False,
+    ) -> Decimal:
+        """Stocks only for now, mirroring the same entry sizing/pricing the
+        automatic strategy uses (dollar-sized during core hours, fixed
+        STOCK_QUANTITY sizing otherwise) rather than a separate ad-hoc
+        path, so a manual buy still respects the account's normal risk
+        limits (MAX_ORDER_NOTIONAL, the $0.10-$0.999 lot rule, etc).
+        """
+        symbol = str(command.get("symbol", "")).upper()
+        if not symbol:
+            return buying_power
+        if symbol in self.broker_conflict_symbols:
+            log.info(
+                "CMD    | manual buy skipped | %-8s | broker conflict blacklisted",
+                symbol,
+            )
+            return buying_power
+        quantity, _cost = self.api.stock_position(symbol, positions)
+        if quantity > 0:
+            log.info(
+                "CMD    | manual buy skipped | %-8s | already holding a position",
+                symbol,
+            )
+            return buying_power
+        blocked_until = self.wash_sales.blocked_until(symbol)
+        if blocked_until:
+            log.info(
+                "CMD    | manual buy skipped | %-8s | wash-sale blocked until %s",
+                symbol,
+                blocked_until.strftime("%Y-%m-%d"),
+            )
+            return buying_power
+        if self.strategy.open_position_count(positions) >= self.config.max_open_positions:
+            log.info(
+                "CMD    | manual buy skipped | %-8s | at MAX_OPEN_POSITIONS",
+                symbol,
+            )
+            return buying_power
+        try:
+            quote = self.api.stock_quote(symbol)
+            price = self.api.quote_price(quote)
+        except Exception as exc:
+            log.error("CMD    | manual buy failed | %-8s | %s", symbol, exc)
+            return buying_power
+        self.strategy.update_stock_snapshot(quote, price)
+        fractional = False
+        if (
+            core_session_active
+            and self.fractional_trading_enabled
+            and self.config.stock_core_session_position_fraction > 0
+        ):
+            target_notional = min(
+                buying_power * self.config.stock_core_session_position_fraction,
+                buying_power,
+                self.config.max_order_notional,
+            )
+            buy_quantity, buffered_price = self.strategy.dollar_stock_quantity(
+                price, target_notional
+            )
+            fractional = buy_quantity > 0
+        else:
+            buy_quantity, buffered_price = self.strategy.stock_order_quantity(
+                price, buying_power
+            )
+            if (
+                buy_quantity == 0
+                and self.config.fractional_shares_enabled
+                and core_session_active
+                and self.fractional_trading_enabled
+            ):
+                fractional_quantity = self.strategy.fractional_stock_quantity(
+                    price, buying_power
+                )
+                if fractional_quantity > 0:
+                    buy_quantity = fractional_quantity
+                    buffered_price = price * Decimal("1.03")
+                    fractional = True
+        if buy_quantity <= 0:
+            log.info(
+                "CMD    | manual buy skipped | %-8s | no affordable quantity",
+                symbol,
+            )
+            return buying_power
+        try:
+            order_id = self.api.place_stock(
+                symbol,
+                "BUY",
+                buy_quantity,
+                limit_price=self.api.stock_limit_price(quote, "BUY"),
+                fractional=fractional,
+            )
+        except Exception as exc:
+            if self.is_fractional_trading_not_enabled(exc):
+                self.handle_fractional_trading_not_enabled(exc)
+            else:
+                log.error("CMD    | manual buy failed | %-8s | %s", symbol, exc)
+            return buying_power
+        self.record_trade(f"STOCK:{symbol}", order_id, "MANUAL_BUY")
+        self.position_buckets[symbol] = "MANUAL"
+        log.warning(
+            "CMD    | manual buy executed | %-8s | qty=%s",
+            symbol,
+            buy_quantity,
+        )
+        return max(Decimal("0"), buying_power - buffered_price * buy_quantity)
+
     def add_to_watchlist(self, symbol: str) -> None:
         symbol = str(symbol).upper().strip()
         if not symbol:
@@ -2203,7 +2320,9 @@ class AutoTrader:
                 self.reprice_resting_exits(self.cached_positions)
                 self.escalate_stalled_stop_losses()
                 buying_power, positions = self.account_state()
-                self.process_ui_commands(positions, core_session_active)
+                buying_power = self.process_ui_commands(
+                    positions, buying_power, core_session_active
+                )
                 circuit_active = self.handle_portfolio_circuit_breaker(
                     positions,
                     buying_power,

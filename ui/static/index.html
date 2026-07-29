@@ -95,7 +95,7 @@
     background: transparent;
     color: var(--text);
   }
-  .tags { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.6rem; }
+  .scroll-tall { max-height: 22rem; overflow-y: auto; }
 </style>
 </head>
 <body>
@@ -138,8 +138,7 @@
         <button class="btn" onclick="addToWatchlist()">Add</button>
       </div>
       <div class="action-msg" id="watchlist-msg"></div>
-      <div id="user-watchlist" class="tags"></div>
-      <div id="watchlist"></div>
+      <div class="scroll-tall" id="watchlist"></div>
     </div>
     <div class="panel">
       <h2>Research Agent</h2>
@@ -234,17 +233,18 @@ async function refresh() {
       { label: "P&L", render: r => r.pnl ? fmtMoney(r.pnl) : "—", cls: r => r.pnl ? pnlClass(r.pnl) : "" },
     ], data.recent_trades);
 
-    const userWatchlist = data.user_watchlist || [];
-    document.getElementById("user-watchlist").innerHTML = userWatchlist.length
-      ? userWatchlist.map(symbol => `<span class="pill">${symbol}</span>`).join("")
-      : '<div class="empty">No pinned symbols yet</div>';
-
     document.getElementById("watchlist").innerHTML = table([
       { label: "Symbol", render: r => r.symbol },
       { label: "Price", render: r => fmtMoney(r.price) },
       { label: "Bucket", render: r => `<span class="pill">${r.bucket}</span>` },
       { label: "Vol", render: r => (r.volume ?? "—").toLocaleString ? r.volume.toLocaleString() : r.volume },
       { label: "Spread%", render: r => r.spread_percent ?? "—" },
+      {
+        label: "",
+        render: r => r.has_position
+          ? '<span class="pill">Held</span>'
+          : `<button class="btn" onclick="buyPosition('${r.symbol}')">Buy</button>`,
+      },
     ], data.watchlist);
 
     const agent = data.agent;
@@ -297,6 +297,17 @@ function sellPosition(symbol, instrumentType) {
     "positions-msg",
     `Selling ${symbol}…`,
     `Sell requested for ${symbol} - the bot will act on its next cycle.`,
+  );
+}
+
+function buyPosition(symbol) {
+  if (!confirm(`Buy ${symbol} now?`)) return;
+  postAction(
+    "/api/buy",
+    { symbol },
+    "watchlist-msg",
+    `Buying ${symbol}…`,
+    `Buy requested for ${symbol} - the bot will act on its next cycle.`,
   );
 }
 

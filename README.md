@@ -1017,27 +1017,41 @@ time the bot starts - unlike `POPULAR_STOCK_SYMBOLS` (which only weights
 priority within the scanned universe), these are always present, a restart
 never loses them, and you never have to re-add them from the dashboard.
 Anything added from the dashboard on top of that stays only in memory for
-the current run.
+the current run. The Watchlist panel shows every watchlist symbol as its
+own row (not just a top-N-by-activity sample) with its live price, bucket,
+volume, and spread, plus a **Buy** button on any symbol you don't already
+hold (shows "Held" instead if you do).
 
-The dashboard can also request four actions: **Close All** (cancels every
+The dashboard can also request five actions: **Close All** (cancels every
 working order and closes every open position, stocks and options alike),
-**Sell** on any individual position, **Cancel** on any individual pending
-order (in the Pending Orders panel - useful for backing out of a BUY
-that's still resting unfilled, or a STOP/PROFIT exit you'd rather reprice
-or handle manually), and adding a symbol to the watchlist. These don't
-give the dashboard trading access directly - clicking a button writes a
-small request to a separate, dedicated shared file (`COMMAND_FILE`, a
-distinct Docker volume the dashboard can only read/write that one file
-in) that the trader process reads once per cycle and executes through its
-own already-safe order-placement, wash-sale, and position-tracking code,
-the same as every automatic exit. A request is picked up on the bot's next
-cycle, not instantly - `POLL_SECONDS` is the worst-case delay. Close All,
-Sell, and Cancel all ask for a JavaScript confirmation before sending the
+**Sell** on any individual position, **Buy** on any watchlist symbol,
+**Cancel** on any individual pending order (in the Pending Orders panel -
+useful for backing out of a BUY that's still resting unfilled, or a
+STOP/PROFIT exit you'd rather reprice or handle manually), and adding a
+symbol to the watchlist. These don't give the dashboard trading access
+directly - clicking a button writes a small request to a separate,
+dedicated shared file (`COMMAND_FILE`, a distinct Docker volume the
+dashboard can only read/write that one file in) that the trader process
+reads once per cycle and executes through its own already-safe
+order-placement, wash-sale, and position-tracking code, the same as every
+automatic entry/exit. A request is picked up on the bot's next cycle, not
+instantly - `POLL_SECONDS` is the worst-case delay. Close All, Sell, Buy,
+and Cancel all ask for a JavaScript confirmation before sending the
 request, since they act on real orders on your account. Cancelling a
 STOP/PROFIT exit only cancels the *order* - the position itself stays
 open, and the bot will submit a fresh exit order for it again next cycle
 unless you also close the position (e.g. via Sell) or the market moves it
 out of an exit condition.
+
+A manual **Buy** is stocks-only for now and sizes/prices itself exactly
+like an automatic entry (dollar-sized during core hours per
+`STOCK_CORE_SESSION_POSITION_FRACTION`, fixed `STOCK_QUANTITY` sizing
+otherwise, at the standard entry limit price) rather than using a separate
+ad-hoc path, so it still respects `MAX_ORDER_NOTIONAL`, `MAX_OPEN_POSITIONS`,
+wash-sale blocks, and the $0.10-$0.999 lot rule. It's skipped (with a log
+line explaining why) if you already hold a position in that symbol, it's
+wash-sale blocked, the symbol is broker-conflict blacklisted, or the
+portfolio is already at `MAX_OPEN_POSITIONS`.
 
 A manual **Sell** is an urgent "get me out now" click, so it's priced
 differently from a patient automatic exit: it sells at the current ask (the

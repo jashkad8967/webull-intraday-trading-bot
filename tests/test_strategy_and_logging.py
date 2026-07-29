@@ -2010,6 +2010,90 @@ class DashboardCommandTests(unittest.TestCase):
 
         self.assertEqual(cancelled, [])
 
+    def test_manual_buy_sizes_by_dollars_during_core_session(self):
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0.10"),
+            max_order_notional=Decimal("1000"),
+            max_open_positions=10,
+        )
+        fake_bot = SimpleNamespace(
+            config=config,
+            broker_conflict_symbols=set(),
+            wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
+            fractional_trading_enabled=True,
+            position_buckets={},
+            strategy=SimpleNamespace(
+                open_position_count=TradingStrategy.open_position_count,
+                update_stock_snapshot=lambda quote, price: None,
+                dollar_stock_quantity=TradingStrategy.dollar_stock_quantity.__get__(
+                    TradingStrategy(config)
+                ),
+            ),
+            api=SimpleNamespace(
+                stock_position=lambda symbol, positions: (Decimal("0"), Decimal("0")),
+                stock_quote=lambda symbol: {"bid": "49.90", "ask": "50.10"},
+                quote_price=lambda quote: Decimal("50.00"),
+                stock_limit_price=lambda quote, side: Decimal("50.00"),
+                place_stock=lambda symbol, side, quantity, limit_price=None, fractional=False: (
+                    placed.append((symbol, side, quantity, fractional)) or "order-1"
+                ),
+            ),
+        )
+        fake_bot.record_trade = lambda *a, **k: None
+        manual_buy = AutoTrader._manual_buy.__get__(fake_bot)
+
+        remaining = manual_buy(
+            {"symbol": "MSFT"}, [], Decimal("1000"), True
+        )
+
+        self.assertEqual(len(placed), 1)
+        symbol, side, quantity, fractional = placed[0]
+        self.assertEqual((symbol, side), ("MSFT", "BUY"))
+        self.assertTrue(fractional)
+        # 10% of $1000 = $100 target notional at ~$50/share -> ~2 shares,
+        # well above fractional_stock_quantity's old 1-share cap.
+        self.assertGreater(quantity, Decimal("1"))
+        self.assertLess(remaining, Decimal("1000"))
+        self.assertEqual(fake_bot.position_buckets.get("MSFT"), "MANUAL")
+
+    def test_manual_buy_skips_when_already_holding_a_position(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            broker_conflict_symbols=set(),
+            api=SimpleNamespace(
+                stock_position=lambda symbol, positions: (Decimal("5"), Decimal("40")),
+            ),
+        )
+        manual_buy = AutoTrader._manual_buy.__get__(fake_bot)
+
+        remaining = manual_buy({"symbol": "MSFT"}, [], Decimal("1000"))
+
+        self.assertEqual(remaining, Decimal("1000"))
+
+    def test_process_ui_commands_dispatches_buy_and_threads_buying_power(self):
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+        fake_bot = SimpleNamespace(
+            commands=SimpleNamespace(
+                pop_all=lambda: [{"type": "buy", "symbol": "MSFT"}]
+            ),
+            _manual_buy=lambda command, positions, buying_power, core_session_active: (
+                calls.append((command, buying_power, core_session_active))
+                or Decimal("42")
+            ),
+        )
+        process = AutoTrader.process_ui_commands.__get__(fake_bot)
+
+        result = process([], Decimal("1000"), True)
+
+        self.assertEqual(result, Decimal("42"))
+        self.assertEqual(calls, [({"type": "buy", "symbol": "MSFT"}, Decimal("1000"), True)])
+
     def test_manual_sell_prices_at_the_ask_outside_core_session(self):
         from webull_bot.bot import AutoTrader
 

@@ -62,6 +62,10 @@ class SellRequest(BaseModel):
     instrument_type: str = "EQUITY"
 
 
+class BuyRequest(BaseModel):
+    symbol: str
+
+
 class WatchlistRequest(BaseModel):
     symbol: str
 
@@ -86,6 +90,15 @@ def sell(request: SellRequest) -> JSONResponse:
         symbol=symbol,
         instrument_type=request.instrument_type.strip().upper() or "EQUITY",
     )
+    return JSONResponse({"queued": True, "id": command_id})
+
+
+@app.post("/api/buy")
+def buy(request: BuyRequest) -> JSONResponse:
+    symbol = request.symbol.strip().upper()
+    if not symbol:
+        return JSONResponse({"queued": False, "error": "symbol is required"}, status_code=400)
+    command_id = enqueue_command("buy", symbol=symbol)
     return JSONResponse({"queued": True, "id": command_id})
 
 
