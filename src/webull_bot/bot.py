@@ -759,8 +759,16 @@ class AutoTrader:
                 ask = self.api.quote_ask(quote)
                 if ask is None or ask == order.get("limit_price"):
                     continue
-                quantity, _cost = self.api.stock_position(symbol, positions)
+                quantity, cost = self.api.stock_position(symbol, positions)
                 if quantity <= 0:
+                    continue
+                if cost > 0 and ask < cost:
+                    # Never chase the ask down below entry cost - the
+                    # existing resting order was already validly priced at
+                    # or above the profit target when submitted; repricing
+                    # to a falling ask here could reprice a profit-take
+                    # into a loss. Leave it resting and let escalation (or
+                    # the ask recovering) handle it instead.
                     continue
                 self.api.cancel(order_id)
                 new_order_id = self.api.place_stock(
@@ -1339,10 +1347,17 @@ class AutoTrader:
                     if target is None:
                         continue
                     ask = self.api.quote_ask(quote)
+                    # ask can be below target - or even below cost - if the
+                    # decision fired off a last-trade print (quote_price)
+                    # that's already stale relative to the current book
+                    # (the market moved down between the two reads). Never
+                    # let a "profit-take" actually price below the target
+                    # that triggered it, or it can silently execute at a
+                    # real loss while still being logged as PROFIT.
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
                         if symbol in self.stop_loss_escalated
-                        else (ask or target)
+                        else (max(ask, target) if ask else target)
                     )
                     order_id = self.api.place_stock(
                         symbol,
@@ -1548,10 +1563,17 @@ class AutoTrader:
                     if target is None:
                         continue
                     ask = self.api.quote_ask(quote)
+                    # ask can be below target - or even below cost - if the
+                    # decision fired off a last-trade print (quote_price)
+                    # that's already stale relative to the current book
+                    # (the market moved down between the two reads). Never
+                    # let a "profit-take" actually price below the target
+                    # that triggered it, or it can silently execute at a
+                    # real loss while still being logged as PROFIT.
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
                         if symbol in self.stop_loss_escalated
-                        else (ask or target)
+                        else (max(ask, target) if ask else target)
                     )
                     order_id = self.api.place_stock(
                         symbol,
