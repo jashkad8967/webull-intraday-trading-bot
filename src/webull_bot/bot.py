@@ -1917,7 +1917,11 @@ class AutoTrader:
             log.error("CLOSE  | failed | %s", exc)
             return False
 
-    def process_ui_commands(self, positions: list[dict]) -> None:
+    def process_ui_commands(
+        self,
+        positions: list[dict],
+        core_session_active: bool = False,
+    ) -> None:
         """Executes dashboard-initiated actions (close all, sell one
         position, add a watchlist symbol). The dashboard has no Webull
         credentials or API access of its own - it can only enqueue a
@@ -1938,7 +1942,7 @@ class AutoTrader:
                     self.close_instruments({"EQUITY", "OPTION"})
                     log.warning("CMD    | manual close-all executed from dashboard")
                 elif command_type == "sell":
-                    self._manual_sell(command, positions)
+                    self._manual_sell(command, positions, core_session_active)
                 elif command_type == "watchlist_add":
                     self.add_to_watchlist(command.get("symbol", ""))
                 else:
@@ -1946,7 +1950,12 @@ class AutoTrader:
             except Exception as exc:
                 log.error("CMD    | %s failed | %s", command_type, exc)
 
-    def _manual_sell(self, command: dict, positions: list[dict]) -> None:
+    def _manual_sell(
+        self,
+        command: dict,
+        positions: list[dict],
+        core_session_active: bool = False,
+    ) -> None:
         symbol = str(command.get("symbol", "")).upper()
         instrument_type = command.get("instrument_type", "EQUITY")
         if not symbol:
@@ -1978,13 +1987,32 @@ class AutoTrader:
                 )
                 return
             quote = self.api.stock_quote(symbol)
-            sell_price = self.api.stock_limit_price(quote, "SELL")
+            is_fractional = quantity != quantity.to_integral_value()
+            # A manual sell is an urgent "get me out" click, not a patient
+            # resting order - the old below-bid crossing price
+            # (stock_limit_price's SELL side) shaved off an extra
+            # STOCK_LIMIT_OFFSET on top of the spread, which could tip an
+            # otherwise-flat or barely-profitable exit into a recorded
+            # loss for no real reason. Price it at the ask (top of the
+            # spread) instead, and place a genuine MARKET order whenever
+            # one is actually usable (whole shares, core hours, account
+            # allows fractional/MARKET orders) so it's not left resting
+            # unfilled either.
+            sell_price = self.api.quote_ask(quote) or self.api.stock_limit_price(
+                quote, "SELL"
+            )
+            use_market = (
+                core_session_active
+                and not is_fractional
+                and self.fractional_trading_enabled
+            )
             order_id = self.api.place_stock(
                 symbol,
                 "SELL",
                 quantity,
-                limit_price=sell_price,
-                fractional=quantity != quantity.to_integral_value(),
+                limit_price=None if use_market else sell_price,
+                fractional=is_fractional,
+                market=use_market,
             )
             self.pending_stock_exits.add(symbol)
             pnl = self.record_realized_exit(cost, sell_price, quantity)
@@ -2006,7 +2034,9 @@ class AutoTrader:
                 )
                 return
             quote = self.api.option_quote(contract["symbol"])
-            sell_price = self.api.option_limit_price(quote, "SELL")
+            sell_price = self.api.quote_ask(quote) or self.api.option_limit_price(
+                quote, "SELL"
+            )
             order_id = self.api.place_option(
                 contract,
                 "SELL",
@@ -2118,7 +2148,7 @@ class AutoTrader:
                 self.reprice_resting_exits(self.cached_positions)
                 self.escalate_stalled_stop_losses()
                 buying_power, positions = self.account_state()
-                self.process_ui_commands(positions)
+                self.process_ui_commands(positions, core_session_active)
                 circuit_active = self.handle_portfolio_circuit_breaker(
                     positions,
                     buying_power,

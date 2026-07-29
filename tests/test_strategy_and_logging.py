@@ -1883,7 +1883,7 @@ class DashboardCommandTests(unittest.TestCase):
     def test_process_ui_commands_survives_unknown_type_and_handler_error(self):
         from webull_bot.bot import AutoTrader
 
-        def boom(command, positions):
+        def boom(command, positions, core_session_active=False):
             raise RuntimeError("boom")
 
         fake_bot = SimpleNamespace(
@@ -1895,7 +1895,7 @@ class DashboardCommandTests(unittest.TestCase):
         process = AutoTrader.process_ui_commands.__get__(fake_bot)
         process([])  # must not raise despite the unknown type and handler error
 
-    def test_manual_sell_closes_equity_position_and_records_pnl(self):
+    def test_manual_sell_prices_at_the_ask_outside_core_session(self):
         from webull_bot.bot import AutoTrader
 
         placed = []
@@ -1904,11 +1904,14 @@ class DashboardCommandTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             pending_stock_exits=set(),
             pending_option_exits=set(),
+            fractional_trading_enabled=True,
             api=SimpleNamespace(
                 stock_quote=lambda symbol: {"bid": "99.00", "ask": "99.20"},
+                quote_ask=lambda quote: Decimal(str(quote["ask"])),
                 stock_limit_price=lambda quote, side: Decimal("99.00"),
-                place_stock=lambda symbol, side, quantity, limit_price=None, fractional=False: (
-                    placed.append((symbol, side, quantity, fractional)) or "order-1"
+                place_stock=lambda symbol, side, quantity, limit_price=None, fractional=False, market=False: (
+                    placed.append((symbol, side, quantity, limit_price, fractional, market))
+                    or "order-1"
                 ),
             ),
             wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
@@ -1927,11 +1930,113 @@ class DashboardCommandTests(unittest.TestCase):
                 "cost_price": "100.00",
             }
         ]
+        # core_session_active defaults to False - a top-of-spread LIMIT
+        # order, not a MARKET order, since MARKET orders outside core
+        # hours aren't reliably supported.
         manual_sell({"symbol": "TSLA", "instrument_type": "EQUITY"}, positions)
 
-        self.assertEqual(placed, [("TSLA", "SELL", Decimal("3"), False)])
+        self.assertEqual(
+            placed,
+            [("TSLA", "SELL", Decimal("3"), Decimal("99.20"), False, False)],
+        )
         self.assertIn("TSLA", fake_bot.pending_stock_exits)
-        self.assertEqual(recorded_pnl, [(Decimal("100.00"), Decimal("99.00"), Decimal("3"))])
+        self.assertEqual(recorded_pnl, [(Decimal("100.00"), Decimal("99.20"), Decimal("3"))])
+
+    def test_manual_sell_uses_a_market_order_during_core_session(self):
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+
+        fake_bot = SimpleNamespace(
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+            fractional_trading_enabled=True,
+            api=SimpleNamespace(
+                stock_quote=lambda symbol: {"bid": "99.00", "ask": "99.20"},
+                quote_ask=lambda quote: Decimal(str(quote["ask"])),
+                stock_limit_price=lambda quote, side: Decimal("99.00"),
+                place_stock=lambda symbol, side, quantity, limit_price=None, fractional=False, market=False: (
+                    placed.append((symbol, side, quantity, limit_price, fractional, market))
+                    or "order-1"
+                ),
+            ),
+            wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
+        )
+        fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: (
+            price - cost
+        ) * qty * multiplier
+        fake_bot.record_trade = lambda *a, **k: None
+        manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TSLA",
+                "quantity": "3",
+                "cost_price": "100.00",
+            }
+        ]
+        manual_sell(
+            {"symbol": "TSLA", "instrument_type": "EQUITY"},
+            positions,
+            True,
+        )
+
+        self.assertEqual(
+            placed,
+            [("TSLA", "SELL", Decimal("3"), None, False, True)],
+        )
+
+    def test_manual_sell_of_a_fractional_position_never_uses_market(self):
+        """A fractional-quantity position must still go through the
+        fractional order machinery (MARKET+CORE forced by fractional=True
+        already) rather than the plain market=True path, even during core
+        hours - the two paths shouldn't both try to force MARKET at once.
+        """
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+
+        fake_bot = SimpleNamespace(
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+            fractional_trading_enabled=True,
+            api=SimpleNamespace(
+                stock_quote=lambda symbol: {"bid": "99.00", "ask": "99.20"},
+                quote_ask=lambda quote: Decimal(str(quote["ask"])),
+                stock_limit_price=lambda quote, side: Decimal("99.00"),
+                place_stock=lambda symbol, side, quantity, limit_price=None, fractional=False, market=False: (
+                    placed.append((symbol, side, quantity, limit_price, fractional, market))
+                    or "order-1"
+                ),
+            ),
+            wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
+        )
+        fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: (
+            price - cost
+        ) * qty * multiplier
+        fake_bot.record_trade = lambda *a, **k: None
+        manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TSLA",
+                "quantity": "2.5",
+                "cost_price": "100.00",
+            }
+        ]
+        manual_sell(
+            {"symbol": "TSLA", "instrument_type": "EQUITY"},
+            positions,
+            True,
+        )
+
+        placed_symbol, placed_side, placed_qty, placed_limit, placed_fractional, placed_market = (
+            placed[0]
+        )
+        self.assertTrue(placed_fractional)
+        self.assertFalse(placed_market)
 
     def test_manual_sell_skips_when_no_matching_position(self):
         from webull_bot.bot import AutoTrader
