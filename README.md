@@ -1016,6 +1016,17 @@ picked up on the bot's next cycle, not instantly - `POLL_SECONDS` is the
 worst-case delay. Close All and Sell both ask for a JavaScript confirmation
 before sending the request, since they submit real orders on your account.
 
+A manual **Sell** is an urgent "get me out now" click, so it's priced
+differently from a patient automatic exit: it sells at the current ask (the
+top of the spread) instead of crossing further below the bid, and during
+core trading hours (with a whole-share position, and once the account has
+agreed to fractional/MARKET trading - see "Fractional shares" above) it
+places a genuine MARKET order instead of a resting LIMIT order, so it
+doesn't sit unfilled either. The old below-bid-crossing price shaved an
+extra `STOCK_LIMIT_OFFSET`/`OPTION_LIMIT_OFFSET` off the sale for no real
+reason, which could turn an otherwise flat or barely-profitable manual exit
+into a recorded loss.
+
 The trader and dashboard run as different non-root container users sharing
 that one volume, so both Dockerfiles pre-create `/var/commands` world-writable
 before either user is dropped into place. If you already ran

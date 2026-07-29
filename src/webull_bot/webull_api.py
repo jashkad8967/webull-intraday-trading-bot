@@ -759,11 +759,17 @@ class WebullAPI:
         quantity: int | Decimal,
         limit_price: Decimal | None = None,
         fractional: bool = False,
+        market: bool = False,
     ) -> str:
         """fractional=True places a fixed-quantity MARKET order for a
         quantity in (0, 1] - Webull only supports fractional share trading
         as a MARKET order during core hours, never LIMIT and never extended
         hours, so those overrides are forced regardless of limit_price.
+
+        market=True is the same MARKET/CORE-only override for a plain
+        whole-share order - for a caller that wants a guaranteed-fill exit
+        (e.g. an urgent manual sell) without going through the fractional-
+        quantity machinery above.
         """
         client_order_id = uuid4().hex
         order = {
@@ -772,14 +778,16 @@ class WebullAPI:
             "symbol": symbol,
             "instrument_type": "EQUITY",
             "market": "US",
-            "order_type": "MARKET" if fractional or limit_price is None else "LIMIT",
+            "order_type": (
+                "MARKET" if fractional or market or limit_price is None else "LIMIT"
+            ),
             "quantity": str(quantity),
-            "support_trading_session": "CORE" if fractional else "ALL",
+            "support_trading_session": "CORE" if (fractional or market) else "ALL",
             "side": side,
             "time_in_force": "DAY",
             "entrust_type": "QTY",
         }
-        if limit_price is not None and not fractional:
+        if limit_price is not None and not fractional and not market:
             order["limit_price"] = str(
                 limit_price.quantize(Decimal("0.01"), rounding=ROUND_UP)
             )
