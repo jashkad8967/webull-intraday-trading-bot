@@ -693,6 +693,52 @@ class RepriceRestingExitsTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIn("order-1", fake_bot.working_orders)
 
+    def test_reprice_never_touches_stop_loss_orders(self):
+        """A stop-loss must never be repriced to chase the ask - it needs
+        to fill fast to cap a loss, not rest above a possibly-falling
+        market hoping for a better price. Only escalate_stalled_stop_losses
+        should ever move a stop, and only towards a guaranteed-fill price.
+        """
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+
+        class FakeApi:
+            @staticmethod
+            def stock_quote(symbol):
+                raise AssertionError("must not fetch a quote for a STOP order")
+
+            @staticmethod
+            def cancel(order_id):
+                calls.append(order_id)
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
+            api=FakeApi(),
+            last_reprice=0.0,
+            stop_loss_escalated=set(),
+            pending_stock_exits={"ASHR"},
+            stop_exit_submitted={"ASHR": 0.0},
+            daily_realized_pnl=Decimal("0"),
+            daily_realized_loss=Decimal("0"),
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "STOP",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("34.00"),
+                }
+            },
+        )
+        reprice = AutoTrader.reprice_resting_exits.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice([{"instrument_type": "EQUITY", "symbol": "ASHR", "quantity": "1"}])
+
+        self.assertEqual(calls, [])
+        self.assertIn("order-1", fake_bot.working_orders)
+
 
 class MicroScalpIntegrationTests(unittest.TestCase):
     def test_trade_micro_scalp_buys_a_qualifying_dip_end_to_end(self):

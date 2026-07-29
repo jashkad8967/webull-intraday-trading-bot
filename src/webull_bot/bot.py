@@ -700,24 +700,26 @@ class AutoTrader:
                 log.error("CANCEL | id=%s | %s", order_id, exc)
 
     def reprice_resting_exits(self, positions: list[dict]) -> None:
-        """Continuously re-quote resting stock PROFIT/STOP sell orders to
-        track the current ask - the top of the spread - for as long as they
-        stay unfilled and unescalated ("keep modifying to stay in the spread
+        """Continuously re-quote a resting stock PROFIT sell order to track
+        the current ask - the top of the spread - for as long as it stays
+        unfilled and unescalated ("keep modifying to stay in the spread
         until sold"). Once a symbol is escalated, this stops chasing the ask
         for it and leaves resubmission to the normal escalation path.
+
+        PROFIT only, deliberately - not STOP. A stop-loss needs to fill
+        fast to cap a loss; chasing the ask means chasing a price *above*
+        the market, and if the stock is actively falling, repeatedly
+        cancelling and re-resting a stop above a falling ask can leave it
+        unfilled for the whole 15s until escalation, during which the loss
+        keeps growing. Only escalate_stalled_stop_losses should ever move a
+        stop's price, and only towards a guaranteed-fill crossing price.
 
         This cancels and replaces the working order *directly* - it does
         not touch pending_stock_exits or stop_exit_submitted, and does not
         call record_trade/record_realized_exit again. Those already ran
-        once at the original PROFIT/LOSS submission; calling them again
-        here on every re-quote would record the same realized P&L multiple
-        times for one logical exit. Leaving stop_exit_submitted's original
-        timestamp untouched is equally deliberate: escalate_stalled_stop_
-        losses depends on that original time to force a guaranteed-fill
-        aggressive price after STOP_LOSS_ESCALATE_SECONDS regardless of how
-        many times the resting order was re-quoted in between - resetting
-        it here would let a stop-loss chase the ask indefinitely while a
-        loss keeps growing.
+        once at the original PROFIT submission; calling them again here on
+        every re-quote would record the same realized P&L multiple times
+        for one logical exit.
         """
         now = time.monotonic()
         if now - self.last_reprice < float(self.config.order_monitor_seconds):
@@ -726,7 +728,7 @@ class AutoTrader:
         for order_id, order in list(self.working_orders.items()):
             action = order.get("action")
             key = str(order.get("key") or "")
-            if action not in ("PROFIT", "STOP") or not key.startswith("STOCK:"):
+            if action != "PROFIT" or not key.startswith("STOCK:"):
                 continue
             if order.get("cancel_requested_at") is not None:
                 continue
@@ -1333,11 +1335,18 @@ class AutoTrader:
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
                     self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
-                    ask = self.api.quote_ask(quote)
+                    # Never price an initial stop-loss at the ask - unlike a
+                    # profit-take, a stop needs to fill fast to cap the loss,
+                    # not rest passively above the market hoping for a
+                    # better price while the position keeps falling further
+                    # away from it. stock_stop_exit_price (bid/ask midpoint)
+                    # balances "don't overshoot the bid" against "don't sit
+                    # unfilled" - only escalation (after 15s unfilled) should
+                    # cross the market harder than that.
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
                         if symbol in self.stop_loss_escalated
-                        else (ask or self.api.stock_stop_exit_price(quote))
+                        else self.api.stock_stop_exit_price(quote)
                     )
                     order_id = self.api.place_stock(
                         symbol,
@@ -1535,11 +1544,18 @@ class AutoTrader:
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
                     self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
-                    ask = self.api.quote_ask(quote)
+                    # Never price an initial stop-loss at the ask - unlike a
+                    # profit-take, a stop needs to fill fast to cap the loss,
+                    # not rest passively above the market hoping for a
+                    # better price while the position keeps falling further
+                    # away from it. stock_stop_exit_price (bid/ask midpoint)
+                    # balances "don't overshoot the bid" against "don't sit
+                    # unfilled" - only escalation (after 15s unfilled) should
+                    # cross the market harder than that.
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
                         if symbol in self.stop_loss_escalated
-                        else (ask or self.api.stock_stop_exit_price(quote))
+                        else self.api.stock_stop_exit_price(quote)
                     )
                     order_id = self.api.place_stock(
                         symbol,
