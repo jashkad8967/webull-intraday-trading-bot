@@ -5,7 +5,7 @@ import sys
 import threading
 import unittest
 import unittest.mock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +15,7 @@ from webull_bot.config import Settings
 from webull_bot.daily_logging import DatedDailyFileHandler
 from webull_bot.market_agent import MarketResearchAgent
 from webull_bot.strategy import TradingStrategy
+from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import QuoteUnavailableError, WebullAPI
 
 
@@ -1652,6 +1653,99 @@ class DashboardCommandTests(unittest.TestCase):
         self.assertIn("TSLA", fake_bot.user_watchlist)
         self.assertEqual(fake_bot.stock_categories.get("TSLA"), "US_STOCK")
         self.assertIn("TSLA", fake_bot.stock_symbols)
+
+
+class WashSaleTrackerTests(unittest.TestCase):
+    def _tracker(self, path, block_days):
+        return WashSaleTracker(str(path), block_days, timezone.utc, logging.getLogger("test-wash"))
+
+    def test_block_then_blocked_until_reflects_configured_days(self):
+        path = Path("tests/.generated_wash/blocks.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path, 31)
+            until = tracker.block("AAPL", "stop-loss exit submitted")
+            expected = datetime.now(timezone.utc) + timedelta(days=31)
+            self.assertLess(abs((until - expected).total_seconds()), 5)
+            self.assertIsNotNone(tracker.blocked_until("AAPL"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_block_expires_after_configured_days(self):
+        path = Path("tests/.generated_wash/expired.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path, 31)
+            blocked_at = datetime.now(timezone.utc) - timedelta(days=32)
+            tracker.blocks["AAPL"] = {"blocked_at": blocked_at.isoformat()}
+            self.assertIsNone(tracker.blocked_until("AAPL"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_legacy_string_format_is_migrated_and_shortened_to_new_day_count(self):
+        """A block written under the old fixed 60-day rule must be
+        re-evaluated against the new (lower) WASH_SALE_BLOCK_DAYS as soon as
+        the tracker loads it, not frozen at whatever the old rule computed.
+        """
+        path = Path("tests/.generated_wash/legacy.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Legacy entry: a loss 40 days ago, blocked for the old 60 days,
+            # so the stored "until" is 20 days in the future.
+            legacy_until = datetime.now(timezone.utc) + timedelta(days=20)
+            path.write_text(
+                json.dumps({"AAPL": legacy_until.isoformat()}),
+                encoding="utf-8",
+            )
+
+            tracker = self._tracker(path, 31)
+
+            # Under the new 31-day rule, a loss 40 days ago is already past
+            # its block window (40 > 31), so it should be gone, not still
+            # blocked for another 20 days.
+            self.assertIsNone(tracker.blocked_until("AAPL"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_legacy_migration_keeps_a_still_active_block_shortened_not_dropped(self):
+        path = Path("tests/.generated_wash/legacy_active.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Legacy entry: a loss 10 days ago, blocked for the old 60 days,
+            # so the stored "until" is 50 days in the future.
+            legacy_until = datetime.now(timezone.utc) + timedelta(days=50)
+            path.write_text(
+                json.dumps({"AAPL": legacy_until.isoformat()}),
+                encoding="utf-8",
+            )
+
+            tracker = self._tracker(path, 31)
+
+            # Under the new 31-day rule, a loss 10 days ago is still blocked
+            # for 21 more days (31 - 10), not the old 50.
+            until = tracker.blocked_until("AAPL")
+            self.assertIsNotNone(until)
+            expected = datetime.now(timezone.utc) + timedelta(days=21)
+            self.assertLess(abs((until - expected).total_seconds()), 5)
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_changing_block_days_after_load_immediately_changes_blocked_until(self):
+        path = Path("tests/.generated_wash/dynamic.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path, 60)
+            tracker.block("TSLA", "manual sell at a loss")
+            far_future = tracker.blocked_until("TSLA")
+
+            tracker.block_days = 31
+            nearer_future = tracker.blocked_until("TSLA")
+
+            self.assertLess(nearer_future, far_future)
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
 
 
 if __name__ == "__main__":
