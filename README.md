@@ -707,13 +707,20 @@ being filled.
 
 When a stock *or option* loss exit is submitted (options block by their
 underlying symbol), it's persisted in `conf/wash_sale_blocks.json` and
-blocked from new purchases — of the stock or a new option on it — for 60
-calendar days, well past the 30-day IRS wash-sale window. This is a
-conservative same-underlying control, not a tax determination: it has no
-visibility into manual trades, other accounts, or IRAs, and it doesn't
-attempt the "substantially identical security" analysis for deep-ITM options
-that real tax software would. It only guards against the bot's own trading
-creating a wash sale.
+blocked from new purchases — of the stock or a new option on it — for
+`WASH_SALE_BLOCK_DAYS` (31 by default), just past the 30-day IRS wash-sale
+window. The tracker stores the date each block was triggered rather than a
+precomputed end date, so changing `WASH_SALE_BLOCK_DAYS` retroactively
+re-shortens or re-lengthens every existing block the next time the bot
+starts, not just new ones going forward. This is a conservative
+same-underlying control, not a tax determination: it has no visibility into
+manual trades, other accounts, or IRAs, and it doesn't attempt the
+"substantially identical security" analysis for deep-ITM options that real
+tax software would. It only guards against the bot's own trading creating a
+wash sale. Lowering `WASH_SALE_BLOCK_DAYS` closer to the 30-day floor
+shrinks that safety margin - a re-entry landing exactly on day 31 is fine
+against a loss 31 days prior, but leaves less room for error than the
+previous 60-day default did.
 
 The end-of-day closeout is the exception: it cancels working profit orders and
 closes remaining positions before market close, which can realize a loss.
@@ -1167,7 +1174,7 @@ OPTION_EOD_CLOSE_TIME=15:50
 OPTION_MARKET_CLOSE_TIME=16:00
 EOD_RETRY_SECONDS=10
 MARKET_HOLIDAYS=
-WASH_SALE_BLOCK_DAYS=60
+WASH_SALE_BLOCK_DAYS=31
 WASH_SALE_STATE_FILE=conf/wash_sale_blocks.json
 STOCK_LIMIT_OFFSET=0.005
 OPTION_LIMIT_OFFSET=0.03

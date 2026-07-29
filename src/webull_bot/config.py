@@ -225,7 +225,7 @@ class Settings(BaseSettings):
     option_market_close_time: str = "16:00"
     eod_retry_seconds: int = Field(default=10, ge=2, le=120)
     market_holidays: str = ""
-    wash_sale_block_days: int = Field(default=60, ge=31, le=365)
+    wash_sale_block_days: int = Field(default=31, ge=31, le=365)
     wash_sale_state_file: str = "conf/wash_sale_blocks.json"
     invalid_symbol_state_file: str = "conf/invalid_symbols.json"
     stock_limit_offset: Decimal = Field(
