@@ -14,6 +14,7 @@ from webull_bot.commands import CommandQueue
 from webull_bot.config import Settings
 from webull_bot.daily_logging import DatedDailyFileHandler
 from webull_bot.market_agent import MarketResearchAgent
+from webull_bot.status import StatusWriter
 from webull_bot.strategy import TradingStrategy
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import QuoteUnavailableError, WebullAPI
@@ -1122,7 +1123,7 @@ class AllocationAndLoggingTests(unittest.TestCase):
         )
         self.assertEqual(
             config.stock_bucket_slot_limits(),
-            {"POPULAR": 3, "PENNY": 1, "DISCOVERY": 1},
+            {"POPULAR": 14, "PENNY": 2, "DISCOVERY": 4},
         )
         self.assertEqual(config.stock_universe_page_size, 200)
         self.assertEqual(config.stocks(), ["ALL"])
@@ -1135,6 +1136,22 @@ class AllocationAndLoggingTests(unittest.TestCase):
         )
         self.assertNotIn("SPY", config.popular_stocks())
         self.assertNotIn("QQQ", config.popular_stocks())
+
+    def test_default_risk_tuning_keeps_stop_ceiling_above_spread_gate(self):
+        """STOCK_ENTRY_MAX_SPREAD_PERCENT must stay below
+        STOCK_STOP_LOSS_MAX_PERCENT - otherwise a position entered right at
+        the widest tolerated spread could already be most of the way to its
+        own stop from the bid/ask bounce alone, before any real price move.
+        """
+        config = Settings()
+        self.assertEqual(config.stock_entry_max_spread_percent, Decimal("0.50"))
+        self.assertEqual(config.stock_stop_loss_min_percent, Decimal("0.0012"))
+        self.assertEqual(config.stock_stop_loss_max_percent, Decimal("0.006"))
+        self.assertEqual(config.stock_stop_loss_range_multiplier, Decimal("0.28"))
+        self.assertLess(
+            config.stock_entry_max_spread_percent / 100,
+            config.stock_stop_loss_max_percent,
+        )
 
     def test_default_watchlist_is_parsed_and_deduplicated_by_membership(self):
         config = Settings()
@@ -1502,7 +1519,7 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(
             cap_config.stock_bucket_slot_limits(),
-            {"LARGE_CAP": 4, "SMALL_CAP": 1},
+            {"LARGE_CAP": 16, "SMALL_CAP": 4},
         )
 
     def test_screener_number_handles_bad_and_nonfinite_values(self):
@@ -1838,6 +1855,60 @@ class BrokerConflictTests(unittest.TestCase):
         self.assertFalse(fake_bot.fractional_trading_enabled)
 
 
+class StatusWriterTests(unittest.TestCase):
+    def test_write_includes_pending_orders_for_the_dashboard(self):
+        path = Path("tests/.generated_status/status.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(path))
+            writer.write(
+                mode="LIVE",
+                buying_power=Decimal("1000"),
+                positions=[],
+                watchlist=[],
+                agent_summary=None,
+                paused=False,
+                stock_count=10,
+                option_count=0,
+                pending_orders=[
+                    {
+                        "order_id": "order-1",
+                        "instrument_type": "STOCK",
+                        "symbol": "TSLA",
+                        "action": "STOP",
+                        "limit_price": "99.00",
+                        "age_seconds": 12,
+                        "cancel_requested": False,
+                    }
+                ],
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["pending_orders"]), 1)
+            self.assertEqual(payload["pending_orders"][0]["symbol"], "TSLA")
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_write_defaults_pending_orders_to_empty_list(self):
+        path = Path("tests/.generated_status/status2.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(path))
+            writer.write(
+                mode="LIVE",
+                buying_power=Decimal("1000"),
+                positions=[],
+                watchlist=[],
+                agent_summary=None,
+                paused=False,
+                stock_count=10,
+                option_count=0,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["pending_orders"], [])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+
 class DashboardCommandTests(unittest.TestCase):
     def test_command_queue_round_trip(self):
         path = Path("tests/.generated_commands/commands.json")
@@ -1894,6 +1965,134 @@ class DashboardCommandTests(unittest.TestCase):
         )
         process = AutoTrader.process_ui_commands.__get__(fake_bot)
         process([])  # must not raise despite the unknown type and handler error
+
+    def test_manual_cancel_order_cancels_a_tracked_working_order(self):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        fake_bot = SimpleNamespace(
+            working_orders={
+                "order-1": {
+                    "key": "STOCK:TSLA",
+                    "action": "STOP",
+                    "cancel_requested_at": None,
+                }
+            },
+            api=SimpleNamespace(cancel=lambda order_id: cancelled.append(order_id)),
+        )
+        cancel = AutoTrader._manual_cancel_order.__get__(fake_bot)
+
+        cancel({"order_id": "order-1"})
+
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertIsNotNone(
+            fake_bot.working_orders["order-1"]["cancel_requested_at"]
+        )
+
+    def test_manual_cancel_order_skips_unknown_or_already_requested(self):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        fake_bot = SimpleNamespace(
+            working_orders={
+                "order-2": {
+                    "key": "STOCK:AAPL",
+                    "action": "PROFIT",
+                    "cancel_requested_at": 123.0,
+                }
+            },
+            api=SimpleNamespace(cancel=lambda order_id: cancelled.append(order_id)),
+        )
+        cancel = AutoTrader._manual_cancel_order.__get__(fake_bot)
+
+        cancel({"order_id": "does-not-exist"})
+        cancel({"order_id": "order-2"})  # already cancel-requested
+
+        self.assertEqual(cancelled, [])
+
+    def test_manual_buy_sizes_by_dollars_during_core_session(self):
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0.10"),
+            max_order_notional=Decimal("1000"),
+            max_open_positions=10,
+        )
+        fake_bot = SimpleNamespace(
+            config=config,
+            broker_conflict_symbols=set(),
+            wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
+            fractional_trading_enabled=True,
+            position_buckets={},
+            strategy=SimpleNamespace(
+                open_position_count=TradingStrategy.open_position_count,
+                update_stock_snapshot=lambda quote, price: None,
+                dollar_stock_quantity=TradingStrategy.dollar_stock_quantity.__get__(
+                    TradingStrategy(config)
+                ),
+            ),
+            api=SimpleNamespace(
+                stock_position=lambda symbol, positions: (Decimal("0"), Decimal("0")),
+                stock_quote=lambda symbol: {"bid": "49.90", "ask": "50.10"},
+                quote_price=lambda quote: Decimal("50.00"),
+                stock_limit_price=lambda quote, side: Decimal("50.00"),
+                place_stock=lambda symbol, side, quantity, limit_price=None, fractional=False: (
+                    placed.append((symbol, side, quantity, fractional)) or "order-1"
+                ),
+            ),
+        )
+        fake_bot.record_trade = lambda *a, **k: None
+        manual_buy = AutoTrader._manual_buy.__get__(fake_bot)
+
+        remaining = manual_buy(
+            {"symbol": "MSFT"}, [], Decimal("1000"), True
+        )
+
+        self.assertEqual(len(placed), 1)
+        symbol, side, quantity, fractional = placed[0]
+        self.assertEqual((symbol, side), ("MSFT", "BUY"))
+        self.assertTrue(fractional)
+        # 10% of $1000 = $100 target notional at ~$50/share -> ~2 shares,
+        # well above fractional_stock_quantity's old 1-share cap.
+        self.assertGreater(quantity, Decimal("1"))
+        self.assertLess(remaining, Decimal("1000"))
+        self.assertEqual(fake_bot.position_buckets.get("MSFT"), "MANUAL")
+
+    def test_manual_buy_skips_when_already_holding_a_position(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            broker_conflict_symbols=set(),
+            api=SimpleNamespace(
+                stock_position=lambda symbol, positions: (Decimal("5"), Decimal("40")),
+            ),
+        )
+        manual_buy = AutoTrader._manual_buy.__get__(fake_bot)
+
+        remaining = manual_buy({"symbol": "MSFT"}, [], Decimal("1000"))
+
+        self.assertEqual(remaining, Decimal("1000"))
+
+    def test_process_ui_commands_dispatches_buy_and_threads_buying_power(self):
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+        fake_bot = SimpleNamespace(
+            commands=SimpleNamespace(
+                pop_all=lambda: [{"type": "buy", "symbol": "MSFT"}]
+            ),
+            _manual_buy=lambda command, positions, buying_power, core_session_active: (
+                calls.append((command, buying_power, core_session_active))
+                or Decimal("42")
+            ),
+        )
+        process = AutoTrader.process_ui_commands.__get__(fake_bot)
+
+        result = process([], Decimal("1000"), True)
+
+        self.assertEqual(result, Decimal("42"))
+        self.assertEqual(calls, [({"type": "buy", "symbol": "MSFT"}, Decimal("1000"), True)])
 
     def test_manual_sell_prices_at_the_ask_outside_core_session(self):
         from webull_bot.bot import AutoTrader

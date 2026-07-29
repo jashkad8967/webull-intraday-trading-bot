@@ -343,7 +343,7 @@ built for exactly that:
 MICRO_SCALP_ENABLED=true
 MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
 MICRO_SCALP_CAPITAL_FRACTION=0.20
-MICRO_SCALP_MAX_POSITIONS=3
+MICRO_SCALP_MAX_POSITIONS=5
 MICRO_SCALP_DIP_CENTS=0.05
 MICRO_SCALP_TARGET_CENTS=0.06
 MICRO_SCALP_STOP_CENTS=0.10
@@ -420,7 +420,7 @@ at one share the way the fallback above is. This is the primary
 core-session sizing method, not a last resort:
 
 ```dotenv
-STOCK_CORE_SESSION_POSITION_FRACTION=0.10
+STOCK_CORE_SESSION_POSITION_FRACTION=0.15
 ```
 
 Outside core hours (pre-market/after-hours), entries always fall back to the
@@ -527,9 +527,9 @@ REENTER_CONFIRMATION_POLLS=2
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_MIN_PERCENT=0.0015
+STOCK_STOP_LOSS_MIN_PERCENT=0.0012
 STOCK_STOP_LOSS_MAX_PERCENT=0.006
-STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
+STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.28
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
@@ -543,6 +543,20 @@ confirms after part of a move has already happened, so without this, the
 bot can end up buying right as a fast spike exhausts and reverses, hitting
 the stop shortly after. Raise it to allow chasing further-extended moves;
 set it to `0` to disable the check entirely.
+
+**Entry gates.** The spread/VWAP/extension/EMA-signal checks run in that
+order, each only evaluating candidates that already passed everything
+before it - so a `GATES` log dominated by "spread too wide" means most
+candidates are being filtered out before VWAP, extension, or the actual
+entry signal are ever checked. `STOCK_ENTRY_MAX_SPREAD_PERCENT` default is
+`0.50` - deliberately wider than the very first ~0.15% this project
+shipped with, which was blocking the large majority of scan candidates
+immediately. This is a real tradeoff, not a free win: a wider tolerated
+spread means some entries pay more of the strategy's already-thin targeted
+margin (`STOCK_MIN_NET_PROFIT_PERCENT` + `STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT`)
+just crossing the spread. Lower it back down for fewer, higher-quality
+fills; raise it further for more fire rate at the cost of average edge per
+trade.
 
 **Opening grace window.** `STOCK_ENTRY_MAX_SPREAD_PERCENT` and
 `STOCK_ENTRY_MAX_EXTENSION_PERCENT` are tuned for profitable mid-day
@@ -815,7 +829,7 @@ that may apply, and orders that do not fill.
 ```dotenv
 STOCK_QUANTITY=1
 OPTION_QUANTITY=1
-MAX_OPEN_POSITIONS=5
+MAX_OPEN_POSITIONS=20
 MAX_ORDER_NOTIONAL=1000
 ```
 
@@ -828,6 +842,23 @@ largest affordable whole-share quantity. Option quantities are similarly
 reduced using the submitted limit price. Remaining buying power is reserved
 locally as each order is submitted so later orders in the same cycle cannot
 reuse it.
+
+**Capital deployment.** `MAX_OPEN_POSITIONS` is the shared cap on concurrent
+open positions across stocks, options, and micro-scalp combined - it drives
+`stock_bucket_slot_limits()`'s proportional split across the POPULAR/PENNY/
+DISCOVERY (or LARGE_CAP/SMALL_CAP) buckets. Because each core-session entry
+sizes itself as `STOCK_CORE_SESSION_POSITION_FRACTION` of *remaining* buying
+power (not the original total), filling every slot at a low position cap
+still leaves a real chunk of capital idle - e.g. ten sequential 10%-of-
+remaining entries only deploy about two-thirds of the original buying power,
+even completely full. Raising `MAX_OPEN_POSITIONS` (and/or the per-trade
+fraction) closes that gap without changing what actually triggers an entry -
+it's still purely signal-driven (EMA/VWAP/spread/extension all still have to
+agree); this only changes how much of the account gets committed once a
+signal does fire, and how many can run at once. More concurrent positions
+also means more simultaneous market exposure if the broader market moves
+against the bot all at once, so treat this as a real risk dial, not a free
+optimization.
 
 ## 7. API request pacing
 
@@ -987,13 +1018,15 @@ Change `LOG_DIRECTORY` to place logs on durable storage.
 
 ## Dashboard
 
-A second container (`ui/`) serves a small live dashboard: buying power, open
-positions (with buy price and live unrealized P&L), recent trades (with
-price and realized P&L on each exit), the current watchlist, and the
-research agent's latest state, polling a JSON snapshot the bot writes each
-cycle (`STATUS_FILE`, default `status.json`). It has no access to your
-Webull credentials or the trade API, and its mount of that status/log data
-is read-only — a display bug in the dashboard can't corrupt the bot's own
+A second container (`ui/`) serves a small live dashboard: buying power,
+today's P&L (both the combined total and the realized/unrealized
+breakdown), open positions (with buy price and live unrealized P&L),
+pending orders still working at the broker, recent trades (with price and
+realized P&L on each exit), the current watchlist, and the research
+agent's latest state, polling a JSON snapshot the bot writes each cycle
+(`STATUS_FILE`, default `status.json`). It has no access to your Webull
+credentials or the trade API, and its mount of that status/log data is
+read-only — a display bug in the dashboard can't corrupt the bot's own
 state.
 
 `DEFAULT_WATCHLIST_SYMBOLS` is seeded into the watchlist automatically every
@@ -1001,20 +1034,41 @@ time the bot starts - unlike `POPULAR_STOCK_SYMBOLS` (which only weights
 priority within the scanned universe), these are always present, a restart
 never loses them, and you never have to re-add them from the dashboard.
 Anything added from the dashboard on top of that stays only in memory for
-the current run.
+the current run. The Watchlist panel shows every watchlist symbol as its
+own row (not just a top-N-by-activity sample) with its live price, bucket,
+volume, and spread, plus a **Buy** button on any symbol you don't already
+hold (shows "Held" instead if you do).
 
-The dashboard can also request three actions: **Close All** (cancels every
+The dashboard can also request five actions: **Close All** (cancels every
 working order and closes every open position, stocks and options alike),
-**Sell** on any individual position, and adding a symbol to the watchlist.
-These don't give the dashboard trading access directly - clicking a button
-writes a small request to a separate, dedicated shared file
-(`COMMAND_FILE`, a distinct Docker volume the dashboard can only read/write
-that one file in) that the trader process reads once per cycle and executes
-through its own already-safe order-placement, wash-sale, and
-position-tracking code, the same as every automatic exit. A request is
-picked up on the bot's next cycle, not instantly - `POLL_SECONDS` is the
-worst-case delay. Close All and Sell both ask for a JavaScript confirmation
-before sending the request, since they submit real orders on your account.
+**Sell** on any individual position, **Buy** on any watchlist symbol,
+**Cancel** on any individual pending order (in the Pending Orders panel -
+useful for backing out of a BUY that's still resting unfilled, or a
+STOP/PROFIT exit you'd rather reprice or handle manually), and adding a
+symbol to the watchlist. These don't give the dashboard trading access
+directly - clicking a button writes a small request to a separate,
+dedicated shared file (`COMMAND_FILE`, a distinct Docker volume the
+dashboard can only read/write that one file in) that the trader process
+reads once per cycle and executes through its own already-safe
+order-placement, wash-sale, and position-tracking code, the same as every
+automatic entry/exit. A request is picked up on the bot's next cycle, not
+instantly - `POLL_SECONDS` is the worst-case delay. Close All, Sell, Buy,
+and Cancel all ask for a JavaScript confirmation before sending the
+request, since they act on real orders on your account. Cancelling a
+STOP/PROFIT exit only cancels the *order* - the position itself stays
+open, and the bot will submit a fresh exit order for it again next cycle
+unless you also close the position (e.g. via Sell) or the market moves it
+out of an exit condition.
+
+A manual **Buy** is stocks-only for now and sizes/prices itself exactly
+like an automatic entry (dollar-sized during core hours per
+`STOCK_CORE_SESSION_POSITION_FRACTION`, fixed `STOCK_QUANTITY` sizing
+otherwise, at the standard entry limit price) rather than using a separate
+ad-hoc path, so it still respects `MAX_ORDER_NOTIONAL`, `MAX_OPEN_POSITIONS`,
+wash-sale blocks, and the $0.10-$0.999 lot rule. It's skipped (with a log
+line explaining why) if you already hold a position in that symbol, it's
+wash-sale blocked, the symbol is broker-conflict blacklisted, or the
+portfolio is already at `MAX_OPEN_POSITIONS`.
 
 A manual **Sell** is an urgent "get me out now" click, so it's priced
 differently from a patient automatic exit: it sells at the current ask (the
@@ -1184,7 +1238,7 @@ STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
 MICRO_SCALP_ENABLED=false
 MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
 MICRO_SCALP_CAPITAL_FRACTION=0.20
-MICRO_SCALP_MAX_POSITIONS=3
+MICRO_SCALP_MAX_POSITIONS=5
 MICRO_SCALP_DIP_CENTS=0.05
 MICRO_SCALP_TARGET_CENTS=0.06
 MICRO_SCALP_STOP_CENTS=0.10
@@ -1197,7 +1251,7 @@ OPTION_DISCOVERY_SECONDS=15
 
 STOCK_QUANTITY=1
 OPTION_QUANTITY=1
-MAX_OPEN_POSITIONS=5
+MAX_OPEN_POSITIONS=20
 MAX_ORDER_NOTIONAL=1000
 
 POLL_SECONDS=0.25
@@ -1211,9 +1265,9 @@ REENTER_CONFIRMATION_POLLS=2
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_MIN_PERCENT=0.0015
+STOCK_STOP_LOSS_MIN_PERCENT=0.0012
 STOCK_STOP_LOSS_MAX_PERCENT=0.006
-STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
+STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.28
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5

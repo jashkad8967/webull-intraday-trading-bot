@@ -62,8 +62,16 @@ class SellRequest(BaseModel):
     instrument_type: str = "EQUITY"
 
 
+class BuyRequest(BaseModel):
+    symbol: str
+
+
 class WatchlistRequest(BaseModel):
     symbol: str
+
+
+class CancelOrderRequest(BaseModel):
+    order_id: str
 
 
 @app.post("/api/close-all")
@@ -82,6 +90,24 @@ def sell(request: SellRequest) -> JSONResponse:
         symbol=symbol,
         instrument_type=request.instrument_type.strip().upper() or "EQUITY",
     )
+    return JSONResponse({"queued": True, "id": command_id})
+
+
+@app.post("/api/buy")
+def buy(request: BuyRequest) -> JSONResponse:
+    symbol = request.symbol.strip().upper()
+    if not symbol:
+        return JSONResponse({"queued": False, "error": "symbol is required"}, status_code=400)
+    command_id = enqueue_command("buy", symbol=symbol)
+    return JSONResponse({"queued": True, "id": command_id})
+
+
+@app.post("/api/cancel-order")
+def cancel_order(request: CancelOrderRequest) -> JSONResponse:
+    order_id = request.order_id.strip()
+    if not order_id:
+        return JSONResponse({"queued": False, "error": "order_id is required"}, status_code=400)
+    command_id = enqueue_command("cancel_order", order_id=order_id)
     return JSONResponse({"queued": True, "id": command_id})
 
 

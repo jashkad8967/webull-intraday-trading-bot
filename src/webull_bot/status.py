@@ -47,6 +47,7 @@ class StatusWriter:
         realized_pnl_today: Decimal = Decimal("0"),
         unrealized_pnl_total: Decimal = Decimal("0"),
         user_watchlist: list[str] | None = None,
+        pending_orders: list[dict] | None = None,
     ) -> None:
         payload = {
             "updated_at": time.time(),
@@ -59,6 +60,7 @@ class StatusWriter:
             "agent": agent_summary,
             "universe": {"stocks": stock_count, "options": option_count},
             "recent_trades": list(self.trades),
+            "pending_orders": pending_orders or [],
             "pnl_today": {
                 "realized": str(realized_pnl_today),
                 "unrealized": str(unrealized_pnl_total),

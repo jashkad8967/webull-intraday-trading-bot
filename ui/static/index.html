@@ -95,7 +95,7 @@
     background: transparent;
     color: var(--text);
   }
-  .tags { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.6rem; }
+  .scroll-tall { max-height: 22rem; overflow-y: auto; }
 </style>
 </head>
 <body>
@@ -103,7 +103,11 @@
 
   <div class="grid">
     <div class="stat"><div class="label">Buying Power</div><div class="value" id="buying-power">—</div></div>
-    <div class="stat"><div class="label">P&L Today</div><div class="value" id="pnl-today">—</div></div>
+    <div class="stat">
+      <div class="label">P&L Today</div>
+      <div class="value" id="pnl-today">—</div>
+      <div class="action-msg" id="pnl-breakdown"></div>
+    </div>
     <div class="stat"><div class="label">Open Positions</div><div class="value" id="position-count">—</div></div>
     <div class="stat"><div class="label">Universe</div><div class="value" id="universe">—</div></div>
     <div class="stat"><div class="label">Last Update</div><div class="value" id="last-update">—</div></div>
@@ -119,6 +123,11 @@
       <div id="positions"></div>
     </div>
     <div class="panel">
+      <h2>Pending Orders</h2>
+      <div class="action-msg" id="pending-orders-msg"></div>
+      <div id="pending-orders"></div>
+    </div>
+    <div class="panel">
       <h2>Recent Trades (Buy / Sell Price / P&amp;L)</h2>
       <div id="trades"></div>
     </div>
@@ -129,8 +138,7 @@
         <button class="btn" onclick="addToWatchlist()">Add</button>
       </div>
       <div class="action-msg" id="watchlist-msg"></div>
-      <div id="user-watchlist" class="tags"></div>
-      <div id="watchlist"></div>
+      <div class="scroll-tall" id="watchlist"></div>
     </div>
     <div class="panel">
       <h2>Research Agent</h2>
@@ -184,6 +192,8 @@ async function refresh() {
     const pnlEl = document.getElementById("pnl-today");
     pnlEl.textContent = fmtMoney(pnl.total ?? 0);
     pnlEl.className = "value " + pnlClass(pnl.total ?? 0);
+    document.getElementById("pnl-breakdown").textContent =
+      `realized ${fmtMoney(pnl.realized ?? 0)} · unrealized ${fmtMoney(pnl.unrealized ?? 0)}`;
     document.getElementById("position-count").textContent = (data.positions || []).length;
     const universe = data.universe || {};
     document.getElementById("universe").textContent = `${universe.stocks ?? 0} stocks / ${universe.options ?? 0} options`;
@@ -200,6 +210,20 @@ async function refresh() {
       { label: "", render: r => `<button class="btn danger" onclick="sellPosition('${r.symbol}','${r.instrument_type}')">Sell</button>` },
     ], data.positions);
 
+    document.getElementById("pending-orders").innerHTML = table([
+      { label: "Symbol", render: r => r.symbol },
+      { label: "Type", render: r => r.instrument_type },
+      { label: "Action", render: r => r.action },
+      { label: "Price", render: r => r.limit_price ? fmtMoney(r.limit_price) : "market" },
+      { label: "Age", render: r => `${r.age_seconds}s` },
+      {
+        label: "",
+        render: r => r.cancel_requested
+          ? '<span class="pill">cancelling…</span>'
+          : `<button class="btn danger" onclick="cancelOrder('${r.order_id}','${r.symbol}')">Cancel</button>`,
+      },
+    ], data.pending_orders);
+
     document.getElementById("trades").innerHTML = table([
       { label: "Time", render: r => fmtTime(r.time) },
       { label: "Type", render: r => r.instrument_type },
@@ -209,17 +233,18 @@ async function refresh() {
       { label: "P&L", render: r => r.pnl ? fmtMoney(r.pnl) : "—", cls: r => r.pnl ? pnlClass(r.pnl) : "" },
     ], data.recent_trades);
 
-    const userWatchlist = data.user_watchlist || [];
-    document.getElementById("user-watchlist").innerHTML = userWatchlist.length
-      ? userWatchlist.map(symbol => `<span class="pill">${symbol}</span>`).join("")
-      : '<div class="empty">No pinned symbols yet</div>';
-
     document.getElementById("watchlist").innerHTML = table([
       { label: "Symbol", render: r => r.symbol },
       { label: "Price", render: r => fmtMoney(r.price) },
       { label: "Bucket", render: r => `<span class="pill">${r.bucket}</span>` },
       { label: "Vol", render: r => (r.volume ?? "—").toLocaleString ? r.volume.toLocaleString() : r.volume },
       { label: "Spread%", render: r => r.spread_percent ?? "—" },
+      {
+        label: "",
+        render: r => r.has_position
+          ? '<span class="pill">Held</span>'
+          : `<button class="btn" onclick="buyPosition('${r.symbol}')">Buy</button>`,
+      },
     ], data.watchlist);
 
     const agent = data.agent;
@@ -272,6 +297,28 @@ function sellPosition(symbol, instrumentType) {
     "positions-msg",
     `Selling ${symbol}…`,
     `Sell requested for ${symbol} - the bot will act on its next cycle.`,
+  );
+}
+
+function buyPosition(symbol) {
+  if (!confirm(`Buy ${symbol} now?`)) return;
+  postAction(
+    "/api/buy",
+    { symbol },
+    "watchlist-msg",
+    `Buying ${symbol}…`,
+    `Buy requested for ${symbol} - the bot will act on its next cycle.`,
+  );
+}
+
+function cancelOrder(orderId, symbol) {
+  if (!confirm(`Cancel the pending order for ${symbol}?`)) return;
+  postAction(
+    "/api/cancel-order",
+    { order_id: orderId },
+    "pending-orders-msg",
+    `Cancelling ${symbol}…`,
+    `Cancel requested for ${symbol} - the bot will act on its next cycle.`,
   );
 }
 
