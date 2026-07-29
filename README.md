@@ -431,6 +431,16 @@ whole-share sizing all day, matching the bot's pre-existing behavior. This
 setting only affects the main stock strategy's `trade_stocks` entries -
 micro-scalp mode keeps its own fixed-cents sizing untouched.
 
+Fractional orders (both the sizing above and the `FRACTIONAL_SHARES_ENABLED`
+fallback) require the Webull account itself to have agreed to fractional
+trading - a one-time click-through, not a code setting. If it hasn't, every
+fractional order is rejected with
+`OAUTH_OPENAPI_OPENAPI_FRACT_VERSION2_ACCOUNT_NOT_TRADE` and a link to that
+agreement page. The bot detects this once, logs the link, and falls back to
+whole-share sizing for the rest of that run instead of repeating the same
+rejection on every symbol every cycle; open the link in the Webull app or
+website and restart the bot to pick fractional sizing back up.
+
 ## 4. Select options
 
 ### All optionable stocks
