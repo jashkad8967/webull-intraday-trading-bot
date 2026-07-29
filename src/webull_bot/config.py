@@ -45,6 +45,21 @@ class Settings(BaseSettings):
         "COIN,PLTR,MSTR,HOOD,SOFI,RIVN,GME,AMC,NIO,BABA,F,SNAP,UBER,"
         "MARA,IONQ,RGTI,QBTS,QUBT,FCX"
     )
+    # Always present in the dashboard watchlist from the moment the bot
+    # starts, every run - unlike POPULAR_STOCK_SYMBOLS (which only weights
+    # priority within the scanned universe), these are seeded directly into
+    # user_watchlist so a restart never loses them and the user never has to
+    # re-add them from the dashboard.
+    default_watchlist_symbols: str = (
+        "AAPL,F,NVDA,MSFT,AMZN,NFLX,TSLA,NIO,ADBE,XPEV,OXY,NOW,XOM,DDOG,OPTT,"
+        "FCEL,CVX,NET,FEMY,CRM,CHPT,KO,AMC,ABNB,BNKK,SNAP,DASH,SBUX,HWH,LCID,"
+        "SIRI,BNGO,NVO,SPCX,SPCE,SHOP,GM,RIVN,IBM,ZM,NEGG,NVGS,ZVRA,V,MRNA,T,"
+        "PYPL,PPSI,DIS,JNJ,COST,ROKU,SPYD,SPY,UBER,COIN,XYZ,WMT,DFLI,PLTR,PFE,"
+        "UNH,TBB,VZ,BABA,SRPT,MARA,AVGO,GOOGL,GOOG,BB,FDX,BRK-A,GNW,OPAD,SPX,"
+        "ACB,ORCL,IXIC,META,QQQ,RBLX,UPS,QCOM,AAL,CCX,SKYA,CRWD,CTRM,NKE,OCGN,"
+        "SNDA,WWR,INTC,HD,NIU,GME,DIA,ATOS,BAD,DKNG,UAL,MOBX,HOOD,DAL,CLOV,"
+        "RKLB,TSM,MU,JPM,AMD,NOK,BA,RIOT,TLRY,SOFI,CENN"
+    )
     popular_stock_min_volume: int = Field(default=1_000_000, ge=0)
     popular_stock_max_spread_percent: Decimal = Field(
         default=Decimal("0.50"),
@@ -342,6 +357,13 @@ class Settings(BaseSettings):
         return [
             item.strip().upper()
             for item in self.popular_stock_symbols.split(",")
+            if item.strip()
+        ]
+
+    def default_watchlist(self) -> list[str]:
+        return [
+            item.strip().upper()
+            for item in self.default_watchlist_symbols.split(",")
             if item.strip()
         ]
 

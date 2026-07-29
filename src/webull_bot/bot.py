@@ -107,7 +107,7 @@ class AutoTrader:
         self.daily_realized_pnl = Decimal("0")
         self.daily_loss_breaker_triggered = False
         self.commands = CommandQueue(self.config.command_file)
-        self.user_watchlist: set[str] = set()
+        self.user_watchlist: set[str] = set(self.config.default_watchlist())
         self.gate_rejections: dict[str, int] = defaultdict(int)
         self.broker_conflict_symbols: set[str] = set()
 
@@ -413,17 +413,26 @@ class AutoTrader:
             symbol for symbol in self.user_watchlist if symbol not in self.stock_symbols
         ]
         if missing_watchlist:
-            for symbol in missing_watchlist:
-                if symbol not in self.stock_categories:
-                    try:
-                        categories = self.api.stock_categories([symbol])
-                    except Exception as exc:
-                        log.error(
-                            "LOAD   | watchlist category lookup failed | %-8s | %s",
-                            symbol,
-                            exc,
-                        )
-                        categories = {}
+            uncategorized = [
+                symbol
+                for symbol in missing_watchlist
+                if symbol not in self.stock_categories
+            ]
+            if uncategorized:
+                # A single batched lookup (stock_categories chunks internally)
+                # instead of one throttled call per symbol - this list can be
+                # 100+ symbols long (the default watchlist alone), and that
+                # throttle is ~3.3s/call, so doing it one at a time would
+                # stall startup for minutes.
+                try:
+                    categories = self.api.stock_categories(uncategorized)
+                except Exception as exc:
+                    log.error(
+                        "LOAD   | watchlist category lookup failed | %s",
+                        exc,
+                    )
+                    categories = {}
+                for symbol in uncategorized:
                     self.stock_categories[symbol] = categories.get(symbol, "US_STOCK")
             self.stock_symbols.extend(missing_watchlist)
             log.info(
