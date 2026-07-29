@@ -512,6 +512,18 @@ bot can end up buying right as a fast spike exhausts and reverses, hitting
 the stop shortly after. Raise it to allow chasing further-extended moves;
 set it to `0` to disable the check entirely.
 
+**Opening grace window.** `STOCK_ENTRY_MAX_SPREAD_PERCENT` and
+`STOCK_ENTRY_MAX_EXTENSION_PERCENT` are tuned for profitable mid-day
+scalping, but the first few minutes after the 9:30 bell naturally have wider
+spreads and an intraday high that hasn't had time to separate from price
+yet — so those same gates can reject nearly every entry right at the open
+(visible as a `GATES` log dominated by "spread too wide"/"already extended"
+right after 9:30). `OPENING_GRACE_MINUTES` (default 10) widens both gates by
+`OPENING_GRACE_SPREAD_MULTIPLIER`/`OPENING_GRACE_EXTENSION_MULTIPLIER`
+(default 2x each) for that opening stretch only, then snaps back to the
+tighter full-day thresholds above. Set `OPENING_GRACE_MINUTES=0` to disable
+and use the plain thresholds all day.
+
 ### Trade cadence and favoring recurring movers
 
 Every stock's profit target scales with its own adaptive stop
@@ -609,14 +621,23 @@ between calls.
 
 Every research response contains `market_direction` and `market_volatility`.
 Every researched symbol contains `priority`, `quick_trade_score`,
-`symbol_volatility`, `spread_opportunity`, `confidence`, `news_sentiment`,
-`catalyst_strength`, `expected_move_percent`, `horizon_minutes`,
-`downside_risk`, and `liquidity_risk`. Missing symbol output is replaced with
-conservative values rather than silently accepted.
+`symbol_volatility`, `spread_opportunity`, `confidence`, `catalyst_strength`,
+`expected_move_percent`, `horizon_minutes`, `downside_risk`, `liquidity_risk`,
+and `exit_bias`. Missing symbol output is replaced with conservative values
+rather than silently accepted.
 
 Groq searches for current popular, widely traded volatile stocks and ETFs in
 addition to assessing supplied candidates. Newly discovered symbols are
 accepted only when they also exist in Webull's current tradable universe.
+Discovery output is symbol-only - no other field downstream ever reads a
+discovery's popularity/volatility/confidence, so the model isn't asked to
+spend completion tokens producing them. Assessments never require a web
+search (they're computed from the numeric price/change/volume/spread already
+sent for each symbol), so an assessment-only retry pass explicitly tells the
+model not to search - this keeps both the request payload and the response
+small and makes it far less likely the model runs out of completion budget
+mid-response and falls back to conservative defaults instead of a real,
+computed assessment.
 Research confidence, volatility, catalysts, and quick-trade scores boost the
 symbol's scan priority. A high-confidence, liquid, bullish setup with a
 30-minute-or-shorter horizon can add an entry path. Research never vetoes an
