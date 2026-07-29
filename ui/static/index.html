@@ -4,6 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Webull Scalping Bot</title>
+<script>
+  // Applied as early as possible (before first paint) to avoid a flash of
+  // the wrong theme: an explicit stored choice always wins over OS
+  // preference. No stored value = fall through to the @media block below.
+  (function () {
+    try {
+      const stored = localStorage.getItem("theme");
+      if (stored === "dark" || stored === "light") {
+        document.documentElement.setAttribute("data-theme", stored);
+      }
+    } catch (err) { /* localStorage unavailable - fall back to OS preference */ }
+  })();
+</script>
 <style>
   :root {
     color-scheme: dark light;
@@ -16,6 +29,24 @@
     --red: #ff6b6b;
     --amber: #f5b942;
     --accent: #5b8cff;
+    --shadow: 0 1px 2px rgba(0,0,0,0.24), 0 8px 24px -12px rgba(0,0,0,0.55);
+    --row-hover: rgba(255,255,255,0.035);
+    --row-alt: rgba(255,255,255,0.018);
+
+    /* Spacing scale (0.25rem base unit) */
+    --sp-1: 0.25rem;
+    --sp-2: 0.5rem;
+    --sp-3: 0.75rem;
+    --sp-4: 1rem;
+    --sp-5: 1.5rem;
+    --sp-6: 2rem;
+
+    /* Type scale */
+    --fs-xs: 0.72rem;
+    --fs-sm: 0.82rem;
+    --fs-base: 0.92rem;
+    --fs-lg: 1.2rem;
+    --fs-xl: 1.4rem;
   }
   @media (prefers-color-scheme: light) {
     :root {
@@ -24,44 +55,167 @@
       --border: #dde2ee;
       --text: #171a22;
       --muted: #5c6478;
+      --shadow: 0 1px 2px rgba(30,40,70,0.06), 0 8px 20px -14px rgba(30,40,70,0.18);
+      --row-hover: rgba(20,30,60,0.035);
+      --row-alt: rgba(20,30,60,0.02);
     }
   }
+  /* Explicit user choice always wins over OS preference. */
+  :root[data-theme="dark"] {
+    --bg: #0b0e14;
+    --panel: #131722;
+    --border: #232838;
+    --text: #e6e9f0;
+    --muted: #8b93a7;
+    --green: #3ddc97;
+    --red: #ff6b6b;
+    --amber: #f5b942;
+    --accent: #5b8cff;
+    --shadow: 0 1px 2px rgba(0,0,0,0.24), 0 8px 24px -12px rgba(0,0,0,0.55);
+    --row-hover: rgba(255,255,255,0.035);
+    --row-alt: rgba(255,255,255,0.018);
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f6fb;
+    --panel: #ffffff;
+    --border: #dde2ee;
+    --text: #171a22;
+    --muted: #5c6478;
+    --green: #3ddc97;
+    --red: #ff6b6b;
+    --amber: #f5b942;
+    --accent: #5b8cff;
+    --shadow: 0 1px 2px rgba(30,40,70,0.06), 0 8px 20px -14px rgba(30,40,70,0.18);
+    --row-hover: rgba(20,30,60,0.035);
+    --row-alt: rgba(20,30,60,0.02);
+  }
+
   * { box-sizing: border-box; }
   body {
     margin: 0;
     font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: var(--fs-base);
     background: var(--bg);
     color: var(--text);
-    padding: 1.25rem;
+    padding: var(--sp-5);
   }
-  h1 { font-size: 1.15rem; margin: 0 0 0.9rem; display: flex; align-items: center; gap: 0.6rem; }
-  .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--muted); }
+
+  .header-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-4);
+    margin-bottom: var(--sp-5);
+    padding-bottom: var(--sp-4);
+    border-bottom: 1px solid var(--border);
+  }
+  h1 {
+    font-size: var(--fs-xl);
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+  }
+  .dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--muted); flex: none; }
   .dot.live { background: var(--green); box-shadow: 0 0 0 4px rgba(61,220,151,0.15); }
-  .dot.paused { background: var(--amber); }
-  .badge { font-size: 0.7rem; color: var(--muted); font-weight: 400; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
-  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 0.85rem 1rem; }
-  .stat .label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
-  .stat .value { font-size: 1.35rem; font-weight: 600; margin-top: 0.15rem; }
-  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1rem; }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 0.9rem 1rem; overflow-x: auto; }
-  .panel h2 { font-size: 0.85rem; margin: 0 0 0.6rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; white-space: nowrap; }
-  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 500; }
+  .dot.paused { background: var(--amber); box-shadow: 0 0 0 4px rgba(245,185,66,0.15); }
+  .badge {
+    font-size: var(--fs-xs);
+    color: var(--muted);
+    font-weight: 500;
+    padding: 0.15rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+  }
+  .header-right { display: flex; align-items: center; gap: var(--sp-3); }
+
+  .theme-toggle {
+    font: inherit;
+    font-size: var(--fs-base);
+    line-height: 1;
+    width: 2.1rem;
+    height: 2.1rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+  }
+  .theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: var(--sp-3);
+    margin-bottom: var(--sp-5);
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    border-radius: 10px;
+    padding: var(--sp-4);
+  }
+  .stat .label { font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+  .stat .value { font-size: var(--fs-lg); font-weight: 650; margin-top: var(--sp-1); font-variant-numeric: tabular-nums; }
+
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: var(--sp-4); }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    border-radius: 10px;
+    padding: var(--sp-4);
+    overflow-x: auto;
+  }
+  .panel h2 {
+    font-size: var(--fs-xs);
+    margin: 0 0 var(--sp-3);
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 650;
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); white-space: nowrap; }
+  th, td { text-align: left; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.03em; }
   tr:last-child td { border-bottom: none; }
+  tbody tr:nth-child(even) { background: var(--row-alt); }
+  tbody tr:hover { background: var(--row-hover); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
   .pos { color: var(--green); }
   .neg { color: var(--red); }
-  .empty { color: var(--muted); font-size: 0.82rem; padding: 0.5rem 0; }
-  .pill { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 999px; font-size: 0.68rem; border: 1px solid var(--border); color: var(--muted); }
+  .empty {
+    color: var(--muted);
+    font-size: var(--fs-sm);
+    padding: var(--sp-5) 0;
+    text-align: center;
+  }
+  .pill {
+    display: inline-block;
+    padding: 0.05rem 0.5rem;
+    border-radius: 999px;
+    font-size: var(--fs-xs);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-variant-numeric: normal;
+  }
   .logs {
     background: #0a0d13;
     color: #c9d1d9;
     border-radius: 8px;
-    padding: 0.6rem 0.75rem;
+    padding: var(--sp-3);
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.72rem;
-    line-height: 1.45;
+    font-size: var(--fs-xs);
+    line-height: 1.5;
     max-height: 22rem;
     overflow-y: auto;
     white-space: pre-wrap;
@@ -70,36 +224,46 @@
   .panel.wide { grid-column: 1 / -1; }
   .btn {
     font: inherit;
-    font-size: 0.75rem;
-    padding: 0.3rem 0.6rem;
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    padding: 0.35rem 0.7rem;
     border-radius: 6px;
     border: 1px solid var(--border);
     background: transparent;
     color: var(--text);
     cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease, opacity 0.15s ease;
   }
-  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(91,140,255,0.08); }
+  .btn:active { transform: translateY(1px); }
   .btn.danger { color: var(--red); border-color: var(--red); }
   .btn.danger:hover { background: rgba(255,107,107,0.1); }
   .btn:disabled { opacity: 0.5; cursor: default; }
-  .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.6rem; gap: 0.6rem; }
-  .action-msg { font-size: 0.75rem; color: var(--muted); }
-  .watchlist-add { display: flex; gap: 0.4rem; margin-bottom: 0.6rem; }
+  .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--sp-3); gap: var(--sp-3); }
+  .action-msg { font-size: var(--fs-xs); color: var(--muted); min-height: 1.1em; }
+  .watchlist-add { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-3); }
   .watchlist-add input {
     flex: 1;
     font: inherit;
-    font-size: 0.8rem;
-    padding: 0.3rem 0.5rem;
+    font-size: var(--fs-sm);
+    padding: 0.35rem var(--sp-3);
     border-radius: 6px;
     border: 1px solid var(--border);
     background: transparent;
     color: var(--text);
+    transition: border-color 0.15s ease;
   }
+  .watchlist-add input:focus { outline: none; border-color: var(--accent); }
   .scroll-tall { max-height: 22rem; overflow-y: auto; }
 </style>
 </head>
 <body>
-  <h1><span class="dot" id="live-dot"></span> Webull Scalping Bot <span class="badge" id="mode-badge"></span></h1>
+  <div class="header-bar">
+    <h1><span class="dot" id="live-dot"></span> Webull Scalping Bot <span class="badge" id="mode-badge"></span></h1>
+    <div class="header-right">
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode" aria-label="Toggle dark/light mode">◐</button>
+    </div>
+  </div>
 
   <div class="grid">
     <div class="stat"><div class="label">Buying Power</div><div class="value" id="buying-power">—</div></div>
@@ -128,7 +292,7 @@
       <div id="pending-orders"></div>
     </div>
     <div class="panel">
-      <h2>Recent Trades (Buy / Sell Price / P&amp;L)</h2>
+      <h2>Recent Trades</h2>
       <div id="trades"></div>
     </div>
     <div class="panel">
@@ -152,23 +316,54 @@
 
 <script>
 function fmtMoney(value) {
+  if (value == null) return "—";
   const n = Number(value);
-  if (Number.isNaN(n)) return value ?? "—";
+  if (Number.isNaN(n)) return value;
   return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+function fmtNum(value) {
+  if (value == null) return "—";
+  const n = Number(value);
+  if (Number.isNaN(n)) return value;
+  return n.toLocaleString();
 }
 function fmtTime(seconds) {
   if (!seconds) return "—";
   return new Date(seconds * 1000).toLocaleTimeString();
 }
 function pnlClass(value) {
+  if (value == null) return "";
   const n = Number(value);
   return n > 0 ? "pos" : n < 0 ? "neg" : "";
 }
+
+// Renders a table from `headers` (each with a `label`, a `render(row)` cell
+// function, an optional `cls(row)` for the cell class, and an optional
+// `num: true` to right-align/tabular-number that column) and `rows`.
+// Every cell is rendered defensively: a single bad/missing field on one row
+// must never throw and blank out the rest of the dashboard (a symbol that
+// hasn't been scanned yet, a trade with no entry_price, etc. are all
+// expected shapes, not error states).
 function table(headers, rows) {
   if (!rows || rows.length === 0) return '<div class="empty">None right now</div>';
-  const head = headers.map(h => `<th>${h.label}</th>`).join("");
+  const head = headers.map(h => `<th class="${h.num ? 'num' : ''}">${h.label}</th>`).join("");
   const body = rows.map(row => {
-    const cells = headers.map(h => `<td class="${h.cls ? h.cls(row) : ''}">${h.render(row)}</td>`).join("");
+    const cells = headers.map(h => {
+      let content;
+      try {
+        content = h.render(row);
+      } catch (err) {
+        content = "—";
+      }
+      let cls = "";
+      try {
+        cls = h.cls ? h.cls(row) : "";
+      } catch (err) {
+        cls = "";
+      }
+      if (h.num) cls = (cls + " num").trim();
+      return `<td class="${cls}">${content}</td>`;
+    }).join("");
     return `<tr>${cells}</tr>`;
   }).join("");
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
@@ -200,22 +395,22 @@ async function refresh() {
     document.getElementById("last-update").textContent = fmtTime(data.updated_at);
 
     document.getElementById("positions").innerHTML = table([
-      { label: "Symbol", render: r => r.symbol },
-      { label: "Type", render: r => r.instrument_type },
-      { label: "Qty", render: r => r.quantity },
-      { label: "Cost", render: r => fmtMoney(r.cost_price) },
-      { label: "Last", render: r => fmtMoney(r.last_price) },
-      { label: "P&L", render: r => fmtMoney(r.unrealized_pnl), cls: r => pnlClass(r.unrealized_pnl) },
-      { label: "Bucket", render: r => `<span class="pill">${r.bucket}</span>` },
+      { label: "Symbol", render: r => r.symbol ?? "—" },
+      { label: "Type", render: r => r.instrument_type ?? "—" },
+      { label: "Qty", render: r => fmtNum(r.quantity), num: true },
+      { label: "Cost", render: r => fmtMoney(r.cost_price), num: true },
+      { label: "Last", render: r => fmtMoney(r.last_price), num: true },
+      { label: "P&L", render: r => fmtMoney(r.unrealized_pnl), cls: r => pnlClass(r.unrealized_pnl), num: true },
+      { label: "Bucket", render: r => r.bucket ? `<span class="pill">${r.bucket}</span>` : "—" },
       { label: "", render: r => `<button class="btn danger" onclick="sellPosition('${r.symbol}','${r.instrument_type}')">Sell</button>` },
     ], data.positions);
 
     document.getElementById("pending-orders").innerHTML = table([
-      { label: "Symbol", render: r => r.symbol },
-      { label: "Type", render: r => r.instrument_type },
-      { label: "Action", render: r => r.action },
-      { label: "Price", render: r => r.limit_price ? fmtMoney(r.limit_price) : "market" },
-      { label: "Age", render: r => `${r.age_seconds}s` },
+      { label: "Symbol", render: r => r.symbol ?? "—" },
+      { label: "Type", render: r => r.instrument_type ?? "—" },
+      { label: "Action", render: r => r.action ?? "—" },
+      { label: "Price", render: r => r.limit_price != null ? fmtMoney(r.limit_price) : "market", num: true },
+      { label: "Age", render: r => r.age_seconds != null ? `${r.age_seconds}s` : "—", num: true },
       {
         label: "",
         render: r => r.cancel_requested
@@ -226,19 +421,28 @@ async function refresh() {
 
     document.getElementById("trades").innerHTML = table([
       { label: "Time", render: r => fmtTime(r.time) },
-      { label: "Type", render: r => r.instrument_type },
-      { label: "Action", render: r => r.action },
-      { label: "Symbol", render: r => r.symbol },
-      { label: "Price", render: r => r.limit_price ? fmtMoney(r.limit_price) : "—" },
-      { label: "P&L", render: r => r.pnl ? fmtMoney(r.pnl) : "—", cls: r => r.pnl ? pnlClass(r.pnl) : "" },
+      { label: "Type", render: r => r.instrument_type ?? "—" },
+      { label: "Action", render: r => r.action ?? "—" },
+      { label: "Symbol", render: r => r.symbol ?? "—" },
+      // entry_price is a new backend field (string like "34.50", or null on
+      // BUY/MANUAL_BUY rows which have no prior entry). Treat missing the
+      // same as null - don't block on the parallel agent's field landing.
+      { label: "Entry", render: r => r.entry_price != null ? fmtMoney(r.entry_price) : "—", num: true },
+      { label: "Exit", render: r => r.limit_price != null ? fmtMoney(r.limit_price) : "—", num: true },
+      { label: "P&L", render: r => r.pnl != null ? fmtMoney(r.pnl) : "—", cls: r => pnlClass(r.pnl), num: true },
     ], data.recent_trades);
 
     document.getElementById("watchlist").innerHTML = table([
-      { label: "Symbol", render: r => r.symbol },
-      { label: "Price", render: r => fmtMoney(r.price) },
-      { label: "Bucket", render: r => `<span class="pill">${r.bucket}</span>` },
-      { label: "Vol", render: r => (r.volume ?? "—").toLocaleString ? r.volume.toLocaleString() : r.volume },
-      { label: "Spread%", render: r => r.spread_percent ?? "—" },
+      { label: "Symbol", render: r => r.symbol ?? "—" },
+      { label: "Price", render: r => fmtMoney(r.price), num: true },
+      { label: "Bucket", render: r => r.bucket ? `<span class="pill">${r.bucket}</span>` : "—" },
+      // Bug fix: previously checked `.toLocaleString` on the fallback "—"
+      // string (always true) then unconditionally called
+      // r.volume.toLocaleString(), which threw on `undefined` for any
+      // not-yet-scanned symbol, aborting the whole refresh() and freezing
+      // every panel after this one. Check the real value instead.
+      { label: "Vol", render: r => r.volume != null ? r.volume.toLocaleString() : "—", num: true },
+      { label: "Spread%", render: r => r.spread_percent != null ? r.spread_percent : "—", num: true },
       {
         label: "",
         render: r => r.has_position
@@ -334,6 +538,17 @@ function addToWatchlist() {
     `${symbol} queued to join the watchlist on the bot's next cycle.`,
   );
   input.value = "";
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute("data-theme");
+  // If no explicit theme is set yet, figure out what's currently showing
+  // (OS preference) so the first click flips away from it, not toward it.
+  const osIsLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+  const effective = current || (osIsLight ? "light" : "dark");
+  const next = effective === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("theme", next); } catch (err) { /* ignore */ }
 }
 
 async function refreshLogs() {

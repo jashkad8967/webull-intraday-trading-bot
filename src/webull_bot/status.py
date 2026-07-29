@@ -1,16 +1,43 @@
 import json
+import logging
 import time
 from collections import deque
 from decimal import Decimal
 from pathlib import Path
 
+log = logging.getLogger("webull-bot")
+
 
 class StatusWriter:
     """Writes a small JSON snapshot the dashboard UI polls; read-only for trading."""
 
-    def __init__(self, path: str, trade_history: int = 50):
+    def __init__(self, path: str, trade_history: int = 50, state_file: str | None = None):
         self.path = Path(path)
-        self.trades: deque = deque(maxlen=trade_history)
+        self.trade_history = trade_history
+        self.state_path = Path(state_file) if state_file else None
+        self.trades: deque = deque(self._load_trades(), maxlen=trade_history)
+
+    def _load_trades(self) -> list[dict]:
+        if self.state_path is None:
+            return []
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
+        except Exception as exc:
+            log.warning("STATUS | trade history read failed | %s", exc)
+            return []
+        if not isinstance(payload, list):
+            return []
+        return payload
+
+    def _save_trades(self) -> None:
+        if self.state_path is None:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(list(self.trades)), encoding="utf-8")
+        temporary.replace(self.state_path)
 
     def record_trade(
         self,
@@ -20,6 +47,7 @@ class StatusWriter:
         limit_price: Decimal | None,
         order_id: str,
         pnl: Decimal | None = None,
+        entry_price: Decimal | None = None,
     ) -> None:
         self.trades.appendleft(
             {
@@ -30,8 +58,10 @@ class StatusWriter:
                 "limit_price": str(limit_price) if limit_price is not None else None,
                 "order_id": order_id,
                 "pnl": str(pnl) if pnl is not None else None,
+                "entry_price": str(entry_price) if entry_price is not None else None,
             }
         )
+        self._save_trades()
 
     def write(
         self,

@@ -10,6 +10,7 @@ from rich.logging import RichHandler
 from webull_bot.commands import CommandQueue
 from webull_bot.config import settings
 from webull_bot.daily_logging import add_daily_file_logging
+from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.invalid_symbols import InvalidSymbolTracker
 from webull_bot.market_agent import MarketResearchAgent
 from webull_bot.status import StatusWriter
@@ -57,6 +58,11 @@ class AutoTrader:
             self.timezone,
             log,
         )
+        self.daily_pnl = DailyPnlTracker(
+            self.config.daily_pnl_state_file,
+            self.timezone,
+            log,
+        )
         self.invalid_symbols = InvalidSymbolTracker(
             self.config.invalid_symbol_state_file,
             log,
@@ -64,7 +70,10 @@ class AutoTrader:
         self.wash_skip_logged: set[str] = set()
         self.last_trade: dict[str, float] = {}
         self.trade_times: dict[str, deque] = defaultdict(deque)
-        self.status = StatusWriter(self.config.status_file)
+        self.status = StatusWriter(
+            self.config.status_file,
+            state_file=self.config.trade_history_state_file,
+        )
         self.last_status_write = 0.0
         self.stock_symbols: list[str] = []
         self.reserve_symbols: list[str] = []
@@ -103,8 +112,8 @@ class AutoTrader:
         self.position_buckets: dict[str, str] = {}
         self.stop_exit_submitted: dict[str, float] = {}
         self.stop_loss_escalated: set[str] = set()
-        self.daily_realized_loss = Decimal("0")
-        self.daily_realized_pnl = Decimal("0")
+        self.daily_realized_loss = self.daily_pnl.realized_loss
+        self.daily_realized_pnl = self.daily_pnl.realized_pnl
         self.daily_loss_breaker_triggered = False
         self.commands = CommandQueue(self.config.command_file)
         self.user_watchlist: set[str] = set(self.config.default_watchlist())
@@ -455,6 +464,7 @@ class AutoTrader:
         self.agent_popular_symbols.clear()
         self.daily_realized_loss = Decimal("0")
         self.daily_realized_pnl = Decimal("0")
+        self.daily_pnl.reset()
         self.daily_loss_breaker_triggered = False
         if self.broker_conflict_symbols:
             log.info(
@@ -611,6 +621,7 @@ class AutoTrader:
         action: str,
         limit_price: Decimal | None = None,
         pnl: Decimal | None = None,
+        entry_price: Decimal | None = None,
     ) -> None:
         submitted_at = time.monotonic()
         self.last_trade[key] = submitted_at
@@ -623,7 +634,15 @@ class AutoTrader:
             "limit_price": limit_price,
         }
         instrument_type, symbol = key.split(":", 1)
-        self.status.record_trade(instrument_type, symbol, action, limit_price, order_id, pnl)
+        self.status.record_trade(
+            instrument_type,
+            symbol,
+            action,
+            limit_price,
+            order_id,
+            pnl,
+            entry_price=entry_price,
+        )
         limit_text = (
             f" | limit={limit_price}"
             if limit_price is not None
@@ -997,6 +1016,7 @@ class AutoTrader:
         self.daily_realized_pnl += pnl
         if pnl < 0:
             self.daily_realized_loss += -pnl
+        self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
         return pnl
 
     def escalate_stalled_stop_losses(self) -> None:
@@ -1333,7 +1353,7 @@ class AutoTrader:
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
+                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
                     # Never price an initial stop-loss at the ask - unlike a
                     # profit-take, a stop needs to fill fast to cap the loss,
@@ -1358,7 +1378,7 @@ class AutoTrader:
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl)
+                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl, entry_price=cost)
             except Exception as exc:
                 self.stop_loss_escalated.discard(symbol)
                 if isinstance(exc, QuoteUnavailableError):
@@ -1542,7 +1562,7 @@ class AutoTrader:
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
+                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
                     # Never price an initial stop-loss at the ask - unlike a
                     # profit-take, a stop needs to fill fast to cap the loss,
@@ -1570,7 +1590,7 @@ class AutoTrader:
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl)
+                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl, entry_price=cost)
             except Exception as exc:
                 self.stop_loss_escalated.discard(symbol)
                 if isinstance(exc, QuoteUnavailableError):
@@ -1706,7 +1726,7 @@ class AutoTrader:
                     )
                     self.pending_option_exits.add(option_symbol)
                     pnl = self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
-                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
+                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
                 if (
                     decision.action == "LOSS"
                     and option_symbol not in self.pending_option_exits
@@ -1726,7 +1746,7 @@ class AutoTrader:
                     )
                     self.pending_option_exits.add(option_symbol)
                     pnl = self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
-                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl)
+                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl, entry_price=cost)
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
                     continue
@@ -1797,7 +1817,7 @@ class AutoTrader:
                     )
                     self.pending_stock_exits.add(symbol)
                     pnl = self.record_realized_exit(average_cost, sell_price, quantity)
-                    self.record_trade(key, order_id, "PROFIT", sell_price, pnl=pnl)
+                    self.record_trade(key, order_id, "PROFIT", sell_price, pnl=pnl, entry_price=average_cost)
                     boosted += 1
                 elif instrument_type == "OPTION" and options_active:
                     if symbol in self.pending_option_exits:
@@ -1824,7 +1844,7 @@ class AutoTrader:
                     )
                     self.pending_option_exits.add(symbol)
                     pnl = self.record_realized_exit(average_cost, sell_price, quantity, multiplier=100)
-                    self.record_trade(key, order_id, "PROFIT", sell_price, pnl=pnl)
+                    self.record_trade(key, order_id, "PROFIT", sell_price, pnl=pnl, entry_price=average_cost)
                     boosted += 1
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
@@ -2093,7 +2113,7 @@ class AutoTrader:
             )
             self.pending_stock_exits.add(symbol)
             pnl = self.record_realized_exit(cost, sell_price, quantity)
-            self.record_trade(f"STOCK:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl)
+            self.record_trade(f"STOCK:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl, entry_price=cost)
             if pnl < 0:
                 self.wash_sales.block(symbol, "manual sell at a loss")
         elif instrument_type == "OPTION":
@@ -2123,7 +2143,7 @@ class AutoTrader:
             )
             self.pending_option_exits.add(symbol)
             pnl = self.record_realized_exit(cost, sell_price, quantity, multiplier=100)
-            self.record_trade(f"OPTION:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl)
+            self.record_trade(f"OPTION:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl, entry_price=cost)
             if pnl < 0:
                 self.wash_sales.block(
                     contract["underlying_symbol"],

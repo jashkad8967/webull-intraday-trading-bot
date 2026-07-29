@@ -269,6 +269,8 @@ class Settings(BaseSettings):
     market_holidays: str = ""
     wash_sale_block_days: int = Field(default=31, ge=31, le=365)
     wash_sale_state_file: str = "conf/wash_sale_blocks.json"
+    daily_pnl_state_file: str = "conf/daily_pnl.json"
+    trade_history_state_file: str = "conf/trade_history.json"
     invalid_symbol_state_file: str = "conf/invalid_symbols.json"
     stock_limit_offset: Decimal = Field(
         default=Decimal("0.005"),
