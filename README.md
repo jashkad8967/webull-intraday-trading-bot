@@ -527,9 +527,9 @@ REENTER_CONFIRMATION_POLLS=2
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_MIN_PERCENT=0.0012
-STOCK_STOP_LOSS_MAX_PERCENT=0.006
-STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.28
+STOCK_STOP_LOSS_MIN_PERCENT=0.006
+STOCK_STOP_LOSS_MAX_PERCENT=0.01
+STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
@@ -557,6 +557,15 @@ margin (`STOCK_MIN_NET_PROFIT_PERCENT` + `STOCK_ESTIMATED_ROUND_TRIP_COST_PERCEN
 just crossing the spread. Lower it back down for fewer, higher-quality
 fills; raise it further for more fire rate at the cost of average edge per
 trade.
+
+Whatever this is set to, `STOCK_STOP_LOSS_MIN_PERCENT` needs real margin
+above it - not just `STOCK_STOP_LOSS_MAX_PERCENT`. A calm stock's adaptive
+stop clamps to the *floor*, not the ceiling, so if the floor sits below the
+max tolerated spread, an entry near that spread ceiling can get stopped
+out by an ordinary bid/ask bounce alone, before any real adverse move -
+stops firing on noise ("trigger happy"), not on an actual loss developing.
+If you raise `STOCK_ENTRY_MAX_SPREAD_PERCENT`, raise the stop-loss bounds
+to match.
 
 **Opening grace window.** `STOCK_ENTRY_MAX_SPREAD_PERCENT` and
 `STOCK_ENTRY_MAX_EXTENSION_PERCENT` are tuned for profitable mid-day
@@ -1265,9 +1274,9 @@ REENTER_CONFIRMATION_POLLS=2
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_MIN_PERCENT=0.0012
-STOCK_STOP_LOSS_MAX_PERCENT=0.006
-STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.28
+STOCK_STOP_LOSS_MIN_PERCENT=0.006
+STOCK_STOP_LOSS_MAX_PERCENT=0.01
+STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
