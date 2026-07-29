@@ -609,14 +609,23 @@ between calls.
 
 Every research response contains `market_direction` and `market_volatility`.
 Every researched symbol contains `priority`, `quick_trade_score`,
-`symbol_volatility`, `spread_opportunity`, `confidence`, `news_sentiment`,
-`catalyst_strength`, `expected_move_percent`, `horizon_minutes`,
-`downside_risk`, and `liquidity_risk`. Missing symbol output is replaced with
-conservative values rather than silently accepted.
+`symbol_volatility`, `spread_opportunity`, `confidence`, `catalyst_strength`,
+`expected_move_percent`, `horizon_minutes`, `downside_risk`, `liquidity_risk`,
+and `exit_bias`. Missing symbol output is replaced with conservative values
+rather than silently accepted.
 
 Groq searches for current popular, widely traded volatile stocks and ETFs in
 addition to assessing supplied candidates. Newly discovered symbols are
 accepted only when they also exist in Webull's current tradable universe.
+Discovery output is symbol-only - no other field downstream ever reads a
+discovery's popularity/volatility/confidence, so the model isn't asked to
+spend completion tokens producing them. Assessments never require a web
+search (they're computed from the numeric price/change/volume/spread already
+sent for each symbol), so an assessment-only retry pass explicitly tells the
+model not to search - this keeps both the request payload and the response
+small and makes it far less likely the model runs out of completion budget
+mid-response and falls back to conservative defaults instead of a real,
+computed assessment.
 Research confidence, volatility, catalysts, and quick-trade scores boost the
 symbol's scan priority. A high-confidence, liquid, bullish setup with a
 30-minute-or-shorter horizon can add an entry path. Research never vetoes an
