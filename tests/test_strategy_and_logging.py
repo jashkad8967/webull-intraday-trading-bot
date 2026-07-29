@@ -6,7 +6,7 @@ import threading
 import unittest
 import unittest.mock
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,6 +46,7 @@ class StrategyConfigMixin:
             stock_target_stop_multiple=Decimal("1.2"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
+            stock_core_session_position_fraction=Decimal("0.10"),
             opening_grace_spread_multiplier=Decimal("2"),
             opening_grace_extension_multiplier=Decimal("2"),
             option_take_profit_price=Decimal("0.01"),
@@ -448,6 +449,10 @@ class StopLossEscalationTests(unittest.TestCase):
             def stock_limit_price(self, q, side):
                 return Decimal("34.00")
 
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
             def place_stock(self, symbol, side, quantity, limit_price=None, fractional=False):
                 placed.append((symbol, side, quantity, limit_price))
                 return "order-1"
@@ -494,6 +499,195 @@ class StopLossEscalationTests(unittest.TestCase):
         self.assertEqual(placed[0][:3], ("ASHR", "SELL", Decimal("1")))
         self.assertEqual(placed[0][3], Decimal("34.00"))
         self.assertIn("ASHR", fake_bot.stop_exit_submitted)
+
+
+class RepriceRestingExitsTests(unittest.TestCase):
+    def test_reprice_cancels_and_replaces_at_new_ask_without_recording_pnl_again(self):
+        """The continuous re-quote loop must cancel + resubmit the resting
+        exit directly at the fresh ask, while leaving stop_exit_submitted's
+        original timestamp, pending_stock_exits membership, and realized PnL
+        completely untouched - record_trade/record_realized_exit must only
+        ever fire once, at the original PROFIT/LOSS submission, never again
+        here (see the module-level constraint this guards against: double-
+        counting realized P&L for a single logical exit).
+        """
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        quote = {"symbol": "ASHR", "bid": "34.18", "ask": "34.20", "price": "34.19"}
+
+        class FakeApi:
+            @staticmethod
+            def stock_quote(symbol):
+                return quote
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def stock_position(symbol, positions):
+                for item in positions:
+                    if item.get("symbol") == symbol:
+                        return (
+                            Decimal(str(item.get("quantity", "0"))),
+                            Decimal(str(item.get("cost_price", "0"))),
+                        )
+                return Decimal("0"), Decimal("0")
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_stock(symbol, side, quantity, limit_price=None, fractional=False):
+                placed.append((symbol, side, quantity, limit_price))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
+            api=FakeApi(),
+            last_reprice=0.0,
+            stop_loss_escalated=set(),
+            pending_stock_exits={"ASHR"},
+            stop_exit_submitted={"ASHR": 12345.0},
+            daily_realized_pnl=Decimal("0"),
+            daily_realized_loss=Decimal("0"),
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("34.00"),
+                }
+            },
+        )
+        reprice = AutoTrader.reprice_resting_exits.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "ASHR",
+                "quantity": "1",
+                "cost_price": "30.00",
+            }
+        ]
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(positions)
+
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0], ("ASHR", "SELL", Decimal("1"), Decimal("34.20")))
+        self.assertNotIn("order-1", fake_bot.working_orders)
+        self.assertIn("order-2", fake_bot.working_orders)
+        new_order = fake_bot.working_orders["order-2"]
+        self.assertEqual(new_order["key"], "STOCK:ASHR")
+        self.assertEqual(new_order["action"], "PROFIT")
+        self.assertEqual(new_order["limit_price"], Decimal("34.20"))
+        # Original stop-loss-escalation timestamp, pending-exit membership,
+        # and realized PnL must all survive untouched - only the very first
+        # PROFIT/LOSS submission is allowed to move any of these.
+        self.assertEqual(fake_bot.stop_exit_submitted["ASHR"], 12345.0)
+        self.assertIn("ASHR", fake_bot.pending_stock_exits)
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0"))
+
+    def test_reprice_skips_when_ask_unchanged(self):
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+        quote = {"symbol": "ASHR", "bid": "33.98", "ask": "34.00", "price": "33.99"}
+
+        class FakeApi:
+            @staticmethod
+            def stock_quote(symbol):
+                return quote
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def stock_position(symbol, positions):
+                return Decimal("1"), Decimal("30.00")
+
+            @staticmethod
+            def cancel(order_id):
+                calls.append(order_id)
+
+            @staticmethod
+            def place_stock(*args, **kwargs):
+                calls.append("placed")
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
+            api=FakeApi(),
+            last_reprice=0.0,
+            stop_loss_escalated=set(),
+            pending_stock_exits={"ASHR"},
+            stop_exit_submitted={"ASHR": 5.0},
+            daily_realized_pnl=Decimal("0"),
+            daily_realized_loss=Decimal("0"),
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("34.00"),
+                }
+            },
+        )
+        reprice = AutoTrader.reprice_resting_exits.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice([{"instrument_type": "EQUITY", "symbol": "ASHR", "quantity": "1"}])
+
+        self.assertEqual(calls, [])
+        self.assertIn("order-1", fake_bot.working_orders)
+
+    def test_reprice_leaves_escalated_symbols_to_the_normal_path(self):
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+
+        class FakeApi:
+            @staticmethod
+            def stock_quote(symbol):
+                raise AssertionError("must not fetch a quote for an escalated symbol")
+
+            @staticmethod
+            def cancel(order_id):
+                calls.append(order_id)
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
+            api=FakeApi(),
+            last_reprice=0.0,
+            stop_loss_escalated={"ASHR"},
+            pending_stock_exits=set(),
+            stop_exit_submitted={},
+            daily_realized_pnl=Decimal("0"),
+            daily_realized_loss=Decimal("0"),
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("34.00"),
+                }
+            },
+        )
+        reprice = AutoTrader.reprice_resting_exits.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice([])
+
+        self.assertEqual(calls, [])
+        self.assertIn("order-1", fake_bot.working_orders)
 
 
 class MicroScalpIntegrationTests(unittest.TestCase):
@@ -669,6 +863,10 @@ class MicroScalpIntegrationTests(unittest.TestCase):
             def stock_limit_price(self, q, side):
                 return Decimal(str(q["bid"]))
 
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
             def place_stock(self, *args, **kwargs):
                 raise RuntimeError("boom")
 
@@ -733,11 +931,16 @@ class BotOvertradingCapTests(unittest.TestCase):
         )
         rate_capped = AutoTrader.rate_capped.__get__(fake_bot)
         key = "STOCK:CAPPED"
-        self.assertFalse(rate_capped(key))
-        fake_bot.trade_times[key].append(0.0)
-        self.assertFalse(rate_capped(key))
-        fake_bot.trade_times[key].append(0.0)
-        self.assertTrue(rate_capped(key))
+        # rate_capped prunes anything more than an hour old against the real
+        # time.monotonic() clock, so timestamps must be pinned relative to a
+        # frozen "now" - a literal 0.0 only stayed "recent" by coincidence of
+        # how long this process/container had been up.
+        with unittest.mock.patch("time.monotonic", return_value=0.0):
+            self.assertFalse(rate_capped(key))
+            fake_bot.trade_times[key].append(0.0)
+            self.assertFalse(rate_capped(key))
+            fake_bot.trade_times[key].append(0.0)
+            self.assertTrue(rate_capped(key))
 
     def test_rate_cap_disabled_when_limit_is_zero(self):
         from collections import defaultdict, deque
@@ -1017,6 +1220,44 @@ class FractionalSharesTests(StrategyConfigMixin, unittest.TestCase):
         strategy = TradingStrategy(config)
 
         quantity = strategy.fractional_stock_quantity(Decimal("0.50"), Decimal("1000"))
+
+        self.assertEqual(quantity, Decimal("0"))
+
+    def test_dollar_stock_quantity_sizes_by_notional_uncapped_at_one_share(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity, buffered_price = strategy.dollar_stock_quantity(
+            Decimal("2"), Decimal("500")
+        )
+
+        self.assertEqual(buffered_price, Decimal("2") * Decimal("1.03"))
+        expected = (Decimal("500") / buffered_price).quantize(
+            Decimal("0.0001"), rounding=ROUND_DOWN
+        )
+        self.assertEqual(quantity, expected)
+        self.assertGreater(quantity, Decimal("1"))
+
+    def test_dollar_stock_quantity_skips_lot_restricted_band(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity, _ = strategy.dollar_stock_quantity(
+            Decimal("0.50"), Decimal("1000")
+        )
+
+        self.assertEqual(quantity, Decimal("0"))
+
+    def test_dollar_stock_quantity_respects_min_notional(self):
+        config = self.config()
+        config.fractional_shares_min_notional = Decimal("5")
+        strategy = TradingStrategy(config)
+
+        quantity, _ = strategy.dollar_stock_quantity(
+            Decimal("400.00"), Decimal("3.00")
+        )
 
         self.assertEqual(quantity, Decimal("0"))
 

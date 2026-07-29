@@ -409,6 +409,28 @@ ones (including by the EOD closeout and stall breaker) - Webull's account
 position quantity is read as a decimal everywhere it matters, not truncated
 to a whole number.
 
+**Dollar-sized core-session entries.** `STOCK_CORE_SESSION_POSITION_FRACTION`
+(default `0.10`) changes how the main EMA-scalp strategy sizes a brand new
+stock entry during core trading hours (9:30-4:00 ET): instead of buying a
+fixed `STOCK_QUANTITY` number of whole shares (falling back to a fractional
+order above only when that doesn't fit), it sizes the entry as this fraction
+of *total account buying power* and places it as a fractional **MARKET**
+order for however many decimal shares that dollar amount buys - not capped
+at one share the way the fallback above is. This is the primary
+core-session sizing method, not a last resort:
+
+```dotenv
+STOCK_CORE_SESSION_POSITION_FRACTION=0.10
+```
+
+Outside core hours (pre-market/after-hours), entries always fall back to the
+fixed `STOCK_QUANTITY` whole-share sizing, since Webull doesn't allow
+fractional orders outside core hours. Set
+`STOCK_CORE_SESSION_POSITION_FRACTION=0` to disable this and use the fixed
+whole-share sizing all day, matching the bot's pre-existing behavior. This
+setting only affects the main stock strategy's `trade_stocks` entries -
+micro-scalp mode keeps its own fixed-cents sizing untouched.
+
 ## 4. Select options
 
 ### All optionable stocks
@@ -484,7 +506,7 @@ movement, liquidity, spreads, and the number of configured instruments.
 Fast scanning, allowing multiple instruments to trade in a minute:
 
 ```dotenv
-POLL_SECONDS=1
+POLL_SECONDS=0.25
 ACCOUNT_REFRESH_SECONDS=5
 TRADE_COOLDOWN_SECONDS=15
 STOCK_MAX_TRADES_PER_HOUR=12
@@ -671,12 +693,23 @@ it has no safe universal default.
 
 ### Stop-loss escalation
 
-Stop-loss exits price at the bid/ask midpoint rather than crossing the
-spread, trading a slightly slower fill for a better price. If that order
-hasn't filled within `STOP_LOSS_ESCALATE_SECONDS` (15s default), it's
-cancelled and resubmitted at an aggressive, spread-crossing price instead —
-a stop that never fills while price keeps falling defeats the entire point
-of having one.
+Stock sell exits — both profit-take and stop-loss — are submitted at the
+current ask (the top of the bid/ask spread, the best price a resting sell
+limit order could hope to get), and that resting order is continuously
+re-quoted (cancelled and replaced) to track the ask as it moves for as long
+as it stays unfilled, for the best available price. If the quote has no
+valid ask, profit-take falls back to its fixed target price and stop-loss
+falls back to the bid/ask midpoint, the same defensive pattern used
+elsewhere in the order-placement code.
+
+If that order still hasn't filled within `STOP_LOSS_ESCALATE_SECONDS` (15s
+default), it's cancelled and resubmitted at an aggressive, spread-crossing
+price instead — a stop that never fills while price keeps falling defeats
+the entire point of having one. Continuous re-quoting to track the ask does
+not reset this clock: it's measured from the exit's original submission, so
+`STOP_LOSS_ESCALATE_SECONDS` remains a hard backstop that forces a
+guaranteed-fill price regardless of how many times the resting order gets
+re-quoted in between.
 
 ### Stall breaker
 
@@ -1139,7 +1172,7 @@ OPTION_QUANTITY=1
 MAX_OPEN_POSITIONS=5
 MAX_ORDER_NOTIONAL=1000
 
-POLL_SECONDS=1
+POLL_SECONDS=0.25
 ACCOUNT_REFRESH_SECONDS=5
 TRADE_COOLDOWN_SECONDS=15
 STOCK_MAX_TRADES_PER_HOUR=12

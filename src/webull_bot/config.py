@@ -156,6 +156,17 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("0.20"),
     )
+    # During core trading hours, size new stock entries as this fraction of
+    # total account buying power (a genuinely fractional/decimal quantity),
+    # instead of the fixed STOCK_QUANTITY whole-share sizing - see
+    # dollar_stock_quantity() and README "Fractional shares". ge=0
+    # deliberately (not gt=0): 0 is the escape hatch back to fixed-quantity
+    # sizing all day, same pattern as OPENING_GRACE_MINUTES=0.
+    stock_core_session_position_fraction: Decimal = Field(
+        default=Decimal("0.10"),
+        ge=0,
+        le=1,
+    )
     # The opening print is naturally wider/choppier than mid-day trading, so
     # the normal spread/extension gates - tuned for profitable mid-day
     # scalping - reject almost everything in the first few minutes after the

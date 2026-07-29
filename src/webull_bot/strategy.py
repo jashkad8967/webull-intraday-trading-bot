@@ -709,6 +709,33 @@ class TradingStrategy:
             return Decimal("0")
         return quantity
 
+    def dollar_stock_quantity(
+        self,
+        price: Decimal,
+        target_notional: Decimal,
+    ) -> tuple[Decimal, Decimal]:
+        """Core-session entry sizing: convert a dollar budget directly into a
+        decimal share quantity for a fractional MARKET order, instead of
+        picking a share count first and checking whether it's affordable.
+        Unlike fractional_stock_quantity, this is not capped at one share -
+        Webull's QTY-type fractional orders accept decimal quantities above 1
+        (only its separate, unused AMOUNT order type is capped under one
+        share's price). Skips the $0.10-$0.999 lot-restricted band entirely
+        (see minimum_lot_size) since Webull requires a 100-share lot there
+        that no decimal-quantity order can satisfy.
+        """
+        buffered_price = price * Decimal("1.03")
+        if price <= 0 or self.minimum_lot_size(price) > 1:
+            return Decimal("0"), buffered_price
+        if target_notional < self.config.fractional_shares_min_notional:
+            return Decimal("0"), buffered_price
+        quantity = (target_notional / buffered_price).quantize(
+            Decimal("0.0001"), rounding=ROUND_DOWN
+        )
+        if quantity <= 0:
+            return Decimal("0"), buffered_price
+        return quantity, buffered_price
+
     def option_order_quantity(
         self,
         limit_price: Decimal,
