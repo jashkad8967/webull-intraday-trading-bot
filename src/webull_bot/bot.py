@@ -110,6 +110,7 @@ class AutoTrader:
         self.user_watchlist: set[str] = set(self.config.default_watchlist())
         self.gate_rejections: dict[str, int] = defaultdict(int)
         self.broker_conflict_symbols: set[str] = set()
+        self.fractional_trading_enabled = True
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -542,6 +543,16 @@ class AutoTrader:
         return symbol in self.stop_loss_escalated or self.cooldown_ready(key)
 
     @staticmethod
+    def is_fractional_trading_not_enabled(exc: Exception) -> bool:
+        """True for Webull's OAUTH_OPENAPI_OPENAPI_FRACT_VERSION2_ACCOUNT_
+        NOT_TRADE rejection - the account itself hasn't agreed to Webull's
+        fractional-trading terms (a one-time click-through at a URL Webull
+        includes in the error), so every fractional order will keep failing
+        identically until that happens. Retrying changes nothing here.
+        """
+        return "FRACT_VERSION2_ACCOUNT_NOT_TRADE" in str(exc).upper()
+
+    @staticmethod
     def is_broker_position_conflict(exc: Exception) -> bool:
         """True for Webull's "this order would reverse an existing
         position" rejection - a sign our local view of the position is out
@@ -566,6 +577,20 @@ class AutoTrader:
             "Webull app for a stuck order or unexpected position on %s. | %s",
             symbol,
             symbol,
+            exc,
+        )
+
+    def handle_fractional_trading_not_enabled(self, exc: Exception) -> None:
+        if not self.fractional_trading_enabled:
+            return
+        self.fractional_trading_enabled = False
+        log.error(
+            "FRACT  | fractional orders rejected - this Webull account "
+            "hasn't agreed to fractional trading yet. Falling back to "
+            "whole-share sizing for the rest of this run; open the "
+            "agreement link below in the Webull app/website once, then "
+            "restart the bot to re-enable dollar-sized core-session "
+            "entries and the fractional-shares fallback. | %s",
             exc,
         )
 
@@ -1212,6 +1237,7 @@ class AutoTrader:
                     fractional = False
                     if (
                         core_session_active
+                        and self.fractional_trading_enabled
                         and self.config.stock_core_session_position_fraction > 0
                     ):
                         target_notional = min(
@@ -1237,6 +1263,7 @@ class AutoTrader:
                         buy_quantity == 0
                         and self.config.fractional_shares_enabled
                         and core_session_active
+                        and self.fractional_trading_enabled
                     ):
                         fractional_quantity = self.strategy.fractional_stock_quantity(
                             price,
@@ -1337,6 +1364,9 @@ class AutoTrader:
                         symbol,
                     )
                     continue
+                if self.is_fractional_trading_not_enabled(exc):
+                    self.handle_fractional_trading_not_enabled(exc)
+                    continue
                 log.error("STOCK  | %s | %s", symbol, exc)
         return buying_power
 
@@ -1434,7 +1464,11 @@ class AutoTrader:
                         self.strategy.stock_order_quantity(price, entry_budget)
                     )
                     fractional = False
-                    if buy_quantity == 0 and self.config.fractional_shares_enabled:
+                    if (
+                        buy_quantity == 0
+                        and self.config.fractional_shares_enabled
+                        and self.fractional_trading_enabled
+                    ):
                         fractional_quantity = self.strategy.fractional_stock_quantity(
                             price,
                             entry_budget,
@@ -1534,6 +1568,9 @@ class AutoTrader:
                         "FUNDS  | %s | micro-scalp buy skipped | insufficient buying power",
                         symbol,
                     )
+                    continue
+                if self.is_fractional_trading_not_enabled(exc):
+                    self.handle_fractional_trading_not_enabled(exc)
                     continue
                 log.error("MSCALP | %s | %s", symbol, exc)
         return buying_power

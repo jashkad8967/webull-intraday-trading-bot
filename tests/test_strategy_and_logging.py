@@ -475,6 +475,9 @@ class StopLossEscalationTests(unittest.TestCase):
             daily_realized_loss=Decimal("0"),
         )
         fake_bot.is_broker_position_conflict = AutoTrader.is_broker_position_conflict
+        fake_bot.is_fractional_trading_not_enabled = (
+            AutoTrader.is_fractional_trading_not_enabled
+        )
         for name in (
             "cooldown_ready",
             "rate_capped",
@@ -893,6 +896,9 @@ class MicroScalpIntegrationTests(unittest.TestCase):
             broker_conflict_symbols=set(),
         )
         fake_bot.is_broker_position_conflict = AutoTrader.is_broker_position_conflict
+        fake_bot.is_fractional_trading_not_enabled = (
+            AutoTrader.is_fractional_trading_not_enabled
+        )
         for name in (
             "cooldown_ready",
             "rate_capped",
@@ -1800,6 +1806,36 @@ class BrokerConflictTests(unittest.TestCase):
         self.assertNotIn("ASHR", fake_bot.pending_stock_exits)
         self.assertNotIn("ASHR", fake_bot.stop_exit_submitted)
         self.assertNotIn("ASHR", fake_bot.stop_loss_escalated)
+
+    def test_is_fractional_trading_not_enabled_matches_account_agreement_rejection(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertTrue(
+            AutoTrader.is_fractional_trading_not_enabled(
+                RuntimeError(
+                    "HTTP Status: 417, Code: "
+                    "OAUTH_OPENAPI_OPENAPI_FRACT_VERSION2_ACCOUNT_NOT_TRADE, "
+                    "Msg: https://sp.webull.com/agreement/third-party"
+                )
+            )
+        )
+        self.assertFalse(
+            AutoTrader.is_fractional_trading_not_enabled(RuntimeError("timeout"))
+        )
+
+    def test_handle_fractional_trading_not_enabled_disables_it_once(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(fractional_trading_enabled=True)
+        handle = AutoTrader.handle_fractional_trading_not_enabled.__get__(fake_bot)
+
+        handle(RuntimeError("FRACT_VERSION2_ACCOUNT_NOT_TRADE"))
+        self.assertFalse(fake_bot.fractional_trading_enabled)
+
+        # A second rejection while already disabled shouldn't re-log/re-flip
+        # anything - just a no-op guard.
+        handle(RuntimeError("FRACT_VERSION2_ACCOUNT_NOT_TRADE"))
+        self.assertFalse(fake_bot.fractional_trading_enabled)
 
 
 class DashboardCommandTests(unittest.TestCase):
