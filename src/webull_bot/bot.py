@@ -1875,6 +1875,23 @@ class AutoTrader:
             (Decimal(row["unrealized_pnl"]) for row in position_rows),
             Decimal("0"),
         )
+        now = time.monotonic()
+        pending_order_rows = [
+            {
+                "order_id": order_id,
+                "instrument_type": order.get("key", "?:?").split(":", 1)[0],
+                "symbol": order.get("key", "?:?").split(":", 1)[-1],
+                "action": order.get("action"),
+                "limit_price": (
+                    str(order["limit_price"])
+                    if order.get("limit_price") is not None
+                    else None
+                ),
+                "age_seconds": round(now - float(order.get("submitted_at", now))),
+                "cancel_requested": order.get("cancel_requested_at") is not None,
+            }
+            for order_id, order in self.working_orders.items()
+        ]
         self.status.write(
             mode=self.config.mode,
             buying_power=buying_power,
@@ -1887,6 +1904,7 @@ class AutoTrader:
             realized_pnl_today=self.daily_realized_pnl,
             unrealized_pnl_total=unrealized_total,
             user_watchlist=sorted(self.user_watchlist),
+            pending_orders=pending_order_rows,
         )
 
     def close_instruments(self, instrument_types: set[str]) -> bool:
@@ -1945,10 +1963,47 @@ class AutoTrader:
                     self._manual_sell(command, positions, core_session_active)
                 elif command_type == "watchlist_add":
                     self.add_to_watchlist(command.get("symbol", ""))
+                elif command_type == "cancel_order":
+                    self._manual_cancel_order(command)
                 else:
                     log.warning("CMD    | unknown command type=%s", command_type)
             except Exception as exc:
                 log.error("CMD    | %s failed | %s", command_type, exc)
+
+    def _manual_cancel_order(self, command: dict) -> None:
+        order_id = str(command.get("order_id", "")).strip()
+        if not order_id:
+            return
+        order = self.working_orders.get(order_id)
+        if not order:
+            log.info(
+                "CMD    | cancel skipped | id=%s | no longer a tracked working order",
+                order_id,
+            )
+            return
+        if order.get("cancel_requested_at") is not None:
+            log.info(
+                "CMD    | cancel skipped | id=%s | already cancel-requested",
+                order_id,
+            )
+            return
+        try:
+            self.api.cancel(order_id)
+        except Exception as exc:
+            log.error("CMD    | cancel failed | id=%s | %s", order_id, exc)
+            return
+        order["cancel_requested_at"] = time.monotonic()
+        # Reconciliation (releasing pending_stock_exits/pending_option_exits
+        # for a cancelled STOP/PROFIT, dropping it from working_orders) is
+        # handled the next time monitor_working_orders sees the order has
+        # actually disappeared from the broker's open-order list - the same
+        # path an automatic timeout cancel already goes through, so a
+        # manual cancel doesn't need its own separate cleanup logic.
+        log.warning(
+            "CMD    | manual cancel requested from dashboard | %s | id=%s",
+            order.get("key", "?"),
+            order_id,
+        )
 
     def _manual_sell(
         self,

@@ -1001,13 +1001,15 @@ Change `LOG_DIRECTORY` to place logs on durable storage.
 
 ## Dashboard
 
-A second container (`ui/`) serves a small live dashboard: buying power, open
-positions (with buy price and live unrealized P&L), recent trades (with
-price and realized P&L on each exit), the current watchlist, and the
-research agent's latest state, polling a JSON snapshot the bot writes each
-cycle (`STATUS_FILE`, default `status.json`). It has no access to your
-Webull credentials or the trade API, and its mount of that status/log data
-is read-only — a display bug in the dashboard can't corrupt the bot's own
+A second container (`ui/`) serves a small live dashboard: buying power,
+today's P&L (both the combined total and the realized/unrealized
+breakdown), open positions (with buy price and live unrealized P&L),
+pending orders still working at the broker, recent trades (with price and
+realized P&L on each exit), the current watchlist, and the research
+agent's latest state, polling a JSON snapshot the bot writes each cycle
+(`STATUS_FILE`, default `status.json`). It has no access to your Webull
+credentials or the trade API, and its mount of that status/log data is
+read-only — a display bug in the dashboard can't corrupt the bot's own
 state.
 
 `DEFAULT_WATCHLIST_SYMBOLS` is seeded into the watchlist automatically every
@@ -1017,18 +1019,25 @@ never loses them, and you never have to re-add them from the dashboard.
 Anything added from the dashboard on top of that stays only in memory for
 the current run.
 
-The dashboard can also request three actions: **Close All** (cancels every
+The dashboard can also request four actions: **Close All** (cancels every
 working order and closes every open position, stocks and options alike),
-**Sell** on any individual position, and adding a symbol to the watchlist.
-These don't give the dashboard trading access directly - clicking a button
-writes a small request to a separate, dedicated shared file
-(`COMMAND_FILE`, a distinct Docker volume the dashboard can only read/write
-that one file in) that the trader process reads once per cycle and executes
-through its own already-safe order-placement, wash-sale, and
-position-tracking code, the same as every automatic exit. A request is
-picked up on the bot's next cycle, not instantly - `POLL_SECONDS` is the
-worst-case delay. Close All and Sell both ask for a JavaScript confirmation
-before sending the request, since they submit real orders on your account.
+**Sell** on any individual position, **Cancel** on any individual pending
+order (in the Pending Orders panel - useful for backing out of a BUY
+that's still resting unfilled, or a STOP/PROFIT exit you'd rather reprice
+or handle manually), and adding a symbol to the watchlist. These don't
+give the dashboard trading access directly - clicking a button writes a
+small request to a separate, dedicated shared file (`COMMAND_FILE`, a
+distinct Docker volume the dashboard can only read/write that one file
+in) that the trader process reads once per cycle and executes through its
+own already-safe order-placement, wash-sale, and position-tracking code,
+the same as every automatic exit. A request is picked up on the bot's next
+cycle, not instantly - `POLL_SECONDS` is the worst-case delay. Close All,
+Sell, and Cancel all ask for a JavaScript confirmation before sending the
+request, since they act on real orders on your account. Cancelling a
+STOP/PROFIT exit only cancels the *order* - the position itself stays
+open, and the bot will submit a fresh exit order for it again next cycle
+unless you also close the position (e.g. via Sell) or the market moves it
+out of an exit condition.
 
 A manual **Sell** is an urgent "get me out now" click, so it's priced
 differently from a patient automatic exit: it sells at the current ask (the

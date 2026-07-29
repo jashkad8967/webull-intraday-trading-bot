@@ -14,6 +14,7 @@ from webull_bot.commands import CommandQueue
 from webull_bot.config import Settings
 from webull_bot.daily_logging import DatedDailyFileHandler
 from webull_bot.market_agent import MarketResearchAgent
+from webull_bot.status import StatusWriter
 from webull_bot.strategy import TradingStrategy
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import QuoteUnavailableError, WebullAPI
@@ -1854,6 +1855,60 @@ class BrokerConflictTests(unittest.TestCase):
         self.assertFalse(fake_bot.fractional_trading_enabled)
 
 
+class StatusWriterTests(unittest.TestCase):
+    def test_write_includes_pending_orders_for_the_dashboard(self):
+        path = Path("tests/.generated_status/status.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(path))
+            writer.write(
+                mode="LIVE",
+                buying_power=Decimal("1000"),
+                positions=[],
+                watchlist=[],
+                agent_summary=None,
+                paused=False,
+                stock_count=10,
+                option_count=0,
+                pending_orders=[
+                    {
+                        "order_id": "order-1",
+                        "instrument_type": "STOCK",
+                        "symbol": "TSLA",
+                        "action": "STOP",
+                        "limit_price": "99.00",
+                        "age_seconds": 12,
+                        "cancel_requested": False,
+                    }
+                ],
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["pending_orders"]), 1)
+            self.assertEqual(payload["pending_orders"][0]["symbol"], "TSLA")
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_write_defaults_pending_orders_to_empty_list(self):
+        path = Path("tests/.generated_status/status2.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(path))
+            writer.write(
+                mode="LIVE",
+                buying_power=Decimal("1000"),
+                positions=[],
+                watchlist=[],
+                agent_summary=None,
+                paused=False,
+                stock_count=10,
+                option_count=0,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["pending_orders"], [])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+
 class DashboardCommandTests(unittest.TestCase):
     def test_command_queue_round_trip(self):
         path = Path("tests/.generated_commands/commands.json")
@@ -1910,6 +1965,50 @@ class DashboardCommandTests(unittest.TestCase):
         )
         process = AutoTrader.process_ui_commands.__get__(fake_bot)
         process([])  # must not raise despite the unknown type and handler error
+
+    def test_manual_cancel_order_cancels_a_tracked_working_order(self):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        fake_bot = SimpleNamespace(
+            working_orders={
+                "order-1": {
+                    "key": "STOCK:TSLA",
+                    "action": "STOP",
+                    "cancel_requested_at": None,
+                }
+            },
+            api=SimpleNamespace(cancel=lambda order_id: cancelled.append(order_id)),
+        )
+        cancel = AutoTrader._manual_cancel_order.__get__(fake_bot)
+
+        cancel({"order_id": "order-1"})
+
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertIsNotNone(
+            fake_bot.working_orders["order-1"]["cancel_requested_at"]
+        )
+
+    def test_manual_cancel_order_skips_unknown_or_already_requested(self):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        fake_bot = SimpleNamespace(
+            working_orders={
+                "order-2": {
+                    "key": "STOCK:AAPL",
+                    "action": "PROFIT",
+                    "cancel_requested_at": 123.0,
+                }
+            },
+            api=SimpleNamespace(cancel=lambda order_id: cancelled.append(order_id)),
+        )
+        cancel = AutoTrader._manual_cancel_order.__get__(fake_bot)
+
+        cancel({"order_id": "does-not-exist"})
+        cancel({"order_id": "order-2"})  # already cancel-requested
+
+        self.assertEqual(cancelled, [])
 
     def test_manual_sell_prices_at_the_ask_outside_core_session(self):
         from webull_bot.bot import AutoTrader

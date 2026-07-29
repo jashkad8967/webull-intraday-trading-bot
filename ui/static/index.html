@@ -103,7 +103,11 @@
 
   <div class="grid">
     <div class="stat"><div class="label">Buying Power</div><div class="value" id="buying-power">—</div></div>
-    <div class="stat"><div class="label">P&L Today</div><div class="value" id="pnl-today">—</div></div>
+    <div class="stat">
+      <div class="label">P&L Today</div>
+      <div class="value" id="pnl-today">—</div>
+      <div class="action-msg" id="pnl-breakdown"></div>
+    </div>
     <div class="stat"><div class="label">Open Positions</div><div class="value" id="position-count">—</div></div>
     <div class="stat"><div class="label">Universe</div><div class="value" id="universe">—</div></div>
     <div class="stat"><div class="label">Last Update</div><div class="value" id="last-update">—</div></div>
@@ -117,6 +121,11 @@
       </div>
       <div class="action-msg" id="positions-msg"></div>
       <div id="positions"></div>
+    </div>
+    <div class="panel">
+      <h2>Pending Orders</h2>
+      <div class="action-msg" id="pending-orders-msg"></div>
+      <div id="pending-orders"></div>
     </div>
     <div class="panel">
       <h2>Recent Trades (Buy / Sell Price / P&amp;L)</h2>
@@ -184,6 +193,8 @@ async function refresh() {
     const pnlEl = document.getElementById("pnl-today");
     pnlEl.textContent = fmtMoney(pnl.total ?? 0);
     pnlEl.className = "value " + pnlClass(pnl.total ?? 0);
+    document.getElementById("pnl-breakdown").textContent =
+      `realized ${fmtMoney(pnl.realized ?? 0)} · unrealized ${fmtMoney(pnl.unrealized ?? 0)}`;
     document.getElementById("position-count").textContent = (data.positions || []).length;
     const universe = data.universe || {};
     document.getElementById("universe").textContent = `${universe.stocks ?? 0} stocks / ${universe.options ?? 0} options`;
@@ -199,6 +210,20 @@ async function refresh() {
       { label: "Bucket", render: r => `<span class="pill">${r.bucket}</span>` },
       { label: "", render: r => `<button class="btn danger" onclick="sellPosition('${r.symbol}','${r.instrument_type}')">Sell</button>` },
     ], data.positions);
+
+    document.getElementById("pending-orders").innerHTML = table([
+      { label: "Symbol", render: r => r.symbol },
+      { label: "Type", render: r => r.instrument_type },
+      { label: "Action", render: r => r.action },
+      { label: "Price", render: r => r.limit_price ? fmtMoney(r.limit_price) : "market" },
+      { label: "Age", render: r => `${r.age_seconds}s` },
+      {
+        label: "",
+        render: r => r.cancel_requested
+          ? '<span class="pill">cancelling…</span>'
+          : `<button class="btn danger" onclick="cancelOrder('${r.order_id}','${r.symbol}')">Cancel</button>`,
+      },
+    ], data.pending_orders);
 
     document.getElementById("trades").innerHTML = table([
       { label: "Time", render: r => fmtTime(r.time) },
@@ -272,6 +297,17 @@ function sellPosition(symbol, instrumentType) {
     "positions-msg",
     `Selling ${symbol}…`,
     `Sell requested for ${symbol} - the bot will act on its next cycle.`,
+  );
+}
+
+function cancelOrder(orderId, symbol) {
+  if (!confirm(`Cancel the pending order for ${symbol}?`)) return;
+  postAction(
+    "/api/cancel-order",
+    { order_id: orderId },
+    "pending-orders-msg",
+    `Cancelling ${symbol}…`,
+    `Cancel requested for ${symbol} - the bot will act on its next cycle.`,
   );
 }
 
