@@ -506,6 +506,107 @@ class StopLossEscalationTests(unittest.TestCase):
         self.assertEqual(placed[0][3], Decimal("34.00"))
         self.assertIn("ASHR", fake_bot.stop_exit_submitted)
 
+    def test_profit_exit_never_prices_below_target_even_if_ask_has_fallen(self):
+        """A PROFIT decision can fire off a last-trade print (quote_price)
+        that's already stale relative to the current book - if the ask has
+        since dropped below the target, pricing the exit at that ask
+        directly (the old `ask or target` logic) can execute at a real
+        loss while still being logged as PROFIT. The floor must win.
+        """
+        from collections import defaultdict, deque
+
+        from webull_bot.bot import AutoTrader
+
+        config = Settings(
+            micro_scalp_enabled=True,
+            micro_scalp_symbols="ASHR",
+            micro_scalp_target_cents=Decimal("0.06"),
+            trade_cooldown_seconds=Decimal("0"),
+        )
+        strategy = TradingStrategy(config)
+        # Last trade printed at 34.10 (above the 34.06 target, triggering
+        # PROFIT), but the current ask has already fallen to 34.02 - below
+        # the target and below the 34.00 entry cost.
+        quote = {"symbol": "ASHR", "bid": "34.00", "ask": "34.02", "price": "34.10"}
+
+        placed = []
+
+        class FakeApi:
+            def stock_quotes_resilient(self, symbols, category):
+                return [quote], set()
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def stock_position(symbol, positions):
+                for item in positions:
+                    if item.get("symbol") == symbol:
+                        return (
+                            Decimal(str(item.get("quantity", "0"))),
+                            Decimal(str(item.get("cost_price", "0"))),
+                        )
+                return Decimal("0"), Decimal("0")
+
+            def stock_limit_price(self, q, side):
+                return Decimal("33.90")
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            def place_stock(self, symbol, side, quantity, limit_price=None, fractional=False):
+                placed.append((symbol, side, quantity, limit_price))
+                return "order-1"
+
+        fake_bot = SimpleNamespace(
+            config=config,
+            api=FakeApi(),
+            strategy=strategy,
+            wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_trade={},
+            trade_times=defaultdict(deque),
+            pending_stock_exits=set(),
+            stop_exit_submitted={},
+            stop_loss_escalated=set(),
+            position_buckets={},
+            working_orders={},
+            broker_conflict_symbols=set(),
+            daily_realized_pnl=Decimal("0"),
+            daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
+        )
+        fake_bot.is_broker_position_conflict = AutoTrader.is_broker_position_conflict
+        fake_bot.is_fractional_trading_not_enabled = (
+            AutoTrader.is_fractional_trading_not_enabled
+        )
+        for name in (
+            "cooldown_ready",
+            "rate_capped",
+            "record_trade",
+            "record_realized_exit",
+            "stop_ready_to_submit",
+            "trade_micro_scalp",
+        ):
+            setattr(fake_bot, name, getattr(AutoTrader, name).__get__(fake_bot))
+
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "ASHR",
+                "quantity": "1",
+                "cost_price": "34.00",
+            }
+        ]
+        fake_bot.trade_micro_scalp(positions, Decimal("10000"))
+
+        self.assertEqual(len(placed), 1)
+        # Must price at the 34.06 target, not the fallen 34.02 ask.
+        self.assertEqual(placed[0][3], Decimal("34.06"))
+        self.assertGreater(placed[0][3], Decimal("34.00"))  # never below cost
+
 
 class RepriceRestingExitsTests(unittest.TestCase):
     def test_reprice_cancels_and_replaces_at_new_ask_without_recording_pnl_again(self):
@@ -740,6 +841,87 @@ class RepriceRestingExitsTests(unittest.TestCase):
 
         self.assertEqual(calls, [])
         self.assertIn("order-1", fake_bot.working_orders)
+
+    def test_reprice_never_chases_the_ask_below_entry_cost(self):
+        """If the ask has fallen below the position's own entry cost since
+        the resting PROFIT order was placed, repricing to that ask would
+        turn a profit-take into a guaranteed loss. Leave the existing
+        (already validly-priced) order resting instead.
+        """
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        quote = {"symbol": "ASHR", "bid": "29.90", "ask": "29.95", "price": "29.95"}
+
+        class FakeApi:
+            @staticmethod
+            def stock_quote(symbol):
+                return quote
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def stock_position(symbol, positions):
+                for item in positions:
+                    if item.get("symbol") == symbol:
+                        return (
+                            Decimal(str(item.get("quantity", "0"))),
+                            Decimal(str(item.get("cost_price", "0"))),
+                        )
+                return Decimal("0"), Decimal("0")
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_stock(*args, **kwargs):
+                placed.append((args, kwargs))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
+            api=FakeApi(),
+            last_reprice=0.0,
+            stop_loss_escalated=set(),
+            pending_stock_exits={"ASHR"},
+            stop_exit_submitted={"ASHR": 12345.0},
+            daily_realized_pnl=Decimal("0"),
+            daily_realized_loss=Decimal("0"),
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("30.20"),
+                }
+            },
+        )
+        reprice = AutoTrader.reprice_resting_exits.__get__(fake_bot)
+
+        # Entry cost (30.00) is above the current ask (29.95) - the stock
+        # dropped after entry.
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "ASHR",
+                "quantity": "1",
+                "cost_price": "30.00",
+            }
+        ]
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(positions)
+
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+        self.assertIn("order-1", fake_bot.working_orders)
+        self.assertEqual(
+            fake_bot.working_orders["order-1"]["limit_price"], Decimal("30.20")
+        )
 
 
 class MicroScalpIntegrationTests(unittest.TestCase):
