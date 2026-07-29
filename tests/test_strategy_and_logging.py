@@ -1183,21 +1183,24 @@ class AllocationAndLoggingTests(unittest.TestCase):
         self.assertNotIn("SPY", config.popular_stocks())
         self.assertNotIn("QQQ", config.popular_stocks())
 
-    def test_default_risk_tuning_keeps_stop_ceiling_above_spread_gate(self):
-        """STOCK_ENTRY_MAX_SPREAD_PERCENT must stay below
-        STOCK_STOP_LOSS_MAX_PERCENT - otherwise a position entered right at
-        the widest tolerated spread could already be most of the way to its
-        own stop from the bid/ask bounce alone, before any real price move.
+    def test_default_risk_tuning_keeps_stop_floor_above_spread_gate(self):
+        """STOCK_ENTRY_MAX_SPREAD_PERCENT must stay comfortably below
+        STOCK_STOP_LOSS_MIN_PERCENT - the *floor*, not just the ceiling.
+        A calm stock's adaptive stop clamps to the floor regardless of the
+        range multiplier, so if the floor sat below the max tolerated
+        spread (it briefly did: a 0.12% floor against a 0.50% spread gate),
+        an entry near that spread ceiling could get stopped out by an
+        ordinary bid/ask bounce alone, before any real adverse move -
+        "trigger happy" stops firing on noise, not on a real loss.
         """
         config = Settings()
         self.assertEqual(config.stock_entry_max_spread_percent, Decimal("0.50"))
-        self.assertEqual(config.stock_stop_loss_min_percent, Decimal("0.0012"))
-        self.assertEqual(config.stock_stop_loss_max_percent, Decimal("0.006"))
-        self.assertEqual(config.stock_stop_loss_range_multiplier, Decimal("0.28"))
-        self.assertLess(
-            config.stock_entry_max_spread_percent / 100,
-            config.stock_stop_loss_max_percent,
-        )
+        self.assertEqual(config.stock_stop_loss_min_percent, Decimal("0.006"))
+        self.assertEqual(config.stock_stop_loss_max_percent, Decimal("0.01"))
+        self.assertEqual(config.stock_stop_loss_range_multiplier, Decimal("0.35"))
+        spread_as_fraction = config.stock_entry_max_spread_percent / 100
+        self.assertLess(spread_as_fraction, config.stock_stop_loss_min_percent)
+        self.assertLess(spread_as_fraction, config.stock_stop_loss_max_percent)
 
     def test_default_watchlist_is_parsed_and_deduplicated_by_membership(self):
         config = Settings()
