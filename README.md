@@ -78,9 +78,13 @@ an empty assessment.
 **6. Safety rails**, all independent of which entry strategy opened a
 position: wash-sale blocking (stocks and options, including from a manual
 dashboard sell at a loss), a simultaneous-unrealized-loss circuit breaker, a
-daily realized-loss circuit breaker, stop-loss escalation for a stuck exit
-(with automatic backoff if the escalated resubmission itself fails, instead
-of retrying every single poll forever), a stall breaker that unsticks
+daily realized-loss circuit breaker, exit escalation for a stuck stop-loss
+*or* profit-take order (a profit target the market never actually reaches
+would otherwise cancel and resubmit at the identical unreachable price
+forever; escalation re-quotes at the current aggressive crossing price
+instead, and backs off normally if the escalated resubmission itself
+fails, instead of retrying every single poll forever), a stall breaker that
+unsticks
 capital that hasn't filled in a while, crash-safe universe loading (a
 screener hiccup logs a warning and falls back to the prior universe instead
 of taking the whole process down), automatic order sizing up to Webull's
