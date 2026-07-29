@@ -931,11 +931,16 @@ class BotOvertradingCapTests(unittest.TestCase):
         )
         rate_capped = AutoTrader.rate_capped.__get__(fake_bot)
         key = "STOCK:CAPPED"
-        self.assertFalse(rate_capped(key))
-        fake_bot.trade_times[key].append(0.0)
-        self.assertFalse(rate_capped(key))
-        fake_bot.trade_times[key].append(0.0)
-        self.assertTrue(rate_capped(key))
+        # rate_capped prunes anything more than an hour old against the real
+        # time.monotonic() clock, so timestamps must be pinned relative to a
+        # frozen "now" - a literal 0.0 only stayed "recent" by coincidence of
+        # how long this process/container had been up.
+        with unittest.mock.patch("time.monotonic", return_value=0.0):
+            self.assertFalse(rate_capped(key))
+            fake_bot.trade_times[key].append(0.0)
+            self.assertFalse(rate_capped(key))
+            fake_bot.trade_times[key].append(0.0)
+            self.assertTrue(rate_capped(key))
 
     def test_rate_cap_disabled_when_limit_is_zero(self):
         from collections import defaultdict, deque
