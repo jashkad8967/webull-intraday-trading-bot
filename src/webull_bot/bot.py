@@ -1,7 +1,7 @@
 import logging
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
@@ -83,6 +83,7 @@ class AutoTrader:
         self.resolved_date = None
         self.last_close_attempt = 0.0
         self.last_status_log = 0.0
+        self.opening_grace_logged_date = None
         self.last_option_discovery = 0.0
         self.last_account_refresh = 0.0
         self.last_order_monitor = 0.0
@@ -963,6 +964,7 @@ class AutoTrader:
         self,
         positions: list[dict],
         buying_power: Decimal,
+        opening_grace_active: bool = False,
     ) -> Decimal:
         open_count = self.strategy.open_position_count(positions)
         self.refresh_agent_discoveries()
@@ -1094,6 +1096,7 @@ class AutoTrader:
                     quantity,
                     cost,
                     self.agent_assessment(symbol),
+                    opening_grace_active,
                 )
                 if decision.action == "HOLD" and quantity == 0:
                     self.gate_rejections[decision.reason] += 1
@@ -1953,6 +1956,19 @@ class AutoTrader:
             if option_closeout <= moment < option_close:
                 self.close_instruments({"OPTION"})
 
+            opening_grace_active = option_open <= moment < option_open + timedelta(
+                minutes=self.config.opening_grace_minutes
+            )
+            if opening_grace_active and self.opening_grace_logged_date != moment.date():
+                self.opening_grace_logged_date = moment.date()
+                log.info(
+                    "GATES  | opening grace window active for %s minutes | "
+                    "spread/extension gates relaxed %sx/%sx near the bell",
+                    self.config.opening_grace_minutes,
+                    self.config.opening_grace_spread_multiplier,
+                    self.config.opening_grace_extension_multiplier,
+                )
+
             cycle_started = time.monotonic()
             try:
                 self.resolve_targets(moment)
@@ -1968,7 +1984,9 @@ class AutoTrader:
                     circuit_active = self.handle_daily_loss_breaker()
                 if not circuit_active:
                     buying_power = self.trade_micro_scalp(positions, buying_power)
-                    buying_power = self.trade_stocks(positions, buying_power)
+                    buying_power = self.trade_stocks(
+                        positions, buying_power, opening_grace_active
+                    )
                     if option_open <= moment < option_closeout:
                         self.discover_option_contracts()
                         buying_power = self.trade_options(positions, buying_power)

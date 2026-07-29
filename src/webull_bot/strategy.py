@@ -485,6 +485,7 @@ class TradingStrategy:
         quantity: int,
         average_cost: Decimal,
         assessment: dict | None = None,
+        opening_grace_active: bool = False,
     ) -> Decision:
         trend = self.trend_signal(key, price)
         symbol = key.split(":", 1)[-1]
@@ -533,11 +534,11 @@ class TradingStrategy:
                         breakeven,
                     )
             return Decision("HOLD", "position between target and stop", target)
-        if not self.entry_spread_ok(key):
+        if not self.entry_spread_ok(key, opening_grace_active):
             return Decision("HOLD", "spread too wide to scalp profitably")
         if not self.vwap_supports_entry(symbol, price):
             return Decision("HOLD", "price below session VWAP")
-        if not self.entry_extension_ok(symbol, price):
+        if not self.entry_extension_ok(symbol, price, opening_grace_active):
             return Decision("HOLD", "price already extended near today's high")
         if trend == "BUY":
             return Decision("BUY", "EMA entry confirmed")
@@ -560,22 +561,33 @@ class TradingStrategy:
             return Decimal("0")
         return max(Decimal("-1"), min(Decimal("1"), bias))
 
-    def entry_spread_ok(self, key: str) -> bool:
+    def entry_spread_ok(self, key: str, opening_grace_active: bool = False) -> bool:
         symbol = key.split(":", 1)[-1]
         spread = self.metrics.get(symbol, {}).get("spread_percent")
         if spread in (None, ""):
             return True
+        threshold = self.config.stock_entry_max_spread_percent
+        if opening_grace_active:
+            threshold *= self.config.opening_grace_spread_multiplier
         try:
-            return Decimal(str(spread)) <= self.config.stock_entry_max_spread_percent
+            return Decimal(str(spread)) <= threshold
         except Exception:
             return True
 
-    def entry_extension_ok(self, symbol: str, price: Decimal) -> bool:
+    def entry_extension_ok(
+        self,
+        symbol: str,
+        price: Decimal,
+        opening_grace_active: bool = False,
+    ) -> bool:
         """Block chasing a name that's already sitting at today's high.
 
         A crossover that only confirms once price is already at the peak
         of a fast spike is buying the top, not the move - require some
-        room below today's high before allowing a fresh entry.
+        room below today's high before allowing a fresh entry. Right after
+        the open, today's high is barely established yet and gets set/reset
+        constantly, so the grace window shrinks the room required (smaller
+        buffer = more lenient) instead of dropping the check entirely.
         """
         high = self.metrics.get(symbol, {}).get("high")
         if not high:
@@ -586,9 +598,10 @@ class TradingStrategy:
             return True
         if high_decimal <= 0:
             return True
-        return price <= high_decimal * (
-            Decimal("1") - self.config.stock_entry_max_extension_percent
-        )
+        extension_percent = self.config.stock_entry_max_extension_percent
+        if opening_grace_active:
+            extension_percent /= self.config.opening_grace_extension_multiplier
+        return price <= high_decimal * (Decimal("1") - extension_percent)
 
     @staticmethod
     def research_supports_entry(assessment: dict | None) -> bool:

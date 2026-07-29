@@ -46,6 +46,8 @@ class StrategyConfigMixin:
             stock_target_stop_multiple=Decimal("1.2"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
+            opening_grace_spread_multiplier=Decimal("2"),
+            opening_grace_extension_multiplier=Decimal("2"),
             option_take_profit_price=Decimal("0.01"),
             option_stop_loss_percent=Decimal("0.50"),
             agent_exit_influence_enabled=True,
@@ -163,6 +165,23 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_extension_gate_does_not_block_entry_without_data(self):
         strategy = TradingStrategy(self.config())
         self.assertTrue(strategy.entry_extension_ok("UNSEEN", Decimal("50")))
+
+    def test_opening_grace_widens_extension_gate(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["SPIKED"] = {"high": 100.0}
+        # Same price/high pair the plain gate rejects above - the grace
+        # multiplier (2x -> 2% room instead of 1%) should let it through.
+        self.assertFalse(strategy.entry_extension_ok("SPIKED", Decimal("99.5")))
+        self.assertTrue(
+            strategy.entry_extension_ok("SPIKED", Decimal("99.5"), True)
+        )
+
+    def test_opening_grace_widens_spread_gate(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["WIDE"] = {"spread_percent": 0.25}
+        key = "STOCK:WIDE"
+        self.assertFalse(strategy.entry_spread_ok(key))
+        self.assertTrue(strategy.entry_spread_ok(key, True))
 
     def test_adaptive_stop_percent_is_clamped_between_configured_bounds(self):
         strategy = TradingStrategy(self.config())

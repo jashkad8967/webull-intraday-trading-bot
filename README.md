@@ -512,6 +512,18 @@ bot can end up buying right as a fast spike exhausts and reverses, hitting
 the stop shortly after. Raise it to allow chasing further-extended moves;
 set it to `0` to disable the check entirely.
 
+**Opening grace window.** `STOCK_ENTRY_MAX_SPREAD_PERCENT` and
+`STOCK_ENTRY_MAX_EXTENSION_PERCENT` are tuned for profitable mid-day
+scalping, but the first few minutes after the 9:30 bell naturally have wider
+spreads and an intraday high that hasn't had time to separate from price
+yet — so those same gates can reject nearly every entry right at the open
+(visible as a `GATES` log dominated by "spread too wide"/"already extended"
+right after 9:30). `OPENING_GRACE_MINUTES` (default 10) widens both gates by
+`OPENING_GRACE_SPREAD_MULTIPLIER`/`OPENING_GRACE_EXTENSION_MULTIPLIER`
+(default 2x each) for that opening stretch only, then snaps back to the
+tighter full-day thresholds above. Set `OPENING_GRACE_MINUTES=0` to disable
+and use the plain thresholds all day.
+
 ### Trade cadence and favoring recurring movers
 
 Every stock's profit target scales with its own adaptive stop

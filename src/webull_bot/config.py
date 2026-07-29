@@ -156,6 +156,22 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("0.20"),
     )
+    # The opening print is naturally wider/choppier than mid-day trading, so
+    # the normal spread/extension gates - tuned for profitable mid-day
+    # scalping - reject almost everything in the first few minutes after the
+    # bell. This grace window relaxes both gates only for that opening
+    # stretch, then snaps back to the tighter full-day thresholds.
+    opening_grace_minutes: int = Field(default=10, ge=0, le=120)
+    opening_grace_spread_multiplier: Decimal = Field(
+        default=Decimal("2"),
+        ge=1,
+        le=10,
+    )
+    opening_grace_extension_multiplier: Decimal = Field(
+        default=Decimal("2"),
+        ge=1,
+        le=10,
+    )
     option_take_profit_price: Decimal = Field(default=Decimal("0.01"), ge=0)
     option_stop_loss_percent: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
     stop_loss_escalate_seconds: int = Field(default=15, ge=5, le=120)
