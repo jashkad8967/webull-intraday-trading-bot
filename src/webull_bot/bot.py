@@ -894,10 +894,16 @@ class AutoTrader:
         return pnl
 
     def escalate_stalled_stop_losses(self) -> None:
-        """Cancel and re-flag a stop-loss for a more aggressive re-quote if
-        its gentler midpoint/aggressive-but-passive price hasn't filled
-        quickly - a stop sitting unfilled while price keeps falling turns a
-        bounded loss into an unbounded one.
+        """Cancel and re-flag an exit (stop-loss OR profit-take) for a more
+        aggressive re-quote if its gentler price hasn't filled quickly.
+
+        A stop sitting unfilled while price keeps falling turns a bounded
+        loss into an unbounded one. A profit-take sitting unfilled at a
+        fixed target that the market never actually reaches (thin ETF, wide
+        spread) is a different failure mode with the same fix: without
+        this, it cancels on the generic order timeout, then resubmits at
+        the exact same unreachable price next cycle since nothing about
+        the decision changed - forever, never realizing the gain.
         """
         threshold = float(self.config.stop_loss_escalate_seconds)
         now = time.monotonic()
@@ -909,14 +915,16 @@ class AutoTrader:
                 continue
             if now - submitted_at < threshold:
                 continue
-            order_id = next(
-                (
-                    oid
-                    for oid, order in self.working_orders.items()
-                    if order.get("key") == key and order.get("action") == "STOP"
-                ),
-                None,
-            )
+            order_id = None
+            action = None
+            for oid, order in self.working_orders.items():
+                if order.get("key") == key and order.get("action") in (
+                    "STOP",
+                    "PROFIT",
+                ):
+                    order_id = oid
+                    action = order.get("action")
+                    break
             if order_id:
                 try:
                     self.api.cancel(order_id)
@@ -932,9 +940,10 @@ class AutoTrader:
             self.pending_stock_exits.discard(symbol)
             self.stop_exit_submitted.pop(symbol, None)
             log.warning(
-                "STOP   | %s | midpoint exit unfilled after %ss | escalating "
-                "to an aggressive crossing price",
+                "STOP   | %s | %s exit unfilled after %ss | escalating to "
+                "an aggressive crossing price",
                 symbol,
+                (action or "pending").lower(),
                 threshold,
             )
 
@@ -1177,15 +1186,21 @@ class AutoTrader:
                     target = decision.target_price
                     if target is None:
                         continue
+                    limit_price = (
+                        self.api.stock_limit_price(quote, "SELL")
+                        if symbol in self.stop_loss_escalated
+                        else target
+                    )
                     order_id = self.api.place_stock(
                         symbol,
                         "SELL",
                         quantity,
-                        limit_price=target,
+                        limit_price=limit_price,
                     )
                     self.pending_stock_exits.add(symbol)
-                    pnl = self.record_realized_exit(cost, target, quantity)
-                    self.record_trade(key, order_id, "PROFIT", target, pnl=pnl)
+                    self.stop_exit_submitted[symbol] = time.monotonic()
+                    pnl = self.record_realized_exit(cost, limit_price, quantity)
+                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")
@@ -1364,15 +1379,21 @@ class AutoTrader:
                     target = decision.target_price
                     if target is None:
                         continue
+                    limit_price = (
+                        self.api.stock_limit_price(quote, "SELL")
+                        if symbol in self.stop_loss_escalated
+                        else target
+                    )
                     order_id = self.api.place_stock(
                         symbol,
                         "SELL",
                         quantity,
-                        limit_price=target,
+                        limit_price=limit_price,
                     )
                     self.pending_stock_exits.add(symbol)
-                    pnl = self.record_realized_exit(cost, target, quantity)
-                    self.record_trade(key, order_id, "PROFIT", target, pnl=pnl)
+                    self.stop_exit_submitted[symbol] = time.monotonic()
+                    pnl = self.record_realized_exit(cost, limit_price, quantity)
+                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
                     limit_price = (
                         self.api.stock_limit_price(quote, "SELL")

@@ -350,6 +350,131 @@ class StopLossEscalationTests(unittest.TestCase):
         ready = AutoTrader.stop_ready_to_submit.__get__(fake_bot)
         self.assertFalse(ready("STOCK:X", "X"))
 
+    def test_escalation_also_catches_a_stalled_profit_order(self):
+        """Regression test: a PROFIT limit order that never fills (target
+        price the market doesn't actually reach) must escalate the same
+        way a stalled STOP does - otherwise it cancels on the generic order
+        timeout and resubmits at the identical unreachable price forever,
+        never realizing the gain.
+        """
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(stop_loss_escalate_seconds=15),
+            api=SimpleNamespace(cancel=lambda order_id: cancelled.append(order_id)),
+            stop_exit_submitted={"ASHR": 0.0},
+            pending_stock_exits={"ASHR"},
+            stop_loss_escalated=set(),
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                }
+            },
+        )
+        escalate = AutoTrader.escalate_stalled_stop_losses.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=20.0):
+            escalate()
+
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertIn("ASHR", fake_bot.stop_loss_escalated)
+        self.assertNotIn("ASHR", fake_bot.pending_stock_exits)
+        self.assertNotIn("ASHR", fake_bot.stop_exit_submitted)
+
+    def test_escalated_profit_order_uses_aggressive_price_not_stale_target(self):
+        """End-to-end via the real trade_micro_scalp() path: once a PROFIT
+        exit is escalated, the resubmission must use the current aggressive
+        crossing price, not the stale theoretical target - the whole point
+        is to actually get a fill instead of re-quoting the exact price
+        that already failed to fill.
+        """
+        from collections import defaultdict, deque
+
+        from webull_bot.bot import AutoTrader
+
+        config = Settings(
+            micro_scalp_enabled=True,
+            micro_scalp_symbols="ASHR",
+            micro_scalp_target_cents=Decimal("0.06"),
+            trade_cooldown_seconds=Decimal("0"),
+        )
+        strategy = TradingStrategy(config)
+        quote = {"symbol": "ASHR", "bid": "34.09", "ask": "34.11", "price": "34.10"}
+
+        placed = []
+
+        class FakeApi:
+            def stock_quotes_resilient(self, symbols, category):
+                return [quote], set()
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def stock_position(symbol, positions):
+                for item in positions:
+                    if item.get("symbol") == symbol:
+                        return (
+                            Decimal(str(item.get("quantity", "0"))),
+                            Decimal(str(item.get("cost_price", "0"))),
+                        )
+                return Decimal("0"), Decimal("0")
+
+            def stock_limit_price(self, q, side):
+                return Decimal("34.00")
+
+            def place_stock(self, symbol, side, quantity, limit_price=None, fractional=False):
+                placed.append((symbol, side, quantity, limit_price))
+                return "order-1"
+
+        fake_bot = SimpleNamespace(
+            config=config,
+            api=FakeApi(),
+            strategy=strategy,
+            wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_trade={},
+            trade_times=defaultdict(deque),
+            pending_stock_exits=set(),
+            stop_exit_submitted={},
+            stop_loss_escalated={"ASHR"},
+            position_buckets={},
+            working_orders={},
+            broker_conflict_symbols=set(),
+            daily_realized_pnl=Decimal("0"),
+            daily_realized_loss=Decimal("0"),
+        )
+        fake_bot.is_broker_position_conflict = AutoTrader.is_broker_position_conflict
+        for name in (
+            "cooldown_ready",
+            "rate_capped",
+            "record_trade",
+            "record_realized_exit",
+            "stop_ready_to_submit",
+            "trade_micro_scalp",
+        ):
+            setattr(fake_bot, name, getattr(AutoTrader, name).__get__(fake_bot))
+
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "ASHR",
+                "quantity": "1",
+                "cost_price": "34.00",
+            }
+        ]
+        fake_bot.trade_micro_scalp(positions, Decimal("10000"))
+
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0][:3], ("ASHR", "SELL", Decimal("1")))
+        self.assertEqual(placed[0][3], Decimal("34.00"))
+        self.assertIn("ASHR", fake_bot.stop_exit_submitted)
+
 
 class MicroScalpIntegrationTests(unittest.TestCase):
     def test_trade_micro_scalp_buys_a_qualifying_dip_end_to_end(self):
