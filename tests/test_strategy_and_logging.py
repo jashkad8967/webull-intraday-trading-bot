@@ -1130,6 +1130,14 @@ class AllocationAndLoggingTests(unittest.TestCase):
         self.assertNotIn("SPY", config.popular_stocks())
         self.assertNotIn("QQQ", config.popular_stocks())
 
+    def test_default_watchlist_is_parsed_and_deduplicated_by_membership(self):
+        config = Settings()
+        watchlist = config.default_watchlist()
+        self.assertTrue(
+            {"AAPL", "NVDA", "TSLA", "MSFT", "AMZN"} <= set(watchlist)
+        )
+        self.assertEqual(watchlist, [item.upper() for item in watchlist])
+
     def test_log_handler_writes_year_month_and_date_path(self):
         directory = Path("tests/.generated_logs")
         shutil.rmtree(directory, ignore_errors=True)

@@ -986,6 +986,13 @@ Webull credentials or the trade API, and its mount of that status/log data
 is read-only — a display bug in the dashboard can't corrupt the bot's own
 state.
 
+`DEFAULT_WATCHLIST_SYMBOLS` is seeded into the watchlist automatically every
+time the bot starts - unlike `POPULAR_STOCK_SYMBOLS` (which only weights
+priority within the scanned universe), these are always present, a restart
+never loses them, and you never have to re-add them from the dashboard.
+Anything added from the dashboard on top of that stays only in memory for
+the current run.
+
 The dashboard can also request three actions: **Close All** (cancels every
 working order and closes every open position, stocks and options alike),
 **Sell** on any individual position, and adding a symbol to the watchlist.
