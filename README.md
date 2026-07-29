@@ -527,9 +527,9 @@ REENTER_CONFIRMATION_POLLS=2
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_MIN_PERCENT=0.0015
+STOCK_STOP_LOSS_MIN_PERCENT=0.0012
 STOCK_STOP_LOSS_MAX_PERCENT=0.006
-STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
+STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.28
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
@@ -543,6 +543,20 @@ confirms after part of a move has already happened, so without this, the
 bot can end up buying right as a fast spike exhausts and reverses, hitting
 the stop shortly after. Raise it to allow chasing further-extended moves;
 set it to `0` to disable the check entirely.
+
+**Entry gates.** The spread/VWAP/extension/EMA-signal checks run in that
+order, each only evaluating candidates that already passed everything
+before it - so a `GATES` log dominated by "spread too wide" means most
+candidates are being filtered out before VWAP, extension, or the actual
+entry signal are ever checked. `STOCK_ENTRY_MAX_SPREAD_PERCENT` default is
+`0.50` - deliberately wider than the very first ~0.15% this project
+shipped with, which was blocking the large majority of scan candidates
+immediately. This is a real tradeoff, not a free win: a wider tolerated
+spread means some entries pay more of the strategy's already-thin targeted
+margin (`STOCK_MIN_NET_PROFIT_PERCENT` + `STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT`)
+just crossing the spread. Lower it back down for fewer, higher-quality
+fills; raise it further for more fire rate at the cost of average edge per
+trade.
 
 **Opening grace window.** `STOCK_ENTRY_MAX_SPREAD_PERCENT` and
 `STOCK_ENTRY_MAX_EXTENSION_PERCENT` are tuned for profitable mid-day
@@ -1211,9 +1225,9 @@ REENTER_CONFIRMATION_POLLS=2
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_MIN_PERCENT=0.0015
+STOCK_STOP_LOSS_MIN_PERCENT=0.0012
 STOCK_STOP_LOSS_MAX_PERCENT=0.006
-STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
+STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.28
 STOCK_TARGET_STOP_MULTIPLE=1.2
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5

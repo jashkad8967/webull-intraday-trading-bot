@@ -1136,6 +1136,22 @@ class AllocationAndLoggingTests(unittest.TestCase):
         self.assertNotIn("SPY", config.popular_stocks())
         self.assertNotIn("QQQ", config.popular_stocks())
 
+    def test_default_risk_tuning_keeps_stop_ceiling_above_spread_gate(self):
+        """STOCK_ENTRY_MAX_SPREAD_PERCENT must stay below
+        STOCK_STOP_LOSS_MAX_PERCENT - otherwise a position entered right at
+        the widest tolerated spread could already be most of the way to its
+        own stop from the bid/ask bounce alone, before any real price move.
+        """
+        config = Settings()
+        self.assertEqual(config.stock_entry_max_spread_percent, Decimal("0.50"))
+        self.assertEqual(config.stock_stop_loss_min_percent, Decimal("0.0012"))
+        self.assertEqual(config.stock_stop_loss_max_percent, Decimal("0.006"))
+        self.assertEqual(config.stock_stop_loss_range_multiplier, Decimal("0.28"))
+        self.assertLess(
+            config.stock_entry_max_spread_percent / 100,
+            config.stock_stop_loss_max_percent,
+        )
+
     def test_default_watchlist_is_parsed_and_deduplicated_by_membership(self):
         config = Settings()
         watchlist = config.default_watchlist()

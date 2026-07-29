@@ -149,10 +149,10 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("0.10"),
     )
-    stock_stop_loss_min_percent: Decimal = Field(default=Decimal("0.0015"), gt=0, le=1)
+    stock_stop_loss_min_percent: Decimal = Field(default=Decimal("0.0012"), gt=0, le=1)
     stock_stop_loss_max_percent: Decimal = Field(default=Decimal("0.006"), gt=0, le=1)
     stock_stop_loss_range_multiplier: Decimal = Field(
-        default=Decimal("0.35"),
+        default=Decimal("0.28"),
         ge=0,
         le=Decimal("5"),
     )
@@ -162,7 +162,7 @@ class Settings(BaseSettings):
         le=Decimal("5"),
     )
     stock_entry_max_spread_percent: Decimal = Field(
-        default=Decimal("0.15"),
+        default=Decimal("0.50"),
         gt=0,
         le=Decimal("5"),
     )
