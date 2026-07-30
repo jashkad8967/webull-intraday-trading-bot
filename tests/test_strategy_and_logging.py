@@ -1254,6 +1254,33 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual(agent._parse_response(""), {})
         self.assertEqual(agent._parse_response(None), {})
 
+    def test_submit_force_bypasses_the_interval_throttle(self):
+        """force=True must actually skip the interval wait - it was
+        previously accepted as a parameter but never read anywhere in
+        submit(), so a forced post-liquidation reevaluation
+        (submit_agent_research(..., force=True)) silently behaved
+        identically to a routine submit and could sit rate-limited for
+        minutes instead of firing immediately.
+        """
+        import queue as queue_module
+        import time as time_module
+
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(agent_daily_request_limit=250)
+        agent._request_date = datetime.now(timezone.utc).date()
+        agent._requests_today = 0
+        agent._limit_logged_date = None
+        agent._last_submitted = time_module.monotonic()  # "just submitted"
+        agent._timezone = timezone.utc
+        agent._interval_seconds = lambda: 120
+        agent._work = queue_module.Queue(maxsize=1)
+
+        agent.submit({"a": 1}, force=False)
+        self.assertTrue(agent._work.empty())  # still within the interval
+
+        agent.submit({"a": 1}, force=True)
+        self.assertFalse(agent._work.empty())  # force bypassed the wait
+
     def test_discovery_retry_skips_when_nothing_left_to_assess(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(agent_daily_request_limit=250)
