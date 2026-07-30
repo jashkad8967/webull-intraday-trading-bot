@@ -142,6 +142,18 @@ class Settings(BaseSettings):
     ema_slow_period: int = Field(default=8, ge=3, le=1000)
     reenter_on_trend: bool = True
     reenter_confirmation_polls: int = Field(default=2, ge=1, le=20)
+    # Proxy for order-flow imbalance: real bid/ask depth isn't available
+    # from the quote feed (Level 1 snapshot only - no size/depth), so this
+    # approximates it from the same poll-to-poll price prints already
+    # collected for the EMA crossover, counting net upticks vs downticks.
+    # An EMA crossover can fire while the last several individual prints
+    # are still net negative; this is a real, if noisy, extra confirmation
+    # that recent tape direction agrees before entering.
+    tick_direction_enabled: bool = True
+    tick_direction_window: int = Field(default=10, ge=3, le=100)
+    tick_direction_veto_threshold: Decimal = Field(
+        default=Decimal("0"), ge=-1, le=1
+    )
     vwap_entry_band_percent: Decimal = Field(
         default=Decimal("0.001"),
         ge=0,
