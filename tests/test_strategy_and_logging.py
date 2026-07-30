@@ -1387,6 +1387,21 @@ class AllocationAndLoggingTests(unittest.TestCase):
         self.assertLess(spread_as_fraction, config.stock_stop_loss_min_percent)
         self.assertLess(spread_as_fraction, config.stock_stop_loss_max_percent)
 
+    def test_default_reward_risk_ratio_gives_a_comfortable_breakeven_margin(self):
+        """At the old STOCK_TARGET_STOP_MULTIPLE=1.2, breakeven needs a
+        ~45.5% win rate (1 / (1 + ratio)) - too thin a margin for normal
+        noise/whipsaw, and a real cause of net-losing days even with
+        plenty of individual winning trades. 1.8 only needs ~35.7%.
+        Trading itself is never automatically halted - no circuit breaker
+        is enabled by default; this fix only improves the ratio each trade
+        is judged against.
+        """
+        config = Settings()
+        self.assertEqual(config.stock_target_stop_multiple, Decimal("1.8"))
+        breakeven_win_rate = 1 / (1 + config.stock_target_stop_multiple)
+        self.assertLess(breakeven_win_rate, Decimal("0.36"))
+        self.assertFalse(config.daily_loss_circuit_breaker_enabled)
+
     def test_default_watchlist_is_parsed_and_deduplicated_by_membership(self):
         config = Settings()
         watchlist = config.default_watchlist()
