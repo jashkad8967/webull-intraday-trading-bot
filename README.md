@@ -531,6 +531,7 @@ TICK_DIRECTION_VETO_THRESHOLD=0
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
+SELL_FEE_DOLLARS=0.02
 STOCK_STOP_LOSS_MIN_PERCENT=0.009
 STOCK_STOP_LOSS_MAX_PERCENT=0.015
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
@@ -818,14 +819,27 @@ percent times `STOCK_TARGET_STOP_MULTIPLE` (default 1.8×, raised from an
 original 1.2× - at 1.2, breakeven needs a ~45.5% win rate, too thin a
 margin for normal noise/whipsaw and a real cause of net-losing days even
 with plenty of individual winners; 1.8 only needs ~35.7%) — so reward:risk
-scales with volatility instead of staying fixed while the stop moves. For
-options, `OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one
-premium cent above average cost, normally $1 per standard 100-share contract
-before fees. Options also stop out at `OPTION_STOP_LOSS_PERCENT` (50% of
-premium by default) — unlike stocks, there was previously no automatic loss
-cut on an option position at all, so a losing contract could only be closed
-by the end-of-day sweep. A profit or stop order remains subject to its limit
-being filled.
+scales with volatility instead of staying fixed while the stop moves. On
+top of that, every stock, option, and micro-scalp target adds
+`SELL_FEE_DOLLARS` (default $0.02 - Webull's flat SEC-fee-plus-FINRA-TAF
+pass-through, charged on the sell leg only, converted to a per-share amount
+by dividing by the position's quantity) so a target isn't hit at a price
+that nets a loss once that fee comes out of the actual fill. For options,
+`OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one premium
+cent above average cost plus that fee, normally just over $1 per standard
+100-share contract. Options also stop out at `OPTION_STOP_LOSS_PERCENT` (50%
+of premium by default) — unlike stocks, there was previously no automatic
+loss cut on an option position at all, so a losing contract could only be
+closed by the end-of-day sweep. A profit or stop order remains subject to
+its limit being filled.
+
+Every realized exit also has `SELL_FEE_DOLLARS` subtracted from the P&L the
+bot records for it - the dashboard's P&L total, the daily-loss circuit
+breaker, and the trade log all reflect the fee, not a fee-free round trip.
+An open position's displayed unrealized P&L is likewise net of the fee it
+will pay once closed. Webull's real per-sell fee can round up to 3 cents
+instead of 2 on a larger-notional trade; raise `SELL_FEE_DOLLARS` if that's
+what you're actually seeing.
 
 When a stock *or option* loss exit is submitted (options block by their
 underlying symbol), it's persisted in `conf/wash_sale_blocks.json` and
@@ -873,8 +887,9 @@ the bot back in on the next favorable-looking poll.
 
 One cent multiplied by 1,000 completed one-share trades is $10 gross. With 100
 shares, a one-cent favorable move is $1 per completed trade. Net results also
-include losing trades, bid/ask spread, slippage, regulatory fees, commissions
-that may apply, and orders that do not fill.
+include losing trades, bid/ask spread, slippage, and orders that do not fill.
+`SELL_FEE_DOLLARS` models the regulatory fee on each sell; any other
+commissions your account is subject to are not.
 
 ## 6. Set sizes and limits
 
@@ -1321,6 +1336,7 @@ TICK_DIRECTION_VETO_THRESHOLD=0
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
+SELL_FEE_DOLLARS=0.02
 STOCK_STOP_LOSS_MIN_PERCENT=0.009
 STOCK_STOP_LOSS_MAX_PERCENT=0.015
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35

@@ -142,7 +142,8 @@ class TradingStrategy:
         """
         symbol = key.split(":", 1)[-1]
         if quantity > 0:
-            target = average_cost + self.config.micro_scalp_target_cents
+            fee_per_share = self.config.sell_fee_dollars / quantity
+            target = average_cost + self.config.micro_scalp_target_cents + fee_per_share
             stop = average_cost - self.config.micro_scalp_stop_cents
             if price <= stop:
                 return Decision("LOSS", "micro-scalp stop reached", price)
@@ -521,13 +522,19 @@ class TradingStrategy:
         trend = self.trend_signal(key, price)
         symbol = key.split(":", 1)[-1]
         if quantity > 0:
+            # The flat per-sell fee doesn't scale with share count, so it
+            # has to be converted to a per-share amount before it can be
+            # added to a per-share target/breakeven price - otherwise a
+            # target hit at exactly the percentage-based price would still
+            # net a loss once the flat fee comes out of the actual fill.
+            fee_per_share = self.config.sell_fee_dollars / quantity
             stop_percent = self.adaptive_stop_percent(symbol)
             target_percent = max(
                 self.config.stock_min_net_profit_percent
                 + self.config.stock_estimated_round_trip_cost_percent,
                 stop_percent * self.config.stock_target_stop_multiple,
             )
-            base_target = average_cost * (Decimal("1") + target_percent)
+            base_target = average_cost * (Decimal("1") + target_percent) + fee_per_share
             stop = average_cost * (Decimal("1") - stop_percent)
             if average_cost > 0 and price <= stop:
                 return Decision("LOSS", "percentage stop reached", price)
@@ -540,7 +547,8 @@ class TradingStrategy:
             ):
                 target = max(
                     base_target,
-                    average_cost * (Decimal("1") + self.config.agent_runner_profit_percent),
+                    average_cost * (Decimal("1") + self.config.agent_runner_profit_percent)
+                    + fee_per_share,
                 )
             if average_cost > 0 and price >= target:
                 reason = (
@@ -557,7 +565,7 @@ class TradingStrategy:
                 breakeven = average_cost * (
                     Decimal("1")
                     + self.config.stock_estimated_round_trip_cost_percent
-                )
+                ) + fee_per_share
                 if price >= breakeven:
                     return Decision(
                         "PROFIT",
@@ -662,7 +670,11 @@ class TradingStrategy:
     ) -> Decision:
         trend = self.trend_signal(key, price)
         if quantity > 0:
-            target = average_cost + self.config.option_take_profit_price
+            # Same flat-fee-to-per-share conversion as stock_decision, but
+            # one contract represents 100 shares, so the fee is spread over
+            # quantity * 100, not quantity alone.
+            fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
+            target = average_cost + self.config.option_take_profit_price + fee_per_share
             stop = average_cost * (
                 Decimal("1") - self.config.option_stop_loss_percent
             )
@@ -800,12 +812,16 @@ class TradingStrategy:
             if Decimal(str(item.get("quantity", "0"))) != 0
         )
 
-    @staticmethod
-    def position_unrealized_pnl(position: dict) -> Decimal:
+    def position_unrealized_pnl(self, position: dict) -> Decimal:
+        """Net of the flat sell fee this position hasn't paid yet - it's
+        still open, but closing it will cost that fee, so showing the raw
+        pre-fee mark-to-market number would overstate what selling right
+        now actually nets.
+        """
         reported = position.get("unrealized_profit_loss")
         if reported not in (None, ""):
             try:
-                return Decimal(str(reported))
+                return Decimal(str(reported)) - self.config.sell_fee_dollars
             except Exception:
                 pass
         try:
@@ -823,7 +839,7 @@ class TradingStrategy:
                 if position.get("instrument_type") == "OPTION"
                 else Decimal("1")
             )
-            return (price - cost) * quantity * multiplier
+            return (price - cost) * quantity * multiplier - self.config.sell_fee_dollars
         except Exception:
             return Decimal("0")
 

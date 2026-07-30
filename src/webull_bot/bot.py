@@ -1027,7 +1027,7 @@ class AutoTrader:
         both care about the running picture, not cent-perfect accounting.
         Returns the estimated pnl so callers can show it on the trade log.
         """
-        pnl = (exit_price - average_cost) * quantity * multiplier
+        pnl = (exit_price - average_cost) * quantity * multiplier - self.config.sell_fee_dollars
         self.daily_realized_pnl += pnl
         if pnl < 0:
             self.daily_realized_loss += -pnl
@@ -1833,12 +1833,13 @@ class AutoTrader:
                     key = f"STOCK:{symbol}"
                     if not self.cooldown_ready(key):
                         continue
+                    fee_per_share = self.config.sell_fee_dollars / quantity
                     quote = self.api.stock_quote(symbol)
                     bid = self.api.quote_bid(quote)
-                    if bid is None or bid - average_cost < min_profit:
+                    if bid is None or bid - average_cost < min_profit + fee_per_share:
                         continue
                     sell_price = bid.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                    if sell_price - average_cost < min_profit:
+                    if sell_price - average_cost < min_profit + fee_per_share:
                         continue
                     order_id = self.api.place_stock(
                         symbol,
@@ -1860,12 +1861,13 @@ class AutoTrader:
                     contract = self.api.contract_from_position(position)
                     if not contract:
                         continue
+                    fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
                     quote = self.api.option_quote(contract["symbol"])
                     bid = self.api.quote_bid(quote)
-                    if bid is None or bid - average_cost < min_profit:
+                    if bid is None or bid - average_cost < min_profit + fee_per_share:
                         continue
                     sell_price = bid.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                    if sell_price - average_cost < min_profit:
+                    if sell_price - average_cost < min_profit + fee_per_share:
                         continue
                     order_id = self.api.place_option(
                         contract,
