@@ -1349,7 +1349,12 @@ class ResearchDiscoveryTests(unittest.TestCase):
         near budget, or a prior 429 still within its backoff window.
         """
         import queue as queue_module
-        import time as time_module
+
+        # A fixed monotonic clock, not the real one - submit()'s interval
+        # check compares elapsed-since-_last_submitted against this, and
+        # the real clock's absolute value depends on how long the host has
+        # been up, which is not something a test should depend on.
+        now = 100_000.0
 
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(
@@ -1367,21 +1372,24 @@ class ResearchDiscoveryTests(unittest.TestCase):
 
         # Over the token budget, even though the interval has long elapsed.
         agent._work = queue_module.Queue(maxsize=1)
-        agent._token_usage_log = [(time_module.monotonic(), 1500)]
-        agent.submit({"a": 1})
+        agent._token_usage_log = [(now, 1500)]
+        with unittest.mock.patch("time.monotonic", return_value=now):
+            agent.submit({"a": 1})
         self.assertTrue(agent._work.empty())
 
         # Under budget and past the interval - goes through normally.
-        agent._token_usage_log = [(time_module.monotonic(), 100)]
-        agent.submit({"a": 1})
+        agent._token_usage_log = [(now, 100)]
+        with unittest.mock.patch("time.monotonic", return_value=now):
+            agent.submit({"a": 1})
         self.assertFalse(agent._work.empty())
 
         # A live rate-limit backoff blocks submission even with budget free.
         agent._work = queue_module.Queue(maxsize=1)
         agent._last_submitted = 0.0
         agent._token_usage_log = []
-        agent._rate_limited_until = time_module.monotonic() + 600
-        agent.submit({"a": 1})
+        agent._rate_limited_until = now + 600
+        with unittest.mock.patch("time.monotonic", return_value=now):
+            agent.submit({"a": 1})
         self.assertTrue(agent._work.empty())
 
     def test_rolling_tokens_used_prunes_entries_older_than_24h(self):
