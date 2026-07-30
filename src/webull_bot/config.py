@@ -149,8 +149,8 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("0.10"),
     )
-    stock_stop_loss_min_percent: Decimal = Field(default=Decimal("0.006"), gt=0, le=1)
-    stock_stop_loss_max_percent: Decimal = Field(default=Decimal("0.01"), gt=0, le=1)
+    stock_stop_loss_min_percent: Decimal = Field(default=Decimal("0.009"), gt=0, le=1)
+    stock_stop_loss_max_percent: Decimal = Field(default=Decimal("0.015"), gt=0, le=1)
     stock_stop_loss_range_multiplier: Decimal = Field(
         default=Decimal("0.35"),
         ge=0,
@@ -229,6 +229,12 @@ class Settings(BaseSettings):
     agent_core_research_seconds: int = Field(default=120, ge=15, le=3600)
     agent_extended_research_seconds: int = Field(default=622, ge=15, le=3600)
     agent_daily_request_limit: int = Field(default=250, ge=1, le=250)
+    # Groq's real cap is tokens per day (TPD), not request count - a quiet
+    # account can exhaust TPD in well under agent_daily_request_limit
+    # requests. This must match your actual Groq model/tier TPD limit (see
+    # console.groq.com/settings/billing) with some margin - the default
+    # assumes the free/on-demand llama-3.3-70b-versatile tier (100000 TPD).
+    agent_daily_token_budget: int = Field(default=90000, ge=1000)
     agent_max_symbols: int = Field(default=5, ge=1, le=50)
     agent_discovery_max_symbols: int = Field(default=5, ge=1, le=25)
     agent_timeout_seconds: int = Field(default=60, ge=5, le=180)

@@ -527,8 +527,8 @@ REENTER_CONFIRMATION_POLLS=2
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_MIN_PERCENT=0.006
-STOCK_STOP_LOSS_MAX_PERCENT=0.01
+STOCK_STOP_LOSS_MIN_PERCENT=0.009
+STOCK_STOP_LOSS_MAX_PERCENT=0.015
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
@@ -654,6 +654,7 @@ GROQ_API_KEY=your_groq_api_key
 GROQ_MODEL=groq/compound-mini
 AGENT_CORE_RESEARCH_SECONDS=120
 AGENT_EXTENDED_RESEARCH_SECONDS=622
+AGENT_DAILY_TOKEN_BUDGET=90000
 AGENT_DAILY_REQUEST_LIMIT=250
 AGENT_MAX_SYMBOLS=5
 AGENT_DISCOVERY_MAX_SYMBOLS=5
@@ -673,6 +674,21 @@ seconds and uses up to the remaining 55 calls. A hard 250-call daily limit
 applies across both windows. A request can still perform broad popular/volatile
 discovery when there are no supplied symbols to assess. Cached results are used
 between calls.
+
+Groq's real cap, though, is tokens per day (TPD) on the model itself, not
+request count - a quiet account can hit `rate_limit_exceeded` well under the
+250-request limit above. `AGENT_DAILY_TOKEN_BUDGET` must match your actual
+Groq model/tier TPD limit (see
+[console.groq.com/settings/billing](https://console.groq.com/settings/billing))
+with some margin - the default assumes the free/on-demand
+`llama-3.3-70b-versatile` tier (100000 TPD). The bot tracks its own rolling
+24-hour usage from each response's real token count and stops submitting
+before it would hit that ceiling. Groq's TPD is a rolling window, not a
+midnight reset - its own 429 gives a "try again in Nm" hint, not "try
+tomorrow" - so if it still 429s anyway (an agentic model's server-side web
+search can consume tokens the bot can't see ahead of a call), the bot backs
+off for the exact duration Groq reports instead of retrying at the next
+interval into the same limit.
 
 Every research response contains `market_direction` and `market_volatility`.
 Every researched symbol contains `priority`, `quick_trade_score`,
@@ -1277,8 +1293,8 @@ REENTER_CONFIRMATION_POLLS=2
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
-STOCK_STOP_LOSS_MIN_PERCENT=0.006
-STOCK_STOP_LOSS_MAX_PERCENT=0.01
+STOCK_STOP_LOSS_MIN_PERCENT=0.009
+STOCK_STOP_LOSS_MAX_PERCENT=0.015
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
@@ -1302,6 +1318,7 @@ GROQ_API_KEY=
 GROQ_MODEL=groq/compound-mini
 AGENT_CORE_RESEARCH_SECONDS=120
 AGENT_EXTENDED_RESEARCH_SECONDS=622
+AGENT_DAILY_TOKEN_BUDGET=90000
 AGENT_DAILY_REQUEST_LIMIT=250
 AGENT_MAX_SYMBOLS=5
 AGENT_DISCOVERY_MAX_SYMBOLS=5
