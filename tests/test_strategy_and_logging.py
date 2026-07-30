@@ -361,6 +361,52 @@ class StopLossEscalationTests(unittest.TestCase):
         with unittest.mock.patch("time.monotonic", return_value=10.0):
             self.assertTrue(ready("STOCK:X", "X"))
 
+    def test_record_trade_marks_last_exit_only_for_exit_actions(self):
+        """STOCK_REENTRY_COOLDOWN_SECONDS gates the next BUY off
+        last_exit_at - that timestamp must only be set on an actual exit
+        (PROFIT/STOP/MANUAL_SELL), never on a BUY, or an entry would look
+        like a fresh exit and the cooldown would never clear correctly.
+        """
+        from collections import defaultdict, deque
+
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade("STOCK:X", "order-1", "BUY")
+        self.assertNotIn("STOCK:X", fake_bot.last_exit_at)
+
+        record_trade(
+            "STOCK:X", "order-2", "PROFIT", Decimal("10.00"), pnl=Decimal("1")
+        )
+        self.assertIn("STOCK:X", fake_bot.last_exit_at)
+
+    def test_reentry_cooldown_blocks_immediate_rebuy_after_an_exit(self):
+        """A stock that just closed shouldn't immediately pull the bot back
+        in on the next favorable-looking poll - it must wait out
+        STOCK_REENTRY_COOLDOWN_SECONDS from the last exit first. A symbol
+        that has never had a position closed has nothing to wait out.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(stock_reentry_cooldown_seconds=Decimal("600")),
+            last_exit_at={"STOCK:X": 1000.0},
+        )
+        ready = AutoTrader.reentry_cooldown_ready.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=1100.0):
+            self.assertFalse(ready("STOCK:X"))  # only 100s since the exit
+        with unittest.mock.patch("time.monotonic", return_value=1601.0):
+            self.assertTrue(ready("STOCK:X"))  # past the 600s cooldown
+        self.assertTrue(ready("STOCK:Y"))  # never exited - nothing to wait out
+
     def test_pending_exit_always_blocks_regardless_of_escalation(self):
         from webull_bot.bot import AutoTrader
 
@@ -466,6 +512,7 @@ class StopLossEscalationTests(unittest.TestCase):
             wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_trade={},
+            last_exit_at={},
             trade_times=defaultdict(deque),
             pending_stock_exits=set(),
             stop_exit_submitted={},
@@ -484,6 +531,7 @@ class StopLossEscalationTests(unittest.TestCase):
         for name in (
             "cooldown_ready",
             "rate_capped",
+            "reentry_cooldown_ready",
             "record_trade",
             "record_realized_exit",
             "stop_ready_to_submit",
@@ -567,6 +615,7 @@ class StopLossEscalationTests(unittest.TestCase):
             wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_trade={},
+            last_exit_at={},
             trade_times=defaultdict(deque),
             pending_stock_exits=set(),
             stop_exit_submitted={},
@@ -585,6 +634,7 @@ class StopLossEscalationTests(unittest.TestCase):
         for name in (
             "cooldown_ready",
             "rate_capped",
+            "reentry_cooldown_ready",
             "record_trade",
             "record_realized_exit",
             "stop_ready_to_submit",
@@ -985,6 +1035,7 @@ class MicroScalpIntegrationTests(unittest.TestCase):
             wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_trade={},
+            last_exit_at={},
             trade_times=defaultdict(deque),
             pending_stock_exits=set(),
             stop_exit_submitted={},
@@ -996,6 +1047,7 @@ class MicroScalpIntegrationTests(unittest.TestCase):
         for name in (
             "cooldown_ready",
             "rate_capped",
+            "reentry_cooldown_ready",
             "record_trade",
             "record_realized_exit",
             "stop_ready_to_submit",
@@ -1115,6 +1167,7 @@ class MicroScalpIntegrationTests(unittest.TestCase):
             ),
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_trade={},
+            last_exit_at={},
             trade_times=defaultdict(deque),
             pending_stock_exits=set(),
             pending_option_exits=set(),
@@ -1133,6 +1186,7 @@ class MicroScalpIntegrationTests(unittest.TestCase):
         for name in (
             "cooldown_ready",
             "rate_capped",
+            "reentry_cooldown_ready",
             "record_trade",
             "record_realized_exit",
             "stop_ready_to_submit",
@@ -1266,7 +1320,9 @@ class ResearchDiscoveryTests(unittest.TestCase):
         import time as time_module
 
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
-        agent.config = SimpleNamespace(agent_daily_request_limit=250)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250, agent_daily_token_budget=90000
+        )
         agent._request_date = datetime.now(timezone.utc).date()
         agent._requests_today = 0
         agent._limit_logged_date = None
@@ -1274,12 +1330,94 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent._timezone = timezone.utc
         agent._interval_seconds = lambda: 120
         agent._work = queue_module.Queue(maxsize=1)
+        agent._rate_limited_until = 0.0
+        agent._token_usage_log = []
+        agent._token_limit_logged_at = 0.0
+        agent.log = logging.getLogger("test-agent")
 
         agent.submit({"a": 1}, force=False)
         self.assertTrue(agent._work.empty())  # still within the interval
 
         agent.submit({"a": 1}, force=True)
         self.assertFalse(agent._work.empty())  # force bypassed the wait
+
+    def test_submit_respects_rolling_token_budget_and_rate_limit_backoff(self):
+        """The interval throttle alone doesn't protect against Groq's real
+        tokens-per-day cap - a request can be perfectly on-schedule and
+        still 429 if the account's rolling 24h usage is near its limit.
+        submit() must refuse to queue work in either case: usage already
+        near budget, or a prior 429 still within its backoff window.
+        """
+        import queue as queue_module
+
+        # A fixed monotonic clock, not the real one - submit()'s interval
+        # check compares elapsed-since-_last_submitted against this, and
+        # the real clock's absolute value depends on how long the host has
+        # been up, which is not something a test should depend on.
+        now = 100_000.0
+
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250, agent_daily_token_budget=1000
+        )
+        agent._request_date = datetime.now(timezone.utc).date()
+        agent._requests_today = 0
+        agent._limit_logged_date = None
+        agent._last_submitted = 0.0
+        agent._timezone = timezone.utc
+        agent._interval_seconds = lambda: 120
+        agent._rate_limited_until = 0.0
+        agent._token_limit_logged_at = 0.0
+        agent.log = logging.getLogger("test-agent")
+
+        # Over the token budget, even though the interval has long elapsed.
+        agent._work = queue_module.Queue(maxsize=1)
+        agent._token_usage_log = [(now, 1500)]
+        with unittest.mock.patch("time.monotonic", return_value=now):
+            agent.submit({"a": 1})
+        self.assertTrue(agent._work.empty())
+
+        # Under budget and past the interval - goes through normally.
+        agent._token_usage_log = [(now, 100)]
+        with unittest.mock.patch("time.monotonic", return_value=now):
+            agent.submit({"a": 1})
+        self.assertFalse(agent._work.empty())
+
+        # A live rate-limit backoff blocks submission even with budget free.
+        agent._work = queue_module.Queue(maxsize=1)
+        agent._last_submitted = 0.0
+        agent._token_usage_log = []
+        agent._rate_limited_until = now + 600
+        with unittest.mock.patch("time.monotonic", return_value=now):
+            agent.submit({"a": 1})
+        self.assertTrue(agent._work.empty())
+
+    def test_rolling_tokens_used_prunes_entries_older_than_24h(self):
+        import time as time_module
+
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        now = time_module.monotonic()
+        agent._token_usage_log = [
+            (now - 86500, 5000),  # just over 24h old - dropped
+            (now - 3600, 200),    # 1h old - kept
+            (now, 100),           # fresh - kept
+        ]
+        self.assertEqual(agent._rolling_tokens_used(), 300)
+        self.assertEqual(len(agent._token_usage_log), 2)
+
+    def test_parse_retry_after_reads_groqs_minutes_seconds_hint(self):
+        message = (
+            "Error code: 429 - {'error': {'message': 'Rate limit reached "
+            "... Please try again in 33m57.312s. Need more tokens?', "
+            "'type': 'compound', 'code': 'rate_limit_exceeded'}}"
+        )
+        seconds = MarketResearchAgent._parse_retry_after(message)
+        # 33*60 + 57.312 + 30s safety margin
+        self.assertAlmostEqual(seconds, 2067.312, places=2)
+
+    def test_parse_retry_after_falls_back_to_a_safe_default_when_unparseable(self):
+        seconds = MarketResearchAgent._parse_retry_after("rate_limit_exceeded")
+        self.assertEqual(seconds, 1800.0)
 
     def test_discovery_retry_skips_when_nothing_left_to_assess(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
@@ -1407,8 +1545,8 @@ class AllocationAndLoggingTests(unittest.TestCase):
         """
         config = Settings()
         self.assertEqual(config.stock_entry_max_spread_percent, Decimal("0.50"))
-        self.assertEqual(config.stock_stop_loss_min_percent, Decimal("0.006"))
-        self.assertEqual(config.stock_stop_loss_max_percent, Decimal("0.01"))
+        self.assertEqual(config.stock_stop_loss_min_percent, Decimal("0.009"))
+        self.assertEqual(config.stock_stop_loss_max_percent, Decimal("0.015"))
         self.assertEqual(config.stock_stop_loss_range_multiplier, Decimal("0.35"))
         spread_as_fraction = config.stock_entry_max_spread_percent / 100
         self.assertLess(spread_as_fraction, config.stock_stop_loss_min_percent)
