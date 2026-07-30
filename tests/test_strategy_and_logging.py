@@ -39,6 +39,9 @@ class StrategyConfigMixin:
             popular_stock_max_spread_percent=Decimal("0.50"),
             reenter_on_trend=True,
             reenter_confirmation_polls=2,
+            tick_direction_enabled=True,
+            tick_direction_window=10,
+            tick_direction_veto_threshold=Decimal("0"),
             vwap_entry_band_percent=Decimal("0.001"),
             stock_min_net_profit_percent=Decimal("0.0001"),
             stock_estimated_round_trip_cost_percent=Decimal("0.002"),
@@ -209,6 +212,51 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         # re-entry is allowed again.
         self.assertEqual(strategy.trend_signal(key, Decimal("10.2")), "BUY")
 
+    def test_tick_direction_score_ranges_from_all_downticks_to_all_upticks(self):
+        strategy = TradingStrategy(self.config())
+        self.assertEqual(strategy.tick_direction_score("STOCK:NODATA"), Decimal("0"))
+
+        for price in ["10", "10.1", "10.2", "10.3"]:
+            strategy.trend_signal("STOCK:UP", Decimal(price))
+        self.assertEqual(strategy.tick_direction_score("STOCK:UP"), Decimal("1"))
+
+        for price in ["10", "9.9", "9.8", "9.7"]:
+            strategy.trend_signal("STOCK:DOWN", Decimal(price))
+        self.assertEqual(strategy.tick_direction_score("STOCK:DOWN"), Decimal("-1"))
+
+    def test_tick_direction_veto_blocks_an_otherwise_qualifying_ema_entry(self):
+        """Real bid/ask depth isn't available from the quote feed, so tick
+        direction (net upticks vs downticks in the recent tape) is the
+        closest proxy for order-flow imbalance. An EMA crossover can fire
+        right as a long downtrend just barely turns - the smoothed EMA
+        already reads "up" while the last several individual prints are
+        still dominated by the downtrend that preceded it. This must hold
+        instead of chasing an entry the raw tape doesn't yet support.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:REENTRY2"
+        downtrend = [10, 9.9, 9.8, 9.7, 9.6, 9.5, 9.4, 9.3, 9.2]
+        for price in downtrend:
+            strategy.trend_signal(key, Decimal(str(price)))
+        strategy.trend_signal(key, Decimal("9.6"))
+
+        decision = strategy.stock_decision(key, Decimal("9.7"), 0, Decimal("0"), None)
+        self.assertEqual(decision.action, "HOLD")
+        self.assertIn("recent ticks", decision.reason)
+
+    def test_tick_direction_disabled_lets_the_ema_entry_through_regardless(self):
+        config = self.config()
+        config.tick_direction_enabled = False
+        strategy = TradingStrategy(config)
+        key = "STOCK:REENTRY3"
+        downtrend = [10, 9.9, 9.8, 9.7, 9.6, 9.5, 9.4, 9.3, 9.2]
+        for price in downtrend:
+            strategy.trend_signal(key, Decimal(str(price)))
+        strategy.trend_signal(key, Decimal("9.6"))
+
+        decision = strategy.stock_decision(key, Decimal("9.7"), 0, Decimal("0"), None)
+        self.assertEqual(decision.action, "BUY")
+
     def test_recurring_crossovers_boost_priority_score(self):
         strategy = TradingStrategy(self.config())
         choppy = [10, 9.8, 9.6, 9.8, 10, 9.8, 9.6, 9.8, 10, 9.8, 9.6, 9.8, 10, 9.8, 9.6]
@@ -234,6 +282,14 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         self.assertGreater(strategy.crossover_counts["CHOP"], 0)
         strategy.clear_market_state()
         self.assertEqual(strategy.crossover_counts["CHOP"], 0)
+
+    def test_clear_market_state_resets_tick_history(self):
+        strategy = TradingStrategy(self.config())
+        for price in [10, 9.9, 9.8, 9.7]:
+            strategy.trend_signal("STOCK:CHOP", Decimal(str(price)))
+        self.assertNotEqual(strategy.tick_direction_score("STOCK:CHOP"), Decimal("0"))
+        strategy.clear_market_state()
+        self.assertEqual(strategy.tick_direction_score("STOCK:CHOP"), Decimal("0"))
 
     def test_stop_and_target_scale_with_adaptive_stop_percent(self):
         strategy = TradingStrategy(self.config())

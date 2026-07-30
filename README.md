@@ -525,6 +525,9 @@ EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
 REENTER_CONFIRMATION_POLLS=2
+TICK_DIRECTION_ENABLED=true
+TICK_DIRECTION_WINDOW=10
+TICK_DIRECTION_VETO_THRESHOLD=0
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
@@ -790,6 +793,18 @@ Repository responsibilities are intentionally separated:
 `VWAP_ENTRY_BAND_PERCENT` of the session VWAP — the crossover alone reacts to
 quote noise more than genuine momentum, so VWAP acts as a second, independent
 confirmation.
+
+A third, independent check gates the EMA path specifically: `TICK_DIRECTION_ENABLED`
+(default true) compares net upticks vs downticks over the last
+`TICK_DIRECTION_WINDOW` poll-to-poll price prints - a lightweight proxy for
+order-flow imbalance (real bid/ask depth isn't available from the quote
+feed, which is Level 1 only). The EMA crossover is smoothed and can fire
+right as a long downtrend just barely turns, while the last several raw
+prints are still net negative; when the tick-direction score falls below
+`TICK_DIRECTION_VETO_THRESHOLD` (default 0, meaning upticks must be at
+least equal to downticks), the entry holds instead of chasing a move the
+raw tape doesn't yet support. It does not gate the research-assisted entry
+path, only the EMA crossover.
 
 **Stops** scale with each symbol's own realized range instead of one flat
 percentage: `STOCK_STOP_LOSS_RANGE_MULTIPLIER` times the symbol's
@@ -1300,6 +1315,9 @@ EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
 REENTER_ON_TREND=true
 REENTER_CONFIRMATION_POLLS=2
+TICK_DIRECTION_ENABLED=true
+TICK_DIRECTION_WINDOW=10
+TICK_DIRECTION_VETO_THRESHOLD=0
 VWAP_ENTRY_BAND_PERCENT=0.001
 STOCK_MIN_NET_PROFIT_PERCENT=0.0015
 STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002

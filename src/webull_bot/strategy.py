@@ -39,6 +39,9 @@ class TradingStrategy:
         self.micro_scalp_reference: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=config.micro_scalp_reference_window)
         )
+        self.tick_history: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=config.tick_direction_window)
+        )
 
     def clear_market_state(self) -> None:
         self.activity.clear()
@@ -48,6 +51,7 @@ class TradingStrategy:
         self.vwap_state.clear()
         self.crossover_counts.clear()
         self.micro_scalp_reference.clear()
+        self.tick_history.clear()
 
     @staticmethod
     def rotating_batch(items: list, cursor: int, batch_size: int) -> tuple[list, int]:
@@ -434,6 +438,7 @@ class TradingStrategy:
     def trend_signal(self, key: str, price: Decimal) -> str:
         values = self.history[key]
         values.append(float(price))
+        self.tick_history[key].append(float(price))
         slow = self.config.ema_slow_period
         fast = self.config.ema_fast_period
         if len(values) < slow + 1:
@@ -469,6 +474,32 @@ class TradingStrategy:
         ):
             return "BUY"
         return "HOLD"
+
+    def tick_direction_score(self, key: str) -> Decimal:
+        """Net upticks vs downticks over the recent poll-to-poll price
+        prints, as a proxy for order-flow imbalance - real bid/ask depth
+        isn't available from the quote feed. Ranges -1 (all downticks) to
+        +1 (all upticks); 0 when there's too little data or no net
+        direction (flat prints, or an equal mix of up/down).
+        """
+        values = list(self.tick_history.get(key, ()))
+        if len(values) < 2:
+            return Decimal("0")
+        up = down = 0
+        for previous, current in zip(values, values[1:]):
+            if current > previous:
+                up += 1
+            elif current < previous:
+                down += 1
+        total = up + down
+        if total == 0:
+            return Decimal("0")
+        return Decimal(up - down) / Decimal(total)
+
+    def tick_direction_ok(self, key: str) -> bool:
+        if not self.config.tick_direction_enabled:
+            return True
+        return self.tick_direction_score(key) >= self.config.tick_direction_veto_threshold
 
     def adaptive_stop_percent(self, symbol: str) -> Decimal:
         range_ratio = Decimal(str(self.metrics.get(symbol, {}).get("range_ratio", 0)))
@@ -541,7 +572,11 @@ class TradingStrategy:
         if not self.entry_extension_ok(symbol, price, opening_grace_active):
             return Decision("HOLD", "price already extended near today's high")
         if trend == "BUY":
-            return Decision("BUY", "EMA entry confirmed")
+            if self.tick_direction_ok(key):
+                return Decision("BUY", "EMA entry confirmed")
+            return Decision(
+                "HOLD", "recent ticks trending against the EMA entry"
+            )
         if self.research_supports_entry(assessment):
             return Decision(
                 "BUY",
