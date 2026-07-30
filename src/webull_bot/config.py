@@ -124,6 +124,14 @@ class Settings(BaseSettings):
         default=Decimal("1"), ge=Decimal("0.25"), le=Decimal("3600")
     )
     trade_cooldown_seconds: Decimal = Field(default=Decimal("15"), ge=0, le=Decimal("21600"))
+    # TRADE_COOLDOWN_SECONDS is just an order-submission debounce (avoids
+    # resubmitting within seconds of the last order); this is a separate,
+    # much longer gate specifically on re-entering a symbol right after a
+    # position in it just closed (profit, stop, or manual sell) - it
+    # doesn't apply to the exit itself, only to the next BUY.
+    stock_reentry_cooldown_seconds: Decimal = Field(
+        default=Decimal("600"), ge=0, le=Decimal("21600")
+    )
     stock_max_trades_per_hour: int = Field(default=12, ge=0, le=1000)
     stock_oscillation_weight: Decimal = Field(
         default=Decimal("0.5"),

@@ -30,13 +30,23 @@ class MarketResearchAgent:
         self._requests_today = 0
         self._timezone = ZoneInfo(config.trading_timezone)
         self._limit_logged_date = None
+        # Groq's TPD limit is a rolling 24h window, not a midnight reset
+        # (its own 429 gives a "try again in Nm" hint, not "try tomorrow") -
+        # tracked here as (monotonic_timestamp, tokens_used) pairs so usage
+        # ages out continuously instead of a lump reset that either holds
+        # a stale block too long or clears a real block too early.
+        self._token_usage_log: list[tuple[float, int]] = []
+        self._rate_limited_until = 0.0
+        self._token_limit_logged_at = 0.0
         threading.Thread(target=self._worker, daemon=True).start()
         self.log.info(
-            "AGENT  | enabled | model=%s | core=%ss | extended=%ss | budget=%s/day | symbols=%s",
+            "AGENT  | enabled | model=%s | core=%ss | extended=%ss | budget=%s/day | "
+            "tokens=%s/day | symbols=%s",
             config.groq_model,
             config.agent_core_research_seconds,
             config.agent_extended_research_seconds,
             config.agent_daily_request_limit,
+            config.agent_daily_token_budget,
             min(config.agent_max_symbols, 10),
         )
 
@@ -51,6 +61,30 @@ class MarketResearchAgent:
         if core_open <= current < core_close:
             return self.config.agent_core_research_seconds
         return self.config.agent_extended_research_seconds
+
+    def _rolling_tokens_used(self) -> int:
+        cutoff = time.monotonic() - 86400
+        self._token_usage_log = [
+            entry for entry in self._token_usage_log if entry[0] >= cutoff
+        ]
+        return sum(tokens for _, tokens in self._token_usage_log)
+
+    _RETRY_AFTER_RE = re.compile(
+        r"try again in (?:(?P<h>\d+)h)?(?:(?P<m>\d+)m)?(?:(?P<s>[\d.]+)s)?",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _parse_retry_after(cls, message: str, default: float = 1800.0) -> float:
+        match = cls._RETRY_AFTER_RE.search(message)
+        if not match or not any(match.groups()):
+            return default
+        hours = float(match.group("h") or 0)
+        minutes = float(match.group("m") or 0)
+        seconds = float(match.group("s") or 0)
+        total = hours * 3600 + minutes * 60 + seconds
+        # +30s margin - Groq's own estimate can undershoot slightly.
+        return total + 30 if total > 0 else default
 
     def submit(self, state: dict, force: bool = False) -> None:
         """force=True (e.g. a post-liquidation reevaluation) bypasses only
@@ -73,12 +107,25 @@ class MarketResearchAgent:
                 )
                 self._limit_logged_date = today
             return
+        now = time.monotonic()
+        if now < self._rate_limited_until:
+            return
+        tokens_used = self._rolling_tokens_used()
+        if tokens_used >= self.config.agent_daily_token_budget:
+            if now - self._token_limit_logged_at > 300:
+                self.log.warning(
+                    "AGENT  | rolling 24h token budget reached | used=%s/%s",
+                    tokens_used,
+                    self.config.agent_daily_token_budget,
+                )
+                self._token_limit_logged_at = now
+            return
         if not force:
-            elapsed = time.monotonic() - self._last_submitted
+            elapsed = now - self._last_submitted
             interval = self._interval_seconds()
             if elapsed < interval:
                 return
-        self._last_submitted = time.monotonic()
+        self._last_submitted = now
         try:
             self._work.put_nowait(state)
         except queue.Full:
@@ -115,7 +162,27 @@ class MarketResearchAgent:
             try:
                 self._research(state)
             except Exception as exc:
-                if "request_too_large" in str(exc) or "413" in str(exc):
+                message = str(exc)
+                if "rate_limit_exceeded" in message or (
+                    "429" in message and "rate_limit" in message.lower()
+                ):
+                    # Groq's tokens-per-day cap is a rolling window (its own
+                    # error gives a "try again in Nm" hint, not "tomorrow"),
+                    # so back off for that long instead of retrying at the
+                    # next interval and hitting the same 429 again - our own
+                    # rolling budget check in submit() should normally catch
+                    # this first, but the server-side web search on an
+                    # agentic model can consume tokens we can't see ahead of
+                    # time, so this is the reactive backstop.
+                    retry_seconds = self._parse_retry_after(message)
+                    self._rate_limited_until = time.monotonic() + retry_seconds
+                    self.log.warning(
+                        "AGENT  | Groq daily token limit hit | pausing "
+                        "research for %.0fs | %s",
+                        retry_seconds,
+                        message,
+                    )
+                elif "request_too_large" in message or "413" in message:
                     self.log.warning(
                         "AGENT  | research skipped | Groq request too large "
                         "(likely compound-mini's own web search results, not "
@@ -400,6 +467,10 @@ class MarketResearchAgent:
                 self._research(state, include_discovery=False)
                 return
             raise
+        usage = getattr(response, "usage", None)
+        tokens_used = int(getattr(usage, "total_tokens", 0) or 0) if usage else 0
+        if tokens_used:
+            self._token_usage_log.append((time.monotonic(), tokens_used))
         content = response.choices[0].message.content
         parsed = self._parse_response(content)
         raw_assessments = parsed.get("assessments") if isinstance(parsed, dict) else None

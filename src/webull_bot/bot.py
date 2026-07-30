@@ -69,6 +69,7 @@ class AutoTrader:
         )
         self.wash_skip_logged: set[str] = set()
         self.last_trade: dict[str, float] = {}
+        self.last_exit_at: dict[str, float] = {}
         self.trade_times: dict[str, deque] = defaultdict(deque)
         self.status = StatusWriter(
             self.config.status_file,
@@ -541,6 +542,10 @@ class AutoTrader:
         elapsed = time.monotonic() - self.last_trade.get(key, float("-inf"))
         return elapsed >= float(self.config.trade_cooldown_seconds)
 
+    def reentry_cooldown_ready(self, key: str) -> bool:
+        elapsed = time.monotonic() - self.last_exit_at.get(key, float("-inf"))
+        return elapsed >= float(self.config.stock_reentry_cooldown_seconds)
+
     def stop_ready_to_submit(self, key: str, symbol: str) -> bool:
         """An escalated stop must resubmit immediately after its cancel, not
         wait out the normal trade cooldown - that cooldown was timed from
@@ -625,6 +630,8 @@ class AutoTrader:
     ) -> None:
         submitted_at = time.monotonic()
         self.last_trade[key] = submitted_at
+        if action in ("PROFIT", "STOP", "MANUAL_SELL"):
+            self.last_exit_at[key] = submitted_at
         self.trade_times[key].append(submitted_at)
         self.working_orders[order_id] = {
             "submitted_at": submitted_at,
@@ -1310,6 +1317,7 @@ class AutoTrader:
                         and buy_quantity > 0
                         and self.cooldown_ready(key)
                         and not self.rate_capped(key)
+                        and self.reentry_cooldown_ready(key)
                     ):
                         order_id = self.api.place_stock(
                             symbol,
@@ -1527,6 +1535,7 @@ class AutoTrader:
                         and buy_quantity > 0
                         and self.cooldown_ready(key)
                         and not self.rate_capped(key)
+                        and self.reentry_cooldown_ready(key)
                     ):
                         order_id = self.api.place_stock(
                             symbol,
@@ -1706,6 +1715,7 @@ class AutoTrader:
                         and buy_quantity > 0
                         and self.cooldown_ready(key)
                         and not self.rate_capped(key)
+                        and self.reentry_cooldown_ready(key)
                     ):
                         order_id = self.api.place_option(
                             contract,

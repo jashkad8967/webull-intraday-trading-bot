@@ -519,6 +519,7 @@ Fast scanning, allowing multiple instruments to trade in a minute:
 POLL_SECONDS=0.25
 ACCOUNT_REFRESH_SECONDS=5
 TRADE_COOLDOWN_SECONDS=15
+STOCK_REENTRY_COOLDOWN_SECONDS=600
 STOCK_MAX_TRADES_PER_HOUR=12
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
@@ -837,6 +838,14 @@ persistent trend can't turn into unbounded churn on one name. It does not
 promise a fixed trade count: EMA/VWAP confirmation, target price movement,
 fills, API response time, open-position limits, and Webull rate limits
 determine the actual count.
+
+`STOCK_REENTRY_COOLDOWN_SECONDS` (default 600) is a separate, longer gate
+specifically on the next BUY in a symbol right after a position in it just
+closed - profit, stop, or manual sell. `TRADE_COOLDOWN_SECONDS` and
+`STOCK_MAX_TRADES_PER_HOUR` above bound *how fast* orders can fire; this
+bounds *how soon after closing* the bot will chase the same name again,
+so a stock that just stopped out (or took profit) doesn't immediately pull
+the bot back in on the next favorable-looking poll.
 
 > **Regulatory note:** FINRA's amended Rule 4210 (effective June 2026)
 > replaced the old $25k/3-trades-per-5-business-days Pattern Day Trader
@@ -1285,6 +1294,7 @@ MAX_ORDER_NOTIONAL=1000
 POLL_SECONDS=0.25
 ACCOUNT_REFRESH_SECONDS=5
 TRADE_COOLDOWN_SECONDS=15
+STOCK_REENTRY_COOLDOWN_SECONDS=600
 STOCK_MAX_TRADES_PER_HOUR=12
 EMA_FAST_PERIOD=3
 EMA_SLOW_PERIOD=8
