@@ -1254,6 +1254,33 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual(agent._parse_response(""), {})
         self.assertEqual(agent._parse_response(None), {})
 
+    def test_submit_force_bypasses_the_interval_throttle(self):
+        """force=True must actually skip the interval wait - it was
+        previously accepted as a parameter but never read anywhere in
+        submit(), so a forced post-liquidation reevaluation
+        (submit_agent_research(..., force=True)) silently behaved
+        identically to a routine submit and could sit rate-limited for
+        minutes instead of firing immediately.
+        """
+        import queue as queue_module
+        import time as time_module
+
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(agent_daily_request_limit=250)
+        agent._request_date = datetime.now(timezone.utc).date()
+        agent._requests_today = 0
+        agent._limit_logged_date = None
+        agent._last_submitted = time_module.monotonic()  # "just submitted"
+        agent._timezone = timezone.utc
+        agent._interval_seconds = lambda: 120
+        agent._work = queue_module.Queue(maxsize=1)
+
+        agent.submit({"a": 1}, force=False)
+        self.assertTrue(agent._work.empty())  # still within the interval
+
+        agent.submit({"a": 1}, force=True)
+        self.assertFalse(agent._work.empty())  # force bypassed the wait
+
     def test_discovery_retry_skips_when_nothing_left_to_assess(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(agent_daily_request_limit=250)
@@ -1386,6 +1413,21 @@ class AllocationAndLoggingTests(unittest.TestCase):
         spread_as_fraction = config.stock_entry_max_spread_percent / 100
         self.assertLess(spread_as_fraction, config.stock_stop_loss_min_percent)
         self.assertLess(spread_as_fraction, config.stock_stop_loss_max_percent)
+
+    def test_default_reward_risk_ratio_gives_a_comfortable_breakeven_margin(self):
+        """At the old STOCK_TARGET_STOP_MULTIPLE=1.2, breakeven needs a
+        ~45.5% win rate (1 / (1 + ratio)) - too thin a margin for normal
+        noise/whipsaw, and a real cause of net-losing days even with
+        plenty of individual winning trades. 1.8 only needs ~35.7%.
+        Trading itself is never automatically halted - no circuit breaker
+        is enabled by default; this fix only improves the ratio each trade
+        is judged against.
+        """
+        config = Settings()
+        self.assertEqual(config.stock_target_stop_multiple, Decimal("1.8"))
+        breakeven_win_rate = 1 / (1 + config.stock_target_stop_multiple)
+        self.assertLess(breakeven_win_rate, Decimal("0.36"))
+        self.assertFalse(config.daily_loss_circuit_breaker_enabled)
 
     def test_default_watchlist_is_parsed_and_deduplicated_by_membership(self):
         config = Settings()

@@ -53,6 +53,12 @@ class MarketResearchAgent:
         return self.config.agent_extended_research_seconds
 
     def submit(self, state: dict, force: bool = False) -> None:
+        """force=True (e.g. a post-liquidation reevaluation) bypasses only
+        the interval throttle below, not the daily request budget above -
+        a forced call still counts against and can still be blocked by
+        AGENT_DAILY_REQUEST_LIMIT, since that's a hard cost cap, not a
+        pacing mechanism.
+        """
         today = datetime.now(self._timezone).date()
         if self._request_date != today:
             self._request_date = today
@@ -67,10 +73,11 @@ class MarketResearchAgent:
                 )
                 self._limit_logged_date = today
             return
-        elapsed = time.monotonic() - self._last_submitted
-        interval = self._interval_seconds()
-        if elapsed < interval:
-            return
+        if not force:
+            elapsed = time.monotonic() - self._last_submitted
+            interval = self._interval_seconds()
+            if elapsed < interval:
+                return
         self._last_submitted = time.monotonic()
         try:
             self._work.put_nowait(state)

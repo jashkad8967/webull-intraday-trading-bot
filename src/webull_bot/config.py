@@ -157,7 +157,7 @@ class Settings(BaseSettings):
         le=Decimal("5"),
     )
     stock_target_stop_multiple: Decimal = Field(
-        default=Decimal("1.2"),
+        default=Decimal("1.8"),
         ge=Decimal("0.5"),
         le=Decimal("5"),
     )

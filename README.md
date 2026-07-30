@@ -530,7 +530,7 @@ STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
 STOCK_STOP_LOSS_MIN_PERCENT=0.006
 STOCK_STOP_LOSS_MAX_PERCENT=0.01
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
-STOCK_TARGET_STOP_MULTIPLE=1.2
+STOCK_TARGET_STOP_MULTIPLE=1.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PRICE=0.01
@@ -782,7 +782,10 @@ large-cap gets a tight stop; a wild small-cap gets a wider one.
 
 **Targets** are the larger of (a) `STOCK_MIN_NET_PROFIT_PERCENT` +
 `STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT`, or (b) that same adaptive stop
-percent times `STOCK_TARGET_STOP_MULTIPLE` (default 1.2×) — so reward:risk
+percent times `STOCK_TARGET_STOP_MULTIPLE` (default 1.8×, raised from an
+original 1.2× - at 1.2, breakeven needs a ~45.5% win rate, too thin a
+margin for normal noise/whipsaw and a real cause of net-losing days even
+with plenty of individual winners; 1.8 only needs ~35.7%) — so reward:risk
 scales with volatility instead of staying fixed while the stop moves. For
 options, `OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one
 premium cent above average cost, normally $1 per standard 100-share contract
@@ -1277,7 +1280,7 @@ STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT=0.002
 STOCK_STOP_LOSS_MIN_PERCENT=0.006
 STOCK_STOP_LOSS_MAX_PERCENT=0.01
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
-STOCK_TARGET_STOP_MULTIPLE=1.2
+STOCK_TARGET_STOP_MULTIPLE=1.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PRICE=0.01
