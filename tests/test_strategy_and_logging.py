@@ -45,6 +45,7 @@ class StrategyConfigMixin:
             vwap_entry_band_percent=Decimal("0.001"),
             stock_min_net_profit_percent=Decimal("0.0001"),
             stock_estimated_round_trip_cost_percent=Decimal("0.002"),
+            sell_fee_dollars=Decimal("0.02"),
             stock_stop_loss_min_percent=Decimal("0.0015"),
             stock_stop_loss_max_percent=Decimal("0.02"),
             stock_stop_loss_range_multiplier=Decimal("0.35"),
@@ -709,8 +710,10 @@ class StopLossEscalationTests(unittest.TestCase):
         fake_bot.trade_micro_scalp(positions, Decimal("10000"))
 
         self.assertEqual(len(placed), 1)
-        # Must price at the 34.06 target, not the fallen 34.02 ask.
-        self.assertEqual(placed[0][3], Decimal("34.06"))
+        # Must price at the 34.08 target (34.06 micro-scalp target plus the
+        # $0.02 flat sell fee, spread over the 1-share quantity), not the
+        # fallen 34.02 ask.
+        self.assertEqual(placed[0][3], Decimal("34.08"))
         self.assertGreater(placed[0][3], Decimal("34.00"))  # never below cost
 
 
@@ -1308,17 +1311,18 @@ class BotOvertradingCapTests(unittest.TestCase):
         from webull_bot.bot import AutoTrader
 
         fake_bot = SimpleNamespace(
+            config=SimpleNamespace(sell_fee_dollars=Decimal("0.02")),
             daily_realized_pnl=Decimal("0"),
             daily_realized_loss=Decimal("0"),
             daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
         )
         record = AutoTrader.record_realized_exit.__get__(fake_bot)
         record(Decimal("100"), Decimal("101"), 10)
-        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("10"))
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("9.98"))
         self.assertEqual(fake_bot.daily_realized_loss, Decimal("0"))
         record(Decimal("50"), Decimal("49"), 5)
-        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("5"))
-        self.assertEqual(fake_bot.daily_realized_loss, Decimal("5"))
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("4.96"))
+        self.assertEqual(fake_bot.daily_realized_loss, Decimal("5.02"))
 
     def test_daily_loss_breaker_triggers_once_threshold_is_reached(self):
         from webull_bot.bot import AutoTrader

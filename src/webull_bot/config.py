@@ -169,6 +169,16 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("0.10"),
     )
+    # The flat regulatory pass-through fee Webull charges on the sell leg
+    # only (SEC fee + FINRA TAF, rounded up to whole cents) - never charged
+    # on the buy. It scales slightly with trade size (larger notional can
+    # round up to 3 cents instead of 2), but a flat estimate is close enough
+    # to make sure every realized P&L figure - dashboard, daily loss
+    # breaker, trade log - reflects a real cost instead of assuming a free
+    # round trip. Also folded into every profit target (stock, option,
+    # micro-scalp) so a target isn't hit at a price that nets a loss once
+    # this fee comes out.
+    sell_fee_dollars: Decimal = Field(default=Decimal("0.02"), ge=0)
     stock_stop_loss_min_percent: Decimal = Field(default=Decimal("0.009"), gt=0, le=1)
     stock_stop_loss_max_percent: Decimal = Field(default=Decimal("0.015"), gt=0, le=1)
     stock_stop_loss_range_multiplier: Decimal = Field(
