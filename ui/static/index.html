@@ -5,9 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Webull Scalping Bot</title>
 <script>
-  // Applied as early as possible (before first paint) to avoid a flash of
-  // the wrong theme: an explicit stored choice always wins over OS
-  // preference. No stored value = fall through to the @media block below.
   (function () {
     try {
       const stored = localStorage.getItem("theme");
@@ -33,7 +30,6 @@
     --row-hover: rgba(255,255,255,0.035);
     --row-alt: rgba(255,255,255,0.018);
 
-    /* Spacing scale (0.25rem base unit) */
     --sp-1: 0.25rem;
     --sp-2: 0.5rem;
     --sp-3: 0.75rem;
@@ -41,7 +37,6 @@
     --sp-5: 1.5rem;
     --sp-6: 2rem;
 
-    /* Type scale */
     --fs-xs: 0.72rem;
     --fs-sm: 0.82rem;
     --fs-base: 0.92rem;
@@ -60,34 +55,17 @@
       --row-alt: rgba(20,30,60,0.02);
     }
   }
-  /* Explicit user choice always wins over OS preference. */
   :root[data-theme="dark"] {
-    --bg: #0b0e14;
-    --panel: #131722;
-    --border: #232838;
-    --text: #e6e9f0;
-    --muted: #8b93a7;
-    --green: #3ddc97;
-    --red: #ff6b6b;
-    --amber: #f5b942;
-    --accent: #5b8cff;
+    --bg: #0b0e14; --panel: #131722; --border: #232838; --text: #e6e9f0; --muted: #8b93a7;
+    --green: #3ddc97; --red: #ff6b6b; --amber: #f5b942; --accent: #5b8cff;
     --shadow: 0 1px 2px rgba(0,0,0,0.24), 0 8px 24px -12px rgba(0,0,0,0.55);
-    --row-hover: rgba(255,255,255,0.035);
-    --row-alt: rgba(255,255,255,0.018);
+    --row-hover: rgba(255,255,255,0.035); --row-alt: rgba(255,255,255,0.018);
   }
   :root[data-theme="light"] {
-    --bg: #f4f6fb;
-    --panel: #ffffff;
-    --border: #dde2ee;
-    --text: #171a22;
-    --muted: #5c6478;
-    --green: #3ddc97;
-    --red: #ff6b6b;
-    --amber: #f5b942;
-    --accent: #5b8cff;
+    --bg: #f4f6fb; --panel: #ffffff; --border: #dde2ee; --text: #171a22; --muted: #5c6478;
+    --green: #3ddc97; --red: #ff6b6b; --amber: #f5b942; --accent: #5b8cff;
     --shadow: 0 1px 2px rgba(30,40,70,0.06), 0 8px 20px -14px rgba(30,40,70,0.18);
-    --row-hover: rgba(20,30,60,0.035);
-    --row-alt: rgba(20,30,60,0.02);
+    --row-hover: rgba(20,30,60,0.035); --row-alt: rgba(20,30,60,0.02);
   }
 
   * { box-sizing: border-box; }
@@ -99,6 +77,7 @@
     color: var(--text);
     padding: var(--sp-5);
   }
+  .page { max-width: 1240px; margin: 0 auto; }
 
   .header-bar {
     display: flex;
@@ -122,66 +101,47 @@
   .dot.live { background: var(--green); box-shadow: 0 0 0 4px rgba(61,220,151,0.15); }
   .dot.paused { background: var(--amber); box-shadow: 0 0 0 4px rgba(245,185,66,0.15); }
   .badge {
-    font-size: var(--fs-xs);
-    color: var(--muted);
-    font-weight: 500;
-    padding: 0.15rem 0.55rem;
-    border: 1px solid var(--border);
-    border-radius: 999px;
+    font-size: var(--fs-xs); color: var(--muted); font-weight: 500;
+    padding: 0.15rem 0.55rem; border: 1px solid var(--border); border-radius: 999px;
   }
   .header-right { display: flex; align-items: center; gap: var(--sp-3); }
 
   .theme-toggle {
-    font: inherit;
-    font-size: var(--fs-base);
-    line-height: 1;
-    width: 2.1rem;
-    height: 2.1rem;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--panel);
-    color: var(--text);
-    cursor: pointer;
-    transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+    font: inherit; font-size: var(--fs-base); line-height: 1;
+    width: 2.1rem; height: 2.1rem; display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    cursor: pointer; transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
   }
   .theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
 
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: var(--sp-3);
-    margin-bottom: var(--sp-5);
+  /* — top row: compact stat list + pending orders side by side — */
+  .top-row { display: flex; gap: var(--sp-4); align-items: stretch; margin-bottom: var(--sp-4); }
+  .stat-list {
+    flex: 1; min-width: 0;
+    background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow);
+    border-radius: 10px; display: flex; flex-direction: column;
   }
-  .stat {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    box-shadow: var(--shadow);
-    border-radius: 10px;
-    padding: var(--sp-4);
+  .stat-row {
+    display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3);
+    padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border);
   }
-  .stat .label { font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
-  .stat .value { font-size: var(--fs-lg); font-weight: 650; margin-top: var(--sp-1); font-variant-numeric: tabular-nums; }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-row .label { font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; white-space: nowrap; }
+  .stat-row .value { font-size: var(--fs-base); font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .stat-row .value-stack { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
+  .stat-row .sub { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; }
 
-  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: var(--sp-4); }
+  .panels { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-flow: dense; gap: var(--sp-4); }
   .panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    box-shadow: var(--shadow);
-    border-radius: 10px;
-    padding: var(--sp-4);
-    overflow-x: auto;
+    background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow);
+    border-radius: 10px; padding: var(--sp-4); min-width: 0; overflow-x: auto;
   }
   .panel h2 {
-    font-size: var(--fs-xs);
-    margin: 0 0 var(--sp-3);
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    font-weight: 650;
+    font-size: var(--fs-xs); margin: 0 0 var(--sp-3); color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em; font-weight: 650;
   }
+  .panel.span2 { grid-column: span 2; }
+  .panel.span3 { grid-column: span 3; }
 
   table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); white-space: nowrap; }
   th, td { text-align: left; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border); }
@@ -189,49 +149,23 @@
   tr:last-child td { border-bottom: none; }
   tbody tr:nth-child(even) { background: var(--row-alt); }
   tbody tr:hover { background: var(--row-hover); }
-  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
 
   .pos { color: var(--green); }
   .neg { color: var(--red); }
-  .empty {
-    color: var(--muted);
-    font-size: var(--fs-sm);
-    padding: var(--sp-5) 0;
-    text-align: center;
-  }
+  .empty { color: var(--muted); font-size: var(--fs-sm); padding: var(--sp-5) 0; text-align: center; }
   .pill {
-    display: inline-block;
-    padding: 0.05rem 0.5rem;
-    border-radius: 999px;
-    font-size: var(--fs-xs);
-    border: 1px solid var(--border);
-    color: var(--muted);
-    font-variant-numeric: normal;
+    display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px; font-size: var(--fs-xs);
+    border: 1px solid var(--border); color: var(--muted); font-variant-numeric: normal; font-weight: 500;
   }
   .logs {
-    background: #0a0d13;
-    color: #c9d1d9;
-    border-radius: 8px;
-    padding: var(--sp-3);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: var(--fs-xs);
-    line-height: 1.5;
-    max-height: 22rem;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
+    background: #0a0d13; color: #c9d1d9; border-radius: 8px; padding: var(--sp-3);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: var(--fs-xs);
+    line-height: 1.5; max-height: 22rem; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
   }
-  .panel.wide { grid-column: 1 / -1; }
   .btn {
-    font: inherit;
-    font-size: var(--fs-xs);
-    font-weight: 600;
-    padding: 0.35rem 0.7rem;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--text);
-    cursor: pointer;
+    font: inherit; font-size: var(--fs-xs); font-weight: 600; padding: 0.35rem 0.7rem; border-radius: 6px;
+    border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer;
     transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease, opacity 0.15s ease;
   }
   .btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(91,140,255,0.08); }
@@ -243,21 +177,16 @@
   .action-msg { font-size: var(--fs-xs); color: var(--muted); min-height: 1.1em; }
   .watchlist-add { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-3); }
   .watchlist-add input {
-    flex: 1;
-    font: inherit;
-    font-size: var(--fs-sm);
-    padding: 0.35rem var(--sp-3);
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--text);
-    transition: border-color 0.15s ease;
+    flex: 1; font: inherit; font-size: var(--fs-sm); padding: 0.35rem var(--sp-3); border-radius: 6px;
+    border: 1px solid var(--border); background: transparent; color: var(--text); transition: border-color 0.15s ease;
   }
   .watchlist-add input:focus { outline: none; border-color: var(--accent); }
   .scroll-tall { max-height: 22rem; overflow-y: auto; }
+  .scroll-pending { max-height: 16rem; overflow-y: auto; }
 </style>
 </head>
 <body>
+<div class="page">
   <div class="header-bar">
     <h1><span class="dot" id="live-dot"></span> Webull Scalping Bot <span class="badge" id="mode-badge"></span></h1>
     <div class="header-right">
@@ -265,20 +194,30 @@
     </div>
   </div>
 
-  <div class="grid">
-    <div class="stat"><div class="label">Buying Power</div><div class="value" id="buying-power">—</div></div>
-    <div class="stat">
-      <div class="label">P&L Today</div>
-      <div class="value" id="pnl-today">—</div>
-      <div class="action-msg" id="pnl-breakdown"></div>
+  <div class="top-row">
+    <div class="stat-list">
+      <div class="stat-row"><span class="label">Buying Power</span><span class="value" id="buying-power">—</span></div>
+      <div class="stat-row">
+        <span class="label">P&amp;L Today</span>
+        <span class="value-stack">
+          <span class="value" id="pnl-today">—</span>
+          <span class="sub" id="pnl-breakdown"></span>
+        </span>
+      </div>
+      <div class="stat-row"><span class="label">Open Positions</span><span class="value" id="position-count">—</span></div>
+      <div class="stat-row"><span class="label">Universe</span><span class="value" id="universe">—</span></div>
+      <div class="stat-row"><span class="label">Last Update</span><span class="value" id="last-update">—</span></div>
     </div>
-    <div class="stat"><div class="label">Open Positions</div><div class="value" id="position-count">—</div></div>
-    <div class="stat"><div class="label">Universe</div><div class="value" id="universe">—</div></div>
-    <div class="stat"><div class="label">Last Update</div><div class="value" id="last-update">—</div></div>
+
+    <div class="panel" style="flex: 2; min-width: 0;">
+      <h2>Pending Orders</h2>
+      <div class="action-msg" id="pending-orders-msg"></div>
+      <div class="scroll-pending" id="pending-orders"></div>
+    </div>
   </div>
 
   <div class="panels">
-    <div class="panel wide">
+    <div class="panel span2">
       <div class="toolbar">
         <h2 style="margin:0">Open Positions</h2>
         <button class="btn danger" id="close-all-btn" onclick="closeAll()">Close All</button>
@@ -286,14 +225,9 @@
       <div class="action-msg" id="positions-msg"></div>
       <div id="positions"></div>
     </div>
-    <div class="panel wide">
+    <div class="panel span2">
       <h2>Recent Trades</h2>
       <div id="trades"></div>
-    </div>
-    <div class="panel">
-      <h2>Pending Orders</h2>
-      <div class="action-msg" id="pending-orders-msg"></div>
-      <div id="pending-orders"></div>
     </div>
     <div class="panel">
       <h2>Watchlist</h2>
@@ -308,11 +242,12 @@
       <h2>Research Agent</h2>
       <div id="agent"></div>
     </div>
-    <div class="panel wide">
+    <div class="panel span3">
       <h2>Live Logs</h2>
       <div class="logs" id="logs"></div>
     </div>
   </div>
+</div>
 
 <script>
 function fmtMoney(value) {
@@ -337,36 +272,24 @@ function pnlClass(value) {
   return n > 0 ? "pos" : n < 0 ? "neg" : "";
 }
 
-// Renders a table from `headers` (each with a `label`, a `render(row)` cell
-// function, an optional `cls(row)` for the cell class, and an optional
-// `num: true` to right-align/tabular-number that column) and `rows`.
-// Every cell is rendered defensively: a single bad/missing field on one row
-// must never throw and blank out the rest of the dashboard (a symbol that
-// hasn't been scanned yet, a trade with no entry_price, etc. are all
-// expected shapes, not error states).
-function table(headers, rows) {
+function table(headers, rows, colWidths) {
   if (!rows || rows.length === 0) return '<div class="empty">None right now</div>';
+  const colgroup = colWidths
+    ? '<colgroup>' + colWidths.map(w => `<col style="width:${w}%">`).join("") + '</colgroup>'
+    : "";
   const head = headers.map(h => `<th class="${h.num ? 'num' : ''}">${h.label}</th>`).join("");
   const body = rows.map(row => {
     const cells = headers.map(h => {
       let content;
-      try {
-        content = h.render(row);
-      } catch (err) {
-        content = "—";
-      }
+      try { content = h.render(row); } catch (err) { content = "—"; }
       let cls = "";
-      try {
-        cls = h.cls ? h.cls(row) : "";
-      } catch (err) {
-        cls = "";
-      }
+      try { cls = h.cls ? h.cls(row) : ""; } catch (err) { cls = ""; }
       if (h.num) cls = (cls + " num").trim();
       return `<td class="${cls}">${content}</td>`;
     }).join("");
     return `<tr>${cells}</tr>`;
   }).join("");
-  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  return `<table>${colgroup}<thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
 async function refresh() {
@@ -407,9 +330,10 @@ async function refresh() {
 
     document.getElementById("pending-orders").innerHTML = table([
       { label: "Symbol", render: r => r.symbol ?? "—" },
-      { label: "Type", render: r => r.instrument_type ?? "—" },
       { label: "Action", render: r => r.action ?? "—" },
       { label: "Price", render: r => r.limit_price != null ? fmtMoney(r.limit_price) : "market", num: true },
+      { label: "P&L", render: r => "—", num: true },
+      { label: "Placed", render: r => r.age_seconds != null ? fmtTime(Date.now() / 1000 - r.age_seconds) : "—" },
       { label: "Age", render: r => r.age_seconds != null ? `${r.age_seconds}s` : "—", num: true },
       {
         label: "",
@@ -417,16 +341,13 @@ async function refresh() {
           ? '<span class="pill">cancelling…</span>'
           : `<button class="btn danger" onclick="cancelOrder('${r.order_id}','${r.symbol}')">Cancel</button>`,
       },
-    ], data.pending_orders);
+    ], data.pending_orders, [16, 12, 14, 12, 16, 12, 18]);
 
     document.getElementById("trades").innerHTML = table([
       { label: "Time", render: r => fmtTime(r.time) },
       { label: "Type", render: r => r.instrument_type ?? "—" },
       { label: "Action", render: r => r.action ?? "—" },
       { label: "Symbol", render: r => r.symbol ?? "—" },
-      // entry_price is a new backend field (string like "34.50", or null on
-      // BUY/MANUAL_BUY rows which have no prior entry). Treat missing the
-      // same as null - don't block on the parallel agent's field landing.
       { label: "Entry", render: r => r.entry_price != null ? fmtMoney(r.entry_price) : "—", num: true },
       { label: "Exit", render: r => r.limit_price != null ? fmtMoney(r.limit_price) : "—", num: true },
       { label: "P&L", render: r => r.pnl != null ? fmtMoney(r.pnl) : "—", cls: r => pnlClass(r.pnl), num: true },
@@ -436,11 +357,6 @@ async function refresh() {
       { label: "Symbol", render: r => r.symbol ?? "—" },
       { label: "Price", render: r => fmtMoney(r.price), num: true },
       { label: "Bucket", render: r => r.bucket ? `<span class="pill">${r.bucket}</span>` : "—" },
-      // Bug fix: previously checked `.toLocaleString` on the fallback "—"
-      // string (always true) then unconditionally called
-      // r.volume.toLocaleString(), which threw on `undefined` for any
-      // not-yet-scanned symbol, aborting the whole refresh() and freezing
-      // every panel after this one. Check the real value instead.
       { label: "Vol", render: r => r.volume != null ? r.volume.toLocaleString() : "—", num: true },
       { label: "Spread%", render: r => r.spread_percent != null ? r.spread_percent : "—", num: true },
       {
@@ -542,8 +458,6 @@ function addToWatchlist() {
 
 function toggleTheme() {
   const current = document.documentElement.getAttribute("data-theme");
-  // If no explicit theme is set yet, figure out what's currently showing
-  // (OS preference) so the first click flips away from it, not toward it.
   const osIsLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
   const effective = current || (osIsLight ? "light" : "dark");
   const next = effective === "dark" ? "light" : "dark";
