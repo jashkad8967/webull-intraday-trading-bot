@@ -13,8 +13,14 @@ from webull_bot.daily_logging import add_daily_file_logging
 from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.invalid_symbols import InvalidSymbolTracker
 from webull_bot.market_agent import MarketResearchAgent
+from webull_bot.pairs import (
+    PAIRS,
+    PAIRS_CAPITAL_FRACTION,
+    PAIRS_MAX_CONCURRENT,
+    PairsStrategy,
+)
 from webull_bot.status import StatusWriter
-from webull_bot.strategy import TradingStrategy
+from webull_bot.strategy import OBI_DEPTH_LEVELS, TradingStrategy
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import (
     MarketDataPermissionError,
@@ -38,6 +44,28 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("webull-bot")
+
+# Execution/risk constants below are hardcoded rather than config: they're
+# fixed institutional-style execution/guardrail behavior, not per-account
+# tuning knobs like the .env-driven strategy thresholds.
+
+# Iceberg / scaled order execution (see place_stock_scaled).
+ICEBERG_MIN_SHARES = Decimal("50")
+ICEBERG_SLICE_SHARES = 10
+ICEBERG_SLICE_INTERVAL_SECONDS = 3
+
+# Automated risk guardrails.
+PRICE_SANITY_TOLERANCE = Decimal("0.05")
+HARD_ORDER_NOTIONAL_CEILING = Decimal("2000")
+CONSECUTIVE_ORDER_ERROR_LIMIT = 5
+ORDER_ERROR_WINDOW_SECONDS = 60
+
+# Hold non-intraday stock positions overnight instead of always flattening
+# at EOD_CLOSE_TIME. Buckets in ALWAYS_FLATTEN_BUCKETS stay same-day-only
+# regardless of this flag, since micro-scalp and pairs are intraday-only
+# strategies by design.
+OVERNIGHT_HOLD_ENABLED = True
+ALWAYS_FLATTEN_BUCKETS = frozenset({"MICRO_SCALP", "PAIRS_LONG", "PAIRS_SHORT"})
 
 
 class AutoTrader:
@@ -121,6 +149,12 @@ class AutoTrader:
         self.gate_rejections: dict[str, int] = defaultdict(int)
         self.broker_conflict_symbols: set[str] = set()
         self.fractional_trading_enabled = True
+        self.iceberg_orders: dict[str, dict] = {}
+        self.order_error_times: deque = deque()
+        self.order_kill_switch_tripped = False
+        self.pairs = PairsStrategy()
+        self.pairs_positions: dict[tuple[str, str], dict] = {}
+        self.last_pairs_sample = 0.0
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -229,6 +263,23 @@ class AutoTrader:
         if not excluded:
             return symbols, []
         remaining = [symbol for symbol in symbols if symbol not in micro_scalp_symbols]
+        return remaining, excluded
+
+    @staticmethod
+    def exclude_pairs_symbols(symbols: list[str]) -> tuple[list[str], list[str]]:
+        """Same reasoning as exclude_micro_scalp_symbols: a pairs leg can
+        be short (a negative broker-reported quantity), and stock_decision
+        treats any non-positive quantity as "flat, eligible to BUY" - left
+        in the main scan, the EMA/OBI strategy would try to buy into a
+        position trade_pairs is deliberately holding short.
+        """
+        pairs_symbols = {symbol for pair in PAIRS for symbol in pair}
+        if not pairs_symbols:
+            return symbols, []
+        excluded = [symbol for symbol in symbols if symbol in pairs_symbols]
+        if not excluded:
+            return symbols, []
+        remaining = [symbol for symbol in symbols if symbol not in pairs_symbols]
         return remaining, excluded
 
     def safe_top_gainers(self, limit: int, page_size: int) -> dict[str, dict]:
@@ -419,6 +470,17 @@ class AutoTrader:
                 "universe scan (managed separately) | %s",
                 len(excluded),
                 ",".join(excluded),
+            )
+        self.stock_symbols, pairs_excluded = self.exclude_pairs_symbols(
+            self.stock_symbols
+        )
+        self.reserve_symbols, _ = self.exclude_pairs_symbols(self.reserve_symbols)
+        if pairs_excluded:
+            log.info(
+                "LOAD   | excluded %s pairs-strategy symbols from the main "
+                "universe scan (managed separately) | %s",
+                len(pairs_excluded),
+                ",".join(pairs_excluded),
             )
         missing_watchlist = [
             symbol for symbol in self.user_watchlist if symbol not in self.stock_symbols
@@ -818,6 +880,40 @@ class AutoTrader:
             return None
         return self.market_agent.assessment(symbol)
 
+    @staticmethod
+    def _quote_size(quote: dict, *fields: str) -> Decimal | None:
+        for field in fields:
+            value = quote.get(field)
+            if value in (None, ""):
+                continue
+            try:
+                size = Decimal(str(value))
+            except Exception:
+                continue
+            if size.is_finite() and size >= 0:
+                return size
+        return None
+
+    def obi_score_for(self, symbol: str, category: str, quote: dict) -> Decimal | None:
+        """Order-book-imbalance score for a symbol that's otherwise about
+        to fire a BUY. Only ever called for that one symbol right before
+        order placement - fetching L2 depth for every scanned symbol every
+        cycle would badly overrun the "market" request-rate budget (a
+        single depth call per symbol vs. today's one snapshot call per
+        whole batch), so this stays a final, on-demand gate rather than a
+        per-cycle metric like everything else in strategy.metrics.
+        """
+        depth = self.api.stock_depth(symbol, category)
+        score = self.api.depth_imbalance(depth, OBI_DEPTH_LEVELS)
+        if score is not None:
+            return score
+        bid_size = self._quote_size(quote, "bid_size", "bidSize", "bid_volume")
+        ask_size = self._quote_size(quote, "ask_size", "askSize", "ask_volume")
+        if bid_size is None or ask_size is None:
+            return None
+        total = bid_size + ask_size
+        return bid_size / total if total > 0 else None
+
     def refresh_agent_discoveries(self) -> None:
         if not self.market_agent:
             self.agent_popular_symbols.clear()
@@ -1033,6 +1129,185 @@ class AutoTrader:
             self.daily_realized_loss += -pnl
         self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
         return pnl
+
+    def price_sanity_ok(self, last_price: Decimal, limit_price: Decimal) -> bool:
+        """Fat-finger guard: reject a limit price that's implausibly far
+        from the last observed trade price instead of trusting sizing/
+        pricing math blindly. Catches a stale or corrupted quote producing
+        a wildly wrong limit before it ever reaches the broker - hardcoded,
+        not config, since this is a sanity backstop, not a tuning knob.
+        """
+        if last_price <= 0:
+            return True
+        deviation = abs(limit_price - last_price) / last_price
+        if deviation > PRICE_SANITY_TOLERANCE:
+            log.error(
+                "GUARD  | price sanity check failed | last=%.4f limit=%.4f "
+                "deviation=%.1f%% (max %.0f%%) | order skipped",
+                last_price,
+                limit_price,
+                deviation * 100,
+                PRICE_SANITY_TOLERANCE * 100,
+            )
+            return False
+        return True
+
+    def record_order_error(self, symbol: str, exc: Exception) -> None:
+        """Order-error kill switch: distinct from the existing P&L-based
+        circuit breakers (daily-loss, loss-spree) because it fires on
+        *error rate*, not realized loss - the guard against a rogue loop
+        or a systematically broken order path (bad auth, malformed
+        payload, API outage) spinning through the whole symbol universe
+        before any single trade even fills.
+
+        Deliberately its own flag, not a reuse of entries_paused: that
+        flag's own consumer (handle_portfolio_circuit_breaker) only even
+        looks at it when LOSS_CIRCUIT_BREAKER_ENABLED is on, and auto-
+        resumes it after LOSS_REEVALUATION_SECONDS - neither behavior is
+        appropriate here (a burst of order errors means something is
+        actually broken, not that prices moved against open positions;
+        it should stay tripped until the process is restarted, not
+        silently no-op under this project's default config). Exits are
+        never blocked by this, same as the existing breakers - only run()
+        checks it, and only to skip the entry-generating steps.
+        """
+        now = time.monotonic()
+        self.order_error_times.append(now)
+        while (
+            self.order_error_times
+            and now - self.order_error_times[0] > ORDER_ERROR_WINDOW_SECONDS
+        ):
+            self.order_error_times.popleft()
+        if (
+            len(self.order_error_times) >= CONSECUTIVE_ORDER_ERROR_LIMIT
+            and not self.order_kill_switch_tripped
+        ):
+            self.order_kill_switch_tripped = True
+            log.critical(
+                "GUARD  | %s order errors in %ss (last: %s | %s) | "
+                "pausing all new entries until restart",
+                len(self.order_error_times),
+                ORDER_ERROR_WINDOW_SECONDS,
+                symbol,
+                exc,
+            )
+
+    def place_stock_scaled(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int | Decimal,
+        key: str,
+        quote: dict,
+        fractional: bool = False,
+    ) -> str | None:
+        """Slices a large order into smaller clips instead of dumping the
+        whole size in one order - large firms never do that because it
+        moves the price against them. Below ICEBERG_MIN_SHARES this is
+        identical to calling api.place_stock directly (today's behavior,
+        unchanged for the bot's normal small scalp sizes); at/above it,
+        places the first clip now and schedules the remainder to trickle
+        out via process_iceberg_orders() on later cycles - never blocks
+        the polling loop with a sleep, since that would stall order
+        monitoring, the dashboard, and every other symbol for the whole
+        slice duration.
+        """
+        total = Decimal(str(quantity))
+        clip = total if total < ICEBERG_MIN_SHARES or fractional else Decimal(ICEBERG_SLICE_SHARES)
+        last_price = self.api.quote_price(quote)
+        if not fractional and clip * last_price > HARD_ORDER_NOTIONAL_CEILING:
+            clip = (HARD_ORDER_NOTIONAL_CEILING / last_price).to_integral_value(
+                rounding=ROUND_DOWN
+            )
+            if clip <= 0:
+                log.error(
+                    "GUARD  | %s | order notional exceeds the hard ceiling "
+                    "($%s) even at 1 share | order skipped",
+                    symbol,
+                    HARD_ORDER_NOTIONAL_CEILING,
+                )
+                return None
+            clip = min(clip, total)
+        elif fractional and clip * last_price > HARD_ORDER_NOTIONAL_CEILING:
+            log.error(
+                "GUARD  | %s | fractional order notional exceeds the hard "
+                "ceiling ($%s) | order skipped",
+                symbol,
+                HARD_ORDER_NOTIONAL_CEILING,
+            )
+            return None
+        limit_price = self.api.stock_limit_price(quote, side)
+        if not self.price_sanity_ok(last_price, limit_price):
+            return None
+        try:
+            order_id = self.api.place_stock(
+                symbol,
+                side,
+                clip if not fractional else total,
+                limit_price=limit_price,
+                fractional=fractional,
+            )
+        except Exception as exc:
+            self.record_order_error(symbol, exc)
+            raise
+        remaining = total - (clip if not fractional else total)
+        if remaining > 0:
+            self.iceberg_orders[f"{symbol}:{side}"] = {
+                "symbol": symbol,
+                "side": side,
+                "key": key,
+                "remaining": remaining,
+                "last_slice_at": time.monotonic(),
+            }
+            log.info(
+                "ICEBERG| %s | %s | first clip=%s | remaining=%s over %s "
+                "more slice(s)",
+                symbol,
+                side,
+                clip,
+                remaining,
+                -(-remaining // ICEBERG_SLICE_SHARES),
+            )
+        return order_id
+
+    def process_iceberg_orders(self) -> None:
+        now = time.monotonic()
+        for iceberg_key in list(self.iceberg_orders):
+            entry = self.iceberg_orders[iceberg_key]
+            if now - entry["last_slice_at"] < ICEBERG_SLICE_INTERVAL_SECONDS:
+                continue
+            symbol = entry["symbol"]
+            side = entry["side"]
+            try:
+                quote = self.api.stock_quote(symbol)
+                clip = min(entry["remaining"], Decimal(ICEBERG_SLICE_SHARES))
+                limit_price = self.api.stock_limit_price(quote, side)
+                if not self.price_sanity_ok(self.api.quote_price(quote), limit_price):
+                    entry["last_slice_at"] = now
+                    continue
+                order_id = self.api.place_stock(
+                    symbol,
+                    side,
+                    clip,
+                    limit_price=limit_price,
+                )
+            except Exception as exc:
+                self.record_order_error(symbol, exc)
+                log.error("ICEBERG| %s | slice failed | %s", symbol, exc)
+                entry["last_slice_at"] = now
+                continue
+            self.record_trade(entry["key"], order_id, side)
+            entry["remaining"] -= clip
+            entry["last_slice_at"] = now
+            log.info(
+                "ICEBERG| %s | %s | slice=%s | remaining=%s",
+                symbol,
+                side,
+                clip,
+                entry["remaining"],
+            )
+            if entry["remaining"] <= 0:
+                del self.iceberg_orders[iceberg_key]
 
     def escalate_stalled_stop_losses(self) -> None:
         """Cancel and re-flag an exit (stop-loss OR profit-take) for a more
@@ -1318,14 +1593,24 @@ class AutoTrader:
                         and self.cooldown_ready(key)
                         and not self.rate_capped(key)
                         and self.reentry_cooldown_ready(key)
+                        and self.strategy.obi_supports_entry(
+                            self.obi_score_for(
+                                symbol,
+                                self.stock_categories.get(symbol, "US_STOCK"),
+                                quote,
+                            )
+                        )
                     ):
-                        order_id = self.api.place_stock(
+                        order_id = self.place_stock_scaled(
                             symbol,
                             "BUY",
                             buy_quantity,
-                            limit_price=self.api.stock_limit_price(quote, "BUY"),
+                            key,
+                            quote,
                             fractional=fractional,
                         )
+                        if order_id is None:
+                            continue
                         self.record_trade(key, order_id, "BUY")
                         buying_power = max(
                             Decimal("0"),
@@ -1420,6 +1705,205 @@ class AutoTrader:
                     self.handle_fractional_trading_not_enabled(exc)
                     continue
                 log.error("STOCK  | %s | %s", symbol, exc)
+        return buying_power
+
+    def trade_pairs(self, positions: list[dict], buying_power: Decimal) -> Decimal:
+        """Correlated-pairs mean reversion: long the relatively cheap leg,
+        short the relatively expensive one, when the spread between two
+        historically-correlated stocks stretches to a statistical extreme,
+        and unwind when it reverts. See src/webull_bot/pairs.py. Its own
+        capital slice (PAIRS_CAPITAL_FRACTION), carved out up front same
+        as trade_micro_scalp already does for its own bucket, so it never
+        competes with the main scan's budget for the rest of the cycle.
+        """
+        if not PAIRS:
+            return buying_power
+        capital_budget = buying_power * PAIRS_CAPITAL_FRACTION
+        per_pair_budget = (
+            capital_budget / PAIRS_MAX_CONCURRENT if PAIRS_MAX_CONCURRENT else Decimal("0")
+        )
+        for pair in PAIRS:
+            symbol_a, symbol_b = pair
+            try:
+                quote_a = self.api.stock_quote(
+                    symbol_a, self.stock_categories.get(symbol_a, "US_STOCK")
+                )
+                quote_b = self.api.stock_quote(
+                    symbol_b, self.stock_categories.get(symbol_b, "US_STOCK")
+                )
+                price_a = self.api.quote_price(quote_a)
+                price_b = self.api.quote_price(quote_b)
+            except Exception as exc:
+                if isinstance(exc, QuoteUnavailableError):
+                    continue
+                log.error("PAIRS  | %s/%s | quote failed | %s", symbol_a, symbol_b, exc)
+                continue
+            self.pairs.update(pair, price_a, price_b)
+            quote_by_symbol = {symbol_a: quote_a, symbol_b: quote_b}
+            held = self.pairs_positions.get(pair)
+            decision = self.pairs.decision(pair, is_open=held is not None)
+
+            if held is None:
+                if decision.action not in (
+                    "ENTER_LONG_A_SHORT_B",
+                    "ENTER_LONG_B_SHORT_A",
+                ):
+                    continue
+                if len(self.pairs_positions) >= PAIRS_MAX_CONCURRENT:
+                    continue
+                key_a, key_b = f"STOCK:{symbol_a}", f"STOCK:{symbol_b}"
+                if not (
+                    self.cooldown_ready(key_a)
+                    and self.cooldown_ready(key_b)
+                    and self.reentry_cooldown_ready(key_a)
+                    and self.reentry_cooldown_ready(key_b)
+                    and not self.rate_capped(key_a)
+                    and not self.rate_capped(key_b)
+                    and symbol_a not in self.broker_conflict_symbols
+                    and symbol_b not in self.broker_conflict_symbols
+                    and not self.wash_sales.blocked_until(symbol_a)
+                    and not self.wash_sales.blocked_until(symbol_b)
+                ):
+                    continue
+                existing_a, _ = self.api.stock_position(symbol_a, positions)
+                existing_b, _ = self.api.stock_position(symbol_b, positions)
+                if existing_a != 0 or existing_b != 0:
+                    continue
+                leg_budget = min(per_pair_budget, buying_power) / 2
+                qty_a = int((leg_budget / price_a).to_integral_value(rounding=ROUND_DOWN))
+                qty_b = int((leg_budget / price_b).to_integral_value(rounding=ROUND_DOWN))
+                if qty_a <= 0 or qty_b <= 0:
+                    continue
+                if decision.action == "ENTER_LONG_A_SHORT_B":
+                    long_symbol, long_qty = symbol_a, qty_a
+                    short_symbol, short_qty = symbol_b, qty_b
+                else:
+                    long_symbol, long_qty = symbol_b, qty_b
+                    short_symbol, short_qty = symbol_a, qty_a
+                try:
+                    long_order = self.place_stock_scaled(
+                        long_symbol,
+                        "BUY",
+                        long_qty,
+                        f"STOCK:{long_symbol}",
+                        quote_by_symbol[long_symbol],
+                    )
+                    if long_order is None:
+                        continue
+                    short_order = self.place_stock_scaled(
+                        short_symbol,
+                        "SHORT",
+                        short_qty,
+                        f"STOCK:{short_symbol}",
+                        quote_by_symbol[short_symbol],
+                    )
+                    if short_order is None:
+                        # The long leg is already working/filled with no
+                        # short hedge behind it - unwind it immediately
+                        # rather than leave a naked, unintended long.
+                        self.api.place_stock(
+                            long_symbol,
+                            "SELL",
+                            long_qty,
+                            limit_price=self.api.stock_limit_price(
+                                quote_by_symbol[long_symbol], "SELL"
+                            ),
+                        )
+                        continue
+                except Exception as exc:
+                    log.error(
+                        "PAIRS  | %s/%s | entry failed | %s",
+                        symbol_a,
+                        symbol_b,
+                        exc,
+                    )
+                    continue
+                self.record_trade(f"STOCK:{long_symbol}", long_order, "BUY")
+                self.record_trade(f"STOCK:{short_symbol}", short_order, "BUY")
+                self.position_buckets[long_symbol] = "PAIRS_LONG"
+                self.position_buckets[short_symbol] = "PAIRS_SHORT"
+                self.pairs_positions[pair] = {"long": long_symbol, "short": short_symbol}
+                self.pairs.mark_entered(pair)
+                buying_power = max(Decimal("0"), buying_power - leg_budget * 2)
+                log.info(
+                    "PAIRS  | %s/%s | entered | long=%s(%s) short=%s(%s) | z=%.2f",
+                    symbol_a,
+                    symbol_b,
+                    long_symbol,
+                    long_qty,
+                    short_symbol,
+                    short_qty,
+                    decision.z_score,
+                )
+                continue
+
+            if decision.action not in ("UNWIND", "STOP"):
+                continue
+            long_symbol, short_symbol = held["long"], held["short"]
+            long_qty, long_cost = self.api.stock_position(long_symbol, positions)
+            # A short position's quantity is reported negative (same
+            # convention close_all_positions already relies on) - normalize
+            # to a positive magnitude for order sizing/pnl below, but the
+            # sign itself is what tells us whether the short is still open.
+            short_position_qty, short_cost = self.api.stock_position(
+                short_symbol, positions
+            )
+            short_qty = -short_position_qty if short_position_qty < 0 else Decimal("0")
+            if long_qty <= 0 and short_qty <= 0:
+                self.pairs_positions.pop(pair, None)
+                self.pairs.mark_exited(pair)
+                continue
+            try:
+                if long_qty > 0:
+                    sell_price = self.api.stock_limit_price(
+                        quote_by_symbol[long_symbol], "SELL"
+                    )
+                    order_id = self.api.place_stock(
+                        long_symbol, "SELL", long_qty, limit_price=sell_price
+                    )
+                    pnl = self.record_realized_exit(long_cost, sell_price, long_qty)
+                    self.record_trade(
+                        f"STOCK:{long_symbol}",
+                        order_id,
+                        "PROFIT" if decision.action == "UNWIND" else "STOP",
+                        sell_price,
+                        pnl=pnl,
+                        entry_price=long_cost,
+                    )
+                if short_qty > 0:
+                    # Covering submits as a plain "BUY" order (Webull has
+                    # no fourth order side), priced via the "COVER" pricing
+                    # branch (crosses above the ask) so it fills with the
+                    # same urgency any other forced exit gets.
+                    cover_price = self.api.stock_limit_price(
+                        quote_by_symbol[short_symbol], "COVER"
+                    )
+                    order_id = self.api.place_stock(
+                        short_symbol, "BUY", short_qty, limit_price=cover_price
+                    )
+                    pnl = self.record_realized_exit(short_cost, cover_price, short_qty, multiplier=-1)
+                    self.record_trade(
+                        f"STOCK:{short_symbol}",
+                        order_id,
+                        "PROFIT" if decision.action == "UNWIND" else "STOP",
+                        cover_price,
+                        pnl=pnl,
+                        entry_price=short_cost,
+                    )
+            except Exception as exc:
+                log.error(
+                    "PAIRS  | %s/%s | unwind failed | %s", symbol_a, symbol_b, exc
+                )
+                continue
+            self.pairs_positions.pop(pair, None)
+            self.pairs.mark_exited(pair)
+            log.info(
+                "PAIRS  | %s/%s | unwound (%s) | z=%.2f",
+                symbol_a,
+                symbol_b,
+                decision.reason,
+                decision.z_score,
+            )
         return buying_power
 
     def log_day_end_summary(self, moment: datetime) -> None:
@@ -1974,15 +2458,38 @@ class AutoTrader:
             pending_orders=pending_order_rows,
         )
 
-    def close_instruments(self, instrument_types: set[str]) -> bool:
+    def overnight_hold_symbols(self) -> set[str]:
+        """Symbols whose bucket is eligible to carry a position past
+        EOD_CLOSE_TIME instead of always flattening. Micro-scalp and pairs
+        positions are excluded - those strategies are intraday-only by
+        design - so only the core EMA/OBI stock strategy's own positions
+        (plus manual buys) ever ride overnight.
+        """
+        if not OVERNIGHT_HOLD_ENABLED:
+            return set()
+        return {
+            symbol
+            for symbol, bucket in self.position_buckets.items()
+            if bucket not in ALWAYS_FLATTEN_BUCKETS
+        }
+
+    def close_instruments(
+        self,
+        instrument_types: set[str],
+        apply_overnight_hold: bool = False,
+    ) -> bool:
         now = time.monotonic()
         if now - self.last_close_attempt < self.config.eod_retry_seconds:
             return False
         self.last_close_attempt = now
+        held_overnight = (
+            self.overnight_hold_symbols() if apply_overnight_hold else set()
+        )
         try:
             submitted = self.api.close_all_positions(
                 instrument_types,
                 loss_callback=self.wash_sales.block,
+                exclude_symbols=held_overnight,
             )
             self.pending_stock_exits.clear()
             self.pending_option_exits.clear()
@@ -1991,11 +2498,13 @@ class AutoTrader:
                 for item in self.api.positions()
                 if item.get("instrument_type") in instrument_types
                 if Decimal(str(item.get("quantity", "0"))) != 0
+                if str(item.get("symbol", "")).upper() not in held_overnight
             ]
             log.info(
-                "CLOSE  | submitted=%s | remaining=%s",
+                "CLOSE  | submitted=%s | remaining=%s%s",
                 len(submitted),
                 len(remaining),
+                f" | held overnight={len(held_overnight)}" if held_overnight else "",
             )
             return not remaining
         except Exception as exc:
@@ -2357,7 +2866,9 @@ class AutoTrader:
                 continue
 
             if closeout <= moment < market_close:
-                finished = self.close_instruments({"EQUITY"})
+                finished = self.close_instruments(
+                    {"EQUITY"}, apply_overnight_hold=True
+                )
                 time.sleep(60 if finished else self.config.eod_retry_seconds)
                 continue
 
@@ -2387,6 +2898,7 @@ class AutoTrader:
             try:
                 self.resolve_targets(moment)
                 self.monitor_working_orders()
+                self.process_iceberg_orders()
                 self.reprice_resting_exits(self.cached_positions)
                 self.escalate_stalled_stop_losses()
                 buying_power, positions = self.account_state()
@@ -2399,8 +2911,11 @@ class AutoTrader:
                 )
                 if not circuit_active:
                     circuit_active = self.handle_daily_loss_breaker()
+                if not circuit_active and self.order_kill_switch_tripped:
+                    circuit_active = True
                 if not circuit_active:
                     buying_power = self.trade_micro_scalp(positions, buying_power)
+                    buying_power = self.trade_pairs(positions, buying_power)
                     buying_power = self.trade_stocks(
                         positions,
                         buying_power,
