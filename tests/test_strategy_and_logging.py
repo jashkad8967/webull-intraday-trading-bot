@@ -3039,15 +3039,32 @@ class OrderBookImbalanceTests(unittest.TestCase):
                 "permission"
             )
 
-        fake_api = SimpleNamespace(
-            _call=fake_call,
-            _subscription_required=WebullAPI._subscription_required,
-        )
+        fake_api = SimpleNamespace(_call=fake_call)
         depth_fn = WebullAPI.stock_depth.__get__(fake_api)
         self.assertIsNone(depth_fn("AAPL", "US_STOCK"))
         self.assertTrue(fake_api._depth_unsupported)
         # Second call must short-circuit without hitting the API again.
         self.assertIsNone(depth_fn("AAPL", "US_STOCK"))
+        self.assertEqual(len(calls), 1)
+
+    def test_stock_depth_latches_on_any_error_not_just_permission_denied(self):
+        # Regression test: this endpoint can fail with a plain 500
+        # INTERNAL_ERROR on an account without the entitlement, not a
+        # clean permission-denied response. stock_depth must swallow that
+        # too - a raised exception here previously escaped all the way out
+        # of the BUY gate in trade_stocks() and aborted the whole symbol's
+        # entry for the cycle, so no order could ever place.
+        calls = []
+
+        def fake_call(callback, group):
+            calls.append(group)
+            raise RuntimeError("HTTP Status: 500, Code: INTERNAL_ERROR, Msg: ")
+
+        fake_api = SimpleNamespace(_call=fake_call)
+        depth_fn = WebullAPI.stock_depth.__get__(fake_api)
+        self.assertIsNone(depth_fn("CVX", "US_STOCK"))
+        self.assertTrue(fake_api._depth_unsupported)
+        self.assertIsNone(depth_fn("CVX", "US_STOCK"))
         self.assertEqual(len(calls), 1)
 
 

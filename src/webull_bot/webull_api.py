@@ -242,12 +242,18 @@ class WebullAPI:
     def stock_depth(self, symbol: str, category: str) -> dict | None:
         """Level-2 order-book depth for order-book-imbalance scoring.
 
-        Depth quotes need a separate market-data entitlement beyond the
-        plain snapshot subscription - if this account doesn't have it,
-        every call would otherwise fail the same way forever and burn
-        "market" rate-limit budget for nothing, so the first permission
-        failure latches self._depth_unsupported and every call after that
-        short-circuits to None without hitting the API again.
+        OBI is a secondary, best-effort signal - it must never be able to
+        abort an otherwise-qualifying entry. Depth quotes need a separate
+        market-data entitlement beyond the plain snapshot subscription, and
+        in practice this account gets back a generic 500 INTERNAL_ERROR
+        rather than a clean permission-denied response for it, so this
+        catches *any* failure (not just the subscription-shaped one) on
+        the first call, latches self._depth_unsupported, and every call
+        after that short-circuits to None without hitting the API again -
+        both to stop burning "market" rate-limit budget on a call that
+        keeps failing, and because a raised exception here was otherwise
+        propagating straight out of the BUY gate in trade_stocks() and
+        aborting that symbol's entry for the cycle entirely.
         """
         if getattr(self, "_depth_unsupported", False):
             return None
@@ -261,15 +267,14 @@ class WebullAPI:
                 "market",
             )
         except Exception as exc:
-            if self._subscription_required(exc):
-                self._depth_unsupported = True
-                logging.getLogger("webull-bot").warning(
-                    "DEPTH  | L2 depth not entitled on this account | "
-                    "OBI falling back to top-of-book size | %s",
-                    exc,
-                )
-                return None
-            raise
+            self._depth_unsupported = True
+            logging.getLogger("webull-bot").warning(
+                "DEPTH  | L2 depth unavailable on this account | "
+                "OBI falling back to top-of-book size for the rest of this "
+                "run | %s",
+                exc,
+            )
+            return None
         if not getattr(self, "_depth_logged", False):
             self._depth_logged = True
             logging.getLogger("webull-bot").debug(
