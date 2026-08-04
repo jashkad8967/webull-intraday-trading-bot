@@ -239,6 +239,82 @@ class WebullAPI:
             raise RuntimeError(f"No stock snapshot returned for {symbol}")
         return data[0]
 
+    def stock_depth(self, symbol: str, category: str) -> dict | None:
+        """Level-2 order-book depth for order-book-imbalance scoring.
+
+        Depth quotes need a separate market-data entitlement beyond the
+        plain snapshot subscription - if this account doesn't have it,
+        every call would otherwise fail the same way forever and burn
+        "market" rate-limit budget for nothing, so the first permission
+        failure latches self._depth_unsupported and every call after that
+        short-circuits to None without hitting the API again.
+        """
+        if getattr(self, "_depth_unsupported", False):
+            return None
+        try:
+            response = self._call(
+                lambda: self.data.market_data.get_quotes(
+                    symbol,
+                    category,
+                    depth="L2",
+                ),
+                "market",
+            )
+        except Exception as exc:
+            if self._subscription_required(exc):
+                self._depth_unsupported = True
+                logging.getLogger("webull-bot").warning(
+                    "DEPTH  | L2 depth not entitled on this account | "
+                    "OBI falling back to top-of-book size | %s",
+                    exc,
+                )
+                return None
+            raise
+        if not getattr(self, "_depth_logged", False):
+            self._depth_logged = True
+            logging.getLogger("webull-bot").debug(
+                "DEPTH  | first non-empty depth payload | %s", response
+            )
+        return response
+
+    @staticmethod
+    def depth_imbalance(depth: dict | None, levels: int) -> Decimal | None:
+        """bid_volume / (bid_volume + ask_volume) across the first `levels`
+        price levels. Webull's exact depth JSON isn't documented in the
+        bundled SDK (REST responses are plain JSON, no typed model), so
+        this tries a few plausible shapes defensively rather than assuming
+        one - confirm/adjust against the DEBUG-logged raw payload in
+        stock_depth() once this runs against a live, entitled account.
+        """
+        if not depth:
+            return None
+        for bid_key, ask_key in (
+            ("bids", "asks"),
+            ("bidList", "askList"),
+            ("bid", "ask"),
+        ):
+            bids = depth.get(bid_key)
+            asks = depth.get(ask_key)
+            if not isinstance(bids, list) or not isinstance(asks, list):
+                continue
+            if not bids or not asks:
+                continue
+            try:
+                bid_volume = sum(
+                    Decimal(str(level.get("volume", level.get("size", 0))))
+                    for level in bids[:levels]
+                )
+                ask_volume = sum(
+                    Decimal(str(level.get("volume", level.get("size", 0))))
+                    for level in asks[:levels]
+                )
+            except Exception:
+                continue
+            total = bid_volume + ask_volume
+            if total > 0:
+                return bid_volume / total
+        return None
+
     def option_quotes(self, option_symbols: list[str]) -> list[dict]:
         from webull.data.common.category import Category
 
@@ -803,7 +879,12 @@ class WebullAPI:
 
     def stock_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.stock_limit_offset
-        if side == "BUY":
+        if side in ("BUY", "SHORT"):
+            # A SHORT entry is priced the same passive way as a BUY entry
+            # (mid-price) - it's a normal opening trade, not an urgent
+            # exit, so it shouldn't use the aggressive crossing price the
+            # `else` branch below is tuned for (that one's for buy-to-cover
+            # unwinds and stop/profit exits that need a fast fill).
             bid = self._quote_decimal(quote, "bid")
             ask = self._quote_decimal(quote, "ask")
             if not bid or not ask or bid > ask:
@@ -814,6 +895,21 @@ class WebullAPI:
             return max(Decimal("0.01"), price).quantize(
                 Decimal("0.01"),
                 rounding=ROUND_DOWN,
+            )
+        elif side == "COVER":
+            # Buying back a short to close it out is economically a BUY,
+            # not a SELL - the aggressive-crossing `else` branch below
+            # prices toward the bid (correct for an urgent SELL, backwards
+            # for a BUY that needs to guarantee a fast fill). Cross above
+            # the ask instead, mirroring the same offset/urgency the SELL
+            # branch uses on the other side of the book.
+            base = Decimal(
+                str(quote.get("ask") or quote.get("price") or quote.get("bid"))
+            )
+            price = base * (Decimal("1") + offset)
+            return max(Decimal("0.01"), price).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_UP,
             )
         else:
             base = Decimal(
@@ -1054,12 +1150,19 @@ class WebullAPI:
         self,
         instrument_types: set[str] | None = None,
         loss_callback=None,
+        exclude_symbols: set[str] | None = None,
     ) -> list[str]:
         positions = [
             position
             for position in self.positions()
-            if instrument_types is None
-            or position.get("instrument_type") in instrument_types
+            if (
+                instrument_types is None
+                or position.get("instrument_type") in instrument_types
+            )
+            and (
+                not exclude_symbols
+                or str(position.get("symbol", "")).upper() not in exclude_symbols
+            )
         ]
         if not positions:
             return []
@@ -1071,6 +1174,12 @@ class WebullAPI:
                 continue
             if position.get("instrument_type") == "EQUITY":
                 side = "SELL" if quantity > 0 else "BUY"
+                # Pricing side is distinct from the broker order side above:
+                # covering a short still submits as a plain "BUY" (Webull's
+                # order API has no fourth side value), but it needs the
+                # urgent cross-the-ask "COVER" pricing branch, not the
+                # passive mid-price one plain "BUY" entries use.
+                pricing_side = "SELL" if quantity > 0 else "COVER"
                 quote = self.stock_quote(position["symbol"])
                 market_price = self.quote_price(quote)
                 average_cost = Decimal(str(position.get("cost_price") or "0"))
@@ -1083,7 +1192,7 @@ class WebullAPI:
                     and average_cost > 0
                     and market_price > average_cost
                 )
-                limit_price = self.stock_limit_price(quote, side)
+                limit_price = self.stock_limit_price(quote, pricing_side)
                 fractional = abs(quantity) != abs(quantity).to_integral_value()
                 submitted.append(
                     self.place_stock(

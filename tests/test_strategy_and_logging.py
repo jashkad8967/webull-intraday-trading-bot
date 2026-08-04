@@ -1,10 +1,13 @@
 import json
 import logging
 import shutil
+import statistics
 import sys
 import threading
+import time
 import unittest
 import unittest.mock
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
@@ -15,6 +18,14 @@ from webull_bot.config import Settings
 from webull_bot.daily_logging import DatedDailyFileHandler
 from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.market_agent import MarketResearchAgent
+from webull_bot.pairs import (
+    PAIRS_ENTRY_Z,
+    PAIRS_EXIT_Z,
+    PAIRS_MAX_HOLD_MINUTES,
+    PAIRS_MIN_SAMPLES,
+    PAIRS_STOP_Z,
+    PairsStrategy,
+)
 from webull_bot.status import StatusWriter
 from webull_bot.strategy import TradingStrategy
 from webull_bot.wash_sale import WashSaleTracker
@@ -2979,6 +2990,538 @@ class DailyPnlTrackerTests(unittest.TestCase):
             self.assertEqual(tracker.realized_loss, Decimal("0"))
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
+
+
+class OrderBookImbalanceTests(unittest.TestCase):
+    def test_obi_supports_entry_passes_through_when_no_data(self):
+        self.assertTrue(TradingStrategy.obi_supports_entry(None))
+
+    def test_obi_supports_entry_blocks_below_threshold(self):
+        self.assertFalse(TradingStrategy.obi_supports_entry(Decimal("0.40")))
+
+    def test_obi_supports_entry_allows_at_or_above_threshold(self):
+        self.assertTrue(TradingStrategy.obi_supports_entry(Decimal("0.60")))
+        self.assertTrue(TradingStrategy.obi_supports_entry(Decimal("0.75")))
+
+    def test_depth_imbalance_computes_ratio_from_bids_asks_shape(self):
+        depth = {
+            "bids": [
+                {"price": "10.00", "volume": "300"},
+                {"price": "9.99", "volume": "200"},
+            ],
+            "asks": [
+                {"price": "10.01", "volume": "100"},
+                {"price": "10.02", "volume": "100"},
+            ],
+        }
+        score = WebullAPI.depth_imbalance(depth, 2)
+        self.assertEqual(score, Decimal("500") / Decimal("700"))
+
+    def test_depth_imbalance_tries_alternate_key_shapes(self):
+        depth = {"bidList": [{"size": "50"}], "askList": [{"size": "50"}]}
+        score = WebullAPI.depth_imbalance(depth, 5)
+        self.assertEqual(score, Decimal("0.5"))
+
+    def test_depth_imbalance_returns_none_for_empty_or_missing_depth(self):
+        self.assertIsNone(WebullAPI.depth_imbalance(None, 5))
+        self.assertIsNone(WebullAPI.depth_imbalance({}, 5))
+        self.assertIsNone(
+            WebullAPI.depth_imbalance({"bids": [], "asks": []}, 5)
+        )
+
+    def test_stock_depth_latches_unsupported_on_permission_error(self):
+        calls = []
+
+        def fake_call(callback, group):
+            calls.append(group)
+            raise RuntimeError(
+                "Webull API error 403: unauthorized, please subscribe for "
+                "permission"
+            )
+
+        fake_api = SimpleNamespace(
+            _call=fake_call,
+            _subscription_required=WebullAPI._subscription_required,
+        )
+        depth_fn = WebullAPI.stock_depth.__get__(fake_api)
+        self.assertIsNone(depth_fn("AAPL", "US_STOCK"))
+        self.assertTrue(fake_api._depth_unsupported)
+        # Second call must short-circuit without hitting the API again.
+        self.assertIsNone(depth_fn("AAPL", "US_STOCK"))
+        self.assertEqual(len(calls), 1)
+
+
+class PairsStrategyTests(unittest.TestCase):
+    @staticmethod
+    def _seeded(values):
+        strat = PairsStrategy()
+        pair = ("A", "B")
+        strat._spread_history[pair].extend(values)
+        return strat, pair
+
+    @staticmethod
+    def _expected_z(values):
+        mean = statistics.mean(values)
+        stdev = statistics.pstdev(values)
+        return Decimal(str((values[-1] - mean) / stdev))
+
+    def test_no_data_below_minimum_samples(self):
+        strat, pair = self._seeded([0.001] * (PAIRS_MIN_SAMPLES - 1))
+        decision = strat.decision(pair, is_open=False)
+        self.assertEqual(decision.action, "NO_DATA")
+
+    def test_no_data_when_history_is_perfectly_flat(self):
+        # stdev == 0 must not raise a division error - just no signal.
+        strat, pair = self._seeded([0.01] * (PAIRS_MIN_SAMPLES + 10))
+        decision = strat.decision(pair, is_open=False)
+        self.assertEqual(decision.action, "NO_DATA")
+        self.assertIsNone(decision.z_score)
+
+    def test_enters_long_b_short_a_when_a_rich(self):
+        values = [0.0] * 40 + [0.05]
+        strat, pair = self._seeded(values)
+        expected_z = self._expected_z(values)
+        self.assertGreaterEqual(expected_z, PAIRS_ENTRY_Z)
+        decision = strat.decision(pair, is_open=False)
+        self.assertEqual(decision.action, "ENTER_LONG_B_SHORT_A")
+        self.assertAlmostEqual(
+            float(decision.z_score), float(expected_z), places=9
+        )
+
+    def test_enters_long_a_short_b_when_b_rich(self):
+        values = [0.0] * 40 + [-0.05]
+        strat, pair = self._seeded(values)
+        decision = strat.decision(pair, is_open=False)
+        self.assertEqual(decision.action, "ENTER_LONG_A_SHORT_B")
+
+    def test_no_entry_when_spread_within_normal_range(self):
+        values = [0.001, -0.001] * 20 + [0.0005]
+        strat, pair = self._seeded(values)
+        expected_z = self._expected_z(values)
+        self.assertLess(abs(expected_z), PAIRS_ENTRY_Z)
+        decision = strat.decision(pair, is_open=False)
+        self.assertEqual(decision.action, "NO_DATA")
+
+    def test_stop_when_open_and_spread_keeps_diverging(self):
+        values = [0.0] * 40 + [0.5]
+        strat, pair = self._seeded(values)
+        expected_z = self._expected_z(values)
+        self.assertGreaterEqual(abs(expected_z), PAIRS_STOP_Z)
+        strat.mark_entered(pair)
+        decision = strat.decision(pair, is_open=True)
+        self.assertEqual(decision.action, "STOP")
+
+    def test_unwind_when_open_and_spread_reverted(self):
+        # A volatile-then-flat spread: 60 samples oscillating +/-0.002 (a
+        # real, nonzero stdev to revert from), then a final sample back at
+        # the set's own mean - a genuine "it came back" shape, not just a
+        # quiet history that never moved.
+        values = [0.002, -0.002] * 30 + [0.0]
+        strat, pair = self._seeded(values)
+        expected_z = self._expected_z(values)
+        self.assertLessEqual(abs(expected_z), PAIRS_EXIT_Z)
+        strat.mark_entered(pair)
+        decision = strat.decision(pair, is_open=True)
+        self.assertEqual(decision.action, "UNWIND")
+
+    def test_unwind_after_max_hold_time_regardless_of_z(self):
+        # A moderate z (between PAIRS_EXIT_Z and PAIRS_STOP_Z) that would
+        # otherwise just HOLD - only the max-hold override should move it.
+        values = [0.002, -0.002] * 20 + [0.004]
+        strat, pair = self._seeded(values)
+        expected_z = self._expected_z(values)
+        self.assertGreater(abs(expected_z), PAIRS_EXIT_Z)
+        self.assertLess(abs(expected_z), PAIRS_STOP_Z)
+        strat.mark_entered(pair)
+        without_override = strat.decision(pair, is_open=True)
+        self.assertEqual(without_override.action, "HOLD")
+        strat._entered_at[pair] = (
+            time.monotonic() - (PAIRS_MAX_HOLD_MINUTES + 1) * 60
+        )
+        decision = strat.decision(pair, is_open=True)
+        self.assertEqual(decision.action, "UNWIND")
+        self.assertIn("max hold", decision.reason)
+
+    def test_mark_exited_clears_entry_time(self):
+        strat, pair = self._seeded([0.0] * PAIRS_MIN_SAMPLES)
+        strat.mark_entered(pair)
+        strat.mark_exited(pair)
+        self.assertNotIn(pair, strat._entered_at)
+
+
+class ExecutionGuardrailTests(unittest.TestCase):
+    def test_price_sanity_ok_within_tolerance(self):
+        from webull_bot.bot import AutoTrader
+
+        check = AutoTrader.price_sanity_ok.__get__(SimpleNamespace())
+        self.assertTrue(check(Decimal("100.00"), Decimal("103.00")))
+
+    def test_price_sanity_rejects_large_deviation(self):
+        from webull_bot.bot import AutoTrader
+
+        check = AutoTrader.price_sanity_ok.__get__(SimpleNamespace())
+        with self.assertLogs("webull-bot", level="ERROR"):
+            self.assertFalse(check(Decimal("100.00"), Decimal("110.00")))
+
+    def test_record_order_error_trips_kill_switch_after_threshold(self):
+        from webull_bot.bot import AutoTrader, CONSECUTIVE_ORDER_ERROR_LIMIT
+
+        fake_bot = SimpleNamespace(
+            order_error_times=deque(), order_kill_switch_tripped=False
+        )
+        record = AutoTrader.record_order_error.__get__(fake_bot)
+        with self.assertLogs("webull-bot", level="CRITICAL"):
+            for _ in range(CONSECUTIVE_ORDER_ERROR_LIMIT):
+                record("TEST", RuntimeError("boom"))
+        self.assertTrue(fake_bot.order_kill_switch_tripped)
+
+    def test_record_order_error_does_not_trip_below_threshold(self):
+        from webull_bot.bot import AutoTrader, CONSECUTIVE_ORDER_ERROR_LIMIT
+
+        fake_bot = SimpleNamespace(
+            order_error_times=deque(), order_kill_switch_tripped=False
+        )
+        record = AutoTrader.record_order_error.__get__(fake_bot)
+        for _ in range(CONSECUTIVE_ORDER_ERROR_LIMIT - 1):
+            record("TEST", RuntimeError("boom"))
+        self.assertFalse(fake_bot.order_kill_switch_tripped)
+
+    def test_record_order_error_prunes_entries_outside_window(self):
+        from webull_bot.bot import AutoTrader, ORDER_ERROR_WINDOW_SECONDS
+
+        fake_bot = SimpleNamespace(
+            order_error_times=deque(), order_kill_switch_tripped=False
+        )
+        record = AutoTrader.record_order_error.__get__(fake_bot)
+        fake_bot.order_error_times.append(
+            time.monotonic() - ORDER_ERROR_WINDOW_SECONDS - 5
+        )
+        record("TEST", RuntimeError("boom"))
+        self.assertEqual(len(fake_bot.order_error_times), 1)
+
+    @staticmethod
+    def _fake_bot_for_placement(placed, price="10.00"):
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def stock_limit_price(q, side):
+                return Decimal(str(q["price"]))
+
+            def place_stock(self, symbol, side, quantity, limit_price=None, fractional=False):
+                placed.append((symbol, side, quantity, limit_price, fractional))
+                return "order-1"
+
+        fake_bot = SimpleNamespace(api=FakeApi(), iceberg_orders={})
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
+        return fake_bot
+
+    def test_place_stock_scaled_below_threshold_places_single_order(self):
+        from webull_bot.bot import AutoTrader, ICEBERG_MIN_SHARES
+
+        placed = []
+        fake_bot = self._fake_bot_for_placement(placed)
+        place = AutoTrader.place_stock_scaled.__get__(fake_bot)
+        quantity = ICEBERG_MIN_SHARES - 1
+        order_id = place("AAA", "BUY", quantity, "STOCK:AAA", {"price": "10.00"})
+        self.assertEqual(order_id, "order-1")
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0][2], quantity)
+        self.assertNotIn("AAA:BUY", fake_bot.iceberg_orders)
+
+    def test_place_stock_scaled_at_threshold_slices_and_registers_remainder(self):
+        from webull_bot.bot import (
+            AutoTrader,
+            ICEBERG_MIN_SHARES,
+            ICEBERG_SLICE_SHARES,
+        )
+
+        placed = []
+        fake_bot = self._fake_bot_for_placement(placed)
+        place = AutoTrader.place_stock_scaled.__get__(fake_bot)
+        total_qty = ICEBERG_MIN_SHARES + 25
+        order_id = place("AAA", "BUY", total_qty, "STOCK:AAA", {"price": "10.00"})
+        self.assertEqual(order_id, "order-1")
+        self.assertEqual(placed[0][2], Decimal(ICEBERG_SLICE_SHARES))
+        entry = fake_bot.iceberg_orders["AAA:BUY"]
+        self.assertEqual(entry["remaining"], total_qty - ICEBERG_SLICE_SHARES)
+
+    def test_place_stock_scaled_clamps_to_hard_notional_ceiling(self):
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+        fake_bot = self._fake_bot_for_placement(placed)
+        place = AutoTrader.place_stock_scaled.__get__(fake_bot)
+        # 10-share slice at $250 = $2500, over the $2000 ceiling -> clamps
+        # to floor(2000/250) = 8 shares instead.
+        order_id = place("AAA", "BUY", 100, "STOCK:AAA", {"price": "250"})
+        self.assertEqual(order_id, "order-1")
+        self.assertEqual(placed[0][2], Decimal("8"))
+
+    def test_place_stock_scaled_returns_none_on_price_sanity_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+
+        class BadPriceApi:
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def stock_limit_price(q, side):
+                return Decimal("999")
+
+            def place_stock(self, *a, **k):
+                placed.append((a, k))
+                return "order-1"
+
+        fake_bot = SimpleNamespace(api=BadPriceApi(), iceberg_orders={})
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
+        place = AutoTrader.place_stock_scaled.__get__(fake_bot)
+        with self.assertLogs("webull-bot", level="ERROR"):
+            order_id = place("AAA", "BUY", 5, "STOCK:AAA", {"price": "10.00"})
+        self.assertIsNone(order_id)
+        self.assertEqual(placed, [])
+
+    def test_process_iceberg_orders_places_next_slice_after_interval(self):
+        from webull_bot.bot import (
+            AutoTrader,
+            ICEBERG_SLICE_INTERVAL_SECONDS,
+            ICEBERG_SLICE_SHARES,
+        )
+
+        placed = []
+
+        class FakeApi:
+            def stock_quote(self, symbol):
+                return {"symbol": symbol, "bid": "10.00", "ask": "10.02", "price": "10.01"}
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def stock_limit_price(q, side):
+                return Decimal(str(q["price"]))
+
+            def place_stock(self, symbol, side, quantity, limit_price=None):
+                placed.append((symbol, side, quantity, limit_price))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            iceberg_orders={
+                "AAA:BUY": {
+                    "symbol": "AAA",
+                    "side": "BUY",
+                    "key": "STOCK:AAA",
+                    "remaining": Decimal("15"),
+                    "last_slice_at": time.monotonic()
+                    - ICEBERG_SLICE_INTERVAL_SECONDS
+                    - 1,
+                }
+            },
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
+        recorded = []
+        fake_bot.record_trade = lambda key, order_id, action: recorded.append(
+            (key, order_id, action)
+        )
+        process = AutoTrader.process_iceberg_orders.__get__(fake_bot)
+        process()
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0][2], Decimal(ICEBERG_SLICE_SHARES))
+        self.assertEqual(
+            fake_bot.iceberg_orders["AAA:BUY"]["remaining"],
+            Decimal("15") - Decimal(ICEBERG_SLICE_SHARES),
+        )
+        self.assertEqual(recorded, [("STOCK:AAA", "order-2", "BUY")])
+
+    def test_process_iceberg_orders_skips_before_interval_elapses(self):
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            def stock_quote(self, symbol):
+                raise AssertionError("must not fetch a quote before the interval")
+
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            iceberg_orders={
+                "AAA:BUY": {
+                    "symbol": "AAA",
+                    "side": "BUY",
+                    "key": "STOCK:AAA",
+                    "remaining": Decimal("15"),
+                    "last_slice_at": time.monotonic(),
+                }
+            },
+        )
+        process = AutoTrader.process_iceberg_orders.__get__(fake_bot)
+        process()
+        self.assertEqual(fake_bot.iceberg_orders["AAA:BUY"]["remaining"], Decimal("15"))
+
+    def test_process_iceberg_orders_removes_entry_when_fully_filled(self):
+        from webull_bot.bot import AutoTrader, ICEBERG_SLICE_INTERVAL_SECONDS, ICEBERG_SLICE_SHARES
+
+        class FakeApi:
+            def stock_quote(self, symbol):
+                return {"symbol": symbol, "bid": "10.00", "ask": "10.02", "price": "10.01"}
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def stock_limit_price(q, side):
+                return Decimal(str(q["price"]))
+
+            def place_stock(self, symbol, side, quantity, limit_price=None):
+                return "order-3"
+
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            iceberg_orders={
+                "AAA:BUY": {
+                    "symbol": "AAA",
+                    "side": "BUY",
+                    "key": "STOCK:AAA",
+                    "remaining": Decimal(str(ICEBERG_SLICE_SHARES)),
+                    "last_slice_at": time.monotonic()
+                    - ICEBERG_SLICE_INTERVAL_SECONDS
+                    - 1,
+                }
+            },
+            record_trade=lambda *a, **k: None,
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
+        process = AutoTrader.process_iceberg_orders.__get__(fake_bot)
+        process()
+        self.assertNotIn("AAA:BUY", fake_bot.iceberg_orders)
+
+
+class OvernightHoldTests(unittest.TestCase):
+    def test_overnight_hold_symbols_excludes_intraday_only_buckets(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            position_buckets={
+                "AAPL": "popular",
+                "TSLA": "MICRO_SCALP",
+                "KO": "PAIRS_LONG",
+                "PEP": "PAIRS_SHORT",
+                "GME": "MANUAL",
+            }
+        )
+        held = AutoTrader.overnight_hold_symbols.__get__(fake_bot)()
+        self.assertEqual(held, {"AAPL", "GME"})
+
+    def test_overnight_hold_disabled_returns_empty_set(self):
+        import webull_bot.bot as bot_module
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(position_buckets={"AAPL": "popular"})
+        original = bot_module.OVERNIGHT_HOLD_ENABLED
+        bot_module.OVERNIGHT_HOLD_ENABLED = False
+        try:
+            held = AutoTrader.overnight_hold_symbols.__get__(fake_bot)()
+        finally:
+            bot_module.OVERNIGHT_HOLD_ENABLED = original
+        self.assertEqual(held, set())
+
+    def test_exclude_pairs_symbols_removes_pairs_tickers(self):
+        from webull_bot.bot import AutoTrader
+        from webull_bot.pairs import PAIRS
+
+        universe = ["AAPL", "MSFT"] + [symbol for pair in PAIRS for symbol in pair]
+        remaining, excluded = AutoTrader.exclude_pairs_symbols(universe)
+        self.assertEqual(set(excluded), {symbol for pair in PAIRS for symbol in pair})
+        self.assertEqual(remaining, ["AAPL", "MSFT"])
+
+
+class CloseAllPositionsExclusionTests(unittest.TestCase):
+    def test_close_all_positions_excludes_given_symbols(self):
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "AAPL", "quantity": "5", "cost_price": "150"},
+            {"instrument_type": "EQUITY", "symbol": "TSLA", "quantity": "3", "cost_price": "200"},
+        ]
+        placed = []
+        fake_api = SimpleNamespace(
+            positions=lambda: positions,
+            cancel_all_orders=lambda: [],
+            stock_quote=lambda symbol: {
+                "symbol": symbol,
+                "bid": "200",
+                "ask": "200.05",
+                "price": "200.02",
+            },
+            quote_price=lambda q: Decimal(str(q["price"])),
+            stock_limit_price=lambda q, side: Decimal(str(q["price"])),
+            place_stock=lambda symbol, side, qty, limit_price, fractional=False: (
+                placed.append((symbol, side, qty)) or "order-x"
+            ),
+        )
+        close = WebullAPI.close_all_positions.__get__(fake_api)
+        submitted = close({"EQUITY"}, exclude_symbols={"AAPL"})
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(placed[0][0], "TSLA")
+
+    def test_close_all_positions_covers_short_positions_with_buy_side(self):
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "PEP", "quantity": "-10", "cost_price": "170"},
+        ]
+        placed = []
+        pricing_calls = []
+        fake_api = SimpleNamespace(
+            positions=lambda: positions,
+            cancel_all_orders=lambda: [],
+            stock_quote=lambda symbol: {
+                "symbol": symbol,
+                "bid": "168",
+                "ask": "168.05",
+                "price": "168.02",
+            },
+            quote_price=lambda q: Decimal(str(q["price"])),
+            stock_limit_price=lambda q, side: (
+                pricing_calls.append(side) or Decimal(str(q["price"]))
+            ),
+            place_stock=lambda symbol, side, qty, limit_price, fractional=False: (
+                placed.append((symbol, side, qty)) or "order-y"
+            ),
+        )
+        close = WebullAPI.close_all_positions.__get__(fake_api)
+        close({"EQUITY"})
+        self.assertEqual(placed[0], ("PEP", "BUY", Decimal("10")))
+        self.assertEqual(pricing_calls, ["COVER"])
+
+
+class ShortPricingTests(unittest.TestCase):
+    def test_short_entry_uses_passive_mid_price(self):
+        fake_api = SimpleNamespace(
+            config=SimpleNamespace(stock_limit_offset=Decimal("0.005")),
+            _quote_decimal=WebullAPI._quote_decimal,
+        )
+        price_fn = WebullAPI.stock_limit_price.__get__(fake_api)
+        quote = {"bid": "10.00", "ask": "10.10"}
+        self.assertEqual(price_fn(quote, "SHORT"), Decimal("10.05"))
+
+    def test_cover_crosses_above_the_ask(self):
+        fake_api = SimpleNamespace(
+            config=SimpleNamespace(stock_limit_offset=Decimal("0.01")),
+            _quote_decimal=WebullAPI._quote_decimal,
+        )
+        price_fn = WebullAPI.stock_limit_price.__get__(fake_api)
+        quote = {"bid": "10.00", "ask": "10.10", "price": "10.05"}
+        # 10.10 * 1.01 = 10.2010, quantized up to the next cent = 10.21.
+        self.assertEqual(price_fn(quote, "COVER"), Decimal("10.21"))
 
 
 if __name__ == "__main__":

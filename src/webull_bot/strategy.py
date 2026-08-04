@@ -3,6 +3,16 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 
+# Order-book-imbalance secondary entry gate. Hardcoded, not config, since
+# it's a fixed institutional-style heuristic rather than a per-account
+# tuning knob: real bid/ask depth is scarce data (needs an L2 market-data
+# entitlement most retail accounts don't have) and only ever fetched for a
+# symbol that already cleared every other entry gate, so it isn't worth
+# exposing as yet another .env dial.
+OBI_ENABLED = True
+OBI_DEPTH_LEVELS = 5
+OBI_BUY_THRESHOLD = Decimal("0.60")
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -501,6 +511,22 @@ class TradingStrategy:
         if not self.config.tick_direction_enabled:
             return True
         return self.tick_direction_score(key) >= self.config.tick_direction_veto_threshold
+
+    @staticmethod
+    def obi_supports_entry(obi_score: Decimal | None) -> bool:
+        """bid volume / (bid + ask volume) across the top few book levels
+        (or top-of-book size as a fallback) - a heavy imbalance toward the
+        bid statistically favors an upward move over the next few seconds.
+        `obi_score` is fetched and computed by the caller (it needs a live
+        API round-trip, unlike every other gate here); `None` means no
+        depth/size data was available and the gate passes through, same
+        convention as entry_spread_ok/entry_extension_ok with missing data.
+        """
+        return (
+            not OBI_ENABLED
+            or obi_score is None
+            or obi_score >= OBI_BUY_THRESHOLD
+        )
 
     def adaptive_stop_percent(self, symbol: str) -> Decimal:
         range_ratio = Decimal(str(self.metrics.get(symbol, {}).get("range_ratio", 0)))
