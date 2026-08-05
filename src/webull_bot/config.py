@@ -212,6 +212,20 @@ class Settings(BaseSettings):
         ge=0,
         le=1,
     )
+    # Webull only allows fractional trading as a MARKET order during core
+    # hours (see "Fractional shares" above), so during core hours capital
+    # splits between two independent per-cycle budgets instead of one
+    # entry style taking every candidate: STOCK_CORE_SESSION_POSITION_FRACTION
+    # above for fractional dollar-sized entries, and this fraction of
+    # buying power for ordinary whole-share entries running alongside it.
+    # Outside core hours this cap doesn't apply at all - fractional isn't
+    # usable then anyway, so whole-share sizing spends against the full
+    # remaining entry budget instead of this slice of it.
+    stock_whole_share_core_session_fraction: Decimal = Field(
+        default=Decimal("0.35"),
+        ge=0,
+        le=1,
+    )
     # The opening print is naturally wider/choppier than mid-day trading, so
     # the normal spread/extension gates - tuned for profitable mid-day
     # scalping - reject almost everything in the first few minutes after the

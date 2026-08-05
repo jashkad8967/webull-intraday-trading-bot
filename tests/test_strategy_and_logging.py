@@ -3425,6 +3425,99 @@ class ExecutionGuardrailTests(unittest.TestCase):
         self.assertNotIn("AAA:BUY", fake_bot.iceberg_orders)
 
 
+class EntrySizingSplitTests(unittest.TestCase):
+    @staticmethod
+    def _size_fn(config, fractional_trading_enabled=True):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=config,
+            strategy=TradingStrategy(config),
+            fractional_trading_enabled=fractional_trading_enabled,
+        )
+        return AutoTrader.size_stock_entry.__get__(fake_bot)
+
+    def test_core_session_prefers_fractional_when_it_produces_a_quantity(self):
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0.15"),
+            stock_whole_share_core_session_fraction=Decimal("0.35"),
+            stock_quantity=100,
+        )
+        size = self._size_fn(config)
+        quantity, buffered_price, fractional = size(
+            Decimal("50"), Decimal("10000"), Decimal("10000"), True
+        )
+        self.assertTrue(fractional)
+        self.assertGreater(quantity, 0)
+
+    def test_core_session_falls_back_to_whole_share_when_fractional_fraction_is_zero(self):
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0"),
+            stock_whole_share_core_session_fraction=Decimal("0.35"),
+            stock_quantity=1000,
+            max_order_notional=Decimal("100000"),
+        )
+        size = self._size_fn(config)
+        quantity, buffered_price, fractional = size(
+            Decimal("50"), Decimal("10000"), Decimal("10000"), True
+        )
+        self.assertFalse(fractional)
+        # whole-share budget = min(entry_budget=10000, 10000*0.35=3500) = 3500
+        # buffered_price = 50*1.03 = 51.5 -> floor(3500/51.5) = 67
+        self.assertEqual(quantity, 67)
+
+    def test_fractional_trading_disabled_uses_whole_share_budget(self):
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0.15"),
+            stock_whole_share_core_session_fraction=Decimal("0.20"),
+            stock_quantity=1000,
+            max_order_notional=Decimal("100000"),
+        )
+        size = self._size_fn(config, fractional_trading_enabled=False)
+        quantity, buffered_price, fractional = size(
+            Decimal("50"), Decimal("10000"), Decimal("10000"), True
+        )
+        self.assertFalse(fractional)
+        # whole-share budget = min(10000, 10000*0.20=2000) = 2000
+        # floor(2000/51.5) = 38
+        self.assertEqual(quantity, 38)
+
+    def test_outside_core_hours_whole_share_budget_is_not_capped(self):
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0.15"),
+            # Deliberately tiny - must NOT apply outside core hours, or
+            # this test would only afford ~1 share instead of ~194.
+            stock_whole_share_core_session_fraction=Decimal("0.01"),
+            stock_quantity=1000,
+            max_order_notional=Decimal("100000"),
+        )
+        size = self._size_fn(config)
+        quantity, buffered_price, fractional = size(
+            Decimal("50"), Decimal("10000"), Decimal("10000"), False
+        )
+        self.assertFalse(fractional)
+        # Full entry_budget=10000 used, uncapped -> floor(10000/51.5) = 194
+        self.assertEqual(quantity, 194)
+
+    def test_fractional_failure_falls_through_to_whole_share(self):
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0.15"),
+            stock_whole_share_core_session_fraction=Decimal("0.35"),
+            stock_quantity=1000,
+            max_order_notional=Decimal("100000"),
+            fractional_shares_min_notional=Decimal("5"),
+        )
+        size = self._size_fn(config)
+        # buying_power=30: 15% = $4.50, under the $5 fractional minimum,
+        # so the fractional attempt must produce 0 and fall through to
+        # whole-share sizing instead of returning 0 outright.
+        quantity, buffered_price, fractional = size(
+            Decimal("5"), Decimal("1000"), Decimal("30"), True
+        )
+        self.assertFalse(fractional)
+        self.assertGreater(quantity, 0)
+
+
 class OvernightHoldTests(unittest.TestCase):
     def test_overnight_hold_symbols_excludes_intraday_only_buckets(self):
         from webull_bot.bot import AutoTrader

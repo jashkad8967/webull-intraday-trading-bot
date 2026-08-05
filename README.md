@@ -410,26 +410,40 @@ position quantity is read as a decimal everywhere it matters, not truncated
 to a whole number.
 
 **Dollar-sized core-session entries.** `STOCK_CORE_SESSION_POSITION_FRACTION`
-(default `0.10`) changes how the main EMA-scalp strategy sizes a brand new
-stock entry during core trading hours (9:30-4:00 ET): instead of buying a
-fixed `STOCK_QUANTITY` number of whole shares (falling back to a fractional
-order above only when that doesn't fit), it sizes the entry as this fraction
-of *total account buying power* and places it as a fractional **MARKET**
-order for however many decimal shares that dollar amount buys - not capped
-at one share the way the fallback above is. This is the primary
-core-session sizing method, not a last resort:
+(default `0.15`) changes how the main EMA-scalp strategy sizes a brand new
+stock entry during core trading hours (9:30-4:00 ET): instead of only ever
+buying a fixed `STOCK_QUANTITY` number of whole shares, it sizes the entry
+as this fraction of *total account buying power* and places it as a
+fractional **MARKET** order for however many decimal shares that dollar
+amount buys - not capped at one share the way the
+`FRACTIONAL_SHARES_ENABLED` fallback above is.
+
+Since Webull only allows fractional orders during core hours,
+`size_stock_entry()` (`bot.py`) splits capital between two independent
+per-cycle budgets during core hours instead of one style claiming every
+candidate: fractional is tried first against
+`STOCK_CORE_SESSION_POSITION_FRACTION` of buying power, and ordinary
+whole-share sizing (still bounded by `STOCK_QUANTITY`/`MAX_ORDER_NOTIONAL`
+as always) runs alongside it against its own slice,
+`STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION`:
 
 ```dotenv
 STOCK_CORE_SESSION_POSITION_FRACTION=0.15
+STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION=0.35
 ```
 
-Outside core hours (pre-market/after-hours), entries always fall back to the
-fixed `STOCK_QUANTITY` whole-share sizing, since Webull doesn't allow
-fractional orders outside core hours. Set
-`STOCK_CORE_SESSION_POSITION_FRACTION=0` to disable this and use the fixed
-whole-share sizing all day, matching the bot's pre-existing behavior. This
-setting only affects the main stock strategy's `trade_stocks` entries -
-micro-scalp mode keeps its own fixed-cents sizing untouched.
+Whenever the fractional attempt produces nothing for a candidate (e.g. its
+slice of buying power falls under `FRACTIONAL_SHARES_MIN_NOTIONAL`), that
+candidate falls through to the whole-share budget instead of being skipped
+outright. Outside core hours, `STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION`
+doesn't apply at all - fractional isn't usable then anyway, so whole-share
+sizing spends against the full remaining entry budget instead of this
+slice of it, same as the bot's original pre-split behavior. Set
+`STOCK_CORE_SESSION_POSITION_FRACTION=0` to disable fractional sizing
+entirely and use fixed whole-share sizing (uncapped by the split fraction)
+all day. Both settings only affect the main stock strategy's
+`trade_stocks` entries - micro-scalp mode keeps its own fixed-cents sizing
+untouched.
 
 Fractional orders (both the sizing above and the `FRACTIONAL_SHARES_ENABLED`
 fallback) require the Webull account itself to have agreed to fractional
