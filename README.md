@@ -69,11 +69,12 @@ the entry.
 **5. Research agent (optional, advisory only).** A Groq-based web-research
 pass biases priority ranking and exit timing - it never gates an entry that
 the technical signals already support, and a missing/degraded agent just
-means less-informed prioritization, not a stopped bot. It's resilient to the
-underlying model's own quirks: oversized-request retries, malformed/
-truncated JSON handling, and a retry-without-discovery fallback for when an
-agentic model spends its whole completion budget on web search and returns
-an empty assessment.
+means less-informed prioritization, not a stopped bot. Each research cycle
+is exactly one Groq request (no retry, so the daily budget is never spent
+faster than its interval pacing intends); it's resilient to the underlying
+model's own quirks - oversized requests and malformed/truncated JSON both
+just fall back to conservative defaults for that one cycle instead of
+costing a second call.
 
 **6. Safety rails**, all independent of which entry strategy opened a
 position: wash-sale blocking (stocks and options, including from a manual
@@ -686,12 +687,18 @@ LOSS_REEVALUATION_SECONDS=120
 
 `groq/compound-mini` is the low-latency Compound system and can perform one
 built-in web search per research request. The free tier currently allows 250
-Compound Mini requests per day. During the 9:30 AM–4:00 PM core session, the
-bot allows one call every 120 seconds, allocating up to 195 calls. During the
-4:00–9:30 AM and 4:00–8:00 PM extended sessions, it allows one call every 622
-seconds and uses up to the remaining 55 calls. A hard 250-call daily limit
-applies across both windows. A request can still perform broad popular/volatile
-discovery when there are no supplied symbols to assess. Cached results are used
+Compound Mini requests per day, and each research cycle is deliberately
+exactly one Groq call - no automatic retry with different parameters, so
+the budget below is never silently spent faster than intended. During the
+9:30 AM–4:00 PM core session, the bot allows one call every 120 seconds,
+allocating up to ~195 calls. During the 4:00–9:30 AM and 4:00–8:00 PM
+extended sessions, it allows one call every 622 seconds and uses up to the
+remaining ~55 calls - together the two intervals are tuned to spend almost
+exactly 250 calls across the full `MARKET_OPEN_TIME`-to-`EOD_CLOSE_TIME`
+trading day, weighted toward core hours where research matters most. The
+budget resets at `MARKET_OPEN_TIME` (start of the extended trading day),
+not calendar midnight - a moment before the bell still belongs to the
+previous session's tail end, not a fresh budget. Cached results are used
 between calls.
 
 Groq's real cap, though, is tokens per day (TPD) on the model itself, not
@@ -716,18 +723,17 @@ Every researched symbol contains `priority`, `quick_trade_score`,
 and `exit_bias`. Missing symbol output is replaced with conservative values
 rather than silently accepted.
 
-Groq searches for current popular, widely traded volatile stocks and ETFs in
-addition to assessing supplied candidates. Newly discovered symbols are
-accepted only when they also exist in Webull's current tradable universe.
-Discovery output is symbol-only - no other field downstream ever reads a
-discovery's popularity/volatility/confidence, so the model isn't asked to
-spend completion tokens producing them. Assessments never require a web
-search (they're computed from the numeric price/change/volume/spread already
-sent for each symbol), so an assessment-only retry pass explicitly tells the
-model not to search - this keeps both the request payload and the response
-small and makes it far less likely the model runs out of completion budget
-mid-response and falls back to conservative defaults instead of a real,
-computed assessment.
+Every request searches for current popular, widely traded volatile stocks and
+ETFs (TASK A) in addition to assessing every supplied candidate (TASK B).
+Newly discovered symbols are accepted only when they also exist in Webull's
+current tradable universe. Discovery output is symbol-only - no other field
+downstream ever reads a discovery's popularity/volatility/confidence, so the
+model isn't asked to spend completion tokens producing them. The prompt is
+explicit that TASK B (the structured per-symbol assessment) is mandatory and
+must be completed in full even if the model skips or cuts short TASK A's web
+search - since there's no retry, a response that burned its whole budget on
+search and returned no assessments just falls back to conservative defaults
+for that one cycle rather than costing a second request.
 Research confidence, volatility, catalysts, and quick-trade scores boost the
 symbol's scan priority. A high-confidence, liquid, bullish setup with a
 30-minute-or-shorter horizon can add an entry path. Research never vetoes an

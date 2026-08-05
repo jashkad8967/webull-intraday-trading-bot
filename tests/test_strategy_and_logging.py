@@ -9,6 +9,7 @@ import unittest
 import unittest.mock
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from datetime import time as datetime_time
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -1381,6 +1382,82 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual(agent._parse_response(""), {})
         self.assertEqual(agent._parse_response(None), {})
 
+    def test_session_date_resets_at_market_open_not_midnight(self):
+        """AGENT_DAILY_REQUEST_LIMIT budgets the extended trading day
+        (MARKET_OPEN_TIME to end of session), not a calendar day - a
+        moment before market open still belongs to the previous session's
+        tail end, not a fresh budget.
+        """
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(market_open_time="04:00")
+        agent.config.session_time = (
+            lambda value: datetime_time(*(int(p) for p in value.split(":")))
+        )
+
+        before_open = datetime(2026, 8, 6, 2, 30, tzinfo=timezone.utc)
+        self.assertEqual(
+            agent._session_date(before_open), datetime(2026, 8, 5).date()
+        )
+
+        at_open = datetime(2026, 8, 6, 4, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            agent._session_date(at_open), datetime(2026, 8, 6).date()
+        )
+
+        mid_session = datetime(2026, 8, 6, 21, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            agent._session_date(mid_session), datetime(2026, 8, 6).date()
+        )
+
+    def test_submit_resets_budget_at_the_new_sessions_market_open(self):
+        import queue as queue_module
+
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250,
+            agent_daily_token_budget=90000,
+            market_open_time="04:00",
+        )
+        agent.config.session_time = (
+            lambda value: datetime_time(*(int(p) for p in value.split(":")))
+        )
+        agent._timezone = timezone.utc
+        agent._requests_today = 200
+        agent._limit_logged_date = None
+        # Still "yesterday's" session per _session_date, even though the
+        # calendar date has already ticked over past midnight.
+        agent._request_date = datetime(2026, 8, 5).date()
+        agent._last_submitted = 0.0
+        agent._interval_seconds = lambda: 0
+        agent._rate_limited_until = 0.0
+        agent._token_usage_log = []
+        agent._token_limit_logged_at = 0.0
+        agent._work = queue_module.Queue(maxsize=1)
+        agent.log = logging.getLogger("test-agent")
+
+        with unittest.mock.patch(
+            "webull_bot.market_agent.datetime"
+        ) as mock_datetime:
+            mock_datetime.now.return_value = datetime(
+                2026, 8, 6, 2, 30, tzinfo=timezone.utc
+            )
+            agent.submit({"a": 1})
+        # Before market open - still yesterday's session, budget untouched.
+        self.assertEqual(agent._requests_today, 200)
+
+        with unittest.mock.patch(
+            "webull_bot.market_agent.datetime"
+        ) as mock_datetime:
+            mock_datetime.now.return_value = datetime(
+                2026, 8, 6, 5, 0, tzinfo=timezone.utc
+            )
+            agent.submit({"a": 1})
+        # Past market open - new session, budget resets to 0 (submit()
+        # only resets/enqueues; _research() is what later advances the
+        # count, on the worker thread this test doesn't run).
+        self.assertEqual(agent._requests_today, 0)
+        self.assertEqual(agent._request_date, datetime(2026, 8, 6).date())
+
     def test_submit_force_bypasses_the_interval_throttle(self):
         """force=True must actually skip the interval wait - it was
         previously accepted as a parameter but never read anywhere in
@@ -1394,7 +1471,10 @@ class ResearchDiscoveryTests(unittest.TestCase):
 
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(
-            agent_daily_request_limit=250, agent_daily_token_budget=90000
+            agent_daily_request_limit=250,
+            agent_daily_token_budget=90000,
+            market_open_time="00:00",
+            session_time=lambda value: datetime_time(0, 0),
         )
         agent._request_date = datetime.now(timezone.utc).date()
         agent._requests_today = 0
@@ -1431,7 +1511,10 @@ class ResearchDiscoveryTests(unittest.TestCase):
 
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(
-            agent_daily_request_limit=250, agent_daily_token_budget=1000
+            agent_daily_request_limit=250,
+            agent_daily_token_budget=1000,
+            market_open_time="00:00",
+            session_time=lambda value: datetime_time(0, 0),
         )
         agent._request_date = datetime.now(timezone.utc).date()
         agent._requests_today = 0
@@ -1492,19 +1575,12 @@ class ResearchDiscoveryTests(unittest.TestCase):
         seconds = MarketResearchAgent._parse_retry_after("rate_limit_exceeded")
         self.assertEqual(seconds, 1800.0)
 
-    def test_discovery_retry_skips_when_nothing_left_to_assess(self):
-        agent = MarketResearchAgent.__new__(MarketResearchAgent)
-        agent.config = SimpleNamespace(agent_daily_request_limit=250)
-        agent._requests_today = 0
-        # No client configured; a real call here would raise AttributeError,
-        # proving the empty-state, no-discovery retry short-circuits first.
-        agent._research({"positions": [], "candidates": []}, include_discovery=False)
-
-    def test_empty_assessments_with_discovery_retries_assessment_only(self):
-        """Regression test: an agentic model can spend its whole completion
-        budget on the discovery web search and return {} for assessments -
-        this must retry once without discovery instead of just falling back
-        to conservative defaults on the first empty response.
+    def test_research_makes_exactly_one_call_per_cycle(self):
+        """Regression test: a retry-with-different-params here used to
+        count a second time against AGENT_DAILY_REQUEST_LIMIT and the
+        rolling token budget, spending the day's budget faster than the
+        core/extended interval pacing intends - _research must now place
+        exactly one Groq call per invocation, no matter what comes back.
         """
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(
@@ -1533,21 +1609,8 @@ class ResearchDiscoveryTests(unittest.TestCase):
                 self.choices = [FakeChoice(content)]
 
         def fake_create(**kwargs):
-            prompt = kwargs["messages"][1]["content"]
-            calls.append(prompt)
-            if len(calls) == 1:
-                return FakeResponse("{}")
-            return FakeResponse(
-                json.dumps(
-                    {
-                        "market_direction": 0.2,
-                        "market_volatility": 0.5,
-                        "assessments": [
-                            {"symbol": "NVDA", "priority": 0.8, "confidence": 0.7}
-                        ],
-                    }
-                )
-            )
+            calls.append(kwargs["messages"][1]["content"])
+            return FakeResponse("{}")
 
         agent.client = SimpleNamespace(
             chat=SimpleNamespace(
@@ -1557,11 +1620,14 @@ class ResearchDiscoveryTests(unittest.TestCase):
 
         agent._research({"positions": [{"symbol": "NVDA"}], "candidates": []})
 
-        self.assertEqual(len(calls), 2)
-        self.assertIn("TASK A discoveries", calls[0])
-        self.assertNotIn("TASK A discoveries", calls[1])
+        # Exactly one call - an empty response falls back to conservative
+        # defaults for this cycle rather than retrying with different
+        # params, and the request budget only ever advances by one.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(agent._requests_today, 1)
         self.assertIn("NVDA", agent._assessments)
-        self.assertEqual(agent._assessments["NVDA"]["priority"], 0.8)
+        self.assertEqual(agent._assessments["NVDA"]["priority"], 0)
+        self.assertEqual(agent._assessments["NVDA"]["confidence"], 0)
 
     def test_discoveries_are_normalized_for_later_broker_validation(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
