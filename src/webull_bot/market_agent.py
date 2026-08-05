@@ -36,7 +36,14 @@ class MarketResearchAgent:
         # ages out continuously instead of a lump reset that either holds
         # a stale block too long or clears a real block too early.
         self._token_usage_log: list[tuple[float, int]] = []
-        self._rate_limited_until = 0.0
+        # A real 429 from Groq's daily token cap means the account is
+        # exhausted for the day - retrying mid-day (even after Groq's own
+        # "try again in Nm" hint elapses) just spends more of an already-
+        # exhausted budget and risks hitting it again. So this blocks all
+        # research for the rest of the current session, cleared only when
+        # submit() rolls over to a new _session_date (start of the next
+        # extended trading day), not after a short backoff.
+        self._rate_limit_blocked = False
         self._token_limit_logged_at = 0.0
         threading.Thread(target=self._worker, daemon=True).start()
         self.log.info(
@@ -103,16 +110,19 @@ class MarketResearchAgent:
 
     def submit(self, state: dict, force: bool = False) -> None:
         """force=True (e.g. a post-liquidation reevaluation) bypasses only
-        the interval throttle below, not the daily request budget above -
-        a forced call still counts against and can still be blocked by
-        AGENT_DAILY_REQUEST_LIMIT, since that's a hard cost cap, not a
-        pacing mechanism.
+        the interval throttle below, not the daily request budget, the
+        rolling token budget, or a rate-limit block above - a forced call
+        still counts against and can still be blocked by all three, since
+        those are hard cost/availability caps, not pacing mechanisms.
         """
         today = self._session_date(datetime.now(self._timezone))
         if self._request_date != today:
             self._request_date = today
             self._requests_today = 0
             self._limit_logged_date = None
+            self._rate_limit_blocked = False
+        if self._rate_limit_blocked:
+            return
         if self._requests_today >= self.config.agent_daily_request_limit:
             if self._limit_logged_date != today:
                 self.log.warning(
@@ -123,8 +133,6 @@ class MarketResearchAgent:
                 self._limit_logged_date = today
             return
         now = time.monotonic()
-        if now < self._rate_limited_until:
-            return
         tokens_used = self._rolling_tokens_used()
         if tokens_used >= self.config.agent_daily_token_budget:
             if now - self._token_limit_logged_at > 300:
@@ -177,42 +185,49 @@ class MarketResearchAgent:
             try:
                 self._research(state)
             except Exception as exc:
-                message = str(exc)
-                if "rate_limit_exceeded" in message or (
-                    "429" in message and "rate_limit" in message.lower()
-                ):
-                    # Groq's tokens-per-day cap is a rolling window (its own
-                    # error gives a "try again in Nm" hint, not "tomorrow"),
-                    # so back off for that long instead of retrying at the
-                    # next interval and hitting the same 429 again - our own
-                    # rolling budget check in submit() should normally catch
-                    # this first, but the server-side web search on an
-                    # agentic model can consume tokens we can't see ahead of
-                    # time, so this is the reactive backstop.
-                    retry_seconds = self._parse_retry_after(message)
-                    self._rate_limited_until = time.monotonic() + retry_seconds
-                    self.log.warning(
-                        "AGENT  | Groq daily token limit hit | pausing "
-                        "research for %.0fs | %s",
-                        retry_seconds,
-                        message,
-                    )
-                elif "request_too_large" in message or "413" in message:
-                    self.log.warning(
-                        "AGENT  | research skipped | Groq request too large "
-                        "(likely compound-mini's own web search results, not "
-                        "our payload) | lower AGENT_DISCOVERY_MAX_SYMBOLS if "
-                        "this keeps happening | %s",
-                        exc,
-                    )
-                elif isinstance(exc, json.JSONDecodeError):
-                    self.log.warning(
-                        "AGENT  | research skipped | Groq returned invalid "
-                        "JSON (truncated or malformed) | %s",
-                        exc,
-                    )
-                else:
-                    self.log.warning("AGENT  | research failed | %s", exc)
+                self._handle_research_error(exc)
+
+    def _handle_research_error(self, exc: Exception) -> None:
+        message = str(exc)
+        if "rate_limit_exceeded" in message or (
+            "429" in message and "rate_limit" in message.lower()
+        ):
+            # A real 429 means the account is exhausted for the day - our
+            # own rolling budget check in submit() should normally catch
+            # this first, but the server-side web search on an agentic
+            # model can consume tokens we can't see ahead of time, so this
+            # is the reactive backstop. Block research for the rest of the
+            # session rather than retrying after Groq's own "try again in
+            # Nm" hint - that hint is when the *next* token would free up
+            # on the rolling window, not when the account is safely clear
+            # of the cap again, so retrying at it tends to just hit the
+            # same 429 a second time.
+            self._rate_limit_blocked = True
+            self.log.warning(
+                "AGENT  | Groq daily token limit hit | pausing "
+                "research until the next session (Groq's own "
+                "estimate was %.0fs, but that's just when the next "
+                "token frees up on the rolling window, not when "
+                "the account is clear of the cap) | %s",
+                self._parse_retry_after(message),
+                message,
+            )
+        elif "request_too_large" in message or "413" in message:
+            self.log.warning(
+                "AGENT  | research skipped | Groq request too large "
+                "(likely compound-mini's own web search results, not "
+                "our payload) | lower AGENT_DISCOVERY_MAX_SYMBOLS if "
+                "this keeps happening | %s",
+                exc,
+            )
+        elif isinstance(exc, json.JSONDecodeError):
+            self.log.warning(
+                "AGENT  | research skipped | Groq returned invalid "
+                "JSON (truncated or malformed) | %s",
+                exc,
+            )
+        else:
+            self.log.warning("AGENT  | research failed | %s", exc)
 
     @staticmethod
     def _number(value, minimum: float, maximum: float, default: float) -> float:

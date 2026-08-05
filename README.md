@@ -709,12 +709,14 @@ Groq model/tier TPD limit (see
 with some margin - the default assumes the free/on-demand
 `llama-3.3-70b-versatile` tier (100000 TPD). The bot tracks its own rolling
 24-hour usage from each response's real token count and stops submitting
-before it would hit that ceiling. Groq's TPD is a rolling window, not a
-midnight reset - its own 429 gives a "try again in Nm" hint, not "try
-tomorrow" - so if it still 429s anyway (an agentic model's server-side web
-search can consume tokens the bot can't see ahead of a call), the bot backs
-off for the exact duration Groq reports instead of retrying at the next
-interval into the same limit.
+before it would hit that ceiling. If it still 429s anyway (an agentic
+model's server-side web search can consume tokens the bot can't see ahead
+of a call), the bot stops all research for the rest of the session instead
+of retrying after Groq's own "try again in Nm" hint - that hint is only
+when the *next* token frees up on Groq's rolling window, not when the
+account is safely clear of the cap, so retrying at it tends to just hit
+the same 429 again. Research resumes automatically at the start of the
+next extended trading day.
 
 Every research response contains `market_direction` and `market_volatility`.
 Every researched symbol contains `priority`, `quick_trade_score`,
