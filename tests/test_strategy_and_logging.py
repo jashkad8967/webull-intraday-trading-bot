@@ -1429,7 +1429,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent._request_date = datetime(2026, 8, 5).date()
         agent._last_submitted = 0.0
         agent._interval_seconds = lambda: 0
-        agent._rate_limited_until = 0.0
+        agent._rate_limit_blocked = False
         agent._token_usage_log = []
         agent._token_limit_logged_at = 0.0
         agent._work = queue_module.Queue(maxsize=1)
@@ -1483,7 +1483,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent._timezone = timezone.utc
         agent._interval_seconds = lambda: 120
         agent._work = queue_module.Queue(maxsize=1)
-        agent._rate_limited_until = 0.0
+        agent._rate_limit_blocked = False
         agent._token_usage_log = []
         agent._token_limit_logged_at = 0.0
         agent.log = logging.getLogger("test-agent")
@@ -1494,12 +1494,12 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent.submit({"a": 1}, force=True)
         self.assertFalse(agent._work.empty())  # force bypassed the wait
 
-    def test_submit_respects_rolling_token_budget_and_rate_limit_backoff(self):
+    def test_submit_respects_rolling_token_budget_and_rate_limit_block(self):
         """The interval throttle alone doesn't protect against Groq's real
         tokens-per-day cap - a request can be perfectly on-schedule and
         still 429 if the account's rolling 24h usage is near its limit.
         submit() must refuse to queue work in either case: usage already
-        near budget, or a prior 429 still within its backoff window.
+        near budget, or a prior 429 having blocked the rest of the session.
         """
         import queue as queue_module
 
@@ -1522,7 +1522,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent._last_submitted = 0.0
         agent._timezone = timezone.utc
         agent._interval_seconds = lambda: 120
-        agent._rate_limited_until = 0.0
+        agent._rate_limit_blocked = False
         agent._token_limit_logged_at = 0.0
         agent.log = logging.getLogger("test-agent")
 
@@ -1539,11 +1539,13 @@ class ResearchDiscoveryTests(unittest.TestCase):
             agent.submit({"a": 1})
         self.assertFalse(agent._work.empty())
 
-        # A live rate-limit backoff blocks submission even with budget free.
+        # A prior 429 blocks submission for the rest of the session, even
+        # with budget free and the interval elapsed - no backoff timer to
+        # wait out, it just stays blocked until the next _session_date.
         agent._work = queue_module.Queue(maxsize=1)
         agent._last_submitted = 0.0
         agent._token_usage_log = []
-        agent._rate_limited_until = now + 600
+        agent._rate_limit_blocked = True
         with unittest.mock.patch("time.monotonic", return_value=now):
             agent.submit({"a": 1})
         self.assertTrue(agent._work.empty())
@@ -1574,6 +1576,74 @@ class ResearchDiscoveryTests(unittest.TestCase):
     def test_parse_retry_after_falls_back_to_a_safe_default_when_unparseable(self):
         seconds = MarketResearchAgent._parse_retry_after("rate_limit_exceeded")
         self.assertEqual(seconds, 1800.0)
+
+    def test_rate_limit_error_blocks_research_for_the_rest_of_the_session(self):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.log = logging.getLogger("test-agent")
+        agent._rate_limit_blocked = False
+
+        error = RuntimeError(
+            "Error code: 429 - {'error': {'message': 'Rate limit reached "
+            "... Please try again in 16m38.784s.', 'type': 'compound', "
+            "'code': 'rate_limit_exceeded'}}"
+        )
+        with self.assertLogs("test-agent", level="WARNING") as logs:
+            agent._handle_research_error(error)
+
+        self.assertTrue(agent._rate_limit_blocked)
+        self.assertIn("until the next session", logs.output[0])
+
+    def test_rate_limit_block_clears_only_at_the_next_session(self):
+        """A prior day's 429 must not silently linger and block research
+        forever - it clears specifically when submit() rolls over to a new
+        _session_date (start of the next extended trading day), same as
+        the request-count budget.
+        """
+        import queue as queue_module
+
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250,
+            agent_daily_token_budget=90000,
+            market_open_time="04:00",
+        )
+        agent.config.session_time = (
+            lambda value: datetime_time(*(int(p) for p in value.split(":")))
+        )
+        agent._timezone = timezone.utc
+        agent._requests_today = 10
+        agent._limit_logged_date = None
+        agent._request_date = datetime(2026, 8, 5).date()
+        agent._rate_limit_blocked = True
+        agent._last_submitted = 0.0
+        agent._interval_seconds = lambda: 0
+        agent._token_usage_log = []
+        agent._token_limit_logged_at = 0.0
+        agent._work = queue_module.Queue(maxsize=1)
+        agent.log = logging.getLogger("test-agent")
+
+        with unittest.mock.patch(
+            "webull_bot.market_agent.datetime"
+        ) as mock_datetime:
+            mock_datetime.now.return_value = datetime(
+                2026, 8, 5, 22, 0, tzinfo=timezone.utc
+            )
+            agent.submit({"a": 1})
+        # Still the same session - the block must still be in effect.
+        self.assertTrue(agent._rate_limit_blocked)
+        self.assertTrue(agent._work.empty())
+
+        with unittest.mock.patch(
+            "webull_bot.market_agent.datetime"
+        ) as mock_datetime:
+            mock_datetime.now.return_value = datetime(
+                2026, 8, 6, 5, 0, tzinfo=timezone.utc
+            )
+            agent.submit({"a": 1})
+        # Past market open on a new day - the block clears and this submit
+        # goes through.
+        self.assertFalse(agent._rate_limit_blocked)
+        self.assertFalse(agent._work.empty())
 
     def test_research_makes_exactly_one_call_per_cycle(self):
         """Regression test: a retry-with-different-params here used to
