@@ -781,6 +781,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             stop_exit_submitted={"ASHR": 12345.0},
             daily_realized_pnl=Decimal("0"),
             daily_realized_loss=Decimal("0"),
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
             working_orders={
                 "order-1": {
                     "submitted_at": 0.0,
@@ -1011,6 +1012,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             stop_exit_submitted={"ASHR": 12345.0},
             daily_realized_pnl=Decimal("0"),
             daily_realized_loss=Decimal("0"),
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
             working_orders={
                 "order-1": {
                     "submitted_at": 0.0,
@@ -2656,6 +2658,7 @@ class DashboardCommandTests(unittest.TestCase):
             pending_stock_exits=set(),
             pending_option_exits=set(),
             fractional_trading_enabled=True,
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
             api=SimpleNamespace(
                 stock_quote=lambda symbol: {"bid": "99.00", "ask": "99.20"},
                 quote_ask=lambda quote: Decimal(str(quote["ask"])),
@@ -2702,6 +2705,7 @@ class DashboardCommandTests(unittest.TestCase):
             pending_stock_exits=set(),
             pending_option_exits=set(),
             fractional_trading_enabled=True,
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
             api=SimpleNamespace(
                 stock_quote=lambda symbol: {"bid": "99.00", "ask": "99.20"},
                 quote_ask=lambda quote: Decimal(str(quote["ask"])),
@@ -2752,6 +2756,7 @@ class DashboardCommandTests(unittest.TestCase):
             pending_stock_exits=set(),
             pending_option_exits=set(),
             fractional_trading_enabled=True,
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
             api=SimpleNamespace(
                 stock_quote=lambda symbol: {"bid": "99.00", "ask": "99.20"},
                 quote_ask=lambda quote: Decimal(str(quote["ask"])),
@@ -3423,6 +3428,64 @@ class ExecutionGuardrailTests(unittest.TestCase):
         process = AutoTrader.process_iceberg_orders.__get__(fake_bot)
         process()
         self.assertNotIn("AAA:BUY", fake_bot.iceberg_orders)
+
+
+class FractionalExitGuardTests(unittest.TestCase):
+    def test_is_fractional_quantity(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertTrue(AutoTrader.is_fractional_quantity(Decimal("2.5847")))
+        self.assertFalse(AutoTrader.is_fractional_quantity(Decimal("5")))
+        self.assertFalse(AutoTrader.is_fractional_quantity(Decimal("0")))
+
+    def test_boost_stalled_positions_skips_fractional_position_outside_core_hours(self):
+        # Regression test: Webull rejects ANY order (buy or sell) on a
+        # non-integer quantity outside core hours regardless of the
+        # client-side fractional/order-type flags - previously this kept
+        # retrying every stall-breaker interval and spamming the same
+        # OAUTH_OPENAPI_FRACT_ONLT_CORE_TIME rejection.
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+
+        class FakeApi:
+            def stock_quote(self, symbol):
+                calls.append(symbol)
+                return {"symbol": symbol, "bid": "100.00", "ask": "100.05"}
+
+            @staticmethod
+            def quote_bid(q):
+                return Decimal(str(q["bid"]))
+
+            def place_stock(self, *a, **k):
+                raise AssertionError("must not place an order outside core hours")
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                stall_breaker_enabled=True,
+                stall_breaker_seconds=1,
+                stall_breaker_min_profit=Decimal("0.01"),
+                sell_fee_dollars=Decimal("0.02"),
+            ),
+            api=FakeApi(),
+            last_fill_time=0.0,
+            last_stall_boost=0.0,
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+        )
+        fake_bot.cooldown_ready = lambda key: True
+        fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
+        boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "COST",
+                "quantity": "2.5847",
+                "cost_price": "95.00",
+            }
+        ]
+        boost(positions, options_active=False, core_session_active=False)
+        self.assertEqual(calls, [])
 
 
 class EntrySizingSplitTests(unittest.TestCase):
