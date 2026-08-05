@@ -914,6 +914,54 @@ class AutoTrader:
         total = bid_size + ask_size
         return bid_size / total if total > 0 else None
 
+    def size_stock_entry(
+        self,
+        price: Decimal,
+        entry_budget: Decimal,
+        buying_power: Decimal,
+        core_session_active: bool,
+    ) -> tuple[Decimal, Decimal, bool]:
+        """Splits capital between fractional and whole-share entry sizing
+        instead of one style claiming every candidate during core hours.
+
+        Fractional (STOCK_CORE_SESSION_POSITION_FRACTION of buying power)
+        is tried first when eligible; whole-share sizing then covers
+        everything else, capped to its own slice
+        (STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION) during core hours so it
+        runs alongside the fractional budget rather than exhausting the
+        whole cycle's capital on one style - but uncapped (the full
+        entry_budget) outside core hours, since fractional isn't usable
+        there at all and there's no second style left to share room with.
+        Returns (quantity, buffered_price, is_fractional).
+        """
+        if (
+            core_session_active
+            and self.fractional_trading_enabled
+            and self.config.stock_core_session_position_fraction > 0
+        ):
+            target_notional = min(
+                buying_power * self.config.stock_core_session_position_fraction,
+                entry_budget,
+                self.config.max_order_notional,
+            )
+            quantity, buffered_price = self.strategy.dollar_stock_quantity(
+                price, target_notional
+            )
+            if quantity > 0:
+                return quantity, buffered_price, True
+        whole_share_budget = (
+            min(
+                entry_budget,
+                buying_power * self.config.stock_whole_share_core_session_fraction,
+            )
+            if core_session_active
+            else entry_budget
+        )
+        quantity, buffered_price = self.strategy.stock_order_quantity(
+            price, whole_share_budget
+        )
+        return quantity, buffered_price, False
+
     def refresh_agent_discoveries(self) -> None:
         if not self.market_agent:
             self.agent_popular_symbols.clear()
@@ -1546,31 +1594,9 @@ class AutoTrader:
                         buying_power,
                         bucket_remaining.get(bucket, Decimal("0")),
                     )
-                    fractional = False
-                    if (
-                        core_session_active
-                        and self.fractional_trading_enabled
-                        and self.config.stock_core_session_position_fraction > 0
-                    ):
-                        target_notional = min(
-                            buying_power
-                            * self.config.stock_core_session_position_fraction,
-                            entry_budget,
-                            self.config.max_order_notional,
-                        )
-                        buy_quantity, buffered_price = (
-                            self.strategy.dollar_stock_quantity(
-                                price, target_notional
-                            )
-                        )
-                        fractional = buy_quantity > 0
-                    else:
-                        buy_quantity, buffered_price = (
-                            self.strategy.stock_order_quantity(
-                                price,
-                                entry_budget,
-                            )
-                        )
+                    buy_quantity, buffered_price, fractional = self.size_stock_entry(
+                        price, entry_budget, buying_power, core_session_active
+                    )
                     if (
                         buy_quantity == 0
                         and self.config.fractional_shares_enabled
