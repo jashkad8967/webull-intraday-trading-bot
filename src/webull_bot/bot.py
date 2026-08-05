@@ -787,7 +787,9 @@ class AutoTrader:
             except Exception as exc:
                 log.error("CANCEL | id=%s | %s", order_id, exc)
 
-    def reprice_resting_exits(self, positions: list[dict]) -> None:
+    def reprice_resting_exits(
+        self, positions: list[dict], core_session_active: bool = False
+    ) -> None:
         """Continuously re-quote a resting stock PROFIT sell order to track
         the current ask - the top of the spread - for as long as it stays
         unfilled and unescalated ("keep modifying to stay in the spread
@@ -830,6 +832,13 @@ class AutoTrader:
                     continue
                 quantity, cost = self.api.stock_position(symbol, positions)
                 if quantity <= 0:
+                    continue
+                # Same fractional/core-hours constraint as trade_stocks'
+                # PROFIT exit: cancel-and-replace can't succeed on a
+                # fractional quantity outside core hours either, so leave
+                # the existing resting order alone rather than cancelling
+                # it for a replacement that will just get rejected.
+                if self.is_fractional_quantity(quantity) and not core_session_active:
                     continue
                 if cost > 0 and ask < cost:
                     # Never chase the ask down below entry cost - the
@@ -1177,6 +1186,10 @@ class AutoTrader:
             self.daily_realized_loss += -pnl
         self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
         return pnl
+
+    @staticmethod
+    def is_fractional_quantity(quantity: Decimal) -> bool:
+        return quantity != quantity.to_integral_value()
 
     def price_sanity_ok(self, last_price: Decimal, limit_price: Decimal) -> bool:
         """Fat-finger guard: reject a limit price that's implausibly far
@@ -1662,6 +1675,19 @@ class AutoTrader:
                     and symbol not in self.pending_stock_exits
                     and self.cooldown_ready(key)
                 ):
+                    # A fractional-quantity position (bought via the core-
+                    # session dollar-sizing path) can only be bought OR
+                    # sold during core hours - Webull rejects any order on
+                    # a non-integer quantity outside core hours regardless
+                    # of order type. Retrying every cycle just spams the
+                    # same rejection until the next core session, so skip
+                    # (and count it like any other gate) instead.
+                    exit_is_fractional = self.is_fractional_quantity(quantity)
+                    if exit_is_fractional and not core_session_active:
+                        self.gate_rejections[
+                            "fractional position - exit waits for core hours"
+                        ] += 1
+                        continue
                     target = decision.target_price
                     if target is None:
                         continue
@@ -1683,12 +1709,19 @@ class AutoTrader:
                         "SELL",
                         quantity,
                         limit_price=limit_price,
+                        fractional=exit_is_fractional,
                     )
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
                     self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
+                    exit_is_fractional = self.is_fractional_quantity(quantity)
+                    if exit_is_fractional and not core_session_active:
+                        self.gate_rejections[
+                            "fractional position - exit waits for core hours"
+                        ] += 1
+                        continue
                     # Never price an initial stop-loss at the ask - unlike a
                     # profit-take, a stop needs to fill fast to cap the loss,
                     # not rest passively above the market hoping for a
@@ -1707,6 +1740,7 @@ class AutoTrader:
                         "SELL",
                         quantity,
                         limit_price=limit_price,
+                        fractional=exit_is_fractional,
                     )
                     self.wash_sales.block(symbol, "stop-loss exit submitted")
                     self.pending_stock_exits.add(symbol)
@@ -2309,6 +2343,7 @@ class AutoTrader:
         self,
         positions: list[dict],
         options_active: bool,
+        core_session_active: bool = False,
     ) -> None:
         """Free capital stuck in a stalled position at breakeven-plus-a-penny.
 
@@ -2342,6 +2377,14 @@ class AutoTrader:
                         continue
                     key = f"STOCK:{symbol}"
                     if not self.cooldown_ready(key):
+                        continue
+                    # Same fractional/core-hours constraint as trade_stocks'
+                    # exits - Webull rejects any order on a non-integer
+                    # quantity outside core hours, so don't bother trying.
+                    if (
+                        self.is_fractional_quantity(quantity)
+                        and not core_session_active
+                    ):
                         continue
                     fee_per_share = self.config.sell_fee_dollars / quantity
                     quote = self.api.stock_quote(symbol)
@@ -2652,8 +2695,16 @@ class AutoTrader:
                     symbol,
                 )
                 return
+            is_fractional = self.is_fractional_quantity(quantity)
+            if is_fractional and not core_session_active:
+                log.info(
+                    "CMD    | manual sell skipped | %-8s | fractional "
+                    "position, Webull only allows an order on it during "
+                    "core hours",
+                    symbol,
+                )
+                return
             quote = self.api.stock_quote(symbol)
-            is_fractional = quantity != quantity.to_integral_value()
             # A manual sell is an urgent "get me out" click, not a patient
             # resting order - the old below-bid crossing price
             # (stock_limit_price's SELL side) shaved off an extra
@@ -2925,7 +2976,7 @@ class AutoTrader:
                 self.resolve_targets(moment)
                 self.monitor_working_orders()
                 self.process_iceberg_orders()
-                self.reprice_resting_exits(self.cached_positions)
+                self.reprice_resting_exits(self.cached_positions, core_session_active)
                 self.escalate_stalled_stop_losses()
                 buying_power, positions = self.account_state()
                 buying_power = self.process_ui_commands(
@@ -2954,6 +3005,7 @@ class AutoTrader:
                     self.boost_stalled_positions(
                         positions,
                         option_open <= moment < option_closeout,
+                        core_session_active,
                     )
                     self.cached_buying_power = buying_power
                     self.cached_positions = [dict(item) for item in positions]
