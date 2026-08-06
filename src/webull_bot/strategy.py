@@ -13,6 +13,22 @@ OBI_ENABLED = True
 OBI_DEPTH_LEVELS = 5
 OBI_BUY_THRESHOLD = Decimal("0.60")
 
+# Options quality-filter thresholds. Hardcoded for the same reason as the
+# OBI constants above: these are fixed heuristics on data that may not even
+# be present on this account's option snapshot (delta/IV field names are
+# unconfirmed - see option_delta/option_implied_vol in webull_api.py), not
+# a per-account risk knob a user would tune via .env.
+OPTION_DELTA_MIN = Decimal("0.20")
+OPTION_DELTA_MAX = Decimal("0.85")
+OPTION_IV_PERCENTILE_MIN_SAMPLES = 10
+OPTION_IV_REJECT_PERCENTILE = Decimal("0.85")
+# VIXY (VIX-futures ETF) proxy for a market-wide volatility regime gate -
+# real VIX/CGIF index data isn't reachable through Webull's OpenAPI
+# (confirmed live: raw "VIX" returns INVALID_SYMBOL, VIXY resolves fine
+# through the ordinary stock-quote path everything else here already uses).
+OPTION_VIXY_SYMBOL = "VIXY"
+OPTION_VIXY_REJECT_PERCENTILE = Decimal("0.85")
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -486,6 +502,65 @@ class TradingStrategy:
             return "BUY"
         return "HOLD"
 
+    def option_direction_signal(self, key: str, price: Decimal) -> str:
+        """Dual-sided sibling of trend_signal for options: a stock strategy
+        only ever needs a bullish entry, but a call needs the same fresh
+        bullish EMA cross while a put needs the mirror-image fresh bearish
+        cross. Deliberately skips trend_signal's reenter_on_trend/streak
+        re-entry logic - theta already punishes waiting on an option, so
+        this fires once per fresh cross and goes quiet, rather than
+        re-firing on a continued trend.
+        """
+        values = self.history[key]
+        values.append(float(price))
+        self.tick_history[key].append(float(price))
+        slow = self.config.ema_slow_period
+        fast = self.config.ema_fast_period
+        if len(values) < slow + 1:
+            return "HOLD"
+        series = list(values)
+        previous = series[:-1]
+        old_spread = self._ema(previous[-slow:], fast) - self._ema(
+            previous[-slow:],
+            slow,
+        )
+        new_spread = self._ema(series[-slow:], fast) - self._ema(
+            series[-slow:],
+            slow,
+        )
+        if new_spread > 0 and old_spread <= 0:
+            return "CALL"
+        if new_spread < 0 and old_spread >= 0:
+            return "PUT"
+        return "HOLD"
+
+    def option_entry_confirmed(
+        self,
+        direction: str,
+        tick_score: Decimal | None,
+        obi_score: Decimal | None,
+    ) -> bool:
+        """Secondary confirmation for an option_direction_signal read, same
+        "no data -> don't block" convention as every other entry gate here.
+        tick_score is -1..+1 (see tick_direction_score); obi_score is
+        bid/(bid+ask) depth imbalance (see obi_supports_entry) and is only
+        ever passed when a depth snapshot happened to already be cached for
+        this underlying this cycle.
+        """
+        if direction not in ("CALL", "PUT"):
+            return False
+        if tick_score is not None:
+            if direction == "CALL" and tick_score <= 0:
+                return False
+            if direction == "PUT" and tick_score >= 0:
+                return False
+        if obi_score is not None:
+            if direction == "CALL" and obi_score < OBI_BUY_THRESHOLD:
+                return False
+            if direction == "PUT" and obi_score > Decimal("1") - OBI_BUY_THRESHOLD:
+                return False
+        return True
+
     def tick_direction_score(self, key: str) -> Decimal:
         """Net upticks vs downticks over the recent poll-to-poll price
         prints, as a proxy for order-flow imbalance - real bid/ask depth
@@ -526,6 +601,78 @@ class TradingStrategy:
             not OBI_ENABLED
             or obi_score is None
             or obi_score >= OBI_BUY_THRESHOLD
+        )
+
+    @staticmethod
+    def option_delta_ok(delta: Decimal | None) -> bool:
+        """Quality filter, not strike selection: rejects a contract that's
+        too far OTM to have real directional exposure (lottery-ticket cheap,
+        decays fast) or so deep ITM it's paying for intrinsic value with no
+        leverage left. `None` (delta unavailable on this account's snapshot)
+        passes through untouched, same as every other best-effort gate.
+        """
+        return delta is None or OPTION_DELTA_MIN <= abs(delta) <= OPTION_DELTA_MAX
+
+    @staticmethod
+    def _percentile_reject_ok(
+        history,
+        current: Decimal | None,
+        min_samples: int,
+        reject_percentile: Decimal,
+    ) -> bool:
+        """Shared rank-within-own-history check: rejects when `current`
+        sits at or above `reject_percentile` of `history`'s own samples -
+        relative, not an absolute threshold, since "high" only means
+        anything compared to that same series' own recent range. Passes
+        through when there's no current sample or not enough history yet
+        to judge (both `option_iv_percentile_ok` and
+        `option_market_regime_ok` share this).
+        """
+        if current is None:
+            return True
+        samples = list(history)
+        if len(samples) < min_samples:
+            return True
+        rank = sum(1 for sample in samples if sample <= current) / len(samples)
+        return Decimal(str(rank)) < reject_percentile
+
+    @staticmethod
+    def option_iv_percentile_ok(
+        iv_history,
+        current_iv: Decimal | None,
+    ) -> bool:
+        """Rejects an entry when current_iv sits in the priciest tail of
+        this SAME contract's own recent IV samples - no external IV-rank
+        source exists here. Passes through when IV data or enough history
+        isn't available yet.
+        """
+        return TradingStrategy._percentile_reject_ok(
+            iv_history,
+            current_iv,
+            OPTION_IV_PERCENTILE_MIN_SAMPLES,
+            OPTION_IV_REJECT_PERCENTILE,
+        )
+
+    @staticmethod
+    def option_market_regime_ok(
+        vixy_history,
+        current_vixy: Decimal | None,
+    ) -> bool:
+        """Market-wide volatility regime gate for options entries: VIXY (a
+        VIX-futures ETF - real VIX/CGIF index data isn't reachable through
+        Webull's OpenAPI, confirmed live) stands in for broad market fear.
+        Rejects a new entry when VIXY is spiking into the top of its own
+        recent range - a bad time to be buying option premium anywhere,
+        regardless of how any one contract's own delta/IV look. Relative to
+        VIXY's own recent range, not an absolute level (VIXY's baseline
+        drifts with its futures-roll decay over time). Passes through when
+        there's no VIXY quote or not enough history yet.
+        """
+        return TradingStrategy._percentile_reject_ok(
+            vixy_history,
+            current_vixy,
+            OPTION_IV_PERCENTILE_MIN_SAMPLES,
+            OPTION_VIXY_REJECT_PERCENTILE,
         )
 
     def adaptive_stop_percent(self, symbol: str) -> Decimal:
@@ -689,31 +836,43 @@ class TradingStrategy:
 
     def option_decision(
         self,
-        key: str,
         price: Decimal,
         quantity: int,
         average_cost: Decimal,
+        days_to_expiration: int,
     ) -> Decision:
-        trend = self.trend_signal(key, price)
-        if quantity > 0:
-            # Same flat-fee-to-per-share conversion as stock_decision, but
-            # one contract represents 100 shares, so the fee is spread over
-            # quantity * 100, not quantity alone.
-            fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
-            target = average_cost + self.config.option_take_profit_price + fee_per_share
-            stop = average_cost * (
-                Decimal("1") - self.config.option_stop_loss_percent
-            )
-            if average_cost > 0 and price <= stop:
-                return Decision("LOSS", "option percentage stop reached", price)
-            if average_cost > 0 and price >= target:
-                return Decision("PROFIT", "option profit target reached", target)
-            return Decision("HOLD", "option waiting for profit", target)
-        return (
-            Decision("BUY", "EMA entry confirmed")
-            if trend == "BUY"
-            else Decision("HOLD", "EMA entry not ready")
+        """Exit-only: entries are now decided externally by
+        option_direction_signal/option_entry_confirmed (bot.py calls those
+        before ever opening a position), since a call needs a bullish
+        underlying and a put needs a bearish one - a single BUY/HOLD signal
+        on the option's own premium can't express that distinction.
+        """
+        if quantity <= 0:
+            return Decision("HOLD", "no position")
+        # Same flat-fee-to-per-share conversion as stock_decision, but one
+        # contract represents 100 shares, so the fee is spread over
+        # quantity * 100, not quantity alone.
+        fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
+        if average_cost > 0 and days_to_expiration <= self.config.option_min_hold_dte:
+            # Forced exit regardless of target/stop - theta/gamma accelerate
+            # sharply in the final days before expiration, and holding
+            # through that isn't a directional bet anymore, it's a coin
+            # flip on pin risk.
+            reason = f"time decay exit - {days_to_expiration}d to expiration"
+            if price > average_cost:
+                return Decision("PROFIT", reason, price)
+            return Decision("LOSS", reason, price)
+        target = average_cost * (
+            Decimal("1") + self.config.option_take_profit_percent
+        ) + fee_per_share
+        stop = average_cost * (
+            Decimal("1") - self.config.option_stop_loss_percent
         )
+        if average_cost > 0 and price <= stop:
+            return Decision("LOSS", "option percentage stop reached", price)
+        if average_cost > 0 and price >= target:
+            return Decision("PROFIT", "option profit target reached", target)
+        return Decision("HOLD", "option waiting for profit", target)
 
     @staticmethod
     def minimum_lot_size(price: Decimal) -> int:
@@ -825,8 +984,16 @@ class TradingStrategy:
                 self.config.max_order_notional / contract_cost
             ).to_integral_value(rounding=ROUND_DOWN)
         )
+        # Never risk more than this fraction of buying power on one entry -
+        # a defined-risk-per-trade cap on top of (not instead of) the
+        # option_quantity/max_order_notional caps above.
+        risk_cap = int(
+            (
+                buying_power * self.config.option_capital_fraction / contract_cost
+            ).to_integral_value(rounding=ROUND_DOWN)
+        )
         return (
-            min(self.config.option_quantity, affordable, notional_limit),
+            min(self.config.option_quantity, affordable, notional_limit, risk_cap),
             contract_cost,
         )
 

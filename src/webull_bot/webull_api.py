@@ -979,6 +979,42 @@ class WebullAPI:
             return None
         return number if number.is_finite() and number > 0 else None
 
+    def option_delta(self, quote: dict) -> Decimal | None:
+        """Best-effort delta extraction. Webull's option snapshot response
+        isn't a typed model in the bundled SDK (plain passthrough dict), so
+        whether/how it exposes delta on this account is unconfirmed - tries
+        a few plausible key names and returns None (quality gate passes
+        through) rather than guessing wrong. Logs the raw quote once at
+        DEBUG the first time a real value shows up so the field name can be
+        confirmed/adjusted from a live log, same precedent as stock_depth.
+        """
+        return self._option_greek_field(quote, ("delta", "Delta"))
+
+    def option_implied_vol(self, quote: dict) -> Decimal | None:
+        return self._option_greek_field(
+            quote, ("impliedVol", "implied_vol", "iv", "impliedVolatility")
+        )
+
+    def _option_greek_field(self, quote: dict, fields: tuple[str, ...]) -> Decimal | None:
+        for field in fields:
+            value = quote.get(field)
+            if value in (None, ""):
+                continue
+            try:
+                number = Decimal(str(value))
+            except Exception:
+                continue
+            if not number.is_finite():
+                continue
+            if not getattr(self, "_option_greeks_logged", False):
+                self._option_greeks_logged = True
+                logging.getLogger("webull-bot").debug(
+                    "OPTION | first option snapshot with a greek field | %s",
+                    quote,
+                )
+            return number
+        return None
+
     def quote_bid(self, quote: dict) -> Decimal | None:
         return self._quote_decimal(quote, "bid")
 

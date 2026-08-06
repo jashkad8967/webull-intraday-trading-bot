@@ -67,8 +67,12 @@ class StrategyConfigMixin:
             stock_core_session_position_fraction=Decimal("0.10"),
             opening_grace_spread_multiplier=Decimal("2"),
             opening_grace_extension_multiplier=Decimal("2"),
-            option_take_profit_price=Decimal("0.01"),
+            option_take_profit_percent=Decimal("0.75"),
             option_stop_loss_percent=Decimal("0.50"),
+            option_min_hold_dte=2,
+            option_capital_fraction=Decimal("0.05"),
+            option_quantity=1,
+            max_order_notional=Decimal("1000"),
             agent_exit_influence_enabled=True,
             agent_exit_min_confidence=Decimal("0.60"),
             agent_runner_bias_threshold=Decimal("0.50"),
@@ -319,22 +323,135 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_option_decision_cuts_loss_before_it_reaches_zero(self):
         strategy = TradingStrategy(self.config())
         decision = strategy.option_decision(
-            "OPTION:TEST260101C00100000",
             Decimal("0.40"),
             5,
             Decimal("1.00"),
+            10,
         )
         self.assertEqual(decision.action, "LOSS")
 
     def test_option_decision_holds_above_stop_and_below_target(self):
         strategy = TradingStrategy(self.config())
         decision = strategy.option_decision(
-            "OPTION:TEST260101C00100000",
             Decimal("0.90"),
             5,
             Decimal("1.00"),
+            10,
         )
         self.assertEqual(decision.action, "HOLD")
+
+    def test_option_decision_forces_exit_inside_the_dte_window(self):
+        strategy = TradingStrategy(self.config())
+        profit_case = strategy.option_decision(
+            Decimal("1.10"),
+            5,
+            Decimal("1.00"),
+            2,
+        )
+        self.assertEqual(profit_case.action, "PROFIT")
+        self.assertIn("time decay exit", profit_case.reason)
+
+        loss_case = strategy.option_decision(
+            Decimal("0.90"),
+            5,
+            Decimal("1.00"),
+            2,
+        )
+        self.assertEqual(loss_case.action, "LOSS")
+        self.assertIn("time decay exit", loss_case.reason)
+
+    def test_option_decision_no_position_holds(self):
+        strategy = TradingStrategy(self.config())
+        decision = strategy.option_decision(Decimal("1.00"), 0, Decimal("0"), 10)
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_option_direction_signal_fires_call_on_a_fresh_bullish_cross(self):
+        strategy = TradingStrategy(self.config())
+        key = "OPTU:TEST"
+        downtrend = [10, 9.9, 9.8, 9.7, 9.6, 9.5, 9.4, 9.3, 9.2]
+        for price in downtrend:
+            strategy.option_direction_signal(key, Decimal(str(price)))
+        self.assertEqual(strategy.option_direction_signal(key, Decimal("9.6")), "HOLD")
+        self.assertEqual(strategy.option_direction_signal(key, Decimal("9.7")), "CALL")
+
+    def test_option_direction_signal_fires_put_on_a_fresh_bearish_cross(self):
+        strategy = TradingStrategy(self.config())
+        key = "OPTU:TEST"
+        uptrend = [10, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8]
+        for price in uptrend:
+            strategy.option_direction_signal(key, Decimal(str(price)))
+        self.assertEqual(strategy.option_direction_signal(key, Decimal("10.4")), "HOLD")
+        self.assertEqual(strategy.option_direction_signal(key, Decimal("10.3")), "PUT")
+
+    def test_option_entry_confirmed_requires_direction(self):
+        strategy = TradingStrategy(self.config())
+        self.assertFalse(strategy.option_entry_confirmed("HOLD", None, None))
+        self.assertTrue(strategy.option_entry_confirmed("CALL", None, None))
+        self.assertTrue(strategy.option_entry_confirmed("PUT", None, None))
+
+    def test_option_entry_confirmed_checks_tick_alignment(self):
+        strategy = TradingStrategy(self.config())
+        self.assertTrue(strategy.option_entry_confirmed("CALL", Decimal("0.5"), None))
+        self.assertFalse(strategy.option_entry_confirmed("CALL", Decimal("-0.5"), None))
+        self.assertTrue(strategy.option_entry_confirmed("PUT", Decimal("-0.5"), None))
+        self.assertFalse(strategy.option_entry_confirmed("PUT", Decimal("0.5"), None))
+
+    def test_option_entry_confirmed_checks_obi_alignment(self):
+        strategy = TradingStrategy(self.config())
+        self.assertTrue(strategy.option_entry_confirmed("CALL", None, Decimal("0.70")))
+        self.assertFalse(strategy.option_entry_confirmed("CALL", None, Decimal("0.30")))
+        self.assertTrue(strategy.option_entry_confirmed("PUT", None, Decimal("0.30")))
+        self.assertFalse(strategy.option_entry_confirmed("PUT", None, Decimal("0.70")))
+
+    def test_option_delta_ok_rejects_outside_the_directional_band(self):
+        self.assertTrue(TradingStrategy.option_delta_ok(None))
+        self.assertTrue(TradingStrategy.option_delta_ok(Decimal("0.45")))
+        self.assertTrue(TradingStrategy.option_delta_ok(Decimal("-0.45")))
+        self.assertFalse(TradingStrategy.option_delta_ok(Decimal("0.05")))
+        self.assertFalse(TradingStrategy.option_delta_ok(Decimal("0.95")))
+
+    def test_option_iv_percentile_ok_passes_with_sparse_history(self):
+        history = deque([Decimal("0.3")] * 3, maxlen=30)
+        self.assertTrue(
+            TradingStrategy.option_iv_percentile_ok(history, Decimal("0.9"))
+        )
+
+    def test_option_iv_percentile_ok_rejects_the_priciest_tail(self):
+        history = deque(
+            [Decimal(str(0.20 + 0.01 * i)) for i in range(20)], maxlen=30
+        )
+        self.assertFalse(
+            TradingStrategy.option_iv_percentile_ok(history, Decimal("0.50"))
+        )
+        self.assertTrue(
+            TradingStrategy.option_iv_percentile_ok(history, Decimal("0.20"))
+        )
+
+    def test_option_market_regime_ok_rejects_a_vixy_spike(self):
+        history = deque([Decimal(str(15 + i)) for i in range(20)], maxlen=30)
+        self.assertFalse(
+            TradingStrategy.option_market_regime_ok(history, Decimal("40"))
+        )
+        self.assertTrue(
+            TradingStrategy.option_market_regime_ok(history, Decimal("15"))
+        )
+        self.assertTrue(TradingStrategy.option_market_regime_ok(history, None))
+
+    def test_option_order_quantity_applies_the_capital_fraction_cap(self):
+        strategy = TradingStrategy(self.config())
+        # $1 premium -> $100/contract. 5% of $500 buying power caps at 0
+        # contracts even though option_quantity/max_order_notional would
+        # otherwise allow one.
+        quantity, contract_cost = strategy.option_order_quantity(
+            Decimal("1.00"), Decimal("500")
+        )
+        self.assertEqual(contract_cost, Decimal("100"))
+        self.assertEqual(quantity, 0)
+
+        quantity, _ = strategy.option_order_quantity(
+            Decimal("1.00"), Decimal("5000")
+        )
+        self.assertEqual(quantity, 1)
 
     def test_micro_scalp_reference_price_is_none_without_data(self):
         strategy = TradingStrategy(self.config())

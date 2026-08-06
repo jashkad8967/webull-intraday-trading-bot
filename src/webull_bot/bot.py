@@ -1,7 +1,7 @@
 import logging
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
@@ -20,7 +20,7 @@ from webull_bot.pairs import (
     PairsStrategy,
 )
 from webull_bot.status import StatusWriter
-from webull_bot.strategy import OBI_DEPTH_LEVELS, TradingStrategy
+from webull_bot.strategy import OBI_DEPTH_LEVELS, OPTION_VIXY_SYMBOL, TradingStrategy
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import (
     MarketDataPermissionError,
@@ -117,6 +117,10 @@ class AutoTrader:
         self.option_discovery_cursor = 0
         self.option_discovery_attempted: set[str] = set()
         self.discover_all_options = False
+        self.option_iv_history: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=30)
+        )
+        self.vixy_history: deque = deque(maxlen=30)
         self.options_enabled = True
         self.resolved_date = None
         self.last_close_attempt = 0.0
@@ -2191,6 +2195,12 @@ class AutoTrader:
         positions: list[dict],
         buying_power: Decimal,
     ) -> Decimal:
+        """Direction-aware options entries: a call needs a bullish
+        underlying, a put needs a bearish one - see
+        strategy.option_direction_signal/option_entry_confirmed. Exit
+        management (profit target, stop, DTE-forced close) is unrelated to
+        direction and stays keyed off strategy.option_decision.
+        """
         if not self.options_enabled:
             return buying_power
         open_count = self.strategy.open_position_count(positions)
@@ -2215,6 +2225,39 @@ class AutoTrader:
         quote_by_symbol = {
             str(quote.get("symbol", "")).upper(): quote for quote in quotes
         }
+        # A fresh underlying quote per cycle, decoupled from whatever batch
+        # the stock-scanning path happens to be covering this cycle - the
+        # direction signal must never silently run on stale/absent state.
+        # VIXY rides along in the same batched call (real VIX/CGIF index
+        # data isn't reachable through the OpenAPI - confirmed live) to
+        # track a market-wide volatility regime gate every cycle.
+        underlyings = sorted({contract["underlying_symbol"] for contract in batch})
+        quote_symbols = sorted(set(underlyings) | {OPTION_VIXY_SYMBOL})
+        underlying_quote_by_symbol: dict[str, dict] = {}
+        current_vixy: Decimal | None = None
+        try:
+            fetched_quotes, _ = self.api.stock_quotes_resilient(
+                quote_symbols, "US_STOCK"
+            )
+            for fetched_quote in fetched_quotes:
+                symbol = str(fetched_quote.get("symbol", "")).upper()
+                if symbol == OPTION_VIXY_SYMBOL:
+                    current_vixy = self.api.quote_price(fetched_quote)
+                    self.vixy_history.append(current_vixy)
+                else:
+                    underlying_quote_by_symbol[symbol] = fetched_quote
+        except Exception as exc:
+            log.warning(
+                "OPTIONS | underlying quote batch failed | new entries "
+                "skipped this cycle, exits unaffected | %s", exc,
+            )
+        directions: dict[str, str] = {}
+        for underlying, underlying_quote in underlying_quote_by_symbol.items():
+            underlying_price = self.api.quote_price(underlying_quote)
+            directions[underlying] = self.strategy.option_direction_signal(
+                f"OPTU:{underlying}", underlying_price
+            )
+        today = date.today()
         for contract in batch:
             option_symbol = contract["symbol"]
             key = f"OPTION:{option_symbol}"
@@ -2226,16 +2269,49 @@ class AutoTrader:
                     continue
                 price = self.api.quote_price(quote)
                 quantity, cost = self.api.option_position(contract, positions)
-                decision = self.strategy.option_decision(
-                    key,
-                    price,
-                    quantity,
-                    cost,
-                )
+                days_to_expiration = (
+                    date.fromisoformat(contract["expiration_date"]) - today
+                ).days
+                current_iv = self.api.option_implied_vol(quote)
+                if current_iv is not None:
+                    self.option_iv_history[option_symbol].append(current_iv)
                 if quantity == 0:
                     self.pending_option_exits.discard(option_symbol)
-                if decision.action == "BUY" and quantity == 0:
+                    if days_to_expiration <= self.config.option_min_hold_dte:
+                        continue
                     underlying = contract["underlying_symbol"]
+                    direction = directions.get(underlying, "HOLD")
+                    contract_type = contract.get("option_type")
+                    if not (
+                        (contract_type == "CALL" and direction == "CALL")
+                        or (contract_type == "PUT" and direction == "PUT")
+                    ):
+                        continue
+                    tick_score = self.strategy.tick_direction_score(
+                        f"OPTU:{underlying}"
+                    )
+                    underlying_quote = underlying_quote_by_symbol.get(underlying)
+                    obi_score = (
+                        self.obi_score_for(underlying, "US_STOCK", underlying_quote)
+                        if underlying_quote is not None
+                        else None
+                    )
+                    if not self.strategy.option_entry_confirmed(
+                        direction, tick_score, obi_score
+                    ):
+                        continue
+                    if not self.strategy.option_delta_ok(
+                        self.api.option_delta(quote)
+                    ):
+                        continue
+                    if not self.strategy.option_iv_percentile_ok(
+                        self.option_iv_history[option_symbol], current_iv
+                    ):
+                        continue
+                    if not self.strategy.option_market_regime_ok(
+                        self.vixy_history, current_vixy
+                    ):
+                        continue
                     blocked_until = self.wash_sales.blocked_until(underlying)
                     if blocked_until:
                         if underlying not in self.wash_skip_logged:
@@ -2281,6 +2357,13 @@ class AutoTrader:
                             }
                         )
                         open_count += 1
+                    continue
+                decision = self.strategy.option_decision(
+                    price,
+                    quantity,
+                    cost,
+                    days_to_expiration,
+                )
                 if (
                     decision.action == "PROFIT"
                     and option_symbol not in self.pending_option_exits
