@@ -520,6 +520,51 @@ OPTION_TYPE=PUT
 
 You can use exact contracts and automatic selection together.
 
+### Direction-aware entries
+
+A call and a put on the same underlying are never bought on the same
+condition. Each cycle the bot fetches a fresh quote for every underlying in
+the current batch and reads its own EMA fast/slow cross for a fresh bullish
+or bearish signal (a call needs a fresh bullish cross, a put needs the
+mirror-image bearish one - continuing an already-established trend doesn't
+re-fire, since theta already punishes waiting on an option). That signal
+must then agree with the underlying's recent tick direction, and with
+order-book imbalance when a depth snapshot happens to be available, before
+either side is eligible to open.
+
+Two more quality filters apply if - and only if - Webull's option snapshot
+actually exposes them on your account (this is unconfirmed pending a live
+run; every filter below passes through untouched if the field isn't there):
+
+- **Delta** rejects a contract that's too far OTM to carry real directional
+  exposure or so deep ITM it's paying for intrinsic value with no leverage
+  left, rather than picking among strikes (still one ATM call + one ATM put
+  per underlying, same discovery as above).
+- **IV percentile** rejects an entry when the contract's current implied
+  vol sits in the priciest ~15% of its own recent samples - relative to its
+  own range, not an absolute level.
+
+On top of both, a market-wide volatility regime gate tracks **VIXY** (a
+VIX-futures ETF) once per cycle and rejects new entries while VIXY is
+spiking into the top of its own recent range - a bad time to be buying
+option premium anywhere. True VIX/CBOE index data (the "CGIF" market-data
+package) isn't reachable through Webull's OpenAPI - confirmed live, a raw
+`VIX` quote returns `INVALID_SYMBOL` - so VIXY stands in as the nearest
+tradable, quotable proxy.
+
+Once a position is open, exits are unrelated to direction:
+`OPTION_TAKE_PROFIT_PERCENT`/`OPTION_STOP_LOSS_PERCENT` (below) as usual,
+plus a forced close - regardless of target/stop - once a held contract is
+`OPTION_MIN_HOLD_DTE` days or fewer from expiration, since theta/gamma
+accelerate sharply in the final days and holding through that stops being a
+directional bet and becomes pin-risk roulette.
+
+Explicitly out of scope: no earnings/event-calendar avoidance (no data
+source for it exists here), no true multi-strike delta-targeted selection
+(still nearest-ATM only), and no overnight options holds - options remain
+same-day, closed out at `OPTION_EOD_CLOSE_TIME` like today, since
+assignment/exercise risk stays out of scope.
+
 ## 5. Set the trading speed
 
 EMA periods count price samples. With `REENTER_ON_TREND=true`, the bot may buy
@@ -553,8 +598,10 @@ STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
-OPTION_TAKE_PROFIT_PRICE=0.01
+OPTION_TAKE_PROFIT_PERCENT=0.75
 OPTION_STOP_LOSS_PERCENT=0.50
+OPTION_MIN_HOLD_DTE=2
+OPTION_CAPITAL_FRACTION=0.05
 ```
 
 `STOCK_ENTRY_MAX_EXTENSION_PERCENT` blocks a fresh entry when price is
@@ -847,12 +894,16 @@ top of that, every stock, option, and micro-scalp target adds
 pass-through, charged on the sell leg only, converted to a per-share amount
 by dividing by the position's quantity) so a target isn't hit at a price
 that nets a loss once that fee comes out of the actual fill. For options,
-`OPTION_TAKE_PROFIT_PRICE=0.01` sets the minimum sell limit one premium
-cent above average cost plus that fee, normally just over $1 per standard
-100-share contract. Options also stop out at `OPTION_STOP_LOSS_PERCENT` (50%
-of premium by default) — unlike stocks, there was previously no automatic
-loss cut on an option position at all, so a losing contract could only be
-closed by the end-of-day sweep. A profit or stop order remains subject to
+`OPTION_TAKE_PROFIT_PERCENT=0.75` sets the target as a percentage gain on
+premium paid (75% by default) plus that fee, not a flat cent amount - a
+real option's premium can move far more than a cent, so a fixed-price
+target was meaningless against actual swings. Options also stop out at
+`OPTION_STOP_LOSS_PERCENT` (50% of premium by default), and force-close
+regardless of target/stop once `OPTION_MIN_HOLD_DTE` days or fewer remain
+to expiration (see "Direction-aware entries" above) — unlike stocks, there
+was previously no automatic loss cut on an option position at all, so a
+losing contract could only be closed by the end-of-day sweep. A profit or
+stop order remains subject to
 its limit being filled.
 
 Every realized exit also has `SELL_FEE_DOLLARS` subtracted from the P&L the
@@ -1365,8 +1416,10 @@ STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
-OPTION_TAKE_PROFIT_PRICE=0.01
+OPTION_TAKE_PROFIT_PERCENT=0.75
 OPTION_STOP_LOSS_PERCENT=0.50
+OPTION_MIN_HOLD_DTE=2
+OPTION_CAPITAL_FRACTION=0.05
 MARKET_REQUESTS_PER_MINUTE=240
 OPTION_INSTRUMENT_REQUESTS_PER_MINUTE=45
 STOCK_INSTRUMENT_REQUESTS_PER_30_SECONDS=9

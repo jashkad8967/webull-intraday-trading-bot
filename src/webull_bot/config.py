@@ -242,8 +242,17 @@ class Settings(BaseSettings):
         ge=1,
         le=10,
     )
-    option_take_profit_price: Decimal = Field(default=Decimal("0.01"), ge=0)
+    option_take_profit_percent: Decimal = Field(default=Decimal("0.75"), gt=0)
     option_stop_loss_percent: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    # Forced exit once a held contract is this many days or fewer from
+    # expiration, regardless of target/stop - theta/gamma accelerate sharply
+    # in the final days and holding through that stops being a directional
+    # bet and becomes pin-risk roulette.
+    option_min_hold_dte: int = Field(default=2, ge=0, le=30)
+    # Never risk more than this fraction of buying power on a single options
+    # entry - a defined-risk-per-trade cap layered on top of (not instead
+    # of) OPTION_QUANTITY and MAX_ORDER_NOTIONAL.
+    option_capital_fraction: Decimal = Field(default=Decimal("0.05"), gt=0, le=1)
     stop_loss_escalate_seconds: int = Field(default=15, ge=5, le=120)
     daily_loss_circuit_breaker_enabled: bool = False
     daily_max_loss_dollars: Decimal = Field(default=Decimal("50"), gt=0)
@@ -361,6 +370,12 @@ class Settings(BaseSettings):
             )
         if self.option_min_dte > self.option_max_dte:
             raise ValueError("OPTION_MIN_DTE must not exceed OPTION_MAX_DTE")
+        if self.option_min_hold_dte >= self.option_max_dte:
+            raise ValueError(
+                "OPTION_MIN_HOLD_DTE must be lower than OPTION_MAX_DTE, or "
+                "every discovered contract would fall inside its own "
+                "forced-exit window and never be enterable"
+            )
         if self.stock_priority_fraction + self.stock_penny_fraction > 0.90:
             raise ValueError(
                 "STOCK_PRIORITY_FRACTION + STOCK_PENNY_FRACTION must be <= 0.90"
