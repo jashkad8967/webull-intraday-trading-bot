@@ -66,6 +66,7 @@ class StrategyConfigMixin:
             stock_entry_max_extension_percent=Decimal("0.01"),
             stock_core_session_position_fraction=Decimal("0.10"),
             sma_trend_filter_enabled=False,
+            short_selling_enabled=False,
             opening_grace_spread_multiplier=Decimal("2"),
             opening_grace_extension_multiplier=Decimal("2"),
             option_take_profit_percent=Decimal("0.75"),
@@ -201,6 +202,97 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         config.sma_trend_filter_enabled = True
         strategy = TradingStrategy(config)
         self.assertTrue(strategy.sma_trend_supports_entry("UNSEEN", Decimal("5")))
+
+    def test_trend_signal_fires_short_on_a_fresh_bearish_cross(self):
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:TEST"
+        uptrend = [10, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8]
+        for price in uptrend:
+            strategy.trend_signal(key, Decimal(str(price)))
+        # 10.4 still confirms the ongoing uptrend (reenter_on_trend fires
+        # here per the shared fixture's reenter_confirmation_polls=2,
+        # unrelated to shorting) - the fresh bearish cross only fires once
+        # the EMA spread actually flips negative, at 10.3.
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.4")), "BUY")
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.3")), "SHORT")
+
+    def test_vwap_gate_short_direction_blocks_price_above_vwap(self):
+        strategy = TradingStrategy(self.config())
+        strategy.update_stock_snapshot(
+            {"symbol": "SHORTVWAP", "volume": "1000", "price": "10"},
+            Decimal("10"),
+        )
+        strategy.update_stock_snapshot(
+            {"symbol": "SHORTVWAP", "volume": "2000", "price": "12"},
+            Decimal("12"),
+        )
+        self.assertFalse(
+            strategy.vwap_supports_entry("SHORTVWAP", Decimal("13"), "SHORT")
+        )
+        self.assertTrue(
+            strategy.vwap_supports_entry("SHORTVWAP", Decimal("12"), "SHORT")
+        )
+
+    def test_extension_gate_short_direction_blocks_chasing_todays_low(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["DIPPED"] = {"low": 50.0}
+        self.assertFalse(
+            strategy.entry_extension_ok("DIPPED", Decimal("50.2"), direction="SHORT")
+        )
+        self.assertTrue(
+            strategy.entry_extension_ok("DIPPED", Decimal("52.0"), direction="SHORT")
+        )
+
+    def test_tick_direction_short_requires_downticks(self):
+        strategy = TradingStrategy(self.config())
+        for price in ["10", "9.9", "9.8", "9.7"]:
+            strategy.trend_signal("STOCK:DOWN", Decimal(price))
+        self.assertTrue(strategy.tick_direction_ok("STOCK:DOWN", "SHORT"))
+        for price in ["10", "10.1", "10.2", "10.3"]:
+            strategy.trend_signal("STOCK:UP", Decimal(price))
+        self.assertFalse(strategy.tick_direction_ok("STOCK:UP", "SHORT"))
+
+    def test_stock_decision_opens_a_short_on_a_fresh_bearish_cross(self):
+        config = self.config()
+        config.short_selling_enabled = True
+        # Tick-direction confirmation is exercised separately in
+        # test_tick_direction_short_requires_downticks - disabled here so
+        # this test isolates just the SHORT entry gate/sizing mechanics.
+        config.tick_direction_enabled = False
+        strategy = TradingStrategy(config)
+        key = "STOCK:TEST"
+        uptrend = [10, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8]
+        for price in uptrend:
+            strategy.stock_decision(key, Decimal(str(price)), 0, Decimal("0"))
+        strategy.stock_decision(key, Decimal("10.4"), 0, Decimal("0"))
+        decision = strategy.stock_decision(key, Decimal("10.3"), 0, Decimal("0"))
+        self.assertEqual(decision.action, "SHORT")
+
+    def test_stock_decision_short_signal_is_a_noop_when_disabled(self):
+        config = self.config()
+        config.short_selling_enabled = False
+        strategy = TradingStrategy(config)
+        key = "STOCK:TEST"
+        uptrend = [10, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8]
+        for price in uptrend:
+            strategy.stock_decision(key, Decimal(str(price)), 0, Decimal("0"))
+        strategy.stock_decision(key, Decimal("10.4"), 0, Decimal("0"))
+        decision = strategy.stock_decision(key, Decimal("10.3"), 0, Decimal("0"))
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_stock_decision_short_position_stop_and_profit_are_mirrored(self):
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:SHORTPOS"
+        # Shorted at 100: a short profits as price falls, stops out as
+        # price rises - the exact mirror of the long-side math.
+        loss = strategy.stock_decision(key, Decimal("102"), -10, Decimal("100"))
+        self.assertEqual(loss.action, "LOSS")
+
+        profit = strategy.stock_decision(key, Decimal("90"), -10, Decimal("100"))
+        self.assertEqual(profit.action, "PROFIT")
+
+        hold = strategy.stock_decision(key, Decimal("99.9"), -10, Decimal("100"))
+        self.assertEqual(hold.action, "HOLD")
 
     def test_stock_decision_buy_blocked_when_price_is_below_sma_trend(self):
         config = self.config()
@@ -4160,16 +4252,29 @@ class OvernightHoldTests(unittest.TestCase):
                 "KO": "PAIRS_LONG",
                 "PEP": "PAIRS_SHORT",
                 "GME": "MANUAL",
-            }
+            },
+            short_symbols=set(),
         )
         held = AutoTrader.overnight_hold_symbols.__get__(fake_bot)()
         self.assertEqual(held, {"AAPL", "GME"})
+
+    def test_overnight_hold_symbols_excludes_main_strategy_shorts(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            position_buckets={"AAPL": "popular", "GME": "popular"},
+            short_symbols={"GME"},
+        )
+        held = AutoTrader.overnight_hold_symbols.__get__(fake_bot)()
+        self.assertEqual(held, {"AAPL"})
 
     def test_overnight_hold_disabled_returns_empty_set(self):
         import webull_bot.bot as bot_module
         from webull_bot.bot import AutoTrader
 
-        fake_bot = SimpleNamespace(position_buckets={"AAPL": "popular"})
+        fake_bot = SimpleNamespace(
+            position_buckets={"AAPL": "popular"}, short_symbols=set()
+        )
         original = bot_module.OVERNIGHT_HOLD_ENABLED
         bot_module.OVERNIGHT_HOLD_ENABLED = False
         try:

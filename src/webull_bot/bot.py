@@ -156,6 +156,14 @@ class AutoTrader:
             "most_active": [],
         }
         self.last_market_pulse_refresh = 0.0
+        # Symbols currently held short via the main strategy (see
+        # trade_stocks' SHORT branch) - always flattened same-day
+        # regardless of OVERNIGHT_HOLD_ENABLED, since a short's overnight
+        # gap/squeeze risk is unbounded, unlike a long's. Separate from
+        # position_buckets/ALWAYS_FLATTEN_BUCKETS since a short can land in
+        # any selection bucket (POPULAR/PENNY/DISCOVERY/...), not a
+        # dedicated one.
+        self.short_symbols: set[str] = set()
         self.position_buckets: dict[str, str] = {}
         self.stop_exit_submitted: dict[str, float] = {}
         self.stop_loss_escalated: set[str] = set()
@@ -1749,6 +1757,7 @@ class AutoTrader:
                     self.pending_stock_exits.discard(symbol)
                     self.stop_exit_submitted.pop(symbol, None)
                     self.stop_loss_escalated.discard(symbol)
+                    self.short_symbols.discard(symbol)
                 if decision.action == "BUY" and quantity == 0:
                     blocked_until = self.wash_sales.blocked_until(symbol)
                     if blocked_until:
@@ -1847,6 +1856,84 @@ class AutoTrader:
                             }
                         )
                         open_count += 1
+                if decision.action == "SHORT" and quantity == 0:
+                    blocked_until = self.wash_sales.blocked_until(symbol)
+                    if blocked_until:
+                        if symbol not in self.wash_skip_logged:
+                            self.wash_skip_logged.add(symbol)
+                            log.info(
+                                "WASH   | %-8s | short entry blocked until %s",
+                                symbol,
+                                blocked_until.strftime("%Y-%m-%d"),
+                            )
+                        continue
+                    self.wash_skip_logged.discard(symbol)
+                    bucket = self.strategy.selection_bucket(symbol)
+                    entry_budget = min(
+                        buying_power,
+                        bucket_remaining.get(bucket, Decimal("0")),
+                    )
+                    # Whole-share sizing only - Webull's fractional-share
+                    # trading is a long-only retail feature, there's no
+                    # confirmed fractional short order type.
+                    short_quantity, buffered_price = self.strategy.stock_order_quantity(
+                        price, entry_budget
+                    )
+                    if (
+                        open_count < self.config.max_open_positions
+                        and bucket_position_counts.get(bucket, 0)
+                        < bucket_slot_limits.get(bucket, 0)
+                        and short_quantity > 0
+                        and self.cooldown_ready(key)
+                        and not self.rate_capped(key)
+                        and self.reentry_cooldown_ready(key)
+                        and self.strategy.obi_supports_entry(
+                            self.obi_score_for(
+                                symbol,
+                                self.stock_categories.get(symbol, "US_STOCK"),
+                                quote,
+                            )
+                        )
+                    ):
+                        order_id = self.place_stock_scaled(
+                            symbol,
+                            "SHORT",
+                            short_quantity,
+                            key,
+                            quote,
+                        )
+                        if order_id is None:
+                            continue
+                        self.record_trade(key, order_id, "SHORT")
+                        # Not exact margin accounting (Webull's actual short
+                        # margin requirement isn't modeled here) - same
+                        # rough capital-pool tracking the rest of this
+                        # function already uses, just enough to stop
+                        # multiple candidates in one cycle from each
+                        # believing they have the full stale buying_power.
+                        buying_power = max(
+                            Decimal("0"),
+                            buying_power - buffered_price * short_quantity,
+                        )
+                        bucket_remaining[bucket] = max(
+                            Decimal("0"),
+                            bucket_remaining.get(bucket, Decimal("0"))
+                            - buffered_price * short_quantity,
+                        )
+                        self.position_buckets[symbol] = bucket
+                        self.short_symbols.add(symbol)
+                        bucket_position_counts[bucket] += 1
+                        positions.append(
+                            {
+                                "instrument_type": "EQUITY",
+                                "symbol": symbol,
+                                "quantity": str(-short_quantity),
+                            }
+                        )
+                        open_count += 1
+                is_short_position = quantity < 0
+                exit_quantity = -quantity if is_short_position else quantity
+                exit_side = "BUY" if is_short_position else "SELL"
                 if (
                     decision.action == "PROFIT"
                     and symbol not in self.pending_stock_exits
@@ -1858,8 +1945,10 @@ class AutoTrader:
                     # a non-integer quantity outside core hours regardless
                     # of order type. Retrying every cycle just spams the
                     # same rejection until the next core session, so skip
-                    # (and count it like any other gate) instead.
-                    exit_is_fractional = self.is_fractional_quantity(quantity)
+                    # (and count it like any other gate) instead. Shorts
+                    # are always whole-share (see the SHORT entry branch
+                    # above), so this is effectively a long-only check.
+                    exit_is_fractional = self.is_fractional_quantity(exit_quantity)
                     if exit_is_fractional and not core_session_active:
                         self.gate_rejections[
                             "fractional position - exit waits for core hours"
@@ -1868,23 +1957,36 @@ class AutoTrader:
                     target = decision.target_price
                     if target is None:
                         continue
-                    ask = self.api.quote_ask(quote)
-                    # ask can be below target - or even below cost - if the
-                    # decision fired off a last-trade print (quote_price)
-                    # that's already stale relative to the current book
-                    # (the market moved down between the two reads). Never
-                    # let a "profit-take" actually price below the target
-                    # that triggered it, or it can silently execute at a
-                    # real loss while still being logged as PROFIT.
-                    limit_price = (
-                        self.api.stock_limit_price(quote, "SELL")
-                        if symbol in self.stop_loss_escalated
-                        else (max(ask, target) if ask else target)
-                    )
+                    if is_short_position:
+                        bid = self.api.quote_bid(quote)
+                        # Mirror of the long case below: never cover above
+                        # the target that triggered this, but also don't
+                        # rest the limit above the current bid (that would
+                        # be paying more than the market for no reason).
+                        limit_price = (
+                            self.api.stock_limit_price(quote, "COVER")
+                            if symbol in self.stop_loss_escalated
+                            else (min(bid, target) if bid else target)
+                        )
+                    else:
+                        ask = self.api.quote_ask(quote)
+                        # ask can be below target - or even below cost - if
+                        # the decision fired off a last-trade print
+                        # (quote_price) that's already stale relative to
+                        # the current book (the market moved down between
+                        # the two reads). Never let a "profit-take"
+                        # actually price below the target that triggered
+                        # it, or it can silently execute at a real loss
+                        # while still being logged as PROFIT.
+                        limit_price = (
+                            self.api.stock_limit_price(quote, "SELL")
+                            if symbol in self.stop_loss_escalated
+                            else (max(ask, target) if ask else target)
+                        )
                     order_id = self.api.place_stock(
                         symbol,
-                        "SELL",
-                        quantity,
+                        exit_side,
+                        exit_quantity,
                         limit_price=limit_price,
                         fractional=exit_is_fractional,
                     )
@@ -1893,29 +1995,32 @@ class AutoTrader:
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
                     self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
-                    exit_is_fractional = self.is_fractional_quantity(quantity)
+                    exit_is_fractional = self.is_fractional_quantity(exit_quantity)
                     if exit_is_fractional and not core_session_active:
                         self.gate_rejections[
                             "fractional position - exit waits for core hours"
                         ] += 1
                         continue
-                    # Never price an initial stop-loss at the ask - unlike a
-                    # profit-take, a stop needs to fill fast to cap the loss,
-                    # not rest passively above the market hoping for a
-                    # better price while the position keeps falling further
-                    # away from it. stock_stop_exit_price (bid/ask midpoint)
-                    # balances "don't overshoot the bid" against "don't sit
-                    # unfilled" - only escalation (after 15s unfilled) should
-                    # cross the market harder than that.
+                    # Never price an initial stop-loss at the passive side -
+                    # unlike a profit-take, a stop needs to fill fast to cap
+                    # the loss, not rest passively hoping for a better price
+                    # while the position keeps moving further away from it.
+                    # stock_stop_exit_price (bid/ask midpoint) balances
+                    # "don't overshoot the market" against "don't sit
+                    # unfilled" for either direction - only escalation
+                    # (after 15s unfilled) should cross the market harder
+                    # than that.
                     limit_price = (
-                        self.api.stock_limit_price(quote, "SELL")
+                        self.api.stock_limit_price(
+                            quote, "COVER" if is_short_position else "SELL"
+                        )
                         if symbol in self.stop_loss_escalated
                         else self.api.stock_stop_exit_price(quote)
                     )
                     order_id = self.api.place_stock(
                         symbol,
-                        "SELL",
-                        quantity,
+                        exit_side,
+                        exit_quantity,
                         limit_price=limit_price,
                         fractional=exit_is_fractional,
                     )
@@ -2796,6 +2901,7 @@ class AutoTrader:
             symbol
             for symbol, bucket in self.position_buckets.items()
             if bucket not in ALWAYS_FLATTEN_BUCKETS
+            and symbol not in self.short_symbols
         }
 
     def close_instruments(

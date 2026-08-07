@@ -145,6 +145,7 @@ class TradingStrategy:
             "spread_percent": round(spread_percent, 4),
             "range_ratio": round(max(0.0, range_ratio), 4),
             "high": high,
+            "low": low,
             "activity_score": activity,
         }
         self._update_vwap(symbol, price, volume)
@@ -212,14 +213,20 @@ class TradingStrategy:
             return None
         return Decimal(str(state["cum_pv"] / state["cum_vol"]))
 
-    def vwap_supports_entry(self, symbol: str, price: Decimal) -> bool:
+    def vwap_supports_entry(
+        self, symbol: str, price: Decimal, direction: str = "BUY"
+    ) -> bool:
         vwap = self.vwap(symbol)
         if vwap is None:
             return True
-        band = Decimal("1") - self.config.vwap_entry_band_percent
-        return price >= vwap * band
+        band = self.config.vwap_entry_band_percent
+        if direction == "SHORT":
+            return price <= vwap * (Decimal("1") + band)
+        return price >= vwap * (Decimal("1") - band)
 
-    def sma_trend_supports_entry(self, symbol: str, price: Decimal) -> bool:
+    def sma_trend_supports_entry(
+        self, symbol: str, price: Decimal, direction: str = "BUY"
+    ) -> bool:
         """Higher-timeframe trend filter: only let the fast EMA(3/8) scalp
         signal fire in the direction of the slower SMA_TREND_DAYS-day
         trend (see AutoTrader.refresh_sma_trend) - a scalp that's fighting
@@ -234,6 +241,8 @@ class TradingStrategy:
         sma = self.sma_trend.get(symbol)
         if sma is None:
             return True
+        if direction == "SHORT":
+            return price <= sma
         return price >= sma
 
     def priority_score(self, symbol: str, assessment: dict | None) -> float:
@@ -513,6 +522,16 @@ class TradingStrategy:
             self.crossover_counts[symbol] += 1
         if new_spread <= 0:
             self.trend_streak[key] = 0
+            # A fresh bearish cross (was bullish/flat, now bearish) is the
+            # short-side mirror of the "BUY" fresh-cross case below - a
+            # one-shot signal, not a continued-downtrend re-fire, same as
+            # option_direction_signal's PUT case. stock_decision only acts
+            # on this when SHORT_SELLING_ENABLED is on; it's always
+            # computed here regardless so the signal is available the
+            # moment shorting gets turned on without waiting on fresh
+            # history.
+            if old_spread > 0:
+                return "SHORT"
             return "HOLD"
         if old_spread <= 0:
             self.trend_streak[key] = 0
@@ -605,10 +624,13 @@ class TradingStrategy:
             return Decimal("0")
         return Decimal(up - down) / Decimal(total)
 
-    def tick_direction_ok(self, key: str) -> bool:
+    def tick_direction_ok(self, key: str, direction: str = "BUY") -> bool:
         if not self.config.tick_direction_enabled:
             return True
-        return self.tick_direction_score(key) >= self.config.tick_direction_veto_threshold
+        score = self.tick_direction_score(key)
+        if direction == "SHORT":
+            return score <= -self.config.tick_direction_veto_threshold
+        return score >= self.config.tick_direction_veto_threshold
 
     @staticmethod
     def obi_supports_entry(obi_score: Decimal | None) -> bool:
@@ -769,8 +791,84 @@ class TradingStrategy:
                         breakeven,
                     )
             return Decision("HOLD", "position between target and stop", target)
+        if quantity < 0:
+            # Mirror image of the long-side math above: a short's
+            # average_cost is the price it was sold short at, so it
+            # profits as price falls and loses as price rises - target/
+            # stop are below/above cost respectively, the opposite of a
+            # long position's.
+            short_quantity = -quantity
+            fee_per_share = self.config.sell_fee_dollars / short_quantity
+            stop_percent = self.adaptive_stop_percent(symbol)
+            target_percent = max(
+                self.config.stock_min_net_profit_percent
+                + self.config.stock_estimated_round_trip_cost_percent,
+                stop_percent * self.config.stock_target_stop_multiple,
+            )
+            base_target = average_cost * (Decimal("1") - target_percent) - fee_per_share
+            stop = average_cost * (Decimal("1") + stop_percent)
+            if average_cost > 0 and price >= stop:
+                return Decision("LOSS", "percentage stop reached (short)", price)
+            bias = self._exit_bias(assessment)
+            target = base_target
+            if (
+                self.config.agent_exit_influence_enabled
+                and average_cost > 0
+                and bias <= self.config.agent_derisk_bias_threshold
+            ):
+                # A negative exit_bias means "de-risk/exit now" for a long;
+                # for a short that same bearish-catalyst-fading signal is
+                # the runner case - a strong bearish thesis still playing
+                # out supports holding for a larger move down.
+                target = min(
+                    base_target,
+                    average_cost * (Decimal("1") - self.config.agent_runner_profit_percent)
+                    - fee_per_share,
+                )
+            if average_cost > 0 and price <= target:
+                reason = (
+                    "agent runner target reached (short)"
+                    if target < base_target
+                    else "percentage profit reached (short)"
+                )
+                return Decision("PROFIT", reason, target)
+            if (
+                self.config.agent_exit_influence_enabled
+                and average_cost > 0
+                and bias >= self.config.agent_runner_bias_threshold
+            ):
+                # A positive exit_bias (bullish catalyst) is the de-risk
+                # signal for a short - lock in whatever's there once past
+                # breakeven rather than let a reversal erase it.
+                breakeven = average_cost * (
+                    Decimal("1")
+                    - self.config.stock_estimated_round_trip_cost_percent
+                ) - fee_per_share
+                if price <= breakeven:
+                    return Decision(
+                        "PROFIT",
+                        "agent de-risk lock-in on fading short catalyst",
+                        breakeven,
+                    )
+            return Decision("HOLD", "short position between target and stop", target)
         if not self.entry_spread_ok(key, opening_grace_active):
             return Decision("HOLD", "spread too wide to scalp profitably")
+        if trend == "SHORT" and self.config.short_selling_enabled:
+            if not self.vwap_supports_entry(symbol, price, "SHORT"):
+                return Decision("HOLD", "price above session VWAP")
+            if not self.entry_extension_ok(symbol, price, opening_grace_active, "SHORT"):
+                return Decision(
+                    "HOLD", "price already extended near today's low"
+                )
+            if not self.sma_trend_supports_entry(symbol, price, "SHORT"):
+                return Decision(
+                    "HOLD", "price above the higher-timeframe SMA trend"
+                )
+            if self.tick_direction_ok(key, "SHORT"):
+                return Decision("SHORT", "EMA bearish entry confirmed")
+            return Decision(
+                "HOLD", "recent ticks trending against the short entry"
+            )
         if not self.vwap_supports_entry(symbol, price):
             return Decision("HOLD", "price below session VWAP")
         if not self.entry_extension_ok(symbol, price, opening_grace_active):
@@ -820,29 +918,37 @@ class TradingStrategy:
         symbol: str,
         price: Decimal,
         opening_grace_active: bool = False,
+        direction: str = "BUY",
     ) -> bool:
-        """Block chasing a name that's already sitting at today's high.
+        """Block chasing a name that's already sitting at today's high (or,
+        for a short, today's low).
 
         A crossover that only confirms once price is already at the peak
         of a fast spike is buying the top, not the move - require some
-        room below today's high before allowing a fresh entry. Right after
-        the open, today's high is barely established yet and gets set/reset
-        constantly, so the grace window shrinks the room required (smaller
-        buffer = more lenient) instead of dropping the check entirely.
+        room below today's high before allowing a fresh entry (mirrored:
+        a short needs room above today's low, not already chasing the
+        bottom). Right after the open, today's high/low is barely
+        established yet and gets set/reset constantly, so the grace window
+        shrinks the room required (smaller buffer = more lenient) instead
+        of dropping the check entirely.
         """
-        high = self.metrics.get(symbol, {}).get("high")
-        if not high:
+        reference = self.metrics.get(symbol, {}).get(
+            "low" if direction == "SHORT" else "high"
+        )
+        if not reference:
             return True
         try:
-            high_decimal = Decimal(str(high))
+            reference_decimal = Decimal(str(reference))
         except Exception:
             return True
-        if high_decimal <= 0:
+        if reference_decimal <= 0:
             return True
         extension_percent = self.config.stock_entry_max_extension_percent
         if opening_grace_active:
             extension_percent /= self.config.opening_grace_extension_multiplier
-        return price <= high_decimal * (Decimal("1") - extension_percent)
+        if direction == "SHORT":
+            return price >= reference_decimal * (Decimal("1") + extension_percent)
+        return price <= reference_decimal * (Decimal("1") - extension_percent)
 
     @staticmethod
     def research_supports_entry(assessment: dict | None) -> bool:
