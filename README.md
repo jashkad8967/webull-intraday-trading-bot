@@ -420,13 +420,18 @@ amount buys - not capped at one share the way the
 `FRACTIONAL_SHARES_ENABLED` fallback above is.
 
 Since Webull only allows fractional orders during core hours,
-`size_stock_entry()` (`bot.py`) splits capital between two independent
-per-cycle budgets during core hours instead of one style claiming every
-candidate: fractional is tried first against
-`STOCK_CORE_SESSION_POSITION_FRACTION` of buying power, and ordinary
-whole-share sizing (still bounded by `STOCK_QUANTITY`/`MAX_ORDER_NOTIONAL`
-as always) runs alongside it against its own slice,
-`STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION`:
+`size_stock_entry()` (`bot.py`) splits capital between two genuinely
+independent per-cycle budgets during core hours instead of one style
+claiming every candidate: `STOCK_CORE_SESSION_POSITION_FRACTION` of buying
+power is set aside for fractional entries and
+`STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION` for ordinary whole-share entries
+(still bounded by `STOCK_QUANTITY`/`MAX_ORDER_NOTIONAL` as always), each
+computed once at the start of the scan and spent down independently as
+entries land across the cycle - not one style re-trying the same "first
+crack" every candidate and only reaching the other's budget on failure,
+which would let fractional (tried first, and rarely failing outright) claim
+nearly every entry and leave the whole-share slice - a *larger* allocation
+by default - essentially unused:
 
 ```dotenv
 STOCK_CORE_SESSION_POSITION_FRACTION=0.15
@@ -434,7 +439,7 @@ STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION=0.35
 ```
 
 Whenever the fractional attempt produces nothing for a candidate (e.g. its
-slice of buying power falls under `FRACTIONAL_SHARES_MIN_NOTIONAL`), that
+remaining pool falls under `FRACTIONAL_SHARES_MIN_NOTIONAL`), that
 candidate falls through to the whole-share budget instead of being skipped
 outright. Outside core hours, `STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION`
 doesn't apply at all - fractional isn't usable then anyway, so whole-share
@@ -445,6 +450,19 @@ entirely and use fixed whole-share sizing (uncapped by the split fraction)
 all day. Both settings only affect the main stock strategy's
 `trade_stocks` entries - micro-scalp mode keeps its own fixed-cents sizing
 untouched.
+
+**Position-slot reservation.** A fractional position can only be exited
+during core hours (see the rejection note below), so if fractional entries
+were allowed to fill every `MAX_OPEN_POSITIONS` slot, the account would be
+stuck maxed-out and unexitable from market close through the next core
+session - blocking *all* new entries, fractional or whole-share, for the
+rest of the day. `trade_stocks` reserves fractional to at most
+`MAX_OPEN_POSITIONS * STOCK_CORE_SESSION_POSITION_FRACTION /
+(STOCK_CORE_SESSION_POSITION_FRACTION +
+STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION)` concurrently-open positions (at
+the defaults above, 6 of 20) - the same proportion as its capital share -
+so whole-share entries always have room to keep running into extended
+hours.
 
 Fractional orders (both the sizing above and the `FRACTIONAL_SHARES_ENABLED`
 fallback) require the Webull account itself to have agreed to fractional
@@ -724,7 +742,7 @@ AGENT_EXTENDED_RESEARCH_SECONDS=622
 AGENT_DAILY_TOKEN_BUDGET=90000
 AGENT_DAILY_REQUEST_LIMIT=250
 AGENT_MAX_SYMBOLS=5
-AGENT_DISCOVERY_MAX_SYMBOLS=5
+AGENT_MARKET_PULSE_SYMBOLS=5
 AGENT_TIMEOUT_SECONDS=60
 LOSS_CIRCUIT_BREAKER_ENABLED=true
 LOSS_SPREE_POSITION_COUNT=3
@@ -772,17 +790,25 @@ Every researched symbol contains `priority`, `quick_trade_score`,
 and `exit_bias`. Missing symbol output is replaced with conservative values
 rather than silently accepted.
 
-Every request searches for current popular, widely traded volatile stocks and
-ETFs (TASK A) in addition to assessing every supplied candidate (TASK B).
-Newly discovered symbols are accepted only when they also exist in Webull's
-current tradable universe. Discovery output is symbol-only - no other field
-downstream ever reads a discovery's popularity/volatility/confidence, so the
-model isn't asked to spend completion tokens producing them. The prompt is
-explicit that TASK B (the structured per-symbol assessment) is mandatory and
-must be completed in full even if the model skips or cuts short TASK A's web
-search - since there's no retry, a response that burned its whole budget on
-search and returned no assessments just falls back to conservative defaults
-for that one cycle rather than costing a second request.
+Every request's size is small and fixed, regardless of market conditions -
+this used to not be true: the agent was asked to freely web-search for
+"volatile stocks worth discovering," and compound-mini's own server-side
+search/retrieval could grow the effective prompt unpredictably, occasionally
+tripping Groq's `request_too_large` (413) and skipping the whole cycle.
+Discovery of new symbols is no longer the model's job at all - it's sourced
+directly and deterministically from Webull's own top-gainers, top-losers, and
+most-active screeners (`AGENT_MARKET_PULSE_SYMBOLS` per list, refreshed every
+two minutes, zero LLM calls involved), which also keeps that signal working
+even with `AGENT_ENABLED=false` or a failed request. The model's job is just
+to assess the STATE symbols it's given (positions/candidates, capped at
+`AGENT_MAX_SYMBOLS`), using the same market-pulse data as extra context rather
+than searching for it. Web search is now optional and narrowly scoped - at
+most one brief lookup, and only when a STATE symbol looks genuinely
+unexplained - instead of a standing open-ended discovery task, since a
+targeted single-ticker check is far more bounded than an open market scan. If
+a request still comes back oversized or malformed, that cycle falls back to
+conservative defaults rather than costing a retry; the next scheduled cycle
+tries again fresh.
 Research confidence, volatility, catalysts, and quick-trade scores boost the
 symbol's scan priority. A high-confidence, liquid, bullish setup with a
 30-minute-or-shorter horizon can add an entry path. Research never vetoes an
@@ -1440,7 +1466,7 @@ AGENT_EXTENDED_RESEARCH_SECONDS=622
 AGENT_DAILY_TOKEN_BUDGET=90000
 AGENT_DAILY_REQUEST_LIMIT=250
 AGENT_MAX_SYMBOLS=5
-AGENT_DISCOVERY_MAX_SYMBOLS=5
+AGENT_MARKET_PULSE_SYMBOLS=5
 AGENT_TIMEOUT_SECONDS=60
 LOSS_CIRCUIT_BREAKER_ENABLED=false
 LOSS_SPREE_POSITION_COUNT=3

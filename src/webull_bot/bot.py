@@ -67,6 +67,14 @@ ORDER_ERROR_WINDOW_SECONDS = 60
 OVERNIGHT_HOLD_ENABLED = True
 ALWAYS_FLATTEN_BUCKETS = frozenset({"MICRO_SCALP", "PAIRS_LONG", "PAIRS_SHORT"})
 
+# Deterministic market context (Webull's own gainers/losers/most-active
+# screeners - no LLM involved) refreshed on a slow, fixed cadence
+# independent of the ~4x/second poll loop. Feeds the research agent's
+# STATE as fixed-size context instead of asking it to discover movers via
+# open-ended web search, and feeds agent_popular_symbols directly so that
+# signal keeps working even if the agent is disabled or a request fails.
+MARKET_PULSE_REFRESH_SECONDS = 120
+
 
 class AutoTrader:
     def __init__(self):
@@ -142,6 +150,12 @@ class AutoTrader:
         self.last_day_end_log_date = None
         self.seed_popular_symbols: set[str] = set()
         self.agent_popular_symbols: set[str] = set()
+        self.market_pulse_cache: dict[str, list[dict]] = {
+            "gainers": [],
+            "losers": [],
+            "most_active": [],
+        }
+        self.last_market_pulse_refresh = 0.0
         self.position_buckets: dict[str, str] = {}
         self.stop_exit_submitted: dict[str, float] = {}
         self.stop_loss_escalated: set[str] = set()
@@ -312,6 +326,64 @@ class AutoTrader:
                 exc,
             )
             return {symbol: {"market_value": self.stock_market_values.get(symbol, 0.0)} for symbol in self.stock_symbols}
+
+    def safe_top_losers(self, limit: int, page_size: int) -> dict[str, dict]:
+        try:
+            return self.api.top_losers(limit, page_size)
+        except Exception as exc:
+            log.warning("LOAD   | top-losers screener failed this cycle | %s", exc)
+            return {}
+
+    def safe_market_pulse_active(self, limit: int, page_size: int) -> dict[str, dict]:
+        """Distinct from safe_top_active_stocks: that method's failure
+        fallback is the prior day's whole trading universe (right for a
+        once-daily universe rebuild), which would blow up market_pulse's
+        small-fixed-size guarantee. This falls back to empty instead.
+        """
+        try:
+            return self.api.top_active_stocks(limit, page_size)
+        except Exception as exc:
+            log.warning("LOAD   | most-active screener failed this cycle | %s", exc)
+            return {}
+
+    @staticmethod
+    def _market_pulse_entries(data: dict[str, dict]) -> list[dict]:
+        return [
+            {
+                "symbol": symbol,
+                "chg": AutoTrader._compact_number(
+                    item.get("change_ratio", 0) * 100, 2
+                ),
+                "vol": AutoTrader._compact_number(item.get("volume", 0)),
+            }
+            for symbol, item in data.items()
+        ]
+
+    def refresh_market_pulse(self) -> None:
+        """Small, fixed-size, fully deterministic market context (Webull's
+        own gainers/losers/most-active screeners) refreshed on a slow,
+        fixed cadence independent of the poll loop - this replaces asking
+        the research agent to discover movers via open-ended web search,
+        which was the actual source of unpredictable request size (and the
+        occasional Groq 413). Each of the three lists is capped at
+        AGENT_MARKET_PULSE_SYMBOLS, so the payload this feeds downstream
+        never grows with market conditions. Uses its own small-list
+        fallback (empty, not the prior universe) on a screener failure -
+        this is market color, not the trading universe.
+        """
+        now = time.monotonic()
+        if now - self.last_market_pulse_refresh < MARKET_PULSE_REFRESH_SECONDS:
+            return
+        self.last_market_pulse_refresh = now
+        limit = self.config.agent_market_pulse_symbols
+        gainers = self.safe_top_gainers(limit, limit)
+        losers = self.safe_top_losers(limit, limit)
+        most_active = self.safe_market_pulse_active(limit, limit)
+        self.market_pulse_cache = {
+            "gainers": self._market_pulse_entries(gainers),
+            "losers": self._market_pulse_entries(losers),
+            "most_active": self._market_pulse_entries(most_active),
+        }
 
     def resolve_targets(self, moment: datetime) -> None:
         if self.resolved_date == moment.date():
@@ -931,29 +1003,37 @@ class AutoTrader:
         self,
         price: Decimal,
         entry_budget: Decimal,
-        buying_power: Decimal,
+        fractional_remaining: Decimal,
+        whole_share_remaining: Decimal,
         core_session_active: bool,
+        fractional_slot_available: bool = True,
     ) -> tuple[Decimal, Decimal, bool]:
         """Splits capital between fractional and whole-share entry sizing
         instead of one style claiming every candidate during core hours.
 
-        Fractional (STOCK_CORE_SESSION_POSITION_FRACTION of buying power)
-        is tried first when eligible; whole-share sizing then covers
-        everything else, capped to its own slice
-        (STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION) during core hours so it
-        runs alongside the fractional budget rather than exhausting the
-        whole cycle's capital on one style - but uncapped (the full
-        entry_budget) outside core hours, since fractional isn't usable
-        there at all and there's no second style left to share room with.
+        fractional_remaining/whole_share_remaining are each computed ONCE
+        per trade_stocks cycle (buying_power * their respective fraction)
+        and decremented by the caller as buys land - passing a live,
+        already-shrinking buying_power in here instead would let fractional
+        sizing succeed for nearly every candidate (its own cap barely
+        shrinks relative to total buying power), leaving whole-share
+        sizing's larger capital slice essentially unreachable during core
+        hours. fractional_slot_available additionally gates fractional
+        sizing on a reserved position-count budget (see trade_stocks) - a
+        fractional position can't be exited outside core hours, so
+        fractional entries alone filling every MAX_OPEN_POSITIONS slot
+        would strand the account with no room for entries of any style for
+        the rest of the day.
         Returns (quantity, buffered_price, is_fractional).
         """
         if (
             core_session_active
             and self.fractional_trading_enabled
-            and self.config.stock_core_session_position_fraction > 0
+            and fractional_slot_available
+            and fractional_remaining > 0
         ):
             target_notional = min(
-                buying_power * self.config.stock_core_session_position_fraction,
+                fractional_remaining,
                 entry_budget,
                 self.config.max_order_notional,
             )
@@ -963,10 +1043,7 @@ class AutoTrader:
             if quantity > 0:
                 return quantity, buffered_price, True
         whole_share_budget = (
-            min(
-                entry_budget,
-                buying_power * self.config.stock_whole_share_core_session_fraction,
-            )
+            min(entry_budget, whole_share_remaining)
             if core_session_active
             else entry_budget
         )
@@ -976,15 +1053,20 @@ class AutoTrader:
         return quantity, buffered_price, False
 
     def refresh_agent_discoveries(self) -> None:
-        if not self.market_agent:
-            self.agent_popular_symbols.clear()
-            return
+        """Sourced from the deterministic market_pulse screener data, not
+        the research agent - this keeps working (and keeps priority
+        scanning pointed at today's actual movers) even if AGENT_ENABLED
+        is false or a Groq request fails.
+        """
+        self.refresh_market_pulse()
         available = set(self.stock_symbols)
-        discoveries = self.market_agent.discoveries()
+        pulse_symbols = {
+            entry["symbol"]
+            for bucket in self.market_pulse_cache.values()
+            for entry in bucket
+        }
         self.agent_popular_symbols = {
-            str(item.get("symbol", "")).upper()
-            for item in discoveries
-            if str(item.get("symbol", "")).upper() in available
+            symbol for symbol in pulse_symbols if symbol in available
         }
 
     def submit_agent_research(
@@ -996,6 +1078,7 @@ class AutoTrader:
     ) -> None:
         if not self.market_agent:
             return
+        self.refresh_market_pulse()
         research_limit = min(self.config.agent_max_symbols, 10)
         held = [
             {
@@ -1036,6 +1119,7 @@ class AutoTrader:
                 "candidates": [
                     self._compact_candidate(item) for item in candidates
                 ],
+                "market_pulse": self.market_pulse_cache,
             },
             force=force,
         )
@@ -1194,6 +1278,28 @@ class AutoTrader:
     @staticmethod
     def is_fractional_quantity(quantity: Decimal) -> bool:
         return quantity != quantity.to_integral_value()
+
+    @staticmethod
+    def max_fractional_position_slots(
+        max_open_positions: int,
+        fractional_fraction: Decimal,
+        whole_share_fraction: Decimal,
+    ) -> int:
+        """Caps how many concurrently-open fractional-quantity stock
+        positions there can be, reserved in the same proportion as
+        fractional's capital share. A fractional position can't be exited
+        outside core hours (Webull constraint - see is_fractional_quantity
+        gating in trade_stocks), so letting fractional entries alone fill
+        every MAX_OPEN_POSITIONS slot during core hours would strand the
+        account with an unexitable, maxed-out position count for the rest
+        of the day - no new entries of any style until the next core
+        session. At least 1 slot is always reserved when fractional
+        capital is allocated at all.
+        """
+        capital_split = fractional_fraction + whole_share_fraction
+        if capital_split <= 0:
+            return max_open_positions
+        return max(1, int(max_open_positions * fractional_fraction / capital_split))
 
     def price_sanity_ok(self, last_price: Decimal, limit_price: Decimal) -> bool:
         """Fat-finger guard: reject a limit price that's implausibly far
@@ -1474,6 +1580,25 @@ class AutoTrader:
         }
         bucket_slot_limits = self.config.stock_bucket_slot_limits()
         bucket_position_counts = {bucket: 0 for bucket in bucket_slot_limits}
+        # Two independent capital pools for this cycle, computed once (not
+        # re-derived from a live-shrinking buying_power on every candidate)
+        # so fractional and whole-share sizing genuinely run side by side -
+        # see size_stock_entry. Previously fractional sizing was tried for
+        # every eligible candidate and almost always succeeded, so
+        # whole-share sizing (a LARGER capital slice than fractional's) was
+        # essentially unreachable during core hours.
+        fractional_remaining = (
+            buying_power * self.config.stock_core_session_position_fraction
+        )
+        whole_share_remaining = (
+            buying_power * self.config.stock_whole_share_core_session_fraction
+        )
+        max_fractional_positions = self.max_fractional_position_slots(
+            self.config.max_open_positions,
+            self.config.stock_core_session_position_fraction,
+            self.config.stock_whole_share_core_session_fraction,
+        )
+        fractional_position_count = 0
         known_popular = self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist
         for position in positions:
             if (
@@ -1481,6 +1606,8 @@ class AutoTrader:
                 or Decimal(str(position.get("quantity", "0"))) == 0
             ):
                 continue
+            if self.is_fractional_quantity(Decimal(str(position.get("quantity", "0")))):
+                fractional_position_count += 1
             position_symbol = str(position.get("symbol", "")).upper()
             bucket = self.position_buckets.get(position_symbol)
             if bucket not in bucket_position_counts:
@@ -1612,13 +1739,19 @@ class AutoTrader:
                         bucket_remaining.get(bucket, Decimal("0")),
                     )
                     buy_quantity, buffered_price, fractional = self.size_stock_entry(
-                        price, entry_budget, buying_power, core_session_active
+                        price,
+                        entry_budget,
+                        fractional_remaining,
+                        whole_share_remaining,
+                        core_session_active,
+                        fractional_position_count < max_fractional_positions,
                     )
                     if (
                         buy_quantity == 0
                         and self.config.fractional_shares_enabled
                         and core_session_active
                         and self.fractional_trading_enabled
+                        and fractional_position_count < max_fractional_positions
                     ):
                         fractional_quantity = self.strategy.fractional_stock_quantity(
                             price,
@@ -1664,6 +1797,17 @@ class AutoTrader:
                             bucket_remaining.get(bucket, Decimal("0"))
                             - buffered_price * buy_quantity,
                         )
+                        if fractional:
+                            fractional_remaining = max(
+                                Decimal("0"),
+                                fractional_remaining - buffered_price * buy_quantity,
+                            )
+                            fractional_position_count += 1
+                        else:
+                            whole_share_remaining = max(
+                                Decimal("0"),
+                                whole_share_remaining - buffered_price * buy_quantity,
+                            )
                         self.position_buckets[symbol] = bucket
                         bucket_position_counts[bucket] += 1
                         positions.append(
@@ -2571,7 +2715,7 @@ class AutoTrader:
         if self.market_agent:
             agent_summary = {
                 "enabled": True,
-                "discoveries": self.market_agent.discoveries(),
+                "market_pulse": self.market_pulse_cache,
                 "popular_symbols": sorted(self.agent_popular_symbols),
             }
         unrealized_total = sum(

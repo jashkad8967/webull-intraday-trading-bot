@@ -289,7 +289,12 @@ class Settings(BaseSettings):
     # assumes the free/on-demand llama-3.3-70b-versatile tier (100000 TPD).
     agent_daily_token_budget: int = Field(default=90000, ge=1000)
     agent_max_symbols: int = Field(default=5, ge=1, le=50)
-    agent_discovery_max_symbols: int = Field(default=5, ge=1, le=25)
+    # Per-list cap (gainers/losers/most-active each) for the deterministic
+    # market-pulse context fed to the research agent - see
+    # AutoTrader.refresh_market_pulse(). Small and fixed on purpose: this
+    # replaced asking the agent to discover movers via open-ended web
+    # search, which was the actual source of unpredictable request size.
+    agent_market_pulse_symbols: int = Field(default=5, ge=1, le=10)
     agent_timeout_seconds: int = Field(default=60, ge=5, le=180)
     agent_exit_influence_enabled: bool = True
     agent_exit_min_confidence: Decimal = Field(

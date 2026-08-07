@@ -371,10 +371,13 @@ async function refresh() {
     if (!agent) {
       document.getElementById("agent").innerHTML = '<div class="empty">Research agent disabled</div>';
     } else {
-      const discoveries = (agent.discoveries || []).map(d => d.symbol).join(", ") || "none yet";
+      const pulse = agent.market_pulse || {};
+      const pulseList = list => (list || []).map(e => `${e.symbol} (${e.chg > 0 ? "+" : ""}${e.chg}%)`).join(", ") || "none yet";
       const popular = (agent.popular_symbols || []).join(", ") || "none yet";
       document.getElementById("agent").innerHTML =
-        `<div><strong>Discoveries:</strong> ${discoveries}</div>` +
+        `<div><strong>Gainers:</strong> ${pulseList(pulse.gainers)}</div>` +
+        `<div style="margin-top:0.4rem"><strong>Losers:</strong> ${pulseList(pulse.losers)}</div>` +
+        `<div style="margin-top:0.4rem"><strong>Most active:</strong> ${pulseList(pulse.most_active)}</div>` +
         `<div style="margin-top:0.4rem"><strong>Boosted priority:</strong> ${popular}</div>`;
     }
   } catch (err) {
