@@ -579,6 +579,30 @@ class WebullAPI:
             page_size,
         )
 
+    def top_losers(
+        self,
+        total_limit: int,
+        page_size: int,
+        rank_type: str = "DAY_1",
+    ) -> dict[str, dict]:
+        """Same screener as top_gainers, ranked ascending instead (today's
+        biggest decliners).
+        """
+        from webull.data.common.category import Category
+
+        return self._page_screener(
+            lambda page_index, requested_size: self.data.screener.get_gainers_losers(
+                rank_type=rank_type,
+                category=Category.US_STOCK.name,
+                sort_by="CHANGE_RATIO",
+                direction="ASC",
+                page_index=page_index,
+                page_size=requested_size,
+            ),
+            total_limit,
+            page_size,
+        )
+
     def historical_volatility(
         self,
         symbols: list[str],

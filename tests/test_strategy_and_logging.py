@@ -1772,13 +1772,11 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(
             agent_daily_request_limit=250,
-            agent_discovery_max_symbols=5,
             groq_model="groq/compound-mini",
         )
         agent.log = logging.getLogger("test-agent")
         agent._requests_today = 0
         agent._assessments = {}
-        agent._discoveries = []
         agent._lock = threading.Lock()
 
         calls = []
@@ -1816,24 +1814,19 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual(agent._assessments["NVDA"]["priority"], 0)
         self.assertEqual(agent._assessments["NVDA"]["confidence"], 0)
 
-    def test_discoveries_are_normalized_for_later_broker_validation(self):
+    def test_normalize_no_longer_produces_a_discoveries_key(self):
+        """Discovery of new symbols moved out of the model entirely (see
+        AutoTrader.refresh_market_pulse) - _normalize's output shape
+        shouldn't carry a vestigial discoveries field even if a stale
+        prompt/response still mentions one.
+        """
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
-        agent.config = SimpleNamespace(agent_discovery_max_symbols=2)
+        agent.config = SimpleNamespace()
         payload = agent._normalize(
-            {
-                "discoveries": [
-                    {
-                        "symbol": "nvda",
-                        "popularity": 2,
-                        "symbol_volatility": 0.8,
-                        "confidence": 0.9,
-                    },
-                    {"symbol": "not a ticker"},
-                ]
-            },
+            {"discoveries": [{"symbol": "NVDA"}]},
             set(),
         )
-        self.assertEqual([item["symbol"] for item in payload["discoveries"]], ["NVDA"])
+        self.assertNotIn("discoveries", payload)
 
 
 class AllocationAndLoggingTests(unittest.TestCase):
@@ -2430,6 +2423,34 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         self.assertEqual(gainers["MOVER1"]["change_ratio"], 12.5)
         self.assertTrue(all(call == "market" for call in calls))
 
+    def test_top_losers_pages_using_ascending_change_ratio_screener(self):
+        api = WebullAPI.__new__(WebullAPI)
+        fake_category = SimpleNamespace(US_STOCK=SimpleNamespace(name="US_STOCK"))
+
+        def fake_call(callback, group):
+            return callback()
+
+        def fake_get_gainers_losers(**kwargs):
+            self.assertEqual(kwargs["sort_by"], "CHANGE_RATIO")
+            self.assertEqual(kwargs["direction"], "ASC")
+            if kwargs["page_index"] == 1:
+                return [{"symbol": "dropper1", "market_value": "5e9", "change_ratio": "-8.2"}]
+            return []
+
+        api._call = fake_call
+        api.data = SimpleNamespace(
+            screener=SimpleNamespace(get_gainers_losers=fake_get_gainers_losers)
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"webull.data.common.category": SimpleNamespace(Category=fake_category)},
+        ):
+            losers = api.top_losers(total_limit=10, page_size=5)
+
+        self.assertEqual(set(losers), {"DROPPER1"})
+        self.assertEqual(losers["DROPPER1"]["change_ratio"], -8.2)
+
     def test_filter_with_popular_reinstated_keeps_configured_names(self):
         from webull_bot.bot import AutoTrader
 
@@ -2525,6 +2546,102 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
 
         self.assertEqual(set(result), {"OLD1", "OLD2"})
         self.assertEqual(result["OLD1"]["market_value"], 1e11)
+
+    def test_safe_top_losers_survives_screener_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("Webull API error 500: boom")
+
+        fake_bot.api = SimpleNamespace(top_losers=boom)
+        safe_call = AutoTrader.safe_top_losers.__get__(fake_bot)
+
+        self.assertEqual(safe_call(5, 5), {})
+
+    def test_safe_market_pulse_active_falls_back_to_empty_not_prior_universe(self):
+        """Distinct from safe_top_active_stocks: market_pulse must stay
+        small on a screener failure, not balloon to the whole trading
+        universe (that fallback is only correct for the once-daily
+        universe rebuild).
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("Webull API error 503: boom")
+
+        fake_bot.api = SimpleNamespace(top_active_stocks=boom)
+        fake_bot.stock_symbols = ["OLD1", "OLD2", "OLD3"]
+        safe_call = AutoTrader.safe_market_pulse_active.__get__(fake_bot)
+
+        self.assertEqual(safe_call(5, 5), {})
+
+    def test_market_pulse_entries_compacts_screener_rows(self):
+        from webull_bot.bot import AutoTrader
+
+        entries = AutoTrader._market_pulse_entries(
+            {"NVDA": {"change_ratio": 0.125, "volume": 1_000_000}}
+        )
+        self.assertEqual(entries, [{"symbol": "NVDA", "chg": 12.5, "vol": 1_000_000}])
+
+    def test_refresh_market_pulse_is_throttled_and_small(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(agent_market_pulse_symbols=2)
+        fake_bot.last_market_pulse_refresh = 0.0
+        fake_bot.market_pulse_cache = {"gainers": [], "losers": [], "most_active": []}
+        calls = []
+        fake_bot.safe_top_gainers = lambda limit, page: (
+            calls.append("gainers"),
+            {"G1": {"change_ratio": 0.05, "volume": 100}},
+        )[1]
+        fake_bot.safe_top_losers = lambda limit, page: (
+            calls.append("losers"),
+            {"L1": {"change_ratio": -0.05, "volume": 200}},
+        )[1]
+        fake_bot.safe_market_pulse_active = lambda limit, page: (
+            calls.append("most_active"),
+            {"A1": {"change_ratio": 0.01, "volume": 300}},
+        )[1]
+        refresh = AutoTrader.refresh_market_pulse.__get__(fake_bot)
+
+        refresh()
+        self.assertEqual(sorted(calls), ["gainers", "losers", "most_active"])
+        self.assertEqual(fake_bot.market_pulse_cache["gainers"][0]["symbol"], "G1")
+        self.assertEqual(fake_bot.market_pulse_cache["losers"][0]["symbol"], "L1")
+        self.assertEqual(fake_bot.market_pulse_cache["most_active"][0]["symbol"], "A1")
+
+        # A second call within MARKET_PULSE_REFRESH_SECONDS makes no new
+        # screener calls - this must stay off the ~4x/second poll loop.
+        calls.clear()
+        refresh()
+        self.assertEqual(calls, [])
+
+    def test_refresh_agent_discoveries_sources_from_market_pulse(self):
+        """agent_popular_symbols must keep working from the deterministic
+        screener data even when the research agent itself is disabled -
+        that's the whole point of decoupling discovery from the LLM call.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.market_agent = None
+        fake_bot.stock_symbols = ["NVDA", "TSLA", "AMD"]
+        fake_bot.market_pulse_cache = {
+            "gainers": [{"symbol": "NVDA", "chg": 5.0, "vol": 1}],
+            "losers": [{"symbol": "TSLA", "chg": -3.0, "vol": 1}],
+            "most_active": [{"symbol": "UNKNOWN", "chg": 0.1, "vol": 1}],
+        }
+        fake_bot.refresh_market_pulse = lambda: None
+        refresh = AutoTrader.refresh_agent_discoveries.__get__(fake_bot)
+
+        refresh()
+
+        self.assertEqual(fake_bot.agent_popular_symbols, {"NVDA", "TSLA"})
 
 
 class BrokerConflictTests(unittest.TestCase):
@@ -3760,8 +3877,11 @@ class EntrySizingSplitTests(unittest.TestCase):
             stock_quantity=100,
         )
         size = self._size_fn(config)
+        # fractional_remaining/whole_share_remaining are precomputed by the
+        # caller once per cycle (10000 * 0.15 / 10000 * 0.35) - see
+        # trade_stocks - not derived live inside size_stock_entry itself.
         quantity, buffered_price, fractional = size(
-            Decimal("50"), Decimal("10000"), Decimal("10000"), True
+            Decimal("50"), Decimal("10000"), Decimal("1500"), Decimal("3500"), True
         )
         self.assertTrue(fractional)
         self.assertGreater(quantity, 0)
@@ -3775,10 +3895,10 @@ class EntrySizingSplitTests(unittest.TestCase):
         )
         size = self._size_fn(config)
         quantity, buffered_price, fractional = size(
-            Decimal("50"), Decimal("10000"), Decimal("10000"), True
+            Decimal("50"), Decimal("10000"), Decimal("0"), Decimal("3500"), True
         )
         self.assertFalse(fractional)
-        # whole-share budget = min(entry_budget=10000, 10000*0.35=3500) = 3500
+        # whole-share budget = min(entry_budget=10000, 3500) = 3500
         # buffered_price = 50*1.03 = 51.5 -> floor(3500/51.5) = 67
         self.assertEqual(quantity, 67)
 
@@ -3791,29 +3911,88 @@ class EntrySizingSplitTests(unittest.TestCase):
         )
         size = self._size_fn(config, fractional_trading_enabled=False)
         quantity, buffered_price, fractional = size(
-            Decimal("50"), Decimal("10000"), Decimal("10000"), True
+            Decimal("50"), Decimal("10000"), Decimal("1500"), Decimal("2000"), True
         )
         self.assertFalse(fractional)
-        # whole-share budget = min(10000, 10000*0.20=2000) = 2000
+        # whole-share budget = min(10000, 2000) = 2000
         # floor(2000/51.5) = 38
         self.assertEqual(quantity, 38)
 
-    def test_outside_core_hours_whole_share_budget_is_not_capped(self):
+    def test_no_fractional_slot_available_uses_whole_share_budget(self):
+        """Position-cap reservation gate (see trade_stocks'
+        max_fractional_positions): even with a full fractional pool and
+        fractional trading enabled, a caller-signaled "no slot available"
+        must force whole-share sizing - a fractional position can't be
+        exited outside core hours, so letting fractional alone fill every
+        MAX_OPEN_POSITIONS slot would strand the account for the rest of
+        the day.
+        """
         config = Settings(
             stock_core_session_position_fraction=Decimal("0.15"),
-            # Deliberately tiny - must NOT apply outside core hours, or
-            # this test would only afford ~1 share instead of ~194.
-            stock_whole_share_core_session_fraction=Decimal("0.01"),
+            stock_whole_share_core_session_fraction=Decimal("0.20"),
             stock_quantity=1000,
             max_order_notional=Decimal("100000"),
         )
         size = self._size_fn(config)
         quantity, buffered_price, fractional = size(
-            Decimal("50"), Decimal("10000"), Decimal("10000"), False
+            Decimal("50"),
+            Decimal("10000"),
+            Decimal("1500"),
+            Decimal("2000"),
+            True,
+            False,
+        )
+        self.assertFalse(fractional)
+        self.assertEqual(quantity, 38)
+
+    def test_outside_core_hours_whole_share_budget_is_not_capped(self):
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0.15"),
+            stock_whole_share_core_session_fraction=Decimal("0.01"),
+            stock_quantity=1000,
+            max_order_notional=Decimal("100000"),
+        )
+        size = self._size_fn(config)
+        # Deliberately tiny whole_share_remaining - must NOT apply outside
+        # core hours, or this test would only afford ~1 share instead of
+        # ~194.
+        quantity, buffered_price, fractional = size(
+            Decimal("50"), Decimal("10000"), Decimal("1500"), Decimal("100"), False
         )
         self.assertFalse(fractional)
         # Full entry_budget=10000 used, uncapped -> floor(10000/51.5) = 194
         self.assertEqual(quantity, 194)
+
+    def test_max_fractional_position_slots_reserves_proportionally(self):
+        from webull_bot.bot import AutoTrader
+
+        # 0.15 fractional : 0.35 whole-share of a 20-slot cap -> 6 slots
+        # reserved for fractional, guaranteeing 14 remain for whole-share/
+        # other styles even if fractional fills every slot it can.
+        self.assertEqual(
+            AutoTrader.max_fractional_position_slots(
+                20, Decimal("0.15"), Decimal("0.35")
+            ),
+            6,
+        )
+
+    def test_max_fractional_position_slots_reserves_at_least_one(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertEqual(
+            AutoTrader.max_fractional_position_slots(
+                20, Decimal("0.01"), Decimal("0.99")
+            ),
+            1,
+        )
+
+    def test_max_fractional_position_slots_falls_back_when_no_capital_allocated(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertEqual(
+            AutoTrader.max_fractional_position_slots(20, Decimal("0"), Decimal("0")),
+            20,
+        )
 
     def test_fractional_failure_falls_through_to_whole_share(self):
         config = Settings(
@@ -3824,11 +4003,11 @@ class EntrySizingSplitTests(unittest.TestCase):
             fractional_shares_min_notional=Decimal("5"),
         )
         size = self._size_fn(config)
-        # buying_power=30: 15% = $4.50, under the $5 fractional minimum,
-        # so the fractional attempt must produce 0 and fall through to
+        # fractional_remaining=$4.50, under the $5 fractional minimum, so
+        # the fractional attempt must produce 0 and fall through to
         # whole-share sizing instead of returning 0 outright.
         quantity, buffered_price, fractional = size(
-            Decimal("5"), Decimal("1000"), Decimal("30"), True
+            Decimal("5"), Decimal("1000"), Decimal("4.5"), Decimal("10.5"), True
         )
         self.assertFalse(fractional)
         self.assertGreater(quantity, 0)
