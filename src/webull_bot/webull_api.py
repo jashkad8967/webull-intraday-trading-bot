@@ -701,6 +701,68 @@ class WebullAPI:
                 amplitudes[symbol] = amplitude
         return amplitudes
 
+    def sma_trend(self, symbols: list[str], days: int) -> dict[str, float]:
+        """Simple moving average of the last `days` daily closes per
+        symbol - a real higher-timeframe trend reference built from actual
+        daily bars, independent of the bot's own fast EMA(3/8) scalp
+        signal (built from a handful of quarter-second tick polls, which
+        isn't a meaningful multi-day trend read on its own). Same
+        resilient batching/parsing structure as historical_volatility.
+        """
+        from webull.data.common.category import Category
+        from webull.data.common.timespan import Timespan
+
+        results: dict[str, float] = {}
+        unique = list(dict.fromkeys(symbol.upper() for symbol in symbols))
+        count = str(max(days, 6))
+        for start in range(0, len(unique), 20):
+            batch = unique[start : start + 20]
+            page = self._history_bars_resilient(
+                batch,
+                Category.US_STOCK.name,
+                Timespan.D.name,
+                count,
+            )
+            for symbol, sma in self._parse_closes(page, days).items():
+                results[symbol] = sma
+        return results
+
+    @classmethod
+    def _parse_closes(cls, page, days: int) -> dict[str, float]:
+        closes: dict[str, float] = {}
+        for entry in page or []:
+            if not isinstance(entry, dict):
+                continue
+            symbol = str(entry.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            bars = entry.get("bars")
+            if not isinstance(bars, list):
+                candles = entry.get("candles")
+                bars = candles if isinstance(candles, list) else None
+            if bars is None:
+                continue
+            sma = cls._average_close(bars, days)
+            if sma is not None:
+                closes[symbol] = sma
+        return closes
+
+    @staticmethod
+    def _average_close(bars: list, days: int) -> float | None:
+        samples: list[float] = []
+        for bar in bars[:days]:
+            if not isinstance(bar, dict):
+                continue
+            try:
+                close = float(bar.get("close"))
+            except (TypeError, ValueError):
+                continue
+            if close > 0:
+                samples.append(close)
+        if not samples:
+            return None
+        return sum(samples) / len(samples)
+
     @staticmethod
     def _average_amplitude(bars: list, days: int) -> float | None:
         samples: list[float] = []

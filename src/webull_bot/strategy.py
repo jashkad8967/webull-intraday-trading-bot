@@ -68,6 +68,12 @@ class TradingStrategy:
         self.tick_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=config.tick_direction_window)
         )
+        # Higher-timeframe SMA trend reference (real daily-bar closes, not
+        # derived from tick polls) - refreshed once daily by
+        # AutoTrader.refresh_sma_trend, deliberately NOT cleared by
+        # clear_market_state's once-daily reset so a failed refresh keeps
+        # yesterday's (still roughly valid) SMA rather than going empty.
+        self.sma_trend: dict[str, Decimal] = {}
 
     def clear_market_state(self) -> None:
         self.activity.clear()
@@ -212,6 +218,23 @@ class TradingStrategy:
             return True
         band = Decimal("1") - self.config.vwap_entry_band_percent
         return price >= vwap * band
+
+    def sma_trend_supports_entry(self, symbol: str, price: Decimal) -> bool:
+        """Higher-timeframe trend filter: only let the fast EMA(3/8) scalp
+        signal fire in the direction of the slower SMA_TREND_DAYS-day
+        trend (see AutoTrader.refresh_sma_trend) - a scalp that's fighting
+        the larger trend is a lower-quality setup even when the short-term
+        crossover looks right. Off by default (SMA_TREND_FILTER_ENABLED)
+        and passes through when a symbol has no cached SMA yet (fresh
+        listing, screener miss, or the refresh hasn't run this run), same
+        "no data -> don't block" convention as every other entry gate.
+        """
+        if not self.config.sma_trend_filter_enabled:
+            return True
+        sma = self.sma_trend.get(symbol)
+        if sma is None:
+            return True
+        return price >= sma
 
     def priority_score(self, symbol: str, assessment: dict | None) -> float:
         score = self.activity.get(symbol, 0.0)
@@ -752,6 +775,8 @@ class TradingStrategy:
             return Decision("HOLD", "price below session VWAP")
         if not self.entry_extension_ok(symbol, price, opening_grace_active):
             return Decision("HOLD", "price already extended near today's high")
+        if not self.sma_trend_supports_entry(symbol, price):
+            return Decision("HOLD", "price below the higher-timeframe SMA trend")
         if trend == "BUY":
             if self.tick_direction_ok(key):
                 return Decision("BUY", "EMA entry confirmed")

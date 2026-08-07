@@ -990,6 +990,34 @@ include losing trades, bid/ask spread, slippage, and orders that do not fill.
 `SELL_FEE_DOLLARS` models the regulatory fee on each sell; any other
 commissions your account is subject to are not.
 
+### Higher-timeframe SMA trend filter
+
+`EMA_FAST_PERIOD`/`EMA_SLOW_PERIOD` above are built from a handful of
+quarter-second price polls - a real signal for a fast scalp, but not a
+meaningful multi-day trend read on their own. `SMA_TREND_FILTER_ENABLED` adds
+a second, independent trend reference built from real daily bars instead:
+
+```dotenv
+SMA_TREND_FILTER_ENABLED=true
+SMA_TREND_DAYS=50
+```
+
+Once enabled, a fresh entry (whether triggered by the EMA crossover or by a
+strong standalone research setup) additionally requires price to be at or
+above the symbol's own `SMA_TREND_DAYS`-day simple moving average of daily
+closes - the bot won't scalp long against the larger trend even when the
+short-term crossover looks right. The SMA reference is refreshed once daily
+(`AutoTrader.refresh_sma_trend`, called during the daily universe rebuild,
+not every poll - daily bars don't meaningfully change intraday) and merges
+into the existing cache rather than replacing it outright, so a partial or
+failed refresh degrades to the previous day's (still roughly valid) values
+instead of going empty and effectively disabling the filter. A symbol with no
+cached SMA yet (fresh listing, screener miss, filter just turned on) passes
+through ungated, same "no data → don't block" convention as every other entry
+gate here. Off by default - a strict trend filter can meaningfully cut entry
+frequency on a chop-heavy universe, so confirm it fits your symbol mix before
+enabling it live.
+
 ## 6. Set sizes and limits
 
 ```dotenv
