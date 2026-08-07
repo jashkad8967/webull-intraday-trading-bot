@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     # frequency on a chop-heavy universe).
     sma_trend_filter_enabled: bool = False
     sma_trend_days: int = Field(default=50, ge=5, le=250)
+    # Directional short-selling in the main EMA/SMA stock strategy - a
+    # fresh bearish EMA cross opens a short instead of just being skipped.
+    # Off by default: the account needs margin/short approval, and Webull
+    # rejections surface naturally (see is_broker_position_conflict-style
+    # handling in bot.py) rather than being pre-checked here. Shorts always
+    # flatten same-day regardless of OVERNIGHT_HOLD_ENABLED - overnight
+    # gap/squeeze risk on a short is asymmetric (unbounded loss) unlike a
+    # long's overnight risk.
+    short_selling_enabled: bool = False
     popular_stock_symbols: str = (
         "NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,GOOGL,NFLX,AVGO,"
         "COIN,PLTR,MSTR,HOOD,SOFI,RIVN,GME,AMC,NIO,BABA,F,SNAP,UBER,"

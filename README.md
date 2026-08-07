@@ -1018,6 +1018,38 @@ gate here. Off by default - a strict trend filter can meaningfully cut entry
 frequency on a chop-heavy universe, so confirm it fits your symbol mix before
 enabling it live.
 
+### Short selling
+
+The main EMA/SMA stock strategy is directional on both sides when enabled:
+
+```dotenv
+SHORT_SELLING_ENABLED=false
+```
+
+Off by default. When on, a fresh *bearish* EMA cross (the mirror image of the
+long-side "BUY" cross - see `trend_signal`) opens a short instead of just
+being skipped, gated by the same confirmations as a long entry, mirrored:
+price at/below session VWAP, room below today's low before chasing it,
+price at/below the higher-timeframe SMA trend if `SMA_TREND_FILTER_ENABLED`
+is on, and recent ticks trending down. Shorts compete for the same
+per-bucket capital/position-slot budget as longs - there's no separate
+short-only capital pool. Exit math is the mirror of a long position's:
+target/stop sit below/above the entry price instead of above/below it, and
+the agent's `exit_bias` research signal is interpreted in reverse (a bearish-
+catalyst-fading signal is the short's *runner* case, a bullish one is its
+*de-risk* case).
+
+Short positions always flatten same-day regardless of `OVERNIGHT_HOLD_ENABLED`
+- overnight gap/squeeze risk on a short is asymmetric (unbounded loss
+potential) and larger than a long's overnight risk, so they're excluded from
+`overnight_hold_symbols()` outright rather than sharing that setting.
+
+Short selling requires the account to actually be approved for it - Webull
+rejections (insufficient margin, shorting not enabled, no borrow available)
+surface naturally like any other broker rejection rather than being
+pre-checked, the same handling the pairs strategy's own real shorting
+already uses (`pairs.py`).
+
 ## 6. Set sizes and limits
 
 ```dotenv
