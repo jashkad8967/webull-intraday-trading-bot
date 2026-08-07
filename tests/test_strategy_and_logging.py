@@ -65,6 +65,7 @@ class StrategyConfigMixin:
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
             stock_core_session_position_fraction=Decimal("0.10"),
+            sma_trend_filter_enabled=False,
             opening_grace_spread_multiplier=Decimal("2"),
             opening_grace_extension_multiplier=Decimal("2"),
             option_take_profit_percent=Decimal("0.75"),
@@ -178,6 +179,42 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_vwap_gate_does_not_block_entry_without_data(self):
         strategy = TradingStrategy(self.config())
         self.assertTrue(strategy.vwap_supports_entry("UNSEEN", Decimal("5")))
+
+    def test_sma_trend_gate_off_by_default_passes_regardless_of_data(self):
+        strategy = TradingStrategy(self.config())
+        strategy.sma_trend["BELOWTREND"] = Decimal("100")
+        self.assertTrue(
+            strategy.sma_trend_supports_entry("BELOWTREND", Decimal("50"))
+        )
+
+    def test_sma_trend_gate_blocks_price_below_the_daily_sma(self):
+        config = self.config()
+        config.sma_trend_filter_enabled = True
+        strategy = TradingStrategy(config)
+        strategy.sma_trend["TREND"] = Decimal("100")
+        self.assertFalse(strategy.sma_trend_supports_entry("TREND", Decimal("99")))
+        self.assertTrue(strategy.sma_trend_supports_entry("TREND", Decimal("100")))
+        self.assertTrue(strategy.sma_trend_supports_entry("TREND", Decimal("101")))
+
+    def test_sma_trend_gate_does_not_block_entry_without_data(self):
+        config = self.config()
+        config.sma_trend_filter_enabled = True
+        strategy = TradingStrategy(config)
+        self.assertTrue(strategy.sma_trend_supports_entry("UNSEEN", Decimal("5")))
+
+    def test_stock_decision_buy_blocked_when_price_is_below_sma_trend(self):
+        config = self.config()
+        config.sma_trend_filter_enabled = True
+        strategy = TradingStrategy(config)
+        strategy.sma_trend["TREND"] = Decimal("100")
+        key = "STOCK:TREND"
+        downtrend = [10, 9.9, 9.8, 9.7, 9.6, 9.5, 9.4, 9.3, 9.2]
+        for price in downtrend:
+            strategy.stock_decision(key, Decimal(str(price)), 0, Decimal("0"))
+        strategy.stock_decision(key, Decimal("9.6"), 0, Decimal("0"))
+        decision = strategy.stock_decision(key, Decimal("9.7"), 0, Decimal("0"))
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.reason, "price below the higher-timeframe SMA trend")
 
     def test_extension_gate_blocks_entry_right_at_todays_high(self):
         strategy = TradingStrategy(self.config())
@@ -2226,6 +2263,105 @@ class HistoricalVolatilityTests(unittest.TestCase):
         ]
         self.assertAlmostEqual(WebullAPI._average_amplitude(bars, days=20), 40.0)
         self.assertIsNone(WebullAPI._average_amplitude([], days=20))
+
+    def test_average_close_ignores_unusable_rows(self):
+        bars = [
+            {"close": "x"},  # unparseable
+            {"close": "0"},  # non-positive, excluded
+            {"close": "10"},
+            {"close": "20"},
+        ]
+        self.assertAlmostEqual(WebullAPI._average_close(bars, days=20), 15.0)
+        self.assertIsNone(WebullAPI._average_close([], days=20))
+
+    def test_sma_trend_parses_batched_daily_bars(self):
+        api = WebullAPI.__new__(WebullAPI)
+        fake_category = SimpleNamespace(US_STOCK=SimpleNamespace(name="US_STOCK"))
+        fake_timespan = SimpleNamespace(D=SimpleNamespace(name="DAY"))
+
+        def fake_call(callback, group):
+            return callback()
+
+        def fake_get_batch_history_bar(symbols, category, timespan, count):
+            return [
+                {
+                    "symbol": "NVDA",
+                    "bars": [{"close": "100"}, {"close": "80"}],
+                }
+            ]
+
+        api._call = fake_call
+        api.data = SimpleNamespace(
+            market_data=SimpleNamespace(
+                get_batch_history_bar=fake_get_batch_history_bar
+            )
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "webull.data.common.category": SimpleNamespace(
+                    Category=fake_category
+                ),
+                "webull.data.common.timespan": SimpleNamespace(
+                    Timespan=fake_timespan
+                ),
+            },
+        ):
+            sma = api.sma_trend(["NVDA"], days=2)
+
+        self.assertEqual(sma, {"NVDA": 90.0})
+
+    def test_refresh_sma_trend_merges_into_existing_cache(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            sma_trend_filter_enabled=True, sma_trend_days=50
+        )
+        fake_bot.strategy = SimpleNamespace(sma_trend={"OLD": Decimal("5")})
+        fake_bot.api = SimpleNamespace(
+            sma_trend=lambda symbols, days: {"NVDA": 123.45}
+        )
+        refresh = AutoTrader.refresh_sma_trend.__get__(fake_bot)
+
+        refresh(["NVDA"])
+
+        self.assertEqual(fake_bot.strategy.sma_trend["NVDA"], Decimal("123.45"))
+        self.assertEqual(fake_bot.strategy.sma_trend["OLD"], Decimal("5"))
+
+    def test_refresh_sma_trend_noop_when_disabled(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(sma_trend_filter_enabled=False)
+
+        def boom(*args, **kwargs):
+            raise AssertionError("must not call the API when disabled")
+
+        fake_bot.api = SimpleNamespace(sma_trend=boom)
+        refresh = AutoTrader.refresh_sma_trend.__get__(fake_bot)
+
+        refresh(["NVDA"])
+
+    def test_refresh_sma_trend_keeps_prior_values_on_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            sma_trend_filter_enabled=True, sma_trend_days=50
+        )
+        fake_bot.strategy = SimpleNamespace(sma_trend={"OLD": Decimal("5")})
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("Webull API error 500: boom")
+
+        fake_bot.api = SimpleNamespace(sma_trend=boom)
+        refresh = AutoTrader.refresh_sma_trend.__get__(fake_bot)
+
+        refresh(["NVDA"])
+
+        self.assertEqual(fake_bot.strategy.sma_trend, {"OLD": Decimal("5")})
 
 
 class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):

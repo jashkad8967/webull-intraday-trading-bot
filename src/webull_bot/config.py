@@ -40,6 +40,13 @@ class Settings(BaseSettings):
         ge=0,
         le=100,
     )
+    # Higher-timeframe SMA trend filter: only allows the fast EMA(3/8)
+    # scalp signal to fire in the direction of this slower daily-bar
+    # trend. Off by default - opt in once you've confirmed it fits your
+    # symbol mix (a strict trend filter can meaningfully cut entry
+    # frequency on a chop-heavy universe).
+    sma_trend_filter_enabled: bool = False
+    sma_trend_days: int = Field(default=50, ge=5, le=250)
     popular_stock_symbols: str = (
         "NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,GOOGL,NFLX,AVGO,"
         "COIN,PLTR,MSTR,HOOD,SOFI,RIVN,GME,AMC,NIO,BABA,F,SNAP,UBER,"
