@@ -2856,9 +2856,17 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
     def test_refresh_market_pulse_is_throttled_and_small(self):
         from webull_bot.bot import AutoTrader
 
+        # A fixed monotonic clock, not the real one - refresh_market_pulse
+        # compares elapsed-since-last-refresh against MARKET_PULSE_REFRESH_
+        # SECONDS, and the real clock's absolute value depends on how long
+        # the host has been up (not guaranteed to already be past that
+        # threshold on every CI runner), same pattern used elsewhere in
+        # this file for time.monotonic()-based throttles.
+        now = 100_000.0
+
         fake_bot = AutoTrader.__new__(AutoTrader)
         fake_bot.config = SimpleNamespace(agent_market_pulse_symbols=2)
-        fake_bot.last_market_pulse_refresh = 0.0
+        fake_bot.last_market_pulse_refresh = now - 999
         fake_bot.market_pulse_cache = {"gainers": [], "losers": [], "most_active": []}
         calls = []
         fake_bot.safe_top_gainers = lambda limit, page: (
@@ -2875,7 +2883,8 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         )[1]
         refresh = AutoTrader.refresh_market_pulse.__get__(fake_bot)
 
-        refresh()
+        with unittest.mock.patch("time.monotonic", return_value=now):
+            refresh()
         self.assertEqual(sorted(calls), ["gainers", "losers", "most_active"])
         self.assertEqual(fake_bot.market_pulse_cache["gainers"][0]["symbol"], "G1")
         self.assertEqual(fake_bot.market_pulse_cache["losers"][0]["symbol"], "L1")
@@ -2884,7 +2893,8 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         # A second call within MARKET_PULSE_REFRESH_SECONDS makes no new
         # screener calls - this must stay off the ~4x/second poll loop.
         calls.clear()
-        refresh()
+        with unittest.mock.patch("time.monotonic", return_value=now):
+            refresh()
         self.assertEqual(calls, [])
 
     def test_refresh_agent_discoveries_sources_from_market_pulse(self):
