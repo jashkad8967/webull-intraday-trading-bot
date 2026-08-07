@@ -256,6 +256,49 @@ class MarketResearchAgent:
                         return content[start : index + 1]
         return None
 
+    @staticmethod
+    def _salvage_assessments(text: str) -> list[dict]:
+        """Last-resort recovery for a genuinely truncated response (cut off
+        mid-string with no balanced top-level object anywhere in it, so
+        _extract_json_object can't find anything): scan for every
+        individually-balanced {...} object at any nesting depth, parse each
+        standalone, and keep the ones shaped like an assessment (a dict
+        with a "symbol" key). An assessment object is self-contained - it
+        doesn't reference anything outside itself - so whatever the model
+        finished writing before the cutoff is still valid, parseable data;
+        only the incomplete tail object (which never gets a closing brace)
+        is correctly left out. Better to keep N-1 real assessments than
+        discard the whole cycle over the Nth one being cut off.
+        """
+        found: list[dict] = []
+        stack: list[int] = []
+        in_string = False
+        escape = False
+        for index, character in enumerate(text):
+            if in_string:
+                if escape:
+                    escape = False
+                elif character == "\\":
+                    escape = True
+                elif character == '"':
+                    in_string = False
+                continue
+            if character == '"':
+                in_string = True
+            elif character == "{":
+                stack.append(index)
+            elif character == "}":
+                if not stack:
+                    continue
+                start = stack.pop()
+                try:
+                    parsed = json.loads(text[start : index + 1])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict) and "symbol" in parsed:
+                    found.append(parsed)
+        return found
+
     def _parse_response(self, content: str) -> dict:
         text = str(content or "").strip()
         if not text:
@@ -268,7 +311,16 @@ class MarketResearchAgent:
         except json.JSONDecodeError:
             candidate = self._extract_json_object(text)
             if candidate is None:
-                raise
+                salvaged = self._salvage_assessments(text)
+                if not salvaged:
+                    raise
+                self.log.warning(
+                    "AGENT  | response was truncated/malformed - salvaged "
+                    "%s complete assessment(s) from before the cutoff "
+                    "instead of discarding the whole cycle",
+                    len(salvaged),
+                )
+                return {"assessments": salvaged}
             parsed = json.loads(candidate)
         return parsed if isinstance(parsed, dict) else {}
 
@@ -410,7 +462,11 @@ class MarketResearchAgent:
             "supports holding for a larger move, 0=neutral. Every field is "
             "required for every STATE symbol - use neutral values with low "
             "confidence when evidence is thin, never omit a symbol or a "
-            "field.\nSTATE:"
+            "field. Completing valid, fully-closed JSON for every STATE "
+            "symbol always outranks the search: if running low on output "
+            "budget, cut the search short (or skip it) rather than risk "
+            "cutting off the JSON - a truncated response is discarded "
+            "entirely and this cycle's research is lost.\nSTATE:"
             + json.dumps(state, separators=(",", ":"), default=str)
         )
         self.log.info(
@@ -438,7 +494,15 @@ class MarketResearchAgent:
                 {"role": "user", "content": prompt},
             ],
             "response_format": {"type": "json_object"},
-            "max_completion_tokens": 4096,
+            # compound-mini's own hard ceiling is 8192 output tokens - this
+            # used to be capped at a conservative 4096, but any tool-use/
+            # reasoning the model does before writing the JSON eats into
+            # that same budget, and hitting the ceiling mid-string produces
+            # exactly the truncated/invalid JSON _parse_response's fallback
+            # has to catch (real assessment data lost for the cycle, not
+            # just a cosmetic issue). Leave a small margin under the true
+            # 8192 ceiling rather than requesting the max itself.
+            "max_completion_tokens": 8000,
             # Low, not zero: keeps numeric fields consistent/reproducible run
             # to run instead of drifting, while still leaving enough room for
             # the model to weigh conflicting signals rather than collapsing

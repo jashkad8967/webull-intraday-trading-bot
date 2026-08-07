@@ -1628,6 +1628,44 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual(agent._parse_response(""), {})
         self.assertEqual(agent._parse_response(None), {})
 
+    def test_salvage_assessments_extracts_complete_objects_before_a_cutoff(self):
+        # Two complete assessment objects, then a third cut off mid-string -
+        # exactly the "Unterminated string" shape a real truncation produces.
+        truncated = (
+            '{"market_direction":0.2,"market_volatility":0.5,"assessments":['
+            '{"symbol":"NVDA","priority":0.8},'
+            '{"symbol":"TSLA","priority":0.6},'
+            '{"symbol":"AMD","priority":0.3,"catalyst_strength":"unterminat'
+        )
+        salvaged = MarketResearchAgent._salvage_assessments(truncated)
+        self.assertEqual([item["symbol"] for item in salvaged], ["NVDA", "TSLA"])
+
+    def test_salvage_assessments_ignores_objects_without_a_symbol_key(self):
+        text = '{"market_direction":0.2,"nested":{"foo":"bar"}}'
+        self.assertEqual(MarketResearchAgent._salvage_assessments(text), [])
+
+    def test_parse_response_recovers_partial_assessments_from_truncation(self):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.log = logging.getLogger("test-agent")
+        truncated = (
+            '{"market_direction":0.2,"market_volatility":0.5,"assessments":['
+            '{"symbol":"NVDA","priority":0.8},'
+            '{"symbol":"TSLA","priority":0.6},'
+            '{"symbol":"AMD","catalyst_strength":"unterminat'
+        )
+        with self.assertLogs("test-agent", level="WARNING") as logs:
+            parsed = agent._parse_response(truncated)
+        self.assertEqual(
+            [item["symbol"] for item in parsed["assessments"]], ["NVDA", "TSLA"]
+        )
+        self.assertIn("salvaged", logs.output[0])
+
+    def test_parse_response_still_raises_when_nothing_is_salvageable(self):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.log = logging.getLogger("test-agent")
+        with self.assertRaises(json.JSONDecodeError):
+            agent._parse_response('{"market_direction": "unterminat')
+
     def test_session_date_resets_at_market_open_not_midnight(self):
         """AGENT_DAILY_REQUEST_LIMIT budgets the extended trading day
         (MARKET_OPEN_TIME to end of session), not a calendar day - a
