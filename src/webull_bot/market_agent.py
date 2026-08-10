@@ -308,20 +308,31 @@ class MarketResearchAgent:
             text = re.sub(r"\s*```$", "", text).strip()
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             candidate = self._extract_json_object(text)
+            if candidate is not None:
+                try:
+                    parsed = json.loads(candidate)
+                except json.JSONDecodeError:
+                    candidate = None
             if candidate is None:
+                # Either no balanced top-level object exists at all (a
+                # genuine truncation), or one does but is internally
+                # malformed for some other reason (a missing comma, a
+                # stray token) - the balanced-brace candidate's own
+                # json.loads can raise too, and that used to propagate
+                # uncaught here, skipping the salvage path entirely for
+                # exactly the "balanced braces, broken inside" case.
                 salvaged = self._salvage_assessments(text)
                 if not salvaged:
-                    raise
+                    raise exc
                 self.log.warning(
                     "AGENT  | response was truncated/malformed - salvaged "
-                    "%s complete assessment(s) from before the cutoff "
-                    "instead of discarding the whole cycle",
+                    "%s complete assessment(s) instead of discarding the "
+                    "whole cycle",
                     len(salvaged),
                 )
                 return {"assessments": salvaged}
-            parsed = json.loads(candidate)
         return parsed if isinstance(parsed, dict) else {}
 
     def _normalize(self, payload, expected_symbols: set[str]) -> dict:
