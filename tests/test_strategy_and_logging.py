@@ -1666,6 +1666,33 @@ class ResearchDiscoveryTests(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             agent._parse_response('{"market_direction": "unterminat')
 
+    def test_parse_response_salvages_a_balanced_but_internally_broken_object(self):
+        """Regression test: a top-level object whose braces are perfectly
+        balanced but has a syntax error INSIDE it (e.g. a missing comma
+        between two assessment objects - "Expecting ',' delimiter" from a
+        real production response) used to propagate straight out of
+        _parse_response uncaught. _extract_json_object found a candidate
+        (braces balance fine), but json.loads(candidate) itself raised and
+        that call sat outside any try/except - the salvage path never even
+        ran for this failure shape, only for a genuinely truncated one.
+        """
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.log = logging.getLogger("test-agent")
+        # Balanced overall, but missing the comma between the two
+        # assessment objects in the array.
+        broken = (
+            '{"market_direction":0.2,"market_volatility":0.5,"assessments":['
+            '{"symbol":"NVDA","priority":0.8}'
+            '{"symbol":"TSLA","priority":0.6}'
+            ']}'
+        )
+        with self.assertLogs("test-agent", level="WARNING") as logs:
+            parsed = agent._parse_response(broken)
+        self.assertEqual(
+            [item["symbol"] for item in parsed["assessments"]], ["NVDA", "TSLA"]
+        )
+        self.assertIn("salvaged", logs.output[0])
+
     def test_session_date_resets_at_market_open_not_midnight(self):
         """AGENT_DAILY_REQUEST_LIMIT budgets the extended trading day
         (MARKET_OPEN_TIME to end of session), not a calendar day - a
