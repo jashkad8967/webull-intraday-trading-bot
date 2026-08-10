@@ -733,9 +733,21 @@ request throttles remain enforced.
 ## Optional web-research agent
 
 The strategy and execution loop do not wait for the agent. A background worker
-uses Groq Compound Mini's built-in web search to research current news and catalysts for
-held positions and EMA entry candidates. Its output changes which symbols are
-scanned most often; it cannot approve, reject, or submit an order.
+uses Groq Compound Mini to score held positions and EMA entry candidates
+purely from the numeric STATE data the bot already has (price/change/volume/
+spread, plus `STATE.market_pulse` - today's actual top gainers/losers/most-
+active from Webull's own screeners, see `AutoTrader.refresh_market_pulse`).
+Its output changes which symbols are scanned most often; it cannot approve,
+reject, or submit an order.
+
+Every built-in tool (web search included) is explicitly disabled for this
+request via `compound_custom.tools.enabled_tools: []` - this used to research
+current news via Compound Mini's web search, but that tool's own orchestration
+overhead before writing the response was an unpredictable, unbounded source of
+truncated/malformed JSON in production (two rounds of trying to budget around
+it with `max_completion_tokens` and prompt instructions weren't reliable).
+Since assessment was always computed purely from STATE's numeric data anyway,
+disabling the tool outright was the only way to actually guarantee it.
 
 Create a free Groq developer key at
 [console.groq.com/keys](https://console.groq.com/keys), then add it to `.env`:
@@ -757,9 +769,10 @@ LOSS_SPREE_TOTAL_DOLLARS=1.00
 LOSS_REEVALUATION_SECONDS=120
 ```
 
-`groq/compound-mini` is the low-latency Compound system and can perform one
-built-in web search per research request. The free tier currently allows 250
-Compound Mini requests per day, and each research cycle is deliberately
+`groq/compound-mini` is the low-latency Compound system; every built-in tool is
+disabled for this use (see above), so each call is a plain scored-JSON request.
+The free tier currently allows 250 Compound Mini requests per day, and each
+research cycle is deliberately
 exactly one Groq call - no automatic retry with different parameters, so
 the budget below is never silently spent faster than intended. During the
 9:30 AM–4:00 PM core session, the bot allows one call every 120 seconds,
@@ -781,10 +794,9 @@ Groq model/tier TPD limit (see
 with some margin - the default assumes the free/on-demand
 `llama-3.3-70b-versatile` tier (100000 TPD). The bot tracks its own rolling
 24-hour usage from each response's real token count and stops submitting
-before it would hit that ceiling. If it still 429s anyway (an agentic
-model's server-side web search can consume tokens the bot can't see ahead
-of a call), the bot stops all research for the rest of the session instead
-of retrying after Groq's own "try again in Nm" hint - that hint is only
+before it would hit that ceiling. If it still 429s anyway, the bot stops
+all research for the rest of the session instead of retrying after Groq's
+own "try again in Nm" hint - that hint is only
 when the *next* token frees up on Groq's rolling window, not when the
 account is safely clear of the cap, so retrying at it tends to just hit
 the same 429 again. Research resumes automatically at the start of the

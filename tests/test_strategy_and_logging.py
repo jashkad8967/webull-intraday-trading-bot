@@ -1981,6 +1981,57 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual(agent._assessments["NVDA"]["priority"], 0)
         self.assertEqual(agent._assessments["NVDA"]["confidence"], 0)
 
+    def test_research_disables_every_built_in_tool(self):
+        """Regression test: raising max_completion_tokens and then telling
+        the model to keep JSON compact both failed to reliably stop
+        truncated/malformed responses in production - Groq's own tool-
+        orchestration overhead before writing the JSON isn't something a
+        prompt instruction can bound. TASK B never needed search (it's
+        computed purely from STATE's numeric data), so every built-in tool
+        must be disabled outright via compound_custom, not just
+        discouraged in the prompt.
+        """
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250,
+            groq_model="groq/compound-mini",
+        )
+        agent.log = logging.getLogger("test-agent")
+        agent._requests_today = 0
+        agent._assessments = {}
+        agent._lock = threading.Lock()
+
+        captured = {}
+
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return FakeResponse("{}")
+
+        agent.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=fake_create)
+            )
+        )
+
+        agent._research({"positions": [], "candidates": []})
+
+        self.assertEqual(
+            captured["compound_custom"], {"tools": {"enabled_tools": []}}
+        )
+        self.assertNotIn("search_settings", captured)
+
     def test_normalize_no_longer_produces_a_discoveries_key(self):
         """Discovery of new symbols moved out of the model entirely (see
         AutoTrader.refresh_market_pulse) - _normalize's output shape
