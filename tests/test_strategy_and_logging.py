@@ -4133,6 +4133,61 @@ class FractionalExitGuardTests(unittest.TestCase):
         boost(positions, options_active=False, core_session_active=False)
         self.assertEqual(calls, [])
 
+    def test_boost_stalled_positions_skips_sub_lot_position_in_penny_band(self):
+        # Regression test: Webull rejects ANY order (either side) under
+        # 100 shares while price sits in $0.10-$0.999
+        # (OAUTH_OPENAPI_CANT_TRADE_FOR_PRICE_BETWEEN_0099_AND_0999),
+        # regardless of how many shares are actually held - a position
+        # that fell into this band with fewer than 100 shares can't be
+        # exited by a normal order at all until price moves back out.
+        from webull_bot.bot import AutoTrader
+        from webull_bot.strategy import TradingStrategy
+
+        calls = []
+
+        class FakeApi:
+            def stock_quote(self, symbol):
+                calls.append(symbol)
+                return {"symbol": symbol, "bid": "0.50", "ask": "0.51"}
+
+            @staticmethod
+            def quote_bid(q):
+                return Decimal(str(q["bid"]))
+
+            def place_stock(self, *a, **k):
+                raise AssertionError(
+                    "must not place a sub-100-share order in the "
+                    "lot-restricted band"
+                )
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                stall_breaker_enabled=True,
+                stall_breaker_seconds=1,
+                stall_breaker_min_profit=Decimal("0.01"),
+                sell_fee_dollars=Decimal("0.02"),
+            ),
+            api=FakeApi(),
+            strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
+            last_fill_time=0.0,
+            last_stall_boost=0.0,
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+        )
+        fake_bot.cooldown_ready = lambda key: True
+        fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
+        boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "OPTT",
+                "quantity": "5",
+                "cost_price": "0.40",
+            }
+        ]
+        boost(positions, options_active=False, core_session_active=True)
+        self.assertEqual(calls, ["OPTT"])
+
 
 class EntrySizingSplitTests(unittest.TestCase):
     @staticmethod
@@ -4395,6 +4450,46 @@ class CloseAllPositionsExclusionTests(unittest.TestCase):
         close({"EQUITY"})
         self.assertEqual(placed[0], ("PEP", "BUY", Decimal("10")))
         self.assertEqual(pricing_calls, ["COVER"])
+
+    def test_close_all_positions_one_rejection_does_not_abort_the_rest(self):
+        # Regression test: a single position's order getting rejected (e.g.
+        # a sub-100-share position stuck in Webull's $0.10-$0.999 lot-
+        # restricted band) previously propagated straight out of the
+        # unwrapped for-loop, silently skipping every other position in
+        # the batch - including the EOD closeout of everything else in the
+        # account.
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "OPTT", "quantity": "5", "cost_price": "0.40"},
+            {"instrument_type": "EQUITY", "symbol": "TSLA", "quantity": "3", "cost_price": "200"},
+        ]
+        placed = []
+
+        def fake_place_stock(symbol, side, qty, limit_price, fractional=False):
+            if symbol == "OPTT":
+                raise RuntimeError(
+                    "HTTP Status: 417, Code: "
+                    "OAUTH_OPENAPI_CANT_TRADE_FOR_PRICE_BETWEEN_0099_AND_0999"
+                )
+            placed.append((symbol, side, qty))
+            return "order-z"
+
+        fake_api = SimpleNamespace(
+            positions=lambda: positions,
+            cancel_all_orders=lambda: [],
+            stock_quote=lambda symbol: {
+                "symbol": symbol,
+                "bid": "0.50" if symbol == "OPTT" else "200",
+                "ask": "0.51" if symbol == "OPTT" else "200.05",
+                "price": "0.50" if symbol == "OPTT" else "200.02",
+            },
+            quote_price=lambda q: Decimal(str(q["price"])),
+            stock_limit_price=lambda q, side: Decimal(str(q["price"])),
+            place_stock=fake_place_stock,
+        )
+        close = WebullAPI.close_all_positions.__get__(fake_api)
+        submitted = close({"EQUITY"})
+        self.assertEqual(submitted, ["order-z"])
+        self.assertEqual(placed, [("TSLA", "SELL", Decimal("3"))])
 
 
 class ShortPricingTests(unittest.TestCase):
