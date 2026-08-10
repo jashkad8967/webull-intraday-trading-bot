@@ -1295,10 +1295,8 @@ class WebullAPI:
             return []
         self.cancel_all_orders()
         submitted: list[str] = []
-        for position in positions:
-            quantity = Decimal(str(position.get("quantity", "0")))
-            if not quantity:
-                continue
+
+        def close_one(position: dict, quantity: Decimal) -> None:
             if position.get("instrument_type") == "EQUITY":
                 side = "SELL" if quantity > 0 else "BUY"
                 # Pricing side is distinct from the broker order side above:
@@ -1339,7 +1337,7 @@ class WebullAPI:
                         "CLOSE  | unresolved option=%s",
                         position.get("symbol", "UNKNOWN"),
                     )
-                    continue
+                    return
                 side = "SELL" if quantity > 0 else "BUY"
                 intent = "SELL_TO_CLOSE" if quantity > 0 else "BUY_TO_CLOSE"
                 quote = self.option_quote(contract["symbol"])
@@ -1369,4 +1367,25 @@ class WebullAPI:
                         contract["underlying_symbol"],
                         "option loss closeout submitted",
                     )
+
+        for position in positions:
+            quantity = Decimal(str(position.get("quantity", "0")))
+            if not quantity:
+                continue
+            try:
+                close_one(position, quantity)
+            except Exception as exc:
+                # One position rejected (e.g. a sub-100-share position
+                # stuck in Webull's $0.10-$0.999 lot-restricted band, which
+                # rejects orders on ANY size below 100 there) must never
+                # abort closing every other position in this batch - this
+                # loop previously had no exception handling at all, so an
+                # unwrapped raise here silently skipped the rest of the EOD
+                # closeout, options included, for the whole account.
+                logging.getLogger("webull-bot").error(
+                    "CLOSE  | %s | close order failed, continuing with "
+                    "remaining positions | %s",
+                    position.get("symbol", "UNKNOWN"),
+                    exc,
+                )
         return submitted

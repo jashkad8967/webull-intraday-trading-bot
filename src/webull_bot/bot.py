@@ -1954,6 +1954,20 @@ class AutoTrader:
                             "fractional position - exit waits for core hours"
                         ] += 1
                         continue
+                    # Webull rejects ANY order (entry or exit, either side)
+                    # under 100 shares while price sits in $0.10-$0.999,
+                    # regardless of how many shares are actually held - a
+                    # position smaller than that, caught in this band
+                    # (e.g. price drifted down into it after entry), can't
+                    # be exited by a normal order at all until price moves
+                    # back out of the band. Retrying every cycle just spams
+                    # the same rejection, so skip (and count it) instead.
+                    if exit_quantity < self.strategy.minimum_lot_size(price):
+                        self.gate_rejections[
+                            "sub-$1 lot-restricted band - exit waits for "
+                            "price to clear it"
+                        ] += 1
+                        continue
                     target = decision.target_price
                     if target is None:
                         continue
@@ -1999,6 +2013,12 @@ class AutoTrader:
                     if exit_is_fractional and not core_session_active:
                         self.gate_rejections[
                             "fractional position - exit waits for core hours"
+                        ] += 1
+                        continue
+                    if exit_quantity < self.strategy.minimum_lot_size(price):
+                        self.gate_rejections[
+                            "sub-$1 lot-restricted band - exit waits for "
+                            "price to clear it"
                         ] += 1
                         continue
                     # Never price an initial stop-loss at the passive side -
@@ -2754,6 +2774,12 @@ class AutoTrader:
                         continue
                     sell_price = bid.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                     if sell_price - average_cost < min_profit + fee_per_share:
+                        continue
+                    # Same $0.10-$0.999 lot-restricted-band rejection as
+                    # trade_stocks' exits - Webull rejects any order under
+                    # 100 shares while price sits in that band, regardless
+                    # of side or how many shares are actually held.
+                    if quantity < self.strategy.minimum_lot_size(sell_price):
                         continue
                     order_id = self.api.place_stock(
                         symbol,

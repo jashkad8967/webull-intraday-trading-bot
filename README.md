@@ -90,7 +90,14 @@ capital that hasn't filled in a while, crash-safe universe loading (a
 screener hiccup logs a warning and falls back to the prior universe instead
 of taking the whole process down), automatic order sizing up to Webull's
 100-share minimum lot for stocks priced $0.10-$0.999 (an order under that
-is rejected outright, not just slower to fill), and broker-conflict
+is rejected outright, not just slower to fill - this applies to *exits*
+too, not just new entries: a held position that drifted into this band
+with fewer than 100 shares skips its profit/stop/stall-breaker exit
+attempt instead of retrying the same rejection every cycle, and resumes
+automatically once price moves back out of the band), a per-position
+try/except around the EOD/manual close-all sweep (one rejected position -
+e.g. exactly that stuck sub-100-share case - no longer aborts closing
+every other position behind it in the same batch), and broker-conflict
 handling: if Webull rejects an order because its account state disagrees
 with the bot's local view of a position (e.g. `..._REVERSE_OPTION`), that
 symbol is blacklisted from further automated action for the rest of the
