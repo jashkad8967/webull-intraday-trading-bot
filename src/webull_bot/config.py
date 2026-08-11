@@ -295,22 +295,35 @@ class Settings(BaseSettings):
     agent_enabled: bool = False
     groq_api_key: str = ""
     groq_model: str = "groq/compound-mini"
-    agent_core_research_seconds: int = Field(default=120, ge=15, le=3600)
-    agent_extended_research_seconds: int = Field(default=622, ge=15, le=3600)
-    agent_daily_request_limit: int = Field(default=250, ge=1, le=250)
+    # Groq's own usage dashboard attributes each compound-mini call to 3
+    # underlying model rows (the compound orchestration plus its 2 backing
+    # models - see console.groq.com's per-key usage table), so the real
+    # cost of one "successful" research cycle is ~3x its nominal request
+    # weight. Intervals below are tuned for AGENT_DAILY_REQUEST_LIMIT=83
+    # (250/3) spent across the MARKET_OPEN_TIME-to-EOD_CLOSE_TIME trading
+    # day, weighted toward core hours the same way the original 250-budget
+    # tuning was: ~65 core-hour calls (23400s / 360s) + ~18 extended-hour
+    # calls (33600s / 1866s) = ~83.
+    agent_core_research_seconds: int = Field(default=360, ge=15, le=3600)
+    agent_extended_research_seconds: int = Field(default=1866, ge=15, le=3600)
+    agent_daily_request_limit: int = Field(default=83, ge=1, le=250)
     # Groq's real cap is tokens per day (TPD), not request count - a quiet
     # account can exhaust TPD in well under agent_daily_request_limit
     # requests. This must match your actual Groq model/tier TPD limit (see
     # console.groq.com/settings/billing) with some margin - the default
     # assumes the free/on-demand llama-3.3-70b-versatile tier (100000 TPD).
     agent_daily_token_budget: int = Field(default=90000, ge=1000)
-    agent_max_symbols: int = Field(default=5, ge=1, le=50)
+    # Smaller on purpose, trading research breadth for reliability: fewer
+    # STATE symbols means a smaller expected response, which means a much
+    # higher chance the model finishes the full JSON within budget every
+    # single cycle rather than needing the truncation-salvage fallback.
+    agent_max_symbols: int = Field(default=3, ge=1, le=50)
     # Per-list cap (gainers/losers/most-active each) for the deterministic
     # market-pulse context fed to the research agent - see
     # AutoTrader.refresh_market_pulse(). Small and fixed on purpose: this
     # replaced asking the agent to discover movers via open-ended web
     # search, which was the actual source of unpredictable request size.
-    agent_market_pulse_symbols: int = Field(default=5, ge=1, le=10)
+    agent_market_pulse_symbols: int = Field(default=3, ge=1, le=10)
     agent_timeout_seconds: int = Field(default=60, ge=5, le=180)
     agent_exit_influence_enabled: bool = True
     agent_exit_min_confidence: Decimal = Field(

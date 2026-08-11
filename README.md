@@ -756,12 +756,12 @@ Create a free Groq developer key at
 AGENT_ENABLED=true
 GROQ_API_KEY=your_groq_api_key
 GROQ_MODEL=groq/compound-mini
-AGENT_CORE_RESEARCH_SECONDS=120
-AGENT_EXTENDED_RESEARCH_SECONDS=622
+AGENT_CORE_RESEARCH_SECONDS=360
+AGENT_EXTENDED_RESEARCH_SECONDS=1866
 AGENT_DAILY_TOKEN_BUDGET=90000
-AGENT_DAILY_REQUEST_LIMIT=250
-AGENT_MAX_SYMBOLS=5
-AGENT_MARKET_PULSE_SYMBOLS=5
+AGENT_DAILY_REQUEST_LIMIT=83
+AGENT_MAX_SYMBOLS=3
+AGENT_MARKET_PULSE_SYMBOLS=3
 AGENT_TIMEOUT_SECONDS=60
 LOSS_CIRCUIT_BREAKER_ENABLED=true
 LOSS_SPREE_POSITION_COUNT=3
@@ -771,16 +771,25 @@ LOSS_REEVALUATION_SECONDS=120
 
 `groq/compound-mini` is the low-latency Compound system; every built-in tool is
 disabled for this use (see above), so each call is a plain scored-JSON request.
-The free tier currently allows 250 Compound Mini requests per day, and each
-research cycle is deliberately
+Even so, Groq's own per-key usage dashboard attributes each compound-mini call
+to 3 underlying model rows (the compound orchestration plus its 2 backing
+models), so the *real* cost of one "successful" cycle is about 3x its nominal
+request weight - `AGENT_DAILY_REQUEST_LIMIT` is set to 83 (250/3), not the free
+tier's raw 250-request ceiling, to actually respect that. `AGENT_MAX_SYMBOLS`
+and `AGENT_MARKET_PULSE_SYMBOLS` are also both kept small (3, not the payload's
+practical maximum) on purpose: a smaller STATE means a smaller expected
+response, which means a much higher chance the model finishes the full JSON
+within its output budget every cycle - trading research breadth for
+reliability. Each research cycle is deliberately
 exactly one Groq call - no automatic retry with different parameters, so
 the budget below is never silently spent faster than intended. During the
-9:30 AM–4:00 PM core session, the bot allows one call every 120 seconds,
-allocating up to ~195 calls. During the 4:00–9:30 AM and 4:00–8:00 PM
-extended sessions, it allows one call every 622 seconds and uses up to the
-remaining ~55 calls - together the two intervals are tuned to spend almost
-exactly 250 calls across the full `MARKET_OPEN_TIME`-to-`EOD_CLOSE_TIME`
-trading day, weighted toward core hours where research matters most. The
+9:30 AM–4:00 PM core session, the bot allows one call every 360 seconds,
+allocating up to ~65 calls. During the 4:00–9:30 AM and 4:00–8:00 PM
+extended sessions, it allows one call every 1866 seconds and uses up to the
+remaining ~18 calls - together the two intervals are tuned to spend almost
+exactly 83 calls across the full `MARKET_OPEN_TIME`-to-`EOD_CLOSE_TIME`
+trading day, weighted toward core hours where research matters most, in the
+same proportion the original 250-call tuning used. The
 budget resets at `MARKET_OPEN_TIME` (start of the extended trading day),
 not calendar midnight - a moment before the bell still belongs to the
 previous session's tail end, not a fresh budget. Cached results are used
@@ -788,7 +797,7 @@ between calls.
 
 Groq's real cap, though, is tokens per day (TPD) on the model itself, not
 request count - a quiet account can hit `rate_limit_exceeded` well under the
-250-request limit above. `AGENT_DAILY_TOKEN_BUDGET` must match your actual
+83-request budget above. `AGENT_DAILY_TOKEN_BUDGET` must match your actual
 Groq model/tier TPD limit (see
 [console.groq.com/settings/billing](https://console.groq.com/settings/billing))
 with some margin - the default assumes the free/on-demand
@@ -1540,12 +1549,12 @@ STALL_BREAKER_MIN_PROFIT=0.01
 AGENT_ENABLED=false
 GROQ_API_KEY=
 GROQ_MODEL=groq/compound-mini
-AGENT_CORE_RESEARCH_SECONDS=120
-AGENT_EXTENDED_RESEARCH_SECONDS=622
+AGENT_CORE_RESEARCH_SECONDS=360
+AGENT_EXTENDED_RESEARCH_SECONDS=1866
 AGENT_DAILY_TOKEN_BUDGET=90000
-AGENT_DAILY_REQUEST_LIMIT=250
-AGENT_MAX_SYMBOLS=5
-AGENT_MARKET_PULSE_SYMBOLS=5
+AGENT_DAILY_REQUEST_LIMIT=83
+AGENT_MAX_SYMBOLS=3
+AGENT_MARKET_PULSE_SYMBOLS=3
 AGENT_TIMEOUT_SECONDS=60
 LOSS_CIRCUIT_BREAKER_ENABLED=false
 LOSS_SPREE_POSITION_COUNT=3
