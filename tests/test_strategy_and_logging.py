@@ -349,7 +349,12 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         for price in downtrend:
             strategy.trend_signal(key, Decimal(str(price)))
 
-        self.assertEqual(strategy.trend_signal(key, Decimal("9.6")), "HOLD")
+        # By this point the downtrend has already held for
+        # reenter_confirmation_polls cycles, so this re-fires "SHORT" -
+        # trend_streak's re-entry counter is shared symmetrically between
+        # directions (see test_reentry_requires_confirmation_polls_for_a_
+        # continuing_downtrend_too for a dedicated check of that).
+        self.assertEqual(strategy.trend_signal(key, Decimal("9.6")), "SHORT")
         self.assertEqual(strategy.trend_signal(key, Decimal("9.7")), "BUY")
         # A fresh crossover fires instantly, but the very next poll of a
         # still-forming uptrend should not immediately re-fire.
@@ -357,6 +362,29 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         # Once the uptrend has held for the configured confirmation polls,
         # re-entry is allowed again.
         self.assertEqual(strategy.trend_signal(key, Decimal("10.2")), "BUY")
+
+    def test_reentry_requires_confirmation_polls_for_a_continuing_downtrend_too(self):
+        """SHORT's re-entry mechanism mirrors BUY's exactly - without it, a
+        short entry needs VWAP/SMA-trend/extension/tick-direction to all
+        align on the single exact tick of the fresh bearish cross, which
+        in production essentially never happened. A persisting downtrend
+        must get repeated chances, the same way a persisting uptrend
+        already does for BUY.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:SHORTREENTRY"
+        uptrend = [10, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8]
+        for price in uptrend:
+            strategy.trend_signal(key, Decimal(str(price)))
+
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.4")), "BUY")
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.3")), "SHORT")
+        # A fresh crossover fires instantly, but the very next poll of a
+        # still-forming downtrend should not immediately re-fire.
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.1")), "HOLD")
+        # Once the downtrend has held for the configured confirmation
+        # polls, re-entry is allowed again.
+        self.assertEqual(strategy.trend_signal(key, Decimal("9.8")), "SHORT")
 
     def test_tick_direction_score_ranges_from_all_downticks_to_all_upticks(self):
         strategy = TradingStrategy(self.config())
@@ -2059,6 +2087,53 @@ class ResearchDiscoveryTests(unittest.TestCase):
         )
         self.assertNotIn("search_settings", captured)
 
+    def test_research_omits_compound_custom_for_a_plain_model(self):
+        """A plain (non-Compound) model doesn't understand compound_custom -
+        it must only be sent when groq_model is actually a Compound system,
+        not unconditionally. The default model (see config.py) switched
+        away from compound-mini entirely once search was disabled, since
+        Compound's tool-orchestration layer was the actual source of the
+        truncated/malformed/empty responses, not something worth paying
+        for once it has no tools left to use.
+        """
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250,
+            groq_model="llama-3.3-70b-versatile",
+        )
+        agent.log = logging.getLogger("test-agent")
+        agent._requests_today = 0
+        agent._assessments = {}
+        agent._lock = threading.Lock()
+
+        captured = {}
+
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return FakeResponse("{}")
+
+        agent.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=fake_create)
+            )
+        )
+
+        agent._research({"positions": [], "candidates": []})
+
+        self.assertNotIn("compound_custom", captured)
+
     def test_normalize_no_longer_produces_a_discoveries_key(self):
         """Discovery of new symbols moved out of the model entirely (see
         AutoTrader.refresh_market_pulse) - _normalize's output shape
@@ -2588,7 +2663,7 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         cap_config = Settings(market_cap_allocation_enabled=True)
         self.assertEqual(
             cap_config.stock_capital_fractions(),
-            {"LARGE_CAP": Decimal("0.80"), "SMALL_CAP": Decimal("0.20")},
+            {"LARGE_CAP": Decimal("0.30"), "SMALL_CAP": Decimal("0.70")},
         )
         self.assertEqual(
             sum(cap_config.stock_capital_fractions().values()),
@@ -2596,7 +2671,7 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(
             cap_config.stock_bucket_slot_limits(),
-            {"LARGE_CAP": 16, "SMALL_CAP": 4},
+            {"LARGE_CAP": 6, "SMALL_CAP": 14},
         )
 
     def test_screener_number_handles_bad_and_nonfinite_values(self):

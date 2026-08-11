@@ -287,8 +287,8 @@ allocate capital by cap-size tier:
 STOCK_SYMBOLS=ALL
 MARKET_CAP_ALLOCATION_ENABLED=true
 STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
-STOCK_LARGE_CAP_CAPITAL_FRACTION=0.80
-STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
+STOCK_LARGE_CAP_CAPITAL_FRACTION=0.30
+STOCK_SMALL_CAP_CAPITAL_FRACTION=0.70
 MAX_SYMBOLS=750
 STOCK_UNIVERSE_PAGE_SIZE=500
 EXCLUDE_ETFS=true
@@ -322,9 +322,13 @@ screener response didn't include that symbol at all that day (rare for a
 liquid name, but not impossible).
 
 Symbols at or above `STOCK_LARGE_CAP_MIN_MARKET_VALUE` are tagged `LARGE_CAP`;
-everything else is `SMALL_CAP`. Buying power is reserved 80/20 between the two
-tiers (configurable via `STOCK_LARGE_CAP_CAPITAL_FRACTION` /
-`STOCK_SMALL_CAP_CAPITAL_FRACTION`, which must sum to 1), and each batch always
+everything else is `SMALL_CAP`. Buying power is reserved 30/70 toward SMALL_CAP
+by default (configurable via `STOCK_LARGE_CAP_CAPITAL_FRACTION` /
+`STOCK_SMALL_CAP_CAPITAL_FRACTION`, which must sum to 1) - a
+volatility-focused scanner's qualifying candidates skew small/mid-cap far more
+often than mega-cap ($100B+ by default), so an even or LARGE_CAP-favoring split
+tends to strand a meaningful chunk of a small account's capital in a bucket
+that rarely gets spent. Each batch always
 includes held positions first, then the top-ranked large-cap and small-cap
 names by the same activity/research priority score used elsewhere, plus a
 rotating exploration slice. This mode replaces (not adds to) the
@@ -733,21 +737,28 @@ request throttles remain enforced.
 ## Optional web-research agent
 
 The strategy and execution loop do not wait for the agent. A background worker
-uses Groq Compound Mini to score held positions and EMA entry candidates
-purely from the numeric STATE data the bot already has (price/change/volume/
-spread, plus `STATE.market_pulse` - today's actual top gainers/losers/most-
-active from Webull's own screeners, see `AutoTrader.refresh_market_pulse`).
-Its output changes which symbols are scanned most often; it cannot approve,
-reject, or submit an order.
+uses a plain Groq model (`llama-3.3-70b-versatile` by default - deliberately
+*not* one of Groq's agentic Compound systems, see below) to score held
+positions and EMA entry candidates purely from the numeric STATE data the bot
+already has (price/change/volume/spread, plus `STATE.market_pulse` - today's
+actual top gainers/losers/most-active from Webull's own screeners, see
+`AutoTrader.refresh_market_pulse`). Its output changes which symbols are
+scanned most often; it cannot approve, reject, or submit an order.
 
-Every built-in tool (web search included) is explicitly disabled for this
-request via `compound_custom.tools.enabled_tools: []` - this used to research
-current news via Compound Mini's web search, but that tool's own orchestration
-overhead before writing the response was an unpredictable, unbounded source of
-truncated/malformed JSON in production (two rounds of trying to budget around
-it with `max_completion_tokens` and prompt instructions weren't reliable).
-Since assessment was always computed purely from STATE's numeric data anyway,
-disabling the tool outright was the only way to actually guarantee it.
+The agent used to run on `groq/compound-mini` with its built-in web search for
+current news. That tool's own orchestration overhead before writing the
+response turned out to be an unpredictable, unbounded source of truncated,
+malformed, and even empty JSON responses in production - three separate
+rounds of trying to budget around it (raising `max_completion_tokens`, telling
+the model to keep JSON compact, then disabling the tool outright via
+`compound_custom.tools.enabled_tools: []`) still weren't fully reliable, since
+Compound's orchestration layer itself was the actual source of the problem,
+not anything in the prompt or schema. Since assessment was always computed
+purely from STATE's numeric data - it never needed search to begin with -
+switching to a plain, non-agentic model removes that whole layer rather than
+trying to keep working around it. If `GROQ_MODEL` is still set to a Compound
+system, `compound_custom` is only sent in that case (a plain model doesn't
+understand the parameter).
 
 Create a free Groq developer key at
 [console.groq.com/keys](https://console.groq.com/keys), then add it to `.env`:
@@ -755,7 +766,7 @@ Create a free Groq developer key at
 ```dotenv
 AGENT_ENABLED=true
 GROQ_API_KEY=your_groq_api_key
-GROQ_MODEL=groq/compound-mini
+GROQ_MODEL=llama-3.3-70b-versatile
 AGENT_CORE_RESEARCH_SECONDS=360
 AGENT_EXTENDED_RESEARCH_SECONDS=1866
 AGENT_DAILY_TOKEN_BUDGET=90000
@@ -769,13 +780,12 @@ LOSS_SPREE_TOTAL_DOLLARS=1.00
 LOSS_REEVALUATION_SECONDS=120
 ```
 
-`groq/compound-mini` is the low-latency Compound system; every built-in tool is
-disabled for this use (see above), so each call is a plain scored-JSON request.
-Even so, Groq's own per-key usage dashboard attributes each compound-mini call
-to 3 underlying model rows (the compound orchestration plus its 2 backing
-models), so the *real* cost of one "successful" cycle is about 3x its nominal
-request weight - `AGENT_DAILY_REQUEST_LIMIT` is set to 83 (250/3), not the free
-tier's raw 250-request ceiling, to actually respect that. `AGENT_MAX_SYMBOLS`
+`AGENT_DAILY_REQUEST_LIMIT` is set to 83, not the free tier's raw 250-request
+ceiling - back when this ran on compound-mini, Groq's own per-key usage
+dashboard attributed each call to 3 underlying model rows (the compound
+orchestration plus its 2 backing models), so the *real* cost of one
+"successful" cycle was about 3x its nominal request weight; 83 keeps that
+same conservative margin even after moving off Compound. `AGENT_MAX_SYMBOLS`
 and `AGENT_MARKET_PULSE_SYMBOLS` are also both kept small (3, not the payload's
 practical maximum) on purpose: a smaller STATE means a smaller expected
 response, which means a much higher chance the model finishes the full JSON
@@ -1487,8 +1497,8 @@ STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
 TOP_GAINERS_LIMIT=200
 MARKET_CAP_ALLOCATION_ENABLED=false
 STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
-STOCK_LARGE_CAP_CAPITAL_FRACTION=0.80
-STOCK_SMALL_CAP_CAPITAL_FRACTION=0.20
+STOCK_LARGE_CAP_CAPITAL_FRACTION=0.30
+STOCK_SMALL_CAP_CAPITAL_FRACTION=0.70
 MICRO_SCALP_ENABLED=false
 MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
 MICRO_SCALP_CAPITAL_FRACTION=0.20
@@ -1548,7 +1558,7 @@ STALL_BREAKER_MIN_PROFIT=0.01
 
 AGENT_ENABLED=false
 GROQ_API_KEY=
-GROQ_MODEL=groq/compound-mini
+GROQ_MODEL=llama-3.3-70b-versatile
 AGENT_CORE_RESEARCH_SECONDS=360
 AGENT_EXTENDED_RESEARCH_SECONDS=1866
 AGENT_DAILY_TOKEN_BUDGET=90000
