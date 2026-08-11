@@ -502,28 +502,28 @@ class MarketResearchAgent:
                 {"role": "user", "content": prompt},
             ],
             "response_format": {"type": "json_object"},
-            # No tools enabled (see compound_custom below) - budgeting
-            # around tool-use overhead with prompt instructions alone
-            # (raising this ceiling, then telling the model to keep JSON
-            # compact) still wasn't reliable; disabling the tool outright
-            # is the only way to guarantee it can't eat the output budget.
-            # compound-mini's own hard ceiling is 8192 output tokens; leave
-            # a small margin under it rather than requesting the max.
+            # 8000 leaves a small margin under Groq's typical 8192-token
+            # output ceiling rather than requesting the max itself.
             "max_completion_tokens": 8000,
             # Low, not zero: keeps numeric fields consistent/reproducible run
             # to run instead of drifting, while still leaving enough room for
             # the model to weigh conflicting signals rather than collapsing
             # to one canned answer.
             "temperature": 0.2,
-            # Disables every built-in tool (web_search, visit_website,
-            # code_interpreter, wolfram_alpha) for this request - TASK B
-            # never needed search to begin with (it's computed purely from
-            # STATE's numeric data), and Groq's own tool-orchestration
-            # overhead before the JSON is written was the actual source of
-            # the truncated/malformed responses _parse_response's fallback
-            # kept having to catch, not the output schema itself.
-            "compound_custom": {"tools": {"enabled_tools": []}},
         }
+        if "compound" in self.config.groq_model.lower():
+            # Only meaningful for a Compound system, and this account
+            # deliberately isn't on one anymore (see groq_model's default
+            # in config.py) - a plain model doesn't understand this param,
+            # so it's only sent when it would actually do something.
+            # Disables every built-in tool (web_search, visit_website,
+            # code_interpreter, wolfram_alpha) - TASK B never needed
+            # search to begin with (it's computed purely from STATE's
+            # numeric data), and Compound's own tool-orchestration
+            # overhead before the JSON is written was the actual source of
+            # the truncated/malformed/empty responses _parse_response's
+            # fallback kept having to catch, not the output schema itself.
+            request_kwargs["compound_custom"] = {"tools": {"enabled_tools": []}}
         # Exactly one Groq call per research cycle, deliberately no retry -
         # a retry-with-different-params here would count a second time
         # against both AGENT_DAILY_REQUEST_LIMIT and the rolling token

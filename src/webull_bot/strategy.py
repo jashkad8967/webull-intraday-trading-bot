@@ -521,16 +521,30 @@ class TradingStrategy:
             symbol = key.split(":", 1)[-1]
             self.crossover_counts[symbol] += 1
         if new_spread <= 0:
-            self.trend_streak[key] = 0
             # A fresh bearish cross (was bullish/flat, now bearish) is the
-            # short-side mirror of the "BUY" fresh-cross case below - a
-            # one-shot signal, not a continued-downtrend re-fire, same as
-            # option_direction_signal's PUT case. stock_decision only acts
-            # on this when SHORT_SELLING_ENABLED is on; it's always
-            # computed here regardless so the signal is available the
-            # moment shorting gets turned on without waiting on fresh
-            # history.
+            # short-side mirror of the "BUY" fresh-cross case below.
+            # stock_decision only acts on this when SHORT_SELLING_ENABLED
+            # is on; it's always computed here regardless so the signal is
+            # available the moment shorting gets turned on without waiting
+            # on fresh history.
+            #
+            # Mirrors BUY's reenter_on_trend continuation below - a short
+            # entry also requires VWAP/SMA-trend/extension/tick-direction
+            # to all align, and requiring that alignment on the exact
+            # single tick of the fresh cross (with no further chances
+            # after) made a real short entry all but impossible in
+            # practice. trend_streak is negative for a continuing
+            # downtrend, positive for a continuing uptrend, so both
+            # directions share the one counter.
             if old_spread > 0:
+                self.trend_streak[key] = 0
+                return "SHORT"
+            current_streak = self.trend_streak.get(key, 0)
+            self.trend_streak[key] = current_streak - 1 if current_streak <= 0 else -1
+            if (
+                self.config.reenter_on_trend
+                and -self.trend_streak[key] >= self.config.reenter_confirmation_polls
+            ):
                 return "SHORT"
             return "HOLD"
         if old_spread <= 0:

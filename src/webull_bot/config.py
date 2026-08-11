@@ -102,13 +102,18 @@ class Settings(BaseSettings):
         default=Decimal("100000000000"),
         gt=0,
     )
+    # Favors SMALL_CAP (companies under stock_large_cap_min_market_value,
+    # $100B by default) over LARGE_CAP - a volatility-focused scanner's
+    # qualifying candidates skew small/mid-cap far more often than
+    # mega-cap, so the old 80/20-toward-LARGE_CAP split left most of a
+    # small account's capital reserved for a bucket that rarely got spent.
     stock_large_cap_capital_fraction: Decimal = Field(
-        default=Decimal("0.80"),
+        default=Decimal("0.30"),
         ge=0,
         le=1,
     )
     stock_small_cap_capital_fraction: Decimal = Field(
-        default=Decimal("0.20"),
+        default=Decimal("0.70"),
         ge=0,
         le=1,
     )
@@ -294,7 +299,12 @@ class Settings(BaseSettings):
 
     agent_enabled: bool = False
     groq_api_key: str = ""
-    groq_model: str = "groq/compound-mini"
+    # A plain (non-agentic) model, not one of Groq's Compound systems -
+    # research is scored entirely from provided STATE data with no web
+    # search (see market_agent.py), so Compound's tool-orchestration layer
+    # was pure overhead: the actual source of the truncated/malformed/
+    # empty responses _parse_response kept having to work around.
+    groq_model: str = "llama-3.3-70b-versatile"
     # Groq's own usage dashboard attributes each compound-mini call to 3
     # underlying model rows (the compound orchestration plus its 2 backing
     # models - see console.groq.com's per-key usage table), so the real
