@@ -176,7 +176,6 @@ class AutoTrader:
         self.fractional_trading_enabled = True
         self.iceberg_orders: dict[str, dict] = {}
         self.order_error_times: deque = deque()
-        self.order_kill_switch_tripped = False
         self.pairs = PairsStrategy()
         self.pairs_positions: dict[tuple[str, str], dict] = {}
         self.last_pairs_sample = 0.0
@@ -1256,23 +1255,25 @@ class AutoTrader:
         return True
 
     def record_order_error(self, symbol: str, exc: Exception) -> None:
-        """Order-error kill switch: distinct from the existing P&L-based
-        circuit breakers (daily-loss, loss-spree) because it fires on
-        *error rate*, not realized loss - the guard against a rogue loop
-        or a systematically broken order path (bad auth, malformed
-        payload, API outage) spinning through the whole symbol universe
-        before any single trade even fills.
+        """Order-error guard: distinct from the existing P&L-based circuit
+        breakers (daily-loss, loss-spree) because it fires on *error
+        rate*, not realized loss - the guard against a rogue loop or a
+        systematically broken order path (bad auth, malformed payload,
+        API outage) spinning through the whole symbol universe before any
+        single trade even fills.
 
-        Deliberately its own flag, not a reuse of entries_paused: that
-        flag's own consumer (handle_portfolio_circuit_breaker) only even
-        looks at it when LOSS_CIRCUIT_BREAKER_ENABLED is on, and auto-
-        resumes it after LOSS_REEVALUATION_SECONDS - neither behavior is
-        appropriate here (a burst of order errors means something is
-        actually broken, not that prices moved against open positions;
-        it should stay tripped until the process is restarted, not
-        silently no-op under this project's default config). Exits are
-        never blocked by this, same as the existing breakers - only run()
-        checks it, and only to skip the entry-generating steps.
+        Blacklists only the offending symbol (reusing
+        broker_conflict_symbols - every entry path already skips symbols
+        in that set), not the whole account. This used to trip a global
+        kill switch that halted every symbol's entries AND exits until
+        the process was restarted - in production, a single symbol stuck
+        in a broker-side rejection (e.g. Webull's $0.10-$0.999 lot-size
+        rule) repeatedly tripped this and froze the entire bot for the
+        rest of the session over a problem confined to one symbol. The
+        error-rate counter itself stays global (still the right signal
+        for "something is systematically broken," e.g. bad auth spamming
+        errors across many different symbols), but the consequence is now
+        scoped to whichever symbol actually caused it.
         """
         now = time.monotonic()
         self.order_error_times.append(now)
@@ -1281,19 +1282,25 @@ class AutoTrader:
             and now - self.order_error_times[0] > ORDER_ERROR_WINDOW_SECONDS
         ):
             self.order_error_times.popleft()
-        if (
-            len(self.order_error_times) >= CONSECUTIVE_ORDER_ERROR_LIMIT
-            and not self.order_kill_switch_tripped
-        ):
-            self.order_kill_switch_tripped = True
-            log.critical(
-                "GUARD  | %s order errors in %ss (last: %s | %s) | "
-                "pausing all new entries until restart",
-                len(self.order_error_times),
-                ORDER_ERROR_WINDOW_SECONDS,
-                symbol,
-                exc,
-            )
+        if len(self.order_error_times) >= CONSECUTIVE_ORDER_ERROR_LIMIT:
+            self.order_error_times.clear()
+            already_blacklisted = symbol in self.broker_conflict_symbols
+            self.broker_conflict_symbols.add(symbol)
+            self.pending_stock_exits.discard(symbol)
+            self.pending_option_exits.discard(symbol)
+            self.stop_exit_submitted.pop(symbol, None)
+            self.stop_loss_escalated.discard(symbol)
+            if not already_blacklisted:
+                log.critical(
+                    "GUARD  | %s order errors in %ss (last: %s | %s) | "
+                    "blacklisting %s from further automated action for "
+                    "the rest of the day - other symbols are unaffected",
+                    CONSECUTIVE_ORDER_ERROR_LIMIT,
+                    ORDER_ERROR_WINDOW_SECONDS,
+                    symbol,
+                    exc,
+                    symbol,
+                )
 
     def place_stock_scaled(
         self,
@@ -3059,8 +3066,6 @@ class AutoTrader:
                 )
                 if not circuit_active:
                     circuit_active = self.handle_daily_loss_breaker()
-                if not circuit_active and self.order_kill_switch_tripped:
-                    circuit_active = True
                 if not circuit_active:
                     buying_power = self.trade_pairs(positions, buying_power)
                     buying_power = self.trade_stocks(
