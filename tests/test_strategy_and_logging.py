@@ -3350,35 +3350,50 @@ class ExecutionGuardrailTests(unittest.TestCase):
         with self.assertLogs("webull-bot", level="ERROR"):
             self.assertFalse(check(Decimal("100.00"), Decimal("110.00")))
 
-    def test_record_order_error_trips_kill_switch_after_threshold(self):
+    @staticmethod
+    def _fake_bot_for_order_errors():
+        return SimpleNamespace(
+            order_error_times=deque(),
+            broker_conflict_symbols=set(),
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+            stop_exit_submitted={},
+            stop_loss_escalated=set(),
+        )
+
+    def test_record_order_error_blacklists_only_the_offending_symbol(self):
+        """Regression test: this used to trip a global kill switch that
+        halted every symbol's entries AND exits until the process was
+        restarted - in production, a single symbol stuck in a broker-side
+        rejection (Webull's $0.10-$0.999 lot-size rule) repeatedly tripped
+        this and froze the entire bot over a problem confined to one
+        symbol. Must now blacklist only that symbol (reusing
+        broker_conflict_symbols, which every entry path already checks),
+        leaving every other symbol unaffected.
+        """
         from webull_bot.bot import AutoTrader, CONSECUTIVE_ORDER_ERROR_LIMIT
 
-        fake_bot = SimpleNamespace(
-            order_error_times=deque(), order_kill_switch_tripped=False
-        )
+        fake_bot = self._fake_bot_for_order_errors()
         record = AutoTrader.record_order_error.__get__(fake_bot)
         with self.assertLogs("webull-bot", level="CRITICAL"):
             for _ in range(CONSECUTIVE_ORDER_ERROR_LIMIT):
-                record("TEST", RuntimeError("boom"))
-        self.assertTrue(fake_bot.order_kill_switch_tripped)
+                record("OPTT", RuntimeError("boom"))
+        self.assertIn("OPTT", fake_bot.broker_conflict_symbols)
+        self.assertFalse(hasattr(fake_bot, "order_kill_switch_tripped"))
 
     def test_record_order_error_does_not_trip_below_threshold(self):
         from webull_bot.bot import AutoTrader, CONSECUTIVE_ORDER_ERROR_LIMIT
 
-        fake_bot = SimpleNamespace(
-            order_error_times=deque(), order_kill_switch_tripped=False
-        )
+        fake_bot = self._fake_bot_for_order_errors()
         record = AutoTrader.record_order_error.__get__(fake_bot)
         for _ in range(CONSECUTIVE_ORDER_ERROR_LIMIT - 1):
             record("TEST", RuntimeError("boom"))
-        self.assertFalse(fake_bot.order_kill_switch_tripped)
+        self.assertEqual(fake_bot.broker_conflict_symbols, set())
 
     def test_record_order_error_prunes_entries_outside_window(self):
         from webull_bot.bot import AutoTrader, ORDER_ERROR_WINDOW_SECONDS
 
-        fake_bot = SimpleNamespace(
-            order_error_times=deque(), order_kill_switch_tripped=False
-        )
+        fake_bot = self._fake_bot_for_order_errors()
         record = AutoTrader.record_order_error.__get__(fake_bot)
         fake_bot.order_error_times.append(
             time.monotonic() - ORDER_ERROR_WINDOW_SECONDS - 5
