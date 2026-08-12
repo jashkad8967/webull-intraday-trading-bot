@@ -97,39 +97,7 @@ class Settings(BaseSettings):
         ge=0,
         le=1,
     )
-    market_cap_allocation_enabled: bool = False
-    stock_large_cap_min_market_value: Decimal = Field(
-        default=Decimal("100000000000"),
-        gt=0,
-    )
-    # Favors SMALL_CAP (companies under stock_large_cap_min_market_value,
-    # $100B by default) over LARGE_CAP - a volatility-focused scanner's
-    # qualifying candidates skew small/mid-cap far more often than
-    # mega-cap, so the old 80/20-toward-LARGE_CAP split left most of a
-    # small account's capital reserved for a bucket that rarely got spent.
-    stock_large_cap_capital_fraction: Decimal = Field(
-        default=Decimal("0.30"),
-        ge=0,
-        le=1,
-    )
-    stock_small_cap_capital_fraction: Decimal = Field(
-        default=Decimal("0.70"),
-        ge=0,
-        le=1,
-    )
     top_gainers_limit: int = Field(default=200, ge=0, le=5000)
-    micro_scalp_enabled: bool = False
-    micro_scalp_symbols: str = "TSLA,NVDA,AMD,COIN,PLTR,MSTR"
-    micro_scalp_capital_fraction: Decimal = Field(
-        default=Decimal("0.20"),
-        ge=0,
-        le=1,
-    )
-    micro_scalp_max_positions: int = Field(default=5, ge=1, le=50)
-    micro_scalp_dip_cents: Decimal = Field(default=Decimal("0.05"), gt=0)
-    micro_scalp_target_cents: Decimal = Field(default=Decimal("0.06"), gt=0)
-    micro_scalp_stop_cents: Decimal = Field(default=Decimal("0.10"), gt=0)
-    micro_scalp_reference_window: int = Field(default=20, ge=3, le=200)
     fractional_shares_enabled: bool = False
     fractional_shares_min_notional: Decimal = Field(default=Decimal("5"), ge=Decimal("5"))
     option_batch_size: int = Field(default=20, ge=1, le=20)
@@ -196,9 +164,8 @@ class Settings(BaseSettings):
     # round up to 3 cents instead of 2), but a flat estimate is close enough
     # to make sure every realized P&L figure - dashboard, daily loss
     # breaker, trade log - reflects a real cost instead of assuming a free
-    # round trip. Also folded into every profit target (stock, option,
-    # micro-scalp) so a target isn't hit at a price that nets a loss once
-    # this fee comes out.
+    # round trip. Also folded into every profit target (stock, option) so a
+    # target isn't hit at a price that nets a loss once this fee comes out.
     sell_fee_dollars: Decimal = Field(default=Decimal("0.02"), ge=0)
     stock_stop_loss_min_percent: Decimal = Field(default=Decimal("0.009"), gt=0, le=1)
     stock_stop_loss_max_percent: Decimal = Field(default=Decimal("0.015"), gt=0, le=1)
@@ -478,19 +445,7 @@ class Settings(BaseSettings):
             if item.strip()
         ]
 
-    def micro_scalp_symbol_list(self) -> list[str]:
-        return [
-            item.strip().upper()
-            for item in self.micro_scalp_symbols.split(",")
-            if item.strip()
-        ]
-
     def stock_capital_fractions(self) -> dict[str, Decimal]:
-        if self.market_cap_allocation_enabled:
-            return {
-                "LARGE_CAP": self.stock_large_cap_capital_fraction,
-                "SMALL_CAP": self.stock_small_cap_capital_fraction,
-            }
         return {
             "POPULAR": self.stock_popular_capital_fraction,
             "PENNY": self.stock_penny_capital_fraction,

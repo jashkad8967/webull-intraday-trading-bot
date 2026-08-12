@@ -29,14 +29,13 @@ shared universe-selection and risk-management layer. Nothing below replaced
 anything - each piece was added alongside what already existed, and every
 layer stays fully configurable/optional.
 
-**1. Universe selection.** `STOCK_SYMBOLS=ALL` builds the tradeable pool one
-of two ways: the classic mode (a capped cross-exchange directory scan) or
-`MARKET_CAP_ALLOCATION_ENABLED` (Webull's screener, tiered into LARGE_CAP/
-SMALL_CAP buckets). Either way, the pool is topped up with today's actual
-top gainers (`TOP_GAINERS_LIMIT`) so real current movers are included, not
-just high-volume names, and any symbol you've explicitly listed in
-`POPULAR_STOCK_SYMBOLS` is reinstated even if the historical-volatility
-filter would have dropped it - your trusted names never silently disappear.
+**1. Universe selection.** `STOCK_SYMBOLS=ALL` builds the tradeable pool via
+a capped cross-exchange directory scan. The pool is topped up with today's
+actual top gainers (`TOP_GAINERS_LIMIT`) so real current movers are
+included, not just high-volume names, and any symbol you've explicitly
+listed in `POPULAR_STOCK_SYMBOLS` is reinstated even if the
+historical-volatility filter would have dropped it - your trusted names
+never silently disappear.
 
 **2. Trend-following core.** The main scan buys on an EMA(fast,slow)
 crossover, gated by session VWAP support and an extension check (don't chase
@@ -49,24 +48,14 @@ and symbols that have repeatedly flipped direction today
 keeps producing fresh scalp setups while a name that made one move and
 stalled doesn't.
 
-**3. Micro-scalp layer.** A handful of extremely liquid single stocks
-(`MICRO_SCALP_SYMBOLS`, e.g. TSLA/NVDA) tick by a few cents constantly
-without ever forming a clean trend - the EMA core structurally can't act on
-that. `MICRO_SCALP_ENABLED` runs a second, fully independent decision path
-for exactly those symbols: buy a small dip below a rolling reference price,
-sell a small fixed-cents bounce. It has its own capital slice
-(`MICRO_SCALP_CAPITAL_FRACTION`) and position cap, and those symbols are
-excluded from the trend-following scan so the two paths never fight over
-managing the same position.
-
-**4. Sizing.** Entries size to whole shares by default, capped by
+**3. Sizing.** Entries size to whole shares by default, capped by
 `MAX_ORDER_NOTIONAL` and the active bucket's capital allocation. When a
 bucket's remaining budget can't afford even one whole share,
 `FRACTIONAL_SHARES_ENABLED` falls back to a fractional MARKET order (Webull
 requires quantity in (0, 1] and a $5 minimum for these) instead of skipping
 the entry.
 
-**5. Research agent (optional, advisory only).** A Groq-based web-research
+**4. Research agent (optional, advisory only).** A Groq-based web-research
 pass biases priority ranking and exit timing - it never gates an entry that
 the technical signals already support, and a missing/degraded agent just
 means less-informed prioritization, not a stopped bot. Each research cycle
@@ -76,7 +65,7 @@ model's own quirks - oversized requests and malformed/truncated JSON both
 just fall back to conservative defaults for that one cycle instead of
 costing a second call.
 
-**6. Safety rails**, all independent of which entry strategy opened a
+**5. Safety rails**, all independent of which entry strategy opened a
 position: wash-sale blocking (stocks and options, including from a manual
 dashboard sell at a loss), a simultaneous-unrealized-loss circuit breaker, a
 daily realized-loss circuit breaker, exit escalation for a stuck stop-loss
@@ -105,11 +94,11 @@ day (logged under `CONFLICT`) instead of retrying an order that can't
 succeed - check the Webull app for a stuck order or unexpected position on
 that symbol.
 
-**7. Manual overrides.** The dashboard's Close All, per-position Sell, and
+**6. Manual overrides.** The dashboard's Close All, per-position Sell, and
 watchlist-add all route through a narrow shared command file rather than
 giving the dashboard direct Webull access - see [Dashboard](#dashboard).
 
-**8. Observability.** Every 30 seconds the log emits a `SCAN` summary
+**7. Observability.** Every 30 seconds the log emits a `SCAN` summary
 (universe size, positions, buying power, today's P&L, watchlist size) and,
 when entries aren't firing, a `GATES` line showing the top reasons why (e.g.
 `price below session VWAP=40 | EMA entry not ready=112`) - so a quiet period
@@ -277,121 +266,10 @@ stocks and ETFs. The bot checks rejected snapshot symbols against the other cate
 corrects stock/ETF mismatches, and skips only symbols invalid in both
 categories. Startup prints `LOAD` progress while symbols are downloaded.
 
-### Market-cap-tiered universe (large-cap + small-cap volatility split)
-
-Instead of the popular/penny/discovery split above, you can load a stock-only
-universe ranked by market cap straight from Webull's most-active screener and
-allocate capital by cap-size tier:
-
-```dotenv
-STOCK_SYMBOLS=ALL
-MARKET_CAP_ALLOCATION_ENABLED=true
-STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
-STOCK_LARGE_CAP_CAPITAL_FRACTION=0.30
-STOCK_SMALL_CAP_CAPITAL_FRACTION=0.70
-MAX_SYMBOLS=750
-STOCK_UNIVERSE_PAGE_SIZE=500
-EXCLUDE_ETFS=true
-HISTORICAL_VOLATILITY_FILTER_ENABLED=true
-MIN_HISTORICAL_VOLATILITY_PERCENT=3
-TOP_GAINERS_LIMIT=200
-```
-
-With this enabled, `STOCK_SYMBOLS=ALL` downloads the universe from Webull's
-most-active screener (stocks only, no ETFs) in pages of
-`STOCK_UNIVERSE_PAGE_SIZE` up to `MAX_SYMBOLS` total, ranked by market value,
-and keeps paging through subsequent pages until either the page limit or
-`MAX_SYMBOLS` is reached. It then merges in `TOP_GAINERS_LIMIT` symbols from
-Webull's today's-top-gainers screener (ranked by actual price change) that
-weren't already in the most-active list, so stocks that are genuinely up big
-today are part of the selectable universe even if they aren't among the
-highest-volume names. Raise `MAX_SYMBOLS` above 500 (e.g. 750-1000) and set
-`STOCK_UNIVERSE_PAGE_SIZE=500` to load more than 500 stocks, 500 per request.
-
-Every symbol still has to pass the existing
-`HISTORICAL_VOLATILITY_FILTER_ENABLED` volatility screen, so only volatile
-names are kept regardless of cap size - except any symbol you've explicitly
-listed in `POPULAR_STOCK_SYMBOLS` that was present in the downloaded universe
-but got cut by that filter (common for well-known large-caps with calmer
-historical amplitude): the bot reinstates it, logging `LOAD | reinstated N
-popular symbols the volatility filter would have dropped`. This is also why
-you should always see your explicitly configured names trading somewhere in
-the universe - if one is missing entirely, check the startup log for `LOAD |
-popular symbols not found in screener universe (skipped)`, which means Webull's
-screener response didn't include that symbol at all that day (rare for a
-liquid name, but not impossible).
-
-Symbols at or above `STOCK_LARGE_CAP_MIN_MARKET_VALUE` are tagged `LARGE_CAP`;
-everything else is `SMALL_CAP`. Buying power is reserved 30/70 toward SMALL_CAP
-by default (configurable via `STOCK_LARGE_CAP_CAPITAL_FRACTION` /
-`STOCK_SMALL_CAP_CAPITAL_FRACTION`, which must sum to 1) - a
-volatility-focused scanner's qualifying candidates skew small/mid-cap far more
-often than mega-cap ($100B+ by default), so an even or LARGE_CAP-favoring split
-tends to strand a meaningful chunk of a small account's capital in a bucket
-that rarely gets spent. Each batch always
-includes held positions first, then the top-ranked large-cap and small-cap
-names by the same activity/research priority score used elsewhere, plus a
-rotating exploration slice. This mode replaces (not adds to) the
-popular/penny/discovery bucketing above — leave
-`MARKET_CAP_ALLOCATION_ENABLED=false` (the default) to keep the original
-behavior.
-
-Webull's screener response field names aren't published in the SDK's type
-stubs, so market value/volume/change/amplitude are parsed defensively; verify
-the `LOAD | market-cap universe ready | large_cap=... | small_cap=...` startup
-log line against your account once deployed to confirm the split looks right.
-
-### Micro-scalp mode (fixed-cents mean reversion on always-ticking stocks)
-
-Everything above is trend-following: it waits for an EMA crossover, which
-requires the price to actually be trending, not just bouncing around. A
-handful of extremely liquid single stocks (TSLA, NVDA, etc.) tick almost
-every second by a few cents without ever forming a clean trend - the
-opportunity there is buying a small dip and selling the bounce back, not
-catching a move. Micro-scalp mode is a second, independent decision path
-built for exactly that:
-
-```dotenv
-MICRO_SCALP_ENABLED=true
-MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
-MICRO_SCALP_CAPITAL_FRACTION=0.20
-MICRO_SCALP_MAX_POSITIONS=5
-MICRO_SCALP_DIP_CENTS=0.05
-MICRO_SCALP_TARGET_CENTS=0.06
-MICRO_SCALP_STOP_CENTS=0.10
-MICRO_SCALP_REFERENCE_WINDOW=20
-```
-
-For each symbol in `MICRO_SCALP_SYMBOLS`, the bot keeps a rolling average of
-the last `MICRO_SCALP_REFERENCE_WINDOW` quote prices - the level it's "just
-been trading around," not a trend direction. It buys when price dips at
-least `MICRO_SCALP_DIP_CENTS` below that average (and the spread still
-passes `STOCK_ENTRY_MAX_SPREAD_PERCENT`), then exits at
-`+MICRO_SCALP_TARGET_CENTS` on a bounce or `-MICRO_SCALP_STOP_CENTS` if the
-dip keeps falling - fixed cents, not percentages, since "a few cents" on a
-$400 stock is a much smaller move than the bot's normal percentage-based
-stop/target bands are tuned for.
-
-This runs as a fully separate path from the main universe scan: it has its
-own capital reservation (`MICRO_SCALP_CAPITAL_FRACTION`, taken as a slice of
-buying power before the normal bucket split runs) and its own position cap
-(`MICRO_SCALP_MAX_POSITIONS`, still bounded by the overall
-`MAX_OPEN_POSITIONS`). Symbols in `MICRO_SCALP_SYMBOLS` are automatically
-excluded from the main EMA-based scan (logged as `LOAD | excluded N
-micro-scalp symbols from the main universe scan`), so the two decision paths
-never end up managing the same position with conflicting rules. It still
-goes through the same order placement, wash-sale blocking, stop escalation,
-and cooldown/rate-cap machinery as every other stock trade - only the
-entry/exit decision itself is different.
-
-Keep the symbol list short and genuinely liquid - this is a high-turnover
-mode by design (small, frequent wins), so slippage and spread on a thin
-name will eat the edge faster than the target captures it.
-
 ### Fractional shares
 
-A capital bucket (or micro-scalp's dedicated slice) can easily be too small
-to afford one whole share of an expensive stock - `STOCK_QUANTITY` shares at
+A capital bucket can easily be too small to afford one whole share of an
+expensive stock - `STOCK_QUANTITY` shares at
 that price simply won't fit the budget, and the entry is skipped. Enabling
 this lets the bot fall back to a fractional-share order instead of skipping:
 
@@ -411,10 +289,9 @@ gets bought.
 
 Because it's a market order, the fill price isn't guaranteed the way a
 limit order's is - on the main stock strategy this is a minor, occasional
-edge case, but if you also enable fractional shares under `MICRO_SCALP_*`,
-be aware that a market-order fill a cent or two off from the intended entry
-eats directly into a strategy that's already targeting only a few cents of
-edge per trade.
+edge case, since a market-order fill a cent or two off from the intended
+entry still fits comfortably inside the strategy's normal percentage-based
+targets.
 
 Fractional positions are tracked and closed out exactly like whole-share
 ones (including by the EOD closeout and stall breaker) - Webull's account
@@ -458,9 +335,7 @@ sizing spends against the full remaining entry budget instead of this
 slice of it, same as the bot's original pre-split behavior. Set
 `STOCK_CORE_SESSION_POSITION_FRACTION=0` to disable fractional sizing
 entirely and use fixed whole-share sizing (uncapped by the split fraction)
-all day. Both settings only affect the main stock strategy's
-`trade_stocks` entries - micro-scalp mode keeps its own fixed-cents sizing
-untouched.
+all day.
 
 **Position-slot reservation.** A fractional position can only be exited
 during core hours (see the rejection note below), so if fractional entries
@@ -953,7 +828,7 @@ original 1.2× - at 1.2, breakeven needs a ~45.5% win rate, too thin a
 margin for normal noise/whipsaw and a real cause of net-losing days even
 with plenty of individual winners; 1.8 only needs ~35.7%) — so reward:risk
 scales with volatility instead of staying fixed while the stop moves. On
-top of that, every stock, option, and micro-scalp target adds
+top of that, every stock and option target adds
 `SELL_FEE_DOLLARS` (default $0.02 - Webull's flat SEC-fee-plus-FINRA-TAF
 pass-through, charged on the sell leg only, converted to a per-share amount
 by dividing by the position's quantity) so a target isn't hit at a price
@@ -1108,9 +983,9 @@ locally as each order is submitted so later orders in the same cycle cannot
 reuse it.
 
 **Capital deployment.** `MAX_OPEN_POSITIONS` is the shared cap on concurrent
-open positions across stocks, options, and micro-scalp combined - it drives
+open positions across stocks and options combined - it drives
 `stock_bucket_slot_limits()`'s proportional split across the POPULAR/PENNY/
-DISCOVERY (or LARGE_CAP/SMALL_CAP) buckets. Because each core-session entry
+DISCOVERY buckets. Because each core-session entry
 sizes itself as `STOCK_CORE_SESSION_POSITION_FRACTION` of *remaining* buying
 power (not the original total), filling every slot at a low position cap
 still leaves a real chunk of capital idle - e.g. ten sequential 10%-of-
@@ -1495,18 +1370,6 @@ STOCK_POPULAR_CAPITAL_FRACTION=0.70
 STOCK_PENNY_CAPITAL_FRACTION=0.10
 STOCK_DISCOVERY_CAPITAL_FRACTION=0.20
 TOP_GAINERS_LIMIT=200
-MARKET_CAP_ALLOCATION_ENABLED=false
-STOCK_LARGE_CAP_MIN_MARKET_VALUE=100000000000
-STOCK_LARGE_CAP_CAPITAL_FRACTION=0.30
-STOCK_SMALL_CAP_CAPITAL_FRACTION=0.70
-MICRO_SCALP_ENABLED=false
-MICRO_SCALP_SYMBOLS=TSLA,NVDA,AMD,COIN,PLTR,MSTR
-MICRO_SCALP_CAPITAL_FRACTION=0.20
-MICRO_SCALP_MAX_POSITIONS=5
-MICRO_SCALP_DIP_CENTS=0.05
-MICRO_SCALP_TARGET_CENTS=0.06
-MICRO_SCALP_STOP_CENTS=0.10
-MICRO_SCALP_REFERENCE_WINDOW=20
 FRACTIONAL_SHARES_ENABLED=false
 FRACTIONAL_SHARES_MIN_NOTIONAL=5
 OPTION_BATCH_SIZE=20
