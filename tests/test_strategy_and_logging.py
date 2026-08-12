@@ -42,10 +42,6 @@ class StrategyConfigMixin:
             stock_priority_fraction=0.6,
             stock_penny_fraction=0.2,
             stock_oscillation_weight=Decimal("0.5"),
-            micro_scalp_reference_window=20,
-            micro_scalp_dip_cents=Decimal("0.05"),
-            micro_scalp_target_cents=Decimal("0.06"),
-            micro_scalp_stop_cents=Decimal("0.10"),
             penny_stock_max_price=Decimal("5"),
             popular_stock_min_volume=1_000_000,
             popular_stock_max_spread_percent=Decimal("0.50"),
@@ -610,79 +606,6 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(quantity, 1)
 
-    def test_micro_scalp_reference_price_is_none_without_data(self):
-        strategy = TradingStrategy(self.config())
-        self.assertIsNone(strategy.micro_scalp_reference_price("TSLA"))
-
-    def test_micro_scalp_decision_buys_a_small_dip_below_reference(self):
-        strategy = TradingStrategy(self.config())
-        for _ in range(5):
-            strategy.update_stock_snapshot(
-                {"symbol": "TSLA", "bid": "99.99", "ask": "100.01"},
-                Decimal("100.00"),
-            )
-        strategy.update_stock_snapshot(
-            {"symbol": "TSLA", "bid": "99.89", "ask": "99.91"},
-            Decimal("99.90"),
-        )
-        decision = strategy.micro_scalp_decision(
-            "STOCK:TSLA",
-            Decimal("99.90"),
-            0,
-            Decimal("0"),
-        )
-        self.assertEqual(decision.action, "BUY")
-
-    def test_micro_scalp_decision_holds_without_a_qualifying_dip(self):
-        strategy = TradingStrategy(self.config())
-        for _ in range(5):
-            strategy.update_stock_snapshot(
-                {"symbol": "TSLA", "bid": "99.99", "ask": "100.01"},
-                Decimal("100.00"),
-            )
-        strategy.update_stock_snapshot(
-            {"symbol": "TSLA", "bid": "99.97", "ask": "99.99"},
-            Decimal("99.98"),
-        )
-        decision = strategy.micro_scalp_decision(
-            "STOCK:TSLA",
-            Decimal("99.98"),
-            0,
-            Decimal("0"),
-        )
-        self.assertEqual(decision.action, "HOLD")
-
-    def test_micro_scalp_decision_takes_profit_on_the_bounce(self):
-        strategy = TradingStrategy(self.config())
-        decision = strategy.micro_scalp_decision(
-            "STOCK:TSLA",
-            Decimal("100.07"),
-            10,
-            Decimal("100.00"),
-        )
-        self.assertEqual(decision.action, "PROFIT")
-
-    def test_micro_scalp_decision_cuts_loss_if_dip_keeps_falling(self):
-        strategy = TradingStrategy(self.config())
-        decision = strategy.micro_scalp_decision(
-            "STOCK:TSLA",
-            Decimal("99.85"),
-            10,
-            Decimal("100.00"),
-        )
-        self.assertEqual(decision.action, "LOSS")
-
-    def test_clear_market_state_resets_micro_scalp_reference(self):
-        strategy = TradingStrategy(self.config())
-        strategy.update_stock_snapshot(
-            {"symbol": "TSLA", "bid": "99.99", "ask": "100.01"},
-            Decimal("100.00"),
-        )
-        self.assertIsNotNone(strategy.micro_scalp_reference_price("TSLA"))
-        strategy.clear_market_state()
-        self.assertIsNone(strategy.micro_scalp_reference_price("TSLA"))
-
-
 class StopLossEscalationTests(unittest.TestCase):
     def test_escalated_stop_bypasses_cooldown_after_cancel(self):
         from webull_bot.bot import AutoTrader
@@ -796,212 +719,6 @@ class StopLossEscalationTests(unittest.TestCase):
         self.assertIn("ASHR", fake_bot.stop_loss_escalated)
         self.assertNotIn("ASHR", fake_bot.pending_stock_exits)
         self.assertNotIn("ASHR", fake_bot.stop_exit_submitted)
-
-    def test_escalated_profit_order_uses_aggressive_price_not_stale_target(self):
-        """End-to-end via the real trade_micro_scalp() path: once a PROFIT
-        exit is escalated, the resubmission must use the current aggressive
-        crossing price, not the stale theoretical target - the whole point
-        is to actually get a fill instead of re-quoting the exact price
-        that already failed to fill.
-        """
-        from collections import defaultdict, deque
-
-        from webull_bot.bot import AutoTrader
-
-        config = Settings(
-            micro_scalp_enabled=True,
-            micro_scalp_symbols="ASHR",
-            micro_scalp_target_cents=Decimal("0.06"),
-            trade_cooldown_seconds=Decimal("0"),
-        )
-        strategy = TradingStrategy(config)
-        quote = {"symbol": "ASHR", "bid": "34.09", "ask": "34.11", "price": "34.10"}
-
-        placed = []
-
-        class FakeApi:
-            def stock_quotes_resilient(self, symbols, category):
-                return [quote], set()
-
-            @staticmethod
-            def quote_price(q):
-                return Decimal(str(q["price"]))
-
-            @staticmethod
-            def stock_position(symbol, positions):
-                for item in positions:
-                    if item.get("symbol") == symbol:
-                        return (
-                            Decimal(str(item.get("quantity", "0"))),
-                            Decimal(str(item.get("cost_price", "0"))),
-                        )
-                return Decimal("0"), Decimal("0")
-
-            def stock_limit_price(self, q, side):
-                return Decimal("34.00")
-
-            @staticmethod
-            def quote_ask(q):
-                return Decimal(str(q["ask"]))
-
-            def place_stock(self, symbol, side, quantity, limit_price=None, fractional=False):
-                placed.append((symbol, side, quantity, limit_price))
-                return "order-1"
-
-        fake_bot = SimpleNamespace(
-            config=config,
-            api=FakeApi(),
-            strategy=strategy,
-            wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
-            status=SimpleNamespace(record_trade=lambda *a, **k: None),
-            last_trade={},
-            last_exit_at={},
-            trade_times=defaultdict(deque),
-            pending_stock_exits=set(),
-            stop_exit_submitted={},
-            stop_loss_escalated={"ASHR"},
-            position_buckets={},
-            working_orders={},
-            broker_conflict_symbols=set(),
-            daily_realized_pnl=Decimal("0"),
-            daily_realized_loss=Decimal("0"),
-            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
-        )
-        fake_bot.is_broker_position_conflict = AutoTrader.is_broker_position_conflict
-        fake_bot.is_fractional_trading_not_enabled = (
-            AutoTrader.is_fractional_trading_not_enabled
-        )
-        for name in (
-            "cooldown_ready",
-            "rate_capped",
-            "reentry_cooldown_ready",
-            "record_trade",
-            "record_realized_exit",
-            "stop_ready_to_submit",
-            "trade_micro_scalp",
-        ):
-            setattr(fake_bot, name, getattr(AutoTrader, name).__get__(fake_bot))
-
-        positions = [
-            {
-                "instrument_type": "EQUITY",
-                "symbol": "ASHR",
-                "quantity": "1",
-                "cost_price": "34.00",
-            }
-        ]
-        fake_bot.trade_micro_scalp(positions, Decimal("10000"))
-
-        self.assertEqual(len(placed), 1)
-        self.assertEqual(placed[0][:3], ("ASHR", "SELL", Decimal("1")))
-        self.assertEqual(placed[0][3], Decimal("34.00"))
-        self.assertIn("ASHR", fake_bot.stop_exit_submitted)
-
-    def test_profit_exit_never_prices_below_target_even_if_ask_has_fallen(self):
-        """A PROFIT decision can fire off a last-trade print (quote_price)
-        that's already stale relative to the current book - if the ask has
-        since dropped below the target, pricing the exit at that ask
-        directly (the old `ask or target` logic) can execute at a real
-        loss while still being logged as PROFIT. The floor must win.
-        """
-        from collections import defaultdict, deque
-
-        from webull_bot.bot import AutoTrader
-
-        config = Settings(
-            micro_scalp_enabled=True,
-            micro_scalp_symbols="ASHR",
-            micro_scalp_target_cents=Decimal("0.06"),
-            trade_cooldown_seconds=Decimal("0"),
-        )
-        strategy = TradingStrategy(config)
-        # Last trade printed at 34.10 (above the 34.06 target, triggering
-        # PROFIT), but the current ask has already fallen to 34.02 - below
-        # the target and below the 34.00 entry cost.
-        quote = {"symbol": "ASHR", "bid": "34.00", "ask": "34.02", "price": "34.10"}
-
-        placed = []
-
-        class FakeApi:
-            def stock_quotes_resilient(self, symbols, category):
-                return [quote], set()
-
-            @staticmethod
-            def quote_price(q):
-                return Decimal(str(q["price"]))
-
-            @staticmethod
-            def stock_position(symbol, positions):
-                for item in positions:
-                    if item.get("symbol") == symbol:
-                        return (
-                            Decimal(str(item.get("quantity", "0"))),
-                            Decimal(str(item.get("cost_price", "0"))),
-                        )
-                return Decimal("0"), Decimal("0")
-
-            def stock_limit_price(self, q, side):
-                return Decimal("33.90")
-
-            @staticmethod
-            def quote_ask(q):
-                return Decimal(str(q["ask"]))
-
-            def place_stock(self, symbol, side, quantity, limit_price=None, fractional=False):
-                placed.append((symbol, side, quantity, limit_price))
-                return "order-1"
-
-        fake_bot = SimpleNamespace(
-            config=config,
-            api=FakeApi(),
-            strategy=strategy,
-            wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
-            status=SimpleNamespace(record_trade=lambda *a, **k: None),
-            last_trade={},
-            last_exit_at={},
-            trade_times=defaultdict(deque),
-            pending_stock_exits=set(),
-            stop_exit_submitted={},
-            stop_loss_escalated=set(),
-            position_buckets={},
-            working_orders={},
-            broker_conflict_symbols=set(),
-            daily_realized_pnl=Decimal("0"),
-            daily_realized_loss=Decimal("0"),
-            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
-        )
-        fake_bot.is_broker_position_conflict = AutoTrader.is_broker_position_conflict
-        fake_bot.is_fractional_trading_not_enabled = (
-            AutoTrader.is_fractional_trading_not_enabled
-        )
-        for name in (
-            "cooldown_ready",
-            "rate_capped",
-            "reentry_cooldown_ready",
-            "record_trade",
-            "record_realized_exit",
-            "stop_ready_to_submit",
-            "trade_micro_scalp",
-        ):
-            setattr(fake_bot, name, getattr(AutoTrader, name).__get__(fake_bot))
-
-        positions = [
-            {
-                "instrument_type": "EQUITY",
-                "symbol": "ASHR",
-                "quantity": "1",
-                "cost_price": "34.00",
-            }
-        ]
-        fake_bot.trade_micro_scalp(positions, Decimal("10000"))
-
-        self.assertEqual(len(placed), 1)
-        # Must price at the 34.08 target (34.06 micro-scalp target plus the
-        # $0.02 flat sell fee, spread over the 1-share quantity), not the
-        # fallen 34.02 ask.
-        self.assertEqual(placed[0][3], Decimal("34.08"))
-        self.assertGreater(placed[0][3], Decimal("34.00"))  # never below cost
-
 
 class RepriceRestingExitsTests(unittest.TestCase):
     def test_reprice_cancels_and_replaces_at_new_ask_without_recording_pnl_again(self):
@@ -1319,242 +1036,6 @@ class RepriceRestingExitsTests(unittest.TestCase):
         self.assertEqual(
             fake_bot.working_orders["order-1"]["limit_price"], Decimal("30.20")
         )
-
-
-class MicroScalpIntegrationTests(unittest.TestCase):
-    def test_trade_micro_scalp_buys_a_qualifying_dip_end_to_end(self):
-        from collections import defaultdict, deque
-
-        from webull_bot.bot import AutoTrader
-
-        config = Settings(
-            micro_scalp_enabled=True,
-            micro_scalp_symbols="TSLA",
-            micro_scalp_dip_cents=Decimal("0.05"),
-            micro_scalp_capital_fraction=Decimal("1.0"),
-            micro_scalp_max_positions=1,
-            max_open_positions=5,
-            trade_cooldown_seconds=Decimal("0"),
-            stock_max_trades_per_hour=10,
-        )
-        strategy = TradingStrategy(config)
-        for _ in range(5):
-            strategy.update_stock_snapshot(
-                {"symbol": "TSLA", "bid": "99.99", "ask": "100.01"},
-                Decimal("100.00"),
-            )
-
-        quote = {"symbol": "TSLA", "bid": "99.89", "ask": "99.91", "price": "99.90"}
-
-        class FakeApi:
-            def __init__(self):
-                self.placed = []
-
-            def stock_quotes_resilient(self, symbols, category):
-                return [quote], set()
-
-            @staticmethod
-            def quote_price(q):
-                return Decimal(str(q["price"]))
-
-            @staticmethod
-            def stock_position(symbol, positions):
-                for item in positions:
-                    if item.get("symbol") == symbol:
-                        return (
-                            int(item.get("quantity", 0)),
-                            Decimal(str(item.get("cost_price", "0"))),
-                        )
-                return 0, Decimal("0")
-
-            def stock_limit_price(self, q, side):
-                return Decimal(str(q["ask"] if side == "BUY" else q["bid"]))
-
-            def place_stock(self, symbol, side, quantity, limit_price=None, fractional=False):
-                self.placed.append((symbol, side, quantity, limit_price))
-                return "order-1"
-
-        api = FakeApi()
-        fake_bot = SimpleNamespace(
-            config=config,
-            api=api,
-            strategy=strategy,
-            wash_sales=SimpleNamespace(blocked_until=lambda symbol: None),
-            status=SimpleNamespace(record_trade=lambda *a, **k: None),
-            last_trade={},
-            last_exit_at={},
-            trade_times=defaultdict(deque),
-            pending_stock_exits=set(),
-            stop_exit_submitted={},
-            stop_loss_escalated=set(),
-            position_buckets={},
-            working_orders={},
-            broker_conflict_symbols=set(),
-        )
-        for name in (
-            "cooldown_ready",
-            "rate_capped",
-            "reentry_cooldown_ready",
-            "record_trade",
-            "record_realized_exit",
-            "stop_ready_to_submit",
-            "trade_micro_scalp",
-        ):
-            setattr(fake_bot, name, getattr(AutoTrader, name).__get__(fake_bot))
-
-        positions: list[dict] = []
-        buying_power = Decimal("10000")
-        result = fake_bot.trade_micro_scalp(positions, buying_power)
-
-        self.assertEqual(len(api.placed), 1)
-        self.assertEqual(api.placed[0][:2], ("TSLA", "BUY"))
-        self.assertTrue(any(p["symbol"] == "TSLA" for p in positions))
-        self.assertLess(result, buying_power)
-        self.assertEqual(fake_bot.position_buckets.get("TSLA"), "MICRO_SCALP")
-
-    def test_trade_micro_scalp_disabled_returns_buying_power_unchanged(self):
-        from webull_bot.bot import AutoTrader
-
-        config = Settings(micro_scalp_enabled=False)
-        fake_bot = SimpleNamespace(config=config)
-        trade_micro_scalp = AutoTrader.trade_micro_scalp.__get__(fake_bot)
-
-        result = trade_micro_scalp([], Decimal("5000"))
-
-        self.assertEqual(result, Decimal("5000"))
-
-    def test_trade_micro_scalp_skips_symbols_in_broker_conflict(self):
-        """A symbol Webull has already rejected as a position conflict must
-        not get any decision/order attempts - no quote snapshot, no BUY/
-        SELL - until the conflict is manually resolved (or the day resets).
-        Position bookkeeping (held_count) still sees it, which is fine.
-        """
-        from webull_bot.bot import AutoTrader
-
-        config = Settings(micro_scalp_enabled=True, micro_scalp_symbols="TSLA")
-
-        class UntouchableApi:
-            def stock_quotes_resilient(self, symbols, category):
-                return [{"symbol": "TSLA", "bid": "89.00", "ask": "89.20"}], set()
-
-            @staticmethod
-            def stock_position(symbol, positions):
-                return Decimal("0"), Decimal("0")
-
-        def forbidden(*args, **kwargs):
-            raise AssertionError("must not evaluate a conflicted symbol")
-
-        fake_bot = SimpleNamespace(
-            config=config,
-            api=UntouchableApi(),
-            strategy=SimpleNamespace(
-                update_stock_snapshot=forbidden,
-                open_position_count=TradingStrategy.open_position_count,
-            ),
-            broker_conflict_symbols={"TSLA"},
-        )
-        trade_micro_scalp = AutoTrader.trade_micro_scalp.__get__(fake_bot)
-
-        result = trade_micro_scalp([], Decimal("10000"))
-
-        self.assertEqual(result, Decimal("10000"))
-
-    def test_failed_stop_resubmission_clears_escalation_instead_of_retrying_forever(self):
-        """Regression test: a stop-loss order that keeps failing (bad
-        request, transient API error, whatever) must not stay in
-        stop_loss_escalated forever - that flag bypasses the normal
-        cooldown entirely, so a persistent failure would otherwise retry on
-        every single poll cycle indefinitely instead of backing off.
-        """
-        from collections import defaultdict, deque
-
-        from webull_bot.bot import AutoTrader
-
-        config = Settings(micro_scalp_enabled=True, micro_scalp_symbols="TSLA")
-        strategy = TradingStrategy(config)
-
-        quote = {"symbol": "TSLA", "bid": "89.00", "ask": "89.20", "price": "89.10"}
-
-        class FailingApi:
-            def stock_quotes_resilient(self, symbols, category):
-                return [quote], set()
-
-            @staticmethod
-            def quote_price(q):
-                return Decimal(str(q["price"]))
-
-            @staticmethod
-            def stock_position(symbol, positions):
-                for item in positions:
-                    if item.get("symbol") == symbol:
-                        return (
-                            Decimal(str(item.get("quantity", "0"))),
-                            Decimal(str(item.get("cost_price", "0"))),
-                        )
-                return Decimal("0"), Decimal("0")
-
-            def stock_limit_price(self, q, side):
-                return Decimal(str(q["bid"]))
-
-            @staticmethod
-            def quote_ask(q):
-                return Decimal(str(q["ask"]))
-
-            def place_stock(self, *args, **kwargs):
-                raise RuntimeError("boom")
-
-        wash_sale_calls = []
-        fake_bot = SimpleNamespace(
-            config=config,
-            api=FailingApi(),
-            strategy=strategy,
-            wash_sales=SimpleNamespace(
-                blocked_until=lambda symbol: None,
-                block=lambda symbol, reason: wash_sale_calls.append((symbol, reason)),
-            ),
-            status=SimpleNamespace(record_trade=lambda *a, **k: None),
-            last_trade={},
-            last_exit_at={},
-            trade_times=defaultdict(deque),
-            pending_stock_exits=set(),
-            pending_option_exits=set(),
-            stop_exit_submitted={},
-            stop_loss_escalated={"TSLA"},
-            position_buckets={},
-            working_orders={},
-            daily_realized_pnl=Decimal("0"),
-            daily_realized_loss=Decimal("0"),
-            broker_conflict_symbols=set(),
-        )
-        fake_bot.is_broker_position_conflict = AutoTrader.is_broker_position_conflict
-        fake_bot.is_fractional_trading_not_enabled = (
-            AutoTrader.is_fractional_trading_not_enabled
-        )
-        for name in (
-            "cooldown_ready",
-            "rate_capped",
-            "reentry_cooldown_ready",
-            "record_trade",
-            "record_realized_exit",
-            "stop_ready_to_submit",
-            "trade_micro_scalp",
-            "handle_broker_conflict",
-        ):
-            setattr(fake_bot, name, getattr(AutoTrader, name).__get__(fake_bot))
-
-        positions = [
-            {
-                "instrument_type": "EQUITY",
-                "symbol": "TSLA",
-                "quantity": "3",
-                "cost_price": "100.00",
-            }
-        ]
-        fake_bot.trade_micro_scalp(positions, Decimal("10000"))
-
-        self.assertNotIn("TSLA", fake_bot.stop_loss_escalated)
-        self.assertNotIn("TSLA", fake_bot.pending_stock_exits)
-        self.assertEqual(wash_sale_calls, [])
 
 
 class BotOvertradingCapTests(unittest.TestCase):
@@ -2647,10 +2128,9 @@ class HistoricalVolatilityTests(unittest.TestCase):
         self.assertEqual(fake_bot.strategy.sma_trend, {"OLD": Decimal("5")})
 
 
-class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
-    def test_default_market_cap_allocation_is_off_and_configurable(self):
+class StockScreenerTests(StrategyConfigMixin, unittest.TestCase):
+    def test_default_stock_capital_fractions_are_popular_penny_discovery(self):
         config = Settings()
-        self.assertFalse(config.market_cap_allocation_enabled)
         self.assertEqual(
             config.stock_capital_fractions(),
             {
@@ -2658,20 +2138,6 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
                 "PENNY": Decimal("0.10"),
                 "DISCOVERY": Decimal("0.20"),
             },
-        )
-
-        cap_config = Settings(market_cap_allocation_enabled=True)
-        self.assertEqual(
-            cap_config.stock_capital_fractions(),
-            {"LARGE_CAP": Decimal("0.30"), "SMALL_CAP": Decimal("0.70")},
-        )
-        self.assertEqual(
-            sum(cap_config.stock_capital_fractions().values()),
-            Decimal("1.00"),
-        )
-        self.assertEqual(
-            cap_config.stock_bucket_slot_limits(),
-            {"LARGE_CAP": 6, "SMALL_CAP": 14},
         )
 
     def test_screener_number_handles_bad_and_nonfinite_values(self):
@@ -2760,56 +2226,6 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
             universe = api.top_active_stocks(total_limit=5, page_size=2)
 
         self.assertEqual(len(universe), 5)
-
-    def test_prioritized_stock_batch_by_market_cap_tiers_by_threshold(self):
-        strategy = TradingStrategy(self.config())
-        symbols = ["BIG1", "BIG2", "SMALL1", "SMALL2", "SMALL3"]
-        strategy.activity.update(
-            {"BIG1": 50, "BIG2": 40, "SMALL1": 30, "SMALL2": 20, "SMALL3": 10}
-        )
-        market_values = {
-            "BIG1": 2e11,
-            "BIG2": 1.5e11,
-            "SMALL1": 5e8,
-            "SMALL2": 3e8,
-            "SMALL3": 1e8,
-        }
-
-        batch, _ = strategy.prioritized_stock_batch_by_market_cap(
-            symbols,
-            0,
-            [],
-            lambda symbol: None,
-            market_values,
-            Decimal("100000000000"),
-            Decimal("0.80"),
-        )
-
-        self.assertIn("BIG1", batch)
-        self.assertEqual(strategy.selection_bucket("BIG1"), "LARGE_CAP")
-        self.assertEqual(strategy.selection_bucket("SMALL1"), "SMALL_CAP")
-
-    def test_prioritized_stock_batch_by_market_cap_marks_held_positions(self):
-        strategy = TradingStrategy(self.config())
-        symbols = ["BIG1", "SMALL1", "SMALL2"]
-        strategy.activity.update({"BIG1": 10, "SMALL1": 5, "SMALL2": 1})
-        positions = [
-            {"instrument_type": "EQUITY", "symbol": "SMALL1", "quantity": "10"}
-        ]
-        market_values = {"BIG1": 2e11, "SMALL1": 5e8, "SMALL2": 3e8}
-
-        batch, _ = strategy.prioritized_stock_batch_by_market_cap(
-            symbols,
-            0,
-            positions,
-            lambda symbol: None,
-            market_values,
-            Decimal("100000000000"),
-            Decimal("0.80"),
-        )
-
-        self.assertIn("SMALL1", batch)
-        self.assertEqual(strategy.selection_bucket("SMALL1"), "HELD")
 
     def test_top_gainers_pages_using_change_ratio_screener(self):
         api = WebullAPI.__new__(WebullAPI)
@@ -2905,36 +2321,6 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
 
         self.assertEqual(result, ["ONE", "TWO"])
 
-    def test_exclude_micro_scalp_symbols_removes_only_configured_names(self):
-        from webull_bot.bot import AutoTrader
-
-        fake_bot = AutoTrader.__new__(AutoTrader)
-        fake_bot.config = SimpleNamespace(
-            micro_scalp_enabled=True,
-            micro_scalp_symbol_list=lambda: ["TSLA", "NVDA"],
-        )
-        exclude = AutoTrader.exclude_micro_scalp_symbols.__get__(fake_bot)
-
-        remaining, excluded = exclude(["TSLA", "AAPL", "NVDA", "MSFT"])
-
-        self.assertEqual(remaining, ["AAPL", "MSFT"])
-        self.assertEqual(excluded, ["TSLA", "NVDA"])
-
-    def test_exclude_micro_scalp_symbols_noop_when_disabled(self):
-        from webull_bot.bot import AutoTrader
-
-        fake_bot = AutoTrader.__new__(AutoTrader)
-        fake_bot.config = SimpleNamespace(
-            micro_scalp_enabled=False,
-            micro_scalp_symbol_list=lambda: ["TSLA"],
-        )
-        exclude = AutoTrader.exclude_micro_scalp_symbols.__get__(fake_bot)
-
-        remaining, excluded = exclude(["TSLA", "AAPL"])
-
-        self.assertEqual(remaining, ["TSLA", "AAPL"])
-        self.assertEqual(excluded, [])
-
     def test_safe_top_gainers_survives_screener_failure(self):
         from webull_bot.bot import AutoTrader
 
@@ -2947,24 +2333,6 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         safe_call = AutoTrader.safe_top_gainers.__get__(fake_bot)
 
         self.assertEqual(safe_call(100, 50), {})
-
-    def test_safe_top_active_stocks_falls_back_to_prior_universe_on_failure(self):
-        from webull_bot.bot import AutoTrader
-
-        fake_bot = AutoTrader.__new__(AutoTrader)
-
-        def boom(*args, **kwargs):
-            raise RuntimeError("Webull API error 503: boom")
-
-        fake_bot.api = SimpleNamespace(top_active_stocks=boom)
-        fake_bot.stock_symbols = ["OLD1", "OLD2"]
-        fake_bot.stock_market_values = {"OLD1": 1e11, "OLD2": 2e8}
-        safe_call = AutoTrader.safe_top_active_stocks.__get__(fake_bot)
-
-        result = safe_call(500, 200)
-
-        self.assertEqual(set(result), {"OLD1", "OLD2"})
-        self.assertEqual(result["OLD1"]["market_value"], 1e11)
 
     def test_safe_top_losers_survives_screener_failure(self):
         from webull_bot.bot import AutoTrader
@@ -2980,10 +2348,8 @@ class MarketCapAllocationTests(StrategyConfigMixin, unittest.TestCase):
         self.assertEqual(safe_call(5, 5), {})
 
     def test_safe_market_pulse_active_falls_back_to_empty_not_prior_universe(self):
-        """Distinct from safe_top_active_stocks: market_pulse must stay
-        small on a screener failure, not balloon to the whole trading
-        universe (that fallback is only correct for the once-daily
-        universe rebuild).
+        """market_pulse must stay small on a screener failure, not balloon
+        to the whole trading universe.
         """
         from webull_bot.bot import AutoTrader
 
@@ -4504,7 +3870,6 @@ class OvernightHoldTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             position_buckets={
                 "AAPL": "popular",
-                "TSLA": "MICRO_SCALP",
                 "KO": "PAIRS_LONG",
                 "PEP": "PAIRS_SHORT",
                 "GME": "MANUAL",

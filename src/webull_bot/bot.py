@@ -62,10 +62,10 @@ ORDER_ERROR_WINDOW_SECONDS = 60
 
 # Hold non-intraday stock positions overnight instead of always flattening
 # at EOD_CLOSE_TIME. Buckets in ALWAYS_FLATTEN_BUCKETS stay same-day-only
-# regardless of this flag, since micro-scalp and pairs are intraday-only
-# strategies by design.
+# regardless of this flag, since pairs is an intraday-only strategy by
+# design.
 OVERNIGHT_HOLD_ENABLED = True
-ALWAYS_FLATTEN_BUCKETS = frozenset({"MICRO_SCALP", "PAIRS_LONG", "PAIRS_SHORT"})
+ALWAYS_FLATTEN_BUCKETS = frozenset({"PAIRS_LONG", "PAIRS_SHORT"})
 
 # Deterministic market context (Webull's own gainers/losers/most-active
 # screeners - no LLM involved) refreshed on a slow, fixed cadence
@@ -115,7 +115,6 @@ class AutoTrader:
         self.stock_symbols: list[str] = []
         self.reserve_symbols: list[str] = []
         self.stock_categories: dict[str, str] = {}
-        self.stock_market_values: dict[str, float] = {}
         self.invalid_stock_symbols: set[str] = set()
         self.option_contracts: list[dict] = []
         self.pending_stock_exits: set[str] = set()
@@ -299,33 +298,13 @@ class AutoTrader:
             filtered = list(dict.fromkeys(reinstated + filtered))
         return filtered
 
-    def exclude_micro_scalp_symbols(
-        self,
-        symbols: list[str],
-    ) -> tuple[list[str], list[str]]:
-        """Micro-scalp symbols are managed by trade_micro_scalp()'s
-        fixed-cents mean-reversion logic - they must not also be selected
-        into the percentage-based main universe scan, or the two decision
-        functions would fight over the same position.
-        """
-        if not self.config.micro_scalp_enabled:
-            return symbols, []
-        micro_scalp_symbols = set(self.config.micro_scalp_symbol_list())
-        if not micro_scalp_symbols:
-            return symbols, []
-        excluded = [symbol for symbol in symbols if symbol in micro_scalp_symbols]
-        if not excluded:
-            return symbols, []
-        remaining = [symbol for symbol in symbols if symbol not in micro_scalp_symbols]
-        return remaining, excluded
-
     @staticmethod
     def exclude_pairs_symbols(symbols: list[str]) -> tuple[list[str], list[str]]:
-        """Same reasoning as exclude_micro_scalp_symbols: a pairs leg can
-        be short (a negative broker-reported quantity), and stock_decision
-        treats any non-positive quantity as "flat, eligible to BUY" - left
-        in the main scan, the EMA/OBI strategy would try to buy into a
-        position trade_pairs is deliberately holding short.
+        """A pairs leg can be short (a negative broker-reported quantity),
+        and stock_decision treats any non-positive quantity as "flat,
+        eligible to BUY" - left in the main scan, the EMA/OBI strategy would
+        try to buy into a position trade_pairs is deliberately holding
+        short.
         """
         pairs_symbols = {symbol for pair in PAIRS for symbol in pair}
         if not pairs_symbols:
@@ -347,21 +326,6 @@ class AutoTrader:
         except Exception as exc:
             log.warning("LOAD   | top-gainers screener failed this cycle | %s", exc)
             return {}
-
-    def safe_top_active_stocks(self, limit: int, page_size: int) -> dict[str, dict]:
-        """Same reasoning as safe_top_gainers: a most-active screener failure
-        must not crash the daily universe rebuild. Falls back to the prior
-        cycle's stock list (if any) instead of an empty universe.
-        """
-        try:
-            return self.api.top_active_stocks(limit, page_size)
-        except Exception as exc:
-            log.warning(
-                "LOAD   | most-active screener failed this cycle | %s | "
-                "keeping prior universe",
-                exc,
-            )
-            return {symbol: {"market_value": self.stock_market_values.get(symbol, 0.0)} for symbol in self.stock_symbols}
 
     def safe_top_losers(self, limit: int, page_size: int) -> dict[str, dict]:
         try:
@@ -425,63 +389,7 @@ class AutoTrader:
         if self.resolved_date == moment.date():
             return
         requested_stocks = self.config.stocks()
-        if requested_stocks == ["ALL"] and self.config.market_cap_allocation_enabled:
-            limit = self.config.stock_universe_limit()
-            page_size = self.config.stock_universe_page_size
-            log.info(
-                "LOAD   | downloading market-cap-ranked stock universe | "
-                "limit=%s | page=%s",
-                limit,
-                page_size,
-            )
-            universe = self.safe_top_active_stocks(limit, page_size)
-            if self.config.top_gainers_limit > 0:
-                gainers = self.safe_top_gainers(
-                    self.config.top_gainers_limit,
-                    page_size,
-                )
-                added = sum(1 for symbol in gainers if symbol not in universe)
-                for symbol, data in gainers.items():
-                    universe.setdefault(symbol, data)
-                if added:
-                    log.info(
-                        "LOAD   | merged %s top-gainer symbols into universe",
-                        added,
-                    )
-            for symbol in self.invalid_symbols.symbols:
-                universe.pop(symbol, None)
-            missing_popular = [
-                symbol
-                for symbol in self.config.popular_stocks()
-                if symbol not in universe
-            ]
-            if missing_popular:
-                log.warning(
-                    "LOAD   | popular symbols not found in screener universe "
-                    "(skipped) | %s",
-                    ",".join(missing_popular),
-                )
-            self.stock_market_values = {
-                symbol: data["market_value"] for symbol, data in universe.items()
-            }
-            self.stock_categories = {symbol: "US_STOCK" for symbol in universe}
-            eligible = self.filter_with_popular_reinstated(list(universe))
-            self.stock_symbols = eligible[:limit]
-            self.reserve_symbols = eligible[limit:]
-            large = sum(
-                1
-                for symbol in self.stock_symbols
-                if self.stock_market_values.get(symbol, 0)
-                >= float(self.config.stock_large_cap_min_market_value)
-            )
-            log.info(
-                "LOAD   | market-cap universe ready | large_cap=%s | "
-                "small_cap=%s | total=%s",
-                large,
-                len(self.stock_symbols) - large,
-                len(self.stock_symbols),
-            )
-        elif requested_stocks == ["ALL"]:
+        if requested_stocks == ["ALL"]:
             limit = self.config.stock_universe_limit()
             pool = self.config.stock_universe_pool()
             log.info(
@@ -570,19 +478,6 @@ class AutoTrader:
                     for symbol in self.stock_symbols
                     if self.stock_categories.get(symbol) != "US_ETF"
                 ]
-        self.stock_symbols, excluded = self.exclude_micro_scalp_symbols(
-            self.stock_symbols
-        )
-        self.reserve_symbols, _ = self.exclude_micro_scalp_symbols(
-            self.reserve_symbols
-        )
-        if excluded:
-            log.info(
-                "LOAD   | excluded %s micro-scalp symbols from the main "
-                "universe scan (managed separately) | %s",
-                len(excluded),
-                ",".join(excluded),
-            )
         self.stock_symbols, pairs_excluded = self.exclude_pairs_symbols(
             self.stock_symbols
         )
@@ -1592,25 +1487,13 @@ class AutoTrader:
     ) -> Decimal:
         open_count = self.strategy.open_position_count(positions)
         self.refresh_agent_discoveries()
-        if self.config.market_cap_allocation_enabled:
-            batch, self.stock_cursor = self.strategy.prioritized_stock_batch_by_market_cap(
-                self.stock_symbols,
-                self.stock_cursor,
-                positions,
-                self.agent_assessment,
-                self.stock_market_values,
-                self.config.stock_large_cap_min_market_value,
-                self.config.stock_large_cap_capital_fraction,
-                self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist,
-            )
-        else:
-            batch, self.stock_cursor = self.strategy.prioritized_stock_batch(
-                self.stock_symbols,
-                self.stock_cursor,
-                positions,
-                self.agent_assessment,
-                self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist,
-            )
+        batch, self.stock_cursor = self.strategy.prioritized_stock_batch(
+            self.stock_symbols,
+            self.stock_cursor,
+            positions,
+            self.agent_assessment,
+            self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist,
+        )
         bucket_remaining = {
             bucket: buying_power * fraction
             for bucket, fraction in self.config.stock_capital_fractions().items()
@@ -1648,31 +1531,23 @@ class AutoTrader:
             position_symbol = str(position.get("symbol", "")).upper()
             bucket = self.position_buckets.get(position_symbol)
             if bucket not in bucket_position_counts:
-                if self.config.market_cap_allocation_enabled:
-                    bucket = (
-                        "LARGE_CAP"
-                        if self.stock_market_values.get(position_symbol, 0.0)
-                        >= float(self.config.stock_large_cap_min_market_value)
-                        else "SMALL_CAP"
-                    )
-                else:
-                    position_price = Decimal(
-                        str(
-                            self.strategy.prices.get(
-                                position_symbol,
-                                position.get("cost_price", "0"),
-                            )
+                position_price = Decimal(
+                    str(
+                        self.strategy.prices.get(
+                            position_symbol,
+                            position.get("cost_price", "0"),
                         )
                     )
-                    if position_symbol in known_popular:
-                        bucket = "POPULAR"
-                    elif (
-                        position_price > 0
-                        and position_price < self.config.penny_stock_max_price
-                    ):
-                        bucket = "PENNY"
-                    else:
-                        bucket = "DISCOVERY"
+                )
+                if position_symbol in known_popular:
+                    bucket = "POPULAR"
+                elif (
+                    position_price > 0
+                    and position_price < self.config.penny_stock_max_price
+                ):
+                    bucket = "PENNY"
+                else:
+                    bucket = "DISCOVERY"
                 self.position_buckets[position_symbol] = bucket
             bucket_position_counts[bucket] += 1
         quotes: list[dict] = []
@@ -2074,9 +1949,9 @@ class AutoTrader:
         short the relatively expensive one, when the spread between two
         historically-correlated stocks stretches to a statistical extreme,
         and unwind when it reverts. See src/webull_bot/pairs.py. Its own
-        capital slice (PAIRS_CAPITAL_FRACTION), carved out up front same
-        as trade_micro_scalp already does for its own bucket, so it never
-        competes with the main scan's budget for the rest of the cycle.
+        capital slice (PAIRS_CAPITAL_FRACTION), carved out up front, so it
+        never competes with the main scan's budget for the rest of the
+        cycle.
         """
         if not PAIRS:
             return buying_power
@@ -2295,198 +2170,6 @@ class AutoTrader:
             )
         except Exception as exc:
             log.error("DAYEND | date=%s | summary failed | %s", moment.date(), exc)
-
-    def trade_micro_scalp(
-        self,
-        positions: list[dict],
-        buying_power: Decimal,
-    ) -> Decimal:
-        """Fixed-cents mean-reversion scalping on a small, curated list of
-        always-ticking, ultra-liquid symbols (MICRO_SCALP_SYMBOLS) - kept
-        fully separate from the bucketed universe scan, with its own
-        dedicated capital slice and position cap, so it doesn't compete with
-        or get starved by the broader stock selection.
-        """
-        symbols = self.config.micro_scalp_symbol_list()
-        if not self.config.micro_scalp_enabled or not symbols:
-            return buying_power
-        try:
-            quotes, invalid = self.api.stock_quotes_resilient(symbols, "US_STOCK")
-        except Exception as exc:
-            log.error("MSCALP | quote batch failed | %s", exc)
-            return buying_power
-        if invalid:
-            log.warning(
-                "MSCALP | invalid symbols skipped | %s",
-                ",".join(sorted(invalid)),
-            )
-        quote_by_symbol = {
-            str(quote.get("symbol", "")).upper(): quote for quote in quotes
-        }
-        open_count = self.strategy.open_position_count(positions)
-        held_count = sum(
-            1
-            for symbol in symbols
-            if self.api.stock_position(symbol, positions)[0] > 0
-        )
-        capital_budget = buying_power * self.config.micro_scalp_capital_fraction
-        for symbol in symbols:
-            if symbol in self.broker_conflict_symbols:
-                continue
-            quote = quote_by_symbol.get(symbol)
-            if not quote:
-                continue
-            try:
-                price = self.api.quote_price(quote)
-                self.strategy.update_stock_snapshot(quote, price)
-                quantity, cost = self.api.stock_position(symbol, positions)
-                key = f"STOCK:{symbol}"
-                decision = self.strategy.micro_scalp_decision(
-                    key,
-                    price,
-                    quantity,
-                    cost,
-                )
-                if decision.action == "HOLD" and quantity == 0:
-                    self.gate_rejections[f"micro-scalp: {decision.reason}"] += 1
-                if quantity == 0:
-                    self.pending_stock_exits.discard(symbol)
-                    self.stop_exit_submitted.pop(symbol, None)
-                    self.stop_loss_escalated.discard(symbol)
-                if decision.action == "BUY" and quantity == 0:
-                    blocked_until = self.wash_sales.blocked_until(symbol)
-                    if blocked_until:
-                        continue
-                    entry_budget = min(buying_power, capital_budget)
-                    buy_quantity, buffered_price = (
-                        self.strategy.stock_order_quantity(price, entry_budget)
-                    )
-                    fractional = False
-                    if (
-                        buy_quantity == 0
-                        and self.config.fractional_shares_enabled
-                        and self.fractional_trading_enabled
-                    ):
-                        fractional_quantity = self.strategy.fractional_stock_quantity(
-                            price,
-                            entry_budget,
-                        )
-                        if fractional_quantity > 0:
-                            buy_quantity = fractional_quantity
-                            buffered_price = price * Decimal("1.03")
-                            fractional = True
-                    if (
-                        open_count < self.config.max_open_positions
-                        and held_count < self.config.micro_scalp_max_positions
-                        and buy_quantity > 0
-                        and self.cooldown_ready(key)
-                        and not self.rate_capped(key)
-                        and self.reentry_cooldown_ready(key)
-                    ):
-                        order_id = self.api.place_stock(
-                            symbol,
-                            "BUY",
-                            buy_quantity,
-                            limit_price=self.api.stock_limit_price(quote, "BUY"),
-                            fractional=fractional,
-                        )
-                        self.record_trade(key, order_id, "BUY")
-                        buying_power = max(
-                            Decimal("0"),
-                            buying_power - buffered_price * buy_quantity,
-                        )
-                        capital_budget = max(
-                            Decimal("0"),
-                            capital_budget - buffered_price * buy_quantity,
-                        )
-                        self.position_buckets[symbol] = "MICRO_SCALP"
-                        positions.append(
-                            {
-                                "instrument_type": "EQUITY",
-                                "symbol": symbol,
-                                "quantity": str(buy_quantity),
-                            }
-                        )
-                        open_count += 1
-                        held_count += 1
-                if (
-                    decision.action == "PROFIT"
-                    and symbol not in self.pending_stock_exits
-                    and self.cooldown_ready(key)
-                ):
-                    target = decision.target_price
-                    if target is None:
-                        continue
-                    ask = self.api.quote_ask(quote)
-                    # ask can be below target - or even below cost - if the
-                    # decision fired off a last-trade print (quote_price)
-                    # that's already stale relative to the current book
-                    # (the market moved down between the two reads). Never
-                    # let a "profit-take" actually price below the target
-                    # that triggered it, or it can silently execute at a
-                    # real loss while still being logged as PROFIT.
-                    limit_price = (
-                        self.api.stock_limit_price(quote, "SELL")
-                        if symbol in self.stop_loss_escalated
-                        else (max(ask, target) if ask else target)
-                    )
-                    order_id = self.api.place_stock(
-                        symbol,
-                        "SELL",
-                        quantity,
-                        limit_price=limit_price,
-                    )
-                    self.pending_stock_exits.add(symbol)
-                    self.stop_exit_submitted[symbol] = time.monotonic()
-                    pnl = self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
-                if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
-                    # Never price an initial stop-loss at the ask - unlike a
-                    # profit-take, a stop needs to fill fast to cap the loss,
-                    # not rest passively above the market hoping for a
-                    # better price while the position keeps falling further
-                    # away from it. stock_stop_exit_price (bid/ask midpoint)
-                    # balances "don't overshoot the bid" against "don't sit
-                    # unfilled" - only escalation (after 15s unfilled) should
-                    # cross the market harder than that.
-                    limit_price = (
-                        self.api.stock_limit_price(quote, "SELL")
-                        if symbol in self.stop_loss_escalated
-                        else self.api.stock_stop_exit_price(quote)
-                    )
-                    order_id = self.api.place_stock(
-                        symbol,
-                        "SELL",
-                        quantity,
-                        limit_price=limit_price,
-                    )
-                    self.wash_sales.block(
-                        symbol,
-                        "micro-scalp stop-loss exit submitted",
-                    )
-                    self.pending_stock_exits.add(symbol)
-                    self.stop_exit_submitted[symbol] = time.monotonic()
-                    pnl = self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl, entry_price=cost)
-            except Exception as exc:
-                self.stop_loss_escalated.discard(symbol)
-                if isinstance(exc, QuoteUnavailableError):
-                    continue
-                if self.is_broker_position_conflict(exc):
-                    self.handle_broker_conflict(symbol, exc)
-                    continue
-                if "BUYING_POWER_INSUFFICIENT" in str(exc):
-                    buying_power = Decimal("0")
-                    log.warning(
-                        "FUNDS  | %s | micro-scalp buy skipped | insufficient buying power",
-                        symbol,
-                    )
-                    continue
-                if self.is_fractional_trading_not_enabled(exc):
-                    self.handle_fractional_trading_not_enabled(exc)
-                    continue
-                log.error("MSCALP | %s | %s", symbol, exc)
-        return buying_power
 
     def trade_options(
         self,
@@ -2916,10 +2599,10 @@ class AutoTrader:
 
     def overnight_hold_symbols(self) -> set[str]:
         """Symbols whose bucket is eligible to carry a position past
-        EOD_CLOSE_TIME instead of always flattening. Micro-scalp and pairs
-        positions are excluded - those strategies are intraday-only by
-        design - so only the core EMA/OBI stock strategy's own positions
-        (plus manual buys) ever ride overnight.
+        EOD_CLOSE_TIME instead of always flattening. Pairs positions are
+        excluded - that strategy is intraday-only by design - so only the
+        core EMA/OBI stock strategy's own positions (plus manual buys)
+        ever ride overnight.
         """
         if not OVERNIGHT_HOLD_ENABLED:
             return set()
@@ -3379,7 +3062,6 @@ class AutoTrader:
                 if not circuit_active and self.order_kill_switch_tripped:
                     circuit_active = True
                 if not circuit_active:
-                    buying_power = self.trade_micro_scalp(positions, buying_power)
                     buying_power = self.trade_pairs(positions, buying_power)
                     buying_power = self.trade_stocks(
                         positions,

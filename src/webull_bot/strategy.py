@@ -62,9 +62,6 @@ class TradingStrategy:
         self.trend_streak: dict[str, int] = {}
         self.vwap_state: dict[str, dict] = {}
         self.crossover_counts: dict[str, int] = defaultdict(int)
-        self.micro_scalp_reference: dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=config.micro_scalp_reference_window)
-        )
         self.tick_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=config.tick_direction_window)
         )
@@ -82,7 +79,6 @@ class TradingStrategy:
         self.selection_buckets.clear()
         self.vwap_state.clear()
         self.crossover_counts.clear()
-        self.micro_scalp_reference.clear()
         self.tick_history.clear()
 
     @staticmethod
@@ -149,48 +145,6 @@ class TradingStrategy:
             "activity_score": activity,
         }
         self._update_vwap(symbol, price, volume)
-        self.micro_scalp_reference[symbol].append(float(price))
-
-    def micro_scalp_reference_price(self, symbol: str) -> Decimal | None:
-        """A short rolling average of recent quote prices - the "just been
-        trading around here" level a dip-buy measures itself against, not a
-        trend signal.
-        """
-        window = self.micro_scalp_reference.get(symbol)
-        if not window:
-            return None
-        return Decimal(str(sum(window) / len(window)))
-
-    def micro_scalp_decision(
-        self,
-        key: str,
-        price: Decimal,
-        quantity: int,
-        average_cost: Decimal,
-    ) -> Decision:
-        """A fixed-cents mean-reversion scalp for a small list of always-
-        ticking, ultra-liquid symbols: buy a small dip below the recent
-        average and take a small fixed profit on the bounce back, instead of
-        requiring an EMA trend agreement that rarely holds tick-to-tick.
-        """
-        symbol = key.split(":", 1)[-1]
-        if quantity > 0:
-            fee_per_share = self.config.sell_fee_dollars / quantity
-            target = average_cost + self.config.micro_scalp_target_cents + fee_per_share
-            stop = average_cost - self.config.micro_scalp_stop_cents
-            if price <= stop:
-                return Decision("LOSS", "micro-scalp stop reached", price)
-            if price >= target:
-                return Decision("PROFIT", "micro-scalp target reached", target)
-            return Decision("HOLD", "micro-scalp waiting for bounce", target)
-        if not self.entry_spread_ok(key):
-            return Decision("HOLD", "spread too wide to scalp profitably")
-        reference = self.micro_scalp_reference_price(symbol)
-        if reference is None:
-            return Decision("HOLD", "insufficient reference history")
-        if price <= reference - self.config.micro_scalp_dip_cents:
-            return Decision("BUY", "micro-scalp dip entry")
-        return Decision("HOLD", "no qualifying dip yet")
 
     def _update_vwap(self, symbol: str, price: Decimal, volume: float) -> None:
         state = self.vwap_state.get(symbol)
@@ -371,78 +325,6 @@ class TradingStrategy:
                 self.selection_buckets[symbol] = "PENNY"
             else:
                 self.selection_buckets[symbol] = "DISCOVERY"
-        return selected, cursor
-
-    def prioritized_stock_batch_by_market_cap(
-        self,
-        symbols: list[str],
-        cursor: int,
-        positions: list[dict],
-        assessment_for,
-        market_values: dict[str, float],
-        large_cap_min_value: Decimal,
-        large_cap_fraction: Decimal,
-        research_symbols: set[str] | None = None,
-    ) -> tuple[list[str], int]:
-        """Same shape as prioritized_stock_batch, but tiers by market cap
-        (LARGE_CAP/SMALL_CAP) instead of price-based penny/popular buckets.
-        """
-        if not symbols:
-            return [], 0
-        size = min(self.config.stock_batch_size, len(symbols))
-        available = set(symbols)
-        research_symbols = (research_symbols or set()) & available
-        held = [
-            str(item.get("symbol", "")).upper()
-            for item in positions
-            if item.get("instrument_type") == "EQUITY"
-            and Decimal(str(item.get("quantity", "0"))) != 0
-            and str(item.get("symbol", "")).upper() in available
-        ]
-        ranked = sorted(
-            (symbol for symbol in self.activity if symbol in available),
-            key=lambda symbol: self.priority_score(symbol, assessment_for(symbol)),
-            reverse=True,
-        )
-        threshold = float(large_cap_min_value)
-        is_large = lambda symbol: market_values.get(symbol, 0.0) >= threshold
-        large_cap = [symbol for symbol in ranked if is_large(symbol)]
-        small_cap = [symbol for symbol in ranked if not is_large(symbol)]
-        researched = sorted(
-            research_symbols,
-            key=lambda symbol: self.priority_score(symbol, assessment_for(symbol)),
-            reverse=True,
-        )
-        large_cap = list(
-            dict.fromkeys([s for s in researched if is_large(s)] + large_cap)
-        )
-        small_cap = list(
-            dict.fromkeys([s for s in researched if not is_large(s)] + small_cap)
-        )
-        exploration, cursor = self.rotating_batch(symbols, cursor, size)
-        large_count = int(size * large_cap_fraction)
-        small_count = size - large_count
-        large_selected = large_cap[:large_count]
-        small_selected = small_cap[:small_count]
-        selected = list(
-            dict.fromkeys(held + large_selected + small_selected + exploration)
-        )
-        selected = selected[:size]
-        self.selection_buckets = {}
-        held_set = set(held)
-        large_set = set(large_selected)
-        small_set = set(small_selected)
-        for symbol in selected:
-            if symbol in held_set:
-                self.selection_buckets[symbol] = "HELD"
-            elif symbol in large_set:
-                self.selection_buckets[symbol] = "LARGE_CAP"
-            elif symbol in small_set:
-                self.selection_buckets[symbol] = "SMALL_CAP"
-            else:
-                self.selection_buckets[symbol] = (
-                    "LARGE_CAP" if is_large(symbol) else "SMALL_CAP"
-                )
         return selected, cursor
 
     def selection_bucket(self, symbol: str) -> str:
