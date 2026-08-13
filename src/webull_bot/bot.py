@@ -131,6 +131,7 @@ class AutoTrader:
         self.options_enabled = True
         self.resolved_date = None
         self.last_close_attempt = 0.0
+        self.last_fractional_sweep = 0.0
         self.last_status_log = 0.0
         self.opening_grace_logged_date = None
         self.last_option_discovery = 0.0
@@ -2707,6 +2708,60 @@ class AutoTrader:
             and symbol not in self.short_symbols
         }
 
+    def close_fractional_positions_before_core_close(self) -> None:
+        """Fractional orders only work during core hours - once core
+        session ends, a fractional position can't be bought, sold,
+        stopped out, or profit-taken at all until the next session opens.
+        Unlike a whole-share position (which OVERNIGHT_HOLD_ENABLED lets
+        ride deliberately, still exitable pre/after-hours if needed), a
+        fractional position caught past this boundary has zero downside
+        protection for the rest of the day/overnight - overnight_hold_
+        symbols() doesn't know about quantity at all, so a fractional
+        position in an otherwise overnight-eligible bucket (POPULAR/
+        PENNY/DISCOVERY) would silently ride along with no way to defend
+        it. Sweeps and closes every fractional EQUITY position here,
+        regardless of bucket or current P&L, a few minutes before that
+        window closes - called from the same option_closeout-to-
+        option_close window the option EOD closeout already uses.
+        """
+        now = time.monotonic()
+        if now - self.last_fractional_sweep < self.config.eod_retry_seconds:
+            return
+        self.last_fractional_sweep = now
+        try:
+            positions = self.api.positions()
+        except Exception as exc:
+            log.error("CLOSE  | fractional pre-close sweep failed | %s", exc)
+            return
+        fractional_symbols = {
+            str(item.get("symbol", "")).upper()
+            for item in positions
+            if item.get("instrument_type") == "EQUITY"
+            and self.is_fractional_quantity(Decimal(str(item.get("quantity", "0"))))
+        }
+        if not fractional_symbols:
+            return
+        non_fractional_symbols = {
+            str(item.get("symbol", "")).upper()
+            for item in positions
+            if item.get("instrument_type") == "EQUITY"
+        } - fractional_symbols
+        try:
+            submitted = self.api.close_all_positions(
+                {"EQUITY"},
+                loss_callback=self.wash_sales.block,
+                exclude_symbols=non_fractional_symbols,
+            )
+        except Exception as exc:
+            log.error("CLOSE  | fractional pre-close sweep failed | %s", exc)
+            return
+        self.pending_stock_exits -= fractional_symbols
+        log.info(
+            "CLOSE  | fractional pre-core-close sweep | submitted=%s | %s",
+            len(submitted),
+            ",".join(sorted(fractional_symbols)),
+        )
+
     def close_instruments(
         self,
         instrument_types: set[str],
@@ -3123,6 +3178,7 @@ class AutoTrader:
 
             if option_closeout <= moment < option_close:
                 self.close_instruments({"OPTION"})
+                self.close_fractional_positions_before_core_close()
 
             opening_grace_active = option_open <= moment < option_open + timedelta(
                 minutes=self.config.opening_grace_minutes

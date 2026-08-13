@@ -4231,6 +4231,101 @@ class OvernightHoldTests(unittest.TestCase):
         self.assertEqual(remaining, ["AAPL", "MSFT"])
 
 
+class FractionalPreCloseSweepTests(unittest.TestCase):
+    @staticmethod
+    def _fake_bot(positions, config=None):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=config or SimpleNamespace(eod_retry_seconds=Decimal("10")),
+            # Not 0.0 - the real time.monotonic() isn't guaranteed to
+            # already be past eod_retry_seconds on every CI runner (same
+            # class of flaky-clock bug fixed earlier this session).
+            last_fractional_sweep=time.monotonic() - 999999,
+            pending_stock_exits={"AAPL", "MSFT"},
+            wash_sales=SimpleNamespace(block=lambda *a, **k: None),
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
+        )
+        fake_bot.api = SimpleNamespace(positions=lambda: positions)
+        return fake_bot
+
+    def test_sweeps_only_fractional_equity_positions(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011"},
+            {"instrument_type": "EQUITY", "symbol": "FPE", "quantity": "1"},
+            {"instrument_type": "OPTION", "symbol": "AAPL260918C00200000", "quantity": "0.5"},
+        ]
+        fake_bot = self._fake_bot(positions)
+        calls = {}
+
+        def fake_close_all_positions(instrument_types, loss_callback=None, exclude_symbols=None):
+            calls["instrument_types"] = instrument_types
+            calls["exclude_symbols"] = exclude_symbols
+            return ["order-1"]
+
+        fake_bot.api.close_all_positions = fake_close_all_positions
+        sweep = AutoTrader.close_fractional_positions_before_core_close.__get__(fake_bot)
+
+        sweep()
+
+        self.assertEqual(calls["instrument_types"], {"EQUITY"})
+        # FPE (whole share) and the OPTION leg must be excluded - only the
+        # fractional EQUITY position (MSFT) should ever be targeted.
+        self.assertEqual(calls["exclude_symbols"], {"FPE"})
+        self.assertNotIn("MSFT", fake_bot.pending_stock_exits)
+        self.assertIn("AAPL", fake_bot.pending_stock_exits)
+
+    def test_noop_when_nothing_is_fractional(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "FPE", "quantity": "1"},
+        ]
+        fake_bot = self._fake_bot(positions)
+
+        def fail_if_called(*a, **k):
+            raise AssertionError("must not attempt to close anything")
+
+        fake_bot.api.close_all_positions = fail_if_called
+        sweep = AutoTrader.close_fractional_positions_before_core_close.__get__(fake_bot)
+
+        sweep()  # must not raise
+
+    def test_throttled_within_eod_retry_seconds(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011"},
+        ]
+        fake_bot = self._fake_bot(positions)
+        fake_bot.last_fractional_sweep = time.monotonic()
+        calls = []
+        fake_bot.api.close_all_positions = lambda *a, **k: (calls.append(1), [])[1]
+        sweep = AutoTrader.close_fractional_positions_before_core_close.__get__(fake_bot)
+
+        sweep()
+
+        self.assertEqual(calls, [])
+
+    def test_survives_a_broker_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011"},
+        ]
+        fake_bot = self._fake_bot(positions)
+
+        def boom(*a, **k):
+            raise RuntimeError("boom")
+
+        fake_bot.api.close_all_positions = boom
+        sweep = AutoTrader.close_fractional_positions_before_core_close.__get__(fake_bot)
+
+        sweep()  # must not raise
+
+
 class CloseAllPositionsExclusionTests(unittest.TestCase):
     def test_close_all_positions_excludes_given_symbols(self):
         positions = [
