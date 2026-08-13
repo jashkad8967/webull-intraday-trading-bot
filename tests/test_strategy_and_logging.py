@@ -2561,6 +2561,55 @@ class BrokerConflictTests(unittest.TestCase):
         handle(RuntimeError("FRACT_VERSION2_ACCOUNT_NOT_TRADE"))
         self.assertFalse(fake_bot.fractional_trading_enabled)
 
+    def test_is_fractional_ticker_unsupported_matches_per_security_rejection(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertTrue(
+            AutoTrader.is_fractional_ticker_unsupported(
+                RuntimeError(
+                    "HTTP Status: 417, Code: "
+                    "OAUTH_OPENAPI_FRACT_TICKER_DONT_SUPPORT_TRADE, Msg: "
+                    "This security is not available for fractional shares "
+                    "trading."
+                )
+            )
+        )
+        self.assertFalse(
+            AutoTrader.is_fractional_ticker_unsupported(RuntimeError("timeout"))
+        )
+        # Distinct from the account-wide rejection - must not cross-match.
+        self.assertFalse(
+            AutoTrader.is_fractional_ticker_unsupported(
+                RuntimeError("FRACT_VERSION2_ACCOUNT_NOT_TRADE")
+            )
+        )
+
+    def test_handle_fractional_ticker_unsupported_blacklists_only_that_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(fractional_unsupported_symbols=set())
+        handle = AutoTrader.handle_fractional_ticker_unsupported.__get__(fake_bot)
+
+        handle("XHG", RuntimeError("FRACT_TICKER_DONT_SUPPORT_TRADE"))
+
+        self.assertEqual(fake_bot.fractional_unsupported_symbols, {"XHG"})
+
+        # A different symbol is unaffected.
+        self.assertNotIn("AAPL", fake_bot.fractional_unsupported_symbols)
+
+    def test_handle_fractional_ticker_unsupported_is_idempotent(self):
+        from webull_bot.bot import AutoTrader
+        from webull_bot import bot as bot_module
+
+        fake_bot = SimpleNamespace(fractional_unsupported_symbols={"XHG"})
+        handle = AutoTrader.handle_fractional_ticker_unsupported.__get__(fake_bot)
+
+        # No new log line for a symbol already known-unsupported - would
+        # otherwise spam a warning every cycle forever.
+        with unittest.mock.patch.object(bot_module.log, "warning") as warn:
+            handle("XHG", RuntimeError("FRACT_TICKER_DONT_SUPPORT_TRADE"))
+        warn.assert_not_called()
+
 
 class StatusWriterTests(unittest.TestCase):
     def test_write_includes_pending_orders_for_the_dashboard(self):
@@ -3999,6 +4048,26 @@ class EntrySizingSplitTests(unittest.TestCase):
         # whole-share budget = min(entry_budget=10000, 3500) = 3500
         # buffered_price = 50*1.03 = 51.5 -> floor(3500/51.5) = 67
         self.assertEqual(quantity, 67)
+
+    def test_fractional_unsupported_ticker_uses_whole_share_budget(self):
+        """A per-security FRACT_TICKER_DONT_SUPPORT_TRADE rejection
+        (see is_fractional_ticker_unsupported) must not disable fractional
+        trading account-wide - fractional_supported=False forces whole-
+        share sizing for just this symbol, unlike fractional_trading_
+        enabled=False which is account-wide.
+        """
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0.15"),
+            stock_whole_share_core_session_fraction=Decimal("0.20"),
+            stock_quantity=1000,
+            max_order_notional=Decimal("100000"),
+        )
+        size = self._size_fn(config)
+        quantity, buffered_price, fractional = size(
+            Decimal("50"), Decimal("10000"), Decimal("1500"), Decimal("2000"), True, True, False
+        )
+        self.assertFalse(fractional)
+        self.assertEqual(quantity, 38)
 
     def test_fractional_trading_disabled_uses_whole_share_budget(self):
         config = Settings(
