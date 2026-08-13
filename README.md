@@ -353,6 +353,22 @@ the defaults above, 6 of 20) - the same proportion as its capital share -
 so whole-share entries always have room to keep running into extended
 hours.
 
+**Fractional pre-core-close sweep.** `OVERNIGHT_HOLD_ENABLED` lets
+whole-share positions in overnight-eligible buckets ride past the close -
+a deliberate choice, since they're still exitable pre/after-hours if
+needed. A fractional position caught the same way is a different, worse
+situation: once core hours end it can't be bought, sold, stopped out, or
+profit-taken *at all* until the next session opens, so "holding
+overnight" isn't a choice for it, it's a total lockout with zero downside
+protection. `AutoTrader.close_fractional_positions_before_core_close()`
+sweeps and force-closes every fractional equity position a few minutes
+before core session ends (in the same `OPTION_EOD_CLOSE_TIME`-to-
+`OPTION_MARKET_CLOSE_TIME` window the option EOD closeout already uses),
+regardless of bucket or current P&L - it's the only way to actually
+defend one of these positions once the close is bearing down, so it
+closes on principle rather than waiting for a target/stop that might
+never fire before the window shuts.
+
 **Cash reserve floor.** `MIN_CASH_RESERVE_DOLLARS` (default `10`) is
 subtracted from buying power once, at the start of every account refresh
 (`AutoTrader.account_state()`) - every downstream spending path (stock,
