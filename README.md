@@ -406,6 +406,13 @@ whole-share sizing for the rest of that run instead of repeating the same
 rejection on every symbol every cycle; open the link in the Webull app or
 website and restart the bot to pick fractional sizing back up.
 
+Separately, some individual securities aren't fractional-eligible on Webull
+at all regardless of account status, rejected with
+`OAUTH_OPENAPI_FRACT_TICKER_DONT_SUPPORT_TRADE`. Unlike the account-wide
+rejection above, this only blacklists that one symbol from fractional sizing
+(falling back to whole-share for it) - every other symbol is unaffected, and
+nothing needs restarting.
+
 ## 4. Select options
 
 ### All optionable stocks

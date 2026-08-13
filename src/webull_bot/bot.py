@@ -178,6 +178,7 @@ class AutoTrader:
         self.gate_rejections: dict[str, int] = defaultdict(int)
         self.broker_conflict_symbols: set[str] = set()
         self.fractional_trading_enabled = True
+        self.fractional_unsupported_symbols: set[str] = set()
         self.iceberg_orders: dict[str, dict] = {}
         self.order_error_times: deque = deque()
         self.pairs = PairsStrategy()
@@ -682,6 +683,30 @@ class AutoTrader:
             exc,
         )
 
+    @staticmethod
+    def is_fractional_ticker_unsupported(exc: Exception) -> bool:
+        """True for Webull's OAUTH_OPENAPI_FRACT_TICKER_DONT_SUPPORT_TRADE
+        rejection - unlike FRACT_VERSION2_ACCOUNT_NOT_TRADE (an account-
+        wide agreement gate), this is a per-security restriction: some
+        tickers just aren't fractional-eligible on Webull regardless of
+        account status, and every other symbol is unaffected. Retrying
+        the same symbol changes nothing; retrying a different one is fine.
+        """
+        return "FRACT_TICKER_DONT_SUPPORT_TRADE" in str(exc).upper()
+
+    def handle_fractional_ticker_unsupported(self, symbol: str, exc: Exception) -> None:
+        if symbol in self.fractional_unsupported_symbols:
+            return
+        self.fractional_unsupported_symbols.add(symbol)
+        log.warning(
+            "FRACT  | %-8s | this security doesn't support fractional "
+            "trading - falling back to whole-share sizing for %s for the "
+            "rest of this run | %s",
+            symbol,
+            symbol,
+            exc,
+        )
+
     def rate_capped(self, key: str) -> bool:
         limit = self.config.stock_max_trades_per_hour
         if limit <= 0:
@@ -976,6 +1001,7 @@ class AutoTrader:
         whole_share_remaining: Decimal,
         core_session_active: bool,
         fractional_slot_available: bool = True,
+        fractional_supported: bool = True,
     ) -> tuple[Decimal, Decimal, bool]:
         """Splits capital between fractional and whole-share entry sizing
         instead of one style claiming every candidate during core hours.
@@ -992,12 +1018,18 @@ class AutoTrader:
         fractional position can't be exited outside core hours, so
         fractional entries alone filling every MAX_OPEN_POSITIONS slot
         would strand the account with no room for entries of any style for
-        the rest of the day.
+        the rest of the day. fractional_supported is False for a specific
+        symbol Webull has already rejected with
+        FRACT_TICKER_DONT_SUPPORT_TRADE (see
+        handle_fractional_ticker_unsupported) - a per-security
+        restriction, distinct from fractional_trading_enabled's
+        account-wide one.
         Returns (quantity, buffered_price, is_fractional).
         """
         if (
             core_session_active
             and self.fractional_trading_enabled
+            and fractional_supported
             and fractional_slot_available
             and fractional_remaining > 0
         ):
@@ -1707,6 +1739,7 @@ class AutoTrader:
                         buying_power,
                         bucket_remaining.get(bucket, Decimal("0")),
                     )
+                    fractional_supported = symbol not in self.fractional_unsupported_symbols
                     buy_quantity, buffered_price, fractional = self.size_stock_entry(
                         price,
                         entry_budget,
@@ -1714,12 +1747,14 @@ class AutoTrader:
                         whole_share_remaining,
                         core_session_active,
                         fractional_position_count < max_fractional_positions,
+                        fractional_supported,
                     )
                     if (
                         buy_quantity == 0
                         and self.config.fractional_shares_enabled
                         and core_session_active
                         and self.fractional_trading_enabled
+                        and fractional_supported
                         and fractional_position_count < max_fractional_positions
                     ):
                         fractional_quantity = self.strategy.fractional_stock_quantity(
@@ -1996,6 +2031,9 @@ class AutoTrader:
                     continue
                 if self.is_fractional_trading_not_enabled(exc):
                     self.handle_fractional_trading_not_enabled(exc)
+                    continue
+                if self.is_fractional_ticker_unsupported(exc):
+                    self.handle_fractional_ticker_unsupported(symbol, exc)
                     continue
                 log.error("STOCK  | %s | %s", symbol, exc)
         return buying_power
@@ -3004,6 +3042,8 @@ class AutoTrader:
         except Exception as exc:
             if self.is_fractional_trading_not_enabled(exc):
                 self.handle_fractional_trading_not_enabled(exc)
+            elif self.is_fractional_ticker_unsupported(exc):
+                self.handle_fractional_ticker_unsupported(symbol, exc)
             else:
                 log.error("CMD    | manual buy failed | %-8s | %s", symbol, exc)
             return buying_power
