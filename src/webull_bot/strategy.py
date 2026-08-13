@@ -655,10 +655,29 @@ class TradingStrategy:
             # net a loss once the flat fee comes out of the actual fill.
             fee_per_share = self.config.sell_fee_dollars / quantity
             stop_percent = self.adaptive_stop_percent(symbol)
+            # A fractional (core-session dollar-sized) position targets a
+            # much smaller move than a whole-share one - it can only be
+            # exited during core hours at all (see is_fractional_quantity
+            # usage in bot.py), so it should cycle capital quickly within
+            # that window (many trades/hour) rather than sit waiting for
+            # the same larger move a whole-share position can afford to
+            # hold toward across a longer stretch of the day.
+            # quantity isn't guaranteed to already be a Decimal here (a
+            # plain int is a valid whole-share quantity too) - only
+            # Decimal has to_integral_value().
+            quantity_decimal = (
+                quantity if isinstance(quantity, Decimal) else Decimal(quantity)
+            )
+            is_fractional = quantity_decimal != quantity_decimal.to_integral_value()
+            target_stop_multiple = (
+                self.config.fractional_target_stop_multiple
+                if is_fractional
+                else self.config.stock_target_stop_multiple
+            )
             target_percent = max(
                 self.config.stock_min_net_profit_percent
                 + self.config.stock_estimated_round_trip_cost_percent,
-                stop_percent * self.config.stock_target_stop_multiple,
+                stop_percent * target_stop_multiple,
             )
             base_target = average_cost * (Decimal("1") + target_percent) + fee_per_share
             stop = average_cost * (Decimal("1") - stop_percent)
