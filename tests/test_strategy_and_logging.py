@@ -7,7 +7,7 @@ import threading
 import time
 import unittest
 import unittest.mock
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from datetime import time as datetime_time
 from decimal import ROUND_DOWN, Decimal
@@ -330,6 +330,61 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         key = "STOCK:WIDE"
         self.assertFalse(strategy.entry_spread_ok(key))
         self.assertTrue(strategy.entry_spread_ok(key, True))
+
+    def test_idle_cash_relaxation_widens_extension_gate(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["SPIKED"] = {"high": 100.0}
+        self.assertFalse(strategy.entry_extension_ok("SPIKED", Decimal("99.5")))
+        self.assertTrue(
+            strategy.entry_extension_ok(
+                "SPIKED", Decimal("99.5"), False, "BUY", Decimal("2")
+            )
+        )
+
+    def test_idle_cash_relaxation_widens_spread_gate(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["WIDE"] = {"spread_percent": 0.25}
+        key = "STOCK:WIDE"
+        self.assertFalse(strategy.entry_spread_ok(key))
+        self.assertTrue(
+            strategy.entry_spread_ok(key, False, Decimal("2"))
+        )
+
+    def test_idle_cash_relaxation_and_opening_grace_take_the_larger_multiplier(self):
+        """Both mechanisms widen the same gates for different reasons -
+        whichever justifies more room this cycle should win, not average
+        or stack multiplicatively.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["WIDE"] = {"spread_percent": 0.25}
+        key = "STOCK:WIDE"
+        # opening_grace_multiplier=2 alone already covers a 0.25 spread
+        # (0.15*2=0.30) - a smaller idle multiplier shouldn't override it.
+        self.assertTrue(
+            strategy.entry_spread_ok(key, True, Decimal("1.1"))
+        )
+
+    def test_idle_cash_relaxation_widens_vwap_band(self):
+        strategy = TradingStrategy(self.config())
+        strategy._update_vwap("TEST", Decimal("100"), 100.0)
+        strategy._update_vwap("TEST", Decimal("100"), 200.0)
+        # 0.5% below VWAP - outside the default 0.1% band, inside a 10x one.
+        price = Decimal("99.5")
+        self.assertFalse(strategy.vwap_supports_entry("TEST", price))
+        self.assertTrue(
+            strategy.vwap_supports_entry("TEST", price, "BUY", Decimal("10"))
+        )
+
+    def test_idle_cash_relaxation_lowers_tick_direction_veto(self):
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:TICKY"
+        for price in (10.0, 9.9, 9.8):
+            strategy.tick_history[key].append(price)
+        # All downticks - score is -1, fails the default (>=0) BUY veto.
+        self.assertFalse(strategy.tick_direction_ok(key))
+        self.assertTrue(
+            strategy.tick_direction_ok(key, "BUY", Decimal("1.5"))
+        )
 
     def test_adaptive_stop_percent_is_clamped_between_configured_bounds(self):
         strategy = TradingStrategy(self.config())
@@ -3412,6 +3467,106 @@ class AccountStateCashReserveTests(unittest.TestCase):
         buying_power, _ = account_state()
 
         self.assertEqual(buying_power, Decimal("0"))
+
+
+class IdleCashRelaxationTests(unittest.TestCase):
+    def test_ramp_progress_is_zero_within_the_grace_period(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                idle_cash_relaxation_enabled=True,
+                idle_cash_grace_seconds=300,
+                idle_cash_ramp_seconds=1800,
+            ),
+            last_capital_deployed_at=time.monotonic() - 60,
+        )
+        progress = AutoTrader.idle_cash_ramp_progress.__get__(fake_bot)
+
+        self.assertEqual(progress(Decimal("50")), Decimal("0"))
+
+    def test_ramp_progress_is_zero_with_no_spendable_cash(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                idle_cash_relaxation_enabled=True,
+                idle_cash_grace_seconds=300,
+                idle_cash_ramp_seconds=1800,
+            ),
+            last_capital_deployed_at=time.monotonic() - 99999,
+        )
+        progress = AutoTrader.idle_cash_ramp_progress.__get__(fake_bot)
+
+        self.assertEqual(progress(Decimal("0")), Decimal("0"))
+
+    def test_ramp_progress_climbs_linearly_after_grace_then_caps_at_one(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                idle_cash_relaxation_enabled=True,
+                idle_cash_grace_seconds=300,
+                idle_cash_ramp_seconds=1800,
+            ),
+            last_capital_deployed_at=time.monotonic() - 300 - 900,
+        )
+        progress = AutoTrader.idle_cash_ramp_progress.__get__(fake_bot)
+
+        self.assertAlmostEqual(float(progress(Decimal("50"))), 0.5, places=2)
+
+        fake_bot.last_capital_deployed_at = time.monotonic() - 300 - 999999
+        self.assertEqual(progress(Decimal("50")), Decimal("1"))
+
+    def test_ramp_progress_disabled_by_config(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                idle_cash_relaxation_enabled=False,
+                idle_cash_grace_seconds=0,
+                idle_cash_ramp_seconds=1800,
+            ),
+            last_capital_deployed_at=time.monotonic() - 999999,
+        )
+        progress = AutoTrader.idle_cash_ramp_progress.__get__(fake_bot)
+
+        self.assertEqual(progress(Decimal("50")), Decimal("0"))
+
+    def test_record_trade_resets_the_idle_cash_timer_on_a_new_entry(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=time.monotonic() - 999999,
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade("STOCK:AAPL", "order-1", "BUY")
+
+        self.assertGreater(fake_bot.last_capital_deployed_at, time.monotonic() - 1)
+
+    def test_record_trade_does_not_reset_the_timer_on_an_exit(self):
+        from webull_bot.bot import AutoTrader
+
+        stale = time.monotonic() - 999999
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=stale,
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade("STOCK:AAPL", "order-1", "PROFIT", Decimal("10"), Decimal("1"), Decimal("9"))
+
+        self.assertEqual(fake_bot.last_capital_deployed_at, stale)
 
 
 class ExecutionGuardrailTests(unittest.TestCase):

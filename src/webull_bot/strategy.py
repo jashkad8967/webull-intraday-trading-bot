@@ -168,12 +168,16 @@ class TradingStrategy:
         return Decimal(str(state["cum_pv"] / state["cum_vol"]))
 
     def vwap_supports_entry(
-        self, symbol: str, price: Decimal, direction: str = "BUY"
+        self,
+        symbol: str,
+        price: Decimal,
+        direction: str = "BUY",
+        idle_relaxation_multiplier: Decimal = Decimal("1"),
     ) -> bool:
         vwap = self.vwap(symbol)
         if vwap is None:
             return True
-        band = self.config.vwap_entry_band_percent
+        band = self.config.vwap_entry_band_percent * idle_relaxation_multiplier
         if direction == "SHORT":
             return price <= vwap * (Decimal("1") + band)
         return price >= vwap * (Decimal("1") - band)
@@ -520,13 +524,19 @@ class TradingStrategy:
             return Decimal("0")
         return Decimal(up - down) / Decimal(total)
 
-    def tick_direction_ok(self, key: str, direction: str = "BUY") -> bool:
+    def tick_direction_ok(
+        self,
+        key: str,
+        direction: str = "BUY",
+        idle_relaxation_amount: Decimal = Decimal("0"),
+    ) -> bool:
         if not self.config.tick_direction_enabled:
             return True
         score = self.tick_direction_score(key)
+        threshold = self.config.tick_direction_veto_threshold - idle_relaxation_amount
         if direction == "SHORT":
-            return score <= -self.config.tick_direction_veto_threshold
-        return score >= self.config.tick_direction_veto_threshold
+            return score <= -threshold
+        return score >= threshold
 
     @staticmethod
     def obi_supports_entry(obi_score: Decimal | None) -> bool:
@@ -632,6 +642,8 @@ class TradingStrategy:
         average_cost: Decimal,
         assessment: dict | None = None,
         opening_grace_active: bool = False,
+        idle_relaxation_multiplier: Decimal = Decimal("1"),
+        idle_relaxation_amount: Decimal = Decimal("0"),
     ) -> Decision:
         trend = self.trend_signal(key, price)
         symbol = key.split(":", 1)[-1]
@@ -747,12 +759,18 @@ class TradingStrategy:
                         breakeven,
                     )
             return Decision("HOLD", "short position between target and stop", target)
-        if not self.entry_spread_ok(key, opening_grace_active):
+        if not self.entry_spread_ok(
+            key, opening_grace_active, idle_relaxation_multiplier
+        ):
             return Decision("HOLD", "spread too wide to scalp profitably")
         if trend == "SHORT" and self.config.short_selling_enabled:
-            if not self.vwap_supports_entry(symbol, price, "SHORT"):
+            if not self.vwap_supports_entry(
+                symbol, price, "SHORT", idle_relaxation_multiplier
+            ):
                 return Decision("HOLD", "price above session VWAP")
-            if not self.entry_extension_ok(symbol, price, opening_grace_active, "SHORT"):
+            if not self.entry_extension_ok(
+                symbol, price, opening_grace_active, "SHORT", idle_relaxation_multiplier
+            ):
                 return Decision(
                     "HOLD", "price already extended near today's low"
                 )
@@ -760,19 +778,23 @@ class TradingStrategy:
                 return Decision(
                     "HOLD", "price above the higher-timeframe SMA trend"
                 )
-            if self.tick_direction_ok(key, "SHORT"):
+            if self.tick_direction_ok(key, "SHORT", idle_relaxation_amount):
                 return Decision("SHORT", "EMA bearish entry confirmed")
             return Decision(
                 "HOLD", "recent ticks trending against the short entry"
             )
-        if not self.vwap_supports_entry(symbol, price):
+        if not self.vwap_supports_entry(
+            symbol, price, "BUY", idle_relaxation_multiplier
+        ):
             return Decision("HOLD", "price below session VWAP")
-        if not self.entry_extension_ok(symbol, price, opening_grace_active):
+        if not self.entry_extension_ok(
+            symbol, price, opening_grace_active, "BUY", idle_relaxation_multiplier
+        ):
             return Decision("HOLD", "price already extended near today's high")
         if not self.sma_trend_supports_entry(symbol, price):
             return Decision("HOLD", "price below the higher-timeframe SMA trend")
         if trend == "BUY":
-            if self.tick_direction_ok(key):
+            if self.tick_direction_ok(key, "BUY", idle_relaxation_amount):
                 return Decision("BUY", "EMA entry confirmed")
             return Decision(
                 "HOLD", "recent ticks trending against the EMA entry"
@@ -796,14 +818,21 @@ class TradingStrategy:
             return Decimal("0")
         return max(Decimal("-1"), min(Decimal("1"), bias))
 
-    def entry_spread_ok(self, key: str, opening_grace_active: bool = False) -> bool:
+    def entry_spread_ok(
+        self,
+        key: str,
+        opening_grace_active: bool = False,
+        idle_relaxation_multiplier: Decimal = Decimal("1"),
+    ) -> bool:
         symbol = key.split(":", 1)[-1]
         spread = self.metrics.get(symbol, {}).get("spread_percent")
         if spread in (None, ""):
             return True
         threshold = self.config.stock_entry_max_spread_percent
+        multiplier = idle_relaxation_multiplier
         if opening_grace_active:
-            threshold *= self.config.opening_grace_spread_multiplier
+            multiplier = max(multiplier, self.config.opening_grace_spread_multiplier)
+        threshold *= multiplier
         try:
             return Decimal(str(spread)) <= threshold
         except Exception:
@@ -815,6 +844,7 @@ class TradingStrategy:
         price: Decimal,
         opening_grace_active: bool = False,
         direction: str = "BUY",
+        idle_relaxation_multiplier: Decimal = Decimal("1"),
     ) -> bool:
         """Block chasing a name that's already sitting at today's high (or,
         for a short, today's low).
@@ -826,7 +856,9 @@ class TradingStrategy:
         bottom). Right after the open, today's high/low is barely
         established yet and gets set/reset constantly, so the grace window
         shrinks the room required (smaller buffer = more lenient) instead
-        of dropping the check entirely.
+        of dropping the check entirely. idle_relaxation_multiplier does the
+        same shrink for the opposite reason - cash sitting idle too long,
+        not the opening print.
         """
         reference = self.metrics.get(symbol, {}).get(
             "low" if direction == "SHORT" else "high"
@@ -840,8 +872,10 @@ class TradingStrategy:
         if reference_decimal <= 0:
             return True
         extension_percent = self.config.stock_entry_max_extension_percent
+        multiplier = idle_relaxation_multiplier
         if opening_grace_active:
-            extension_percent /= self.config.opening_grace_extension_multiplier
+            multiplier = max(multiplier, self.config.opening_grace_extension_multiplier)
+        extension_percent /= multiplier
         if direction == "SHORT":
             return price >= reference_decimal * (Decimal("1") + extension_percent)
         return price <= reference_decimal * (Decimal("1") - extension_percent)

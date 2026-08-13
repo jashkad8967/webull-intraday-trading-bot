@@ -225,12 +225,41 @@ class Settings(BaseSettings):
     # before any sizing math runs each cycle (see AutoTrader.run()), so
     # nothing downstream - stock/option/pairs entries, manual dashboard
     # buys - ever plans to spend into the last MIN_CASH_RESERVE_DOLLARS of
-    # the account. This bounds what the bot is willing to risk spending,
-    # not a promise that cash will actually reach this floor - it still
-    # only trades when a candidate clears the normal entry gates (spread,
-    # EMA, VWAP, extension, etc.); no amount of capital-sizing tuning
-    # forces a trade into existence when nothing qualifies.
+    # the account. This bounds what the bot is willing to risk spending;
+    # see idle_cash_relaxation_enabled below for how the bot tries to
+    # actually keep spending down to this floor, not just permit it.
     min_cash_reserve_dollars: Decimal = Field(default=Decimal("10"), ge=0)
+    # Keeping cash deployed outranks entry quality, but not entirely -
+    # entry gates only progressively loosen the longer cash sits above
+    # MIN_CASH_RESERVE_DOLLARS with nothing bought (see
+    # AutoTrader.idle_cash_ramp_progress), snapping back to full strictness
+    # the moment any entry fires. This never touches the directional
+    # EMA/SMA signal itself (still no trade without a real crossover) -
+    # only the secondary confirmation gates: max spread, extension from
+    # today's high/low, VWAP band, and the tick-direction veto threshold.
+    idle_cash_relaxation_enabled: bool = True
+    # No relaxation at all for this long after the last entry - a burst of
+    # trading shouldn't immediately start loosening gates again just
+    # because the very next cycle still has leftover cash.
+    idle_cash_grace_seconds: int = Field(default=300, ge=0, le=21600)
+    # After the grace period, gates linearly loosen toward their max
+    # multiplier/relaxation over this many additional seconds, then hold
+    # at the max for as long as cash keeps sitting idle.
+    idle_cash_ramp_seconds: int = Field(default=1800, ge=1, le=21600)
+    # Shared ceiling for every multiplicative gate (max spread, extension
+    # from today's high/low, VWAP band) at full ramp - one knob, not three,
+    # since there's no real reason to relax these three at different rates
+    # and a fake extra layer of granularity is worse than none.
+    idle_cash_max_gate_multiplier: Decimal = Field(
+        default=Decimal("3"), ge=1, le=10
+    )
+    # Subtracted from tick_direction_veto_threshold at full ramp (e.g. the
+    # default threshold 0 becomes -0.5 fully relaxed) - allows a slightly
+    # tick-negative entry through rather than requiring purely non-negative
+    # recent tape direction.
+    idle_cash_max_tick_relaxation: Decimal = Field(
+        default=Decimal("0.5"), ge=0, le=2
+    )
     # The opening print is naturally wider/choppier than mid-day trading, so
     # the normal spread/extension gates - tuned for profitable mid-day
     # scalping - reject almost everything in the first few minutes after the

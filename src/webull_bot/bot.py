@@ -139,6 +139,10 @@ class AutoTrader:
         self.last_reprice = 0.0
         self.last_fill_time = time.monotonic()
         self.last_stall_boost = 0.0
+        # See idle_cash_ramp_progress()/record_trade() - tracks how long
+        # cash has sat above MIN_CASH_RESERVE_DOLLARS with nothing bought,
+        # to progressively relax entry quality gates the longer it sits.
+        self.last_capital_deployed_at = time.monotonic()
         self.cached_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
         self.working_orders: dict[str, dict] = {}
@@ -701,6 +705,12 @@ class AutoTrader:
         self.last_trade[key] = submitted_at
         if action in ("PROFIT", "STOP", "MANUAL_SELL"):
             self.last_exit_at[key] = submitted_at
+        if action in ("BUY", "SHORT", "MANUAL_BUY"):
+            # Resets the idle-cash gate-relaxation ramp (see
+            # idle_cash_ramp_progress) - capital just got deployed, so
+            # quality gates snap back to their normal strictness until
+            # cash sits idle above MIN_CASH_RESERVE_DOLLARS again.
+            self.last_capital_deployed_at = submitted_at
         self.trade_times[key].append(submitted_at)
         self.working_orders[order_id] = {
             "submitted_at": submitted_at,
@@ -900,6 +910,24 @@ class AutoTrader:
             self.cached_positions = self.api.positions()
             self.last_account_refresh = now
         return self.cached_buying_power, [dict(item) for item in self.cached_positions]
+
+    def idle_cash_ramp_progress(self, buying_power: Decimal) -> Decimal:
+        """0..1 - how far along the idle-cash gate-relaxation ramp the bot
+        currently is. Keeping buying_power (already net of
+        MIN_CASH_RESERVE_DOLLARS) deployed outranks entry quality, so the
+        longer it sits unspent, the more entry_spread_ok/entry_extension_ok/
+        vwap_supports_entry/tick_direction_ok loosen - see their
+        idle_relaxation_multiplier parameter. Resets to 0 the moment
+        record_trade() sees a new BUY/SHORT/MANUAL_BUY fill.
+        """
+        if not self.config.idle_cash_relaxation_enabled or buying_power <= 0:
+            return Decimal("0")
+        idle_seconds = time.monotonic() - self.last_capital_deployed_at
+        grace = float(self.config.idle_cash_grace_seconds)
+        if idle_seconds <= grace:
+            return Decimal("0")
+        ramp = float(self.config.idle_cash_ramp_seconds)
+        return Decimal(str(min(1.0, (idle_seconds - grace) / ramp)))
 
     def agent_assessment(self, symbol: str) -> dict | None:
         if not self.market_agent:
@@ -1503,6 +1531,15 @@ class AutoTrader:
         core_session_active: bool = False,
     ) -> Decimal:
         open_count = self.strategy.open_position_count(positions)
+        # Keeping cash deployed outranks entry quality, but only
+        # progressively - see idle_cash_ramp_progress(). ramp_progress is
+        # 0 right after any entry, climbing to 1 the longer buying_power
+        # sits idle above MIN_CASH_RESERVE_DOLLARS with nothing bought.
+        ramp_progress = self.idle_cash_ramp_progress(buying_power)
+        idle_relaxation_multiplier = Decimal("1") + ramp_progress * (
+            self.config.idle_cash_max_gate_multiplier - Decimal("1")
+        )
+        idle_relaxation_amount = ramp_progress * self.config.idle_cash_max_tick_relaxation
         self.refresh_agent_discoveries()
         batch, self.stock_cursor = self.strategy.prioritized_stock_batch(
             self.stock_symbols,
@@ -1634,6 +1671,8 @@ class AutoTrader:
                     cost,
                     self.agent_assessment(symbol),
                     opening_grace_active,
+                    idle_relaxation_multiplier,
+                    idle_relaxation_amount,
                 )
                 if decision.action == "HOLD" and quantity == 0:
                     self.gate_rejections[decision.reason] += 1
