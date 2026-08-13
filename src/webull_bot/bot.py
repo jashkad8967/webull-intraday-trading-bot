@@ -886,7 +886,17 @@ class AutoTrader:
             now - self.last_account_refresh
             >= float(self.config.account_refresh_seconds)
         ):
-            self.cached_buying_power = self.api.buying_power()
+            # MIN_CASH_RESERVE_DOLLARS is subtracted right here, once, at
+            # the fresh broker read - not at every call site that reads
+            # cached_buying_power. This value stays cached (and this
+            # already-reduced) for ACCOUNT_REFRESH_SECONDS; subtracting
+            # the reserve again on every cache hit within that window
+            # would compound each cycle and drive spendable capital to
+            # zero almost immediately.
+            self.cached_buying_power = max(
+                Decimal("0"),
+                self.api.buying_power() - self.config.min_cash_reserve_dollars,
+            )
             self.cached_positions = self.api.positions()
             self.last_account_refresh = now
         return self.cached_buying_power, [dict(item) for item in self.cached_positions]

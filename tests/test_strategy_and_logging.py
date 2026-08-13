@@ -3336,6 +3336,84 @@ class PairsStrategyTests(unittest.TestCase):
         self.assertNotIn(pair, strat._entered_at)
 
 
+class AccountStateCashReserveTests(unittest.TestCase):
+    def test_fresh_refresh_subtracts_the_reserve_once(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                account_refresh_seconds=Decimal("5"),
+                min_cash_reserve_dollars=Decimal("10"),
+            ),
+            api=SimpleNamespace(
+                buying_power=lambda: Decimal("120.00"),
+                positions=lambda: [{"symbol": "AAPL"}],
+            ),
+            cached_buying_power=Decimal("0"),
+            cached_positions=[],
+            last_account_refresh=0.0,
+        )
+        account_state = AutoTrader.account_state.__get__(fake_bot)
+
+        buying_power, positions = account_state()
+
+        self.assertEqual(buying_power, Decimal("110.00"))
+        self.assertEqual(positions, [{"symbol": "AAPL"}])
+
+    def test_cache_hit_does_not_subtract_the_reserve_again(self):
+        """Regression test: account_state() only re-fetches from the
+        broker every ACCOUNT_REFRESH_SECONDS - subtracting the reserve at
+        every call site that reads the cached value (instead of once,
+        right at the fresh fetch) would compound on every poll cycle
+        within that window and drive spendable capital toward zero almost
+        immediately.
+        """
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                account_refresh_seconds=Decimal("5"),
+                min_cash_reserve_dollars=Decimal("10"),
+            ),
+            api=SimpleNamespace(
+                buying_power=lambda: (calls.append(1), Decimal("120.00"))[1],
+                positions=lambda: [],
+            ),
+            cached_buying_power=Decimal("0"),
+            cached_positions=[],
+            last_account_refresh=time.monotonic(),
+        )
+        account_state = AutoTrader.account_state.__get__(fake_bot)
+
+        buying_power, _ = account_state()
+
+        self.assertEqual(buying_power, Decimal("0"))
+        self.assertEqual(calls, [])
+
+    def test_reserve_never_takes_buying_power_below_zero(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                account_refresh_seconds=Decimal("5"),
+                min_cash_reserve_dollars=Decimal("10"),
+            ),
+            api=SimpleNamespace(
+                buying_power=lambda: Decimal("3.00"),
+                positions=lambda: [],
+            ),
+            cached_buying_power=Decimal("0"),
+            cached_positions=[],
+            last_account_refresh=0.0,
+        )
+        account_state = AutoTrader.account_state.__get__(fake_bot)
+
+        buying_power, _ = account_state()
+
+        self.assertEqual(buying_power, Decimal("0"))
+
+
 class ExecutionGuardrailTests(unittest.TestCase):
     def test_price_sanity_ok_within_tolerance(self):
         from webull_bot.bot import AutoTrader
