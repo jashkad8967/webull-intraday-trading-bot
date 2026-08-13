@@ -360,9 +360,41 @@ option, and pairs entries, manual dashboard buys) sees and sizes against
 this already-reduced figure, so nothing plans to spend into the last
 `MIN_CASH_RESERVE_DOLLARS` of the account. This bounds what the bot is
 *willing* to risk spending, not a guarantee that cash will actually reach
-the floor - it still only trades when a candidate clears the normal entry
-gates (spread, EMA, VWAP, extension, etc.); no amount of capital-sizing
-tuning forces a trade into existence when nothing qualifies that cycle.
+the floor by itself - it still only trades when a candidate clears the
+entry gates (spread, EMA, VWAP, extension, etc.). See below for how the
+bot actively tries to close that gap instead of just leaving cash idle.
+
+**Idle-cash gate relaxation.** Keeping cash deployed down to
+`MIN_CASH_RESERVE_DOLLARS` outranks entry quality, but only
+progressively. `IDLE_CASH_RELAXATION_ENABLED` (default `true`) tracks how
+long buying power has sat above the reserve floor with nothing bought
+(`AutoTrader.idle_cash_ramp_progress`, reset to zero the instant any BUY/
+SHORT/manual-buy fills): for the first `IDLE_CASH_GRACE_SECONDS` (default
+`300`) nothing changes, then over the next `IDLE_CASH_RAMP_SECONDS`
+(default `1800`) the secondary confirmation gates - max spread
+(`STOCK_ENTRY_MAX_SPREAD_PERCENT`), extension from today's high/low
+(`STOCK_ENTRY_MAX_EXTENSION_PERCENT`), and the VWAP entry band
+(`VWAP_ENTRY_BAND_PERCENT`) - linearly widen toward
+`IDLE_CASH_MAX_GATE_MULTIPLIER` (default `3x`), while the tick-direction
+veto threshold (`TICK_DIRECTION_VETO_THRESHOLD`) linearly lowers toward
+`IDLE_CASH_MAX_TICK_RELAXATION` (default `0.5`) below its normal value,
+then holds at the max for as long as cash keeps sitting idle:
+
+```dotenv
+IDLE_CASH_RELAXATION_ENABLED=true
+IDLE_CASH_GRACE_SECONDS=300
+IDLE_CASH_RAMP_SECONDS=1800
+IDLE_CASH_MAX_GATE_MULTIPLIER=3
+IDLE_CASH_MAX_TICK_RELAXATION=0.5
+```
+
+This never touches the directional EMA/SMA signal itself - there's still
+no trade without a real crossover (`trend_signal`/`sma_trend_supports_entry`
+still gate on an actual bullish/bearish move, not just "any stock"). Only
+how strict the confirmation *around* that signal has to be relaxes, and
+only the longer capital sits unused. If gates are relaxed to the max and
+still nothing qualifies, cash still won't be forced into a trade - this
+widens what counts as a good-enough setup, it doesn't invent one.
 
 Fractional orders (both the sizing above and the `FRACTIONAL_SHARES_ENABLED`
 fallback) require the Webull account itself to have agreed to fractional
