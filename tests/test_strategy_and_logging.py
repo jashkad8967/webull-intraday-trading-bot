@@ -58,6 +58,7 @@ class StrategyConfigMixin:
             stock_stop_loss_max_percent=Decimal("0.02"),
             stock_stop_loss_range_multiplier=Decimal("0.35"),
             stock_target_stop_multiple=Decimal("1.2"),
+            fractional_target_stop_multiple=Decimal("0.8"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
             stock_core_session_position_fraction=Decimal("0.10"),
@@ -527,6 +528,28 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
             None,
         )
         self.assertEqual(decision.action, "LOSS")
+
+    def test_fractional_position_targets_a_smaller_move_than_whole_share(self):
+        """A fractional position can only be exited during core hours at
+        all, so it should cycle capital quickly (many trades/hour) rather
+        than sit waiting for the same larger move a whole-share position
+        can hold toward - fractional_target_stop_multiple (0.8) is lower
+        than stock_target_stop_multiple (1.2), so at the same elevated
+        volatility the fractional target is reached first.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["WILD"] = {"range_ratio": 0.10}
+        price = Decimal("101.80")
+
+        whole_share = strategy.stock_decision(
+            "STOCK:WILD", price, 10, Decimal("100"), None
+        )
+        self.assertEqual(whole_share.action, "HOLD")
+
+        fractional = strategy.stock_decision(
+            "STOCK:WILD", price, Decimal("0.5"), Decimal("100"), None
+        )
+        self.assertEqual(fractional.action, "PROFIT")
 
     def test_option_decision_cuts_loss_before_it_reaches_zero(self):
         strategy = TradingStrategy(self.config())
@@ -4233,7 +4256,7 @@ class OvernightHoldTests(unittest.TestCase):
 
 class FractionalPreCloseSweepTests(unittest.TestCase):
     @staticmethod
-    def _fake_bot(positions, config=None):
+    def _fake_bot(positions, quotes=None, config=None):
         from webull_bot.bot import AutoTrader
 
         fake_bot = SimpleNamespace(
@@ -4246,18 +4269,31 @@ class FractionalPreCloseSweepTests(unittest.TestCase):
             wash_sales=SimpleNamespace(block=lambda *a, **k: None),
             is_fractional_quantity=AutoTrader.is_fractional_quantity,
         )
-        fake_bot.api = SimpleNamespace(positions=lambda: positions)
+        quotes = quotes or {}
+        fake_bot.api = SimpleNamespace(
+            positions=lambda: positions,
+            stock_quote=lambda symbol: {"symbol": symbol, "price": str(quotes.get(symbol, "0"))},
+            quote_price=lambda quote: Decimal(str(quote["price"])),
+        )
         return fake_bot
 
-    def test_sweeps_only_fractional_equity_positions(self):
+    def test_closes_only_profitable_fractional_positions(self):
+        """MSFT is a fractional position sitting at a profit (must close);
+        BABA is fractional but underwater (must NOT be force-sold - it's
+        already undefendable either way, and forcing a realized loss here
+        isn't necessary the way capturing a gain is); FPE is whole-share
+        (excluded regardless of P&L); the OPTION leg is never touched.
+        """
         from webull_bot.bot import AutoTrader
 
         positions = [
-            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011"},
-            {"instrument_type": "EQUITY", "symbol": "FPE", "quantity": "1"},
-            {"instrument_type": "OPTION", "symbol": "AAPL260918C00200000", "quantity": "0.5"},
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011", "cost_price": "493.23"},
+            {"instrument_type": "EQUITY", "symbol": "BABA", "quantity": "0.109", "cost_price": "128.93"},
+            {"instrument_type": "EQUITY", "symbol": "FPE", "quantity": "1", "cost_price": "17.81"},
+            {"instrument_type": "OPTION", "symbol": "AAPL260918C00200000", "quantity": "0.5", "cost_price": "1.00"},
         ]
-        fake_bot = self._fake_bot(positions)
+        quotes = {"MSFT": "497.33", "BABA": "122.20"}
+        fake_bot = self._fake_bot(positions, quotes)
         calls = {}
 
         def fake_close_all_positions(instrument_types, loss_callback=None, exclude_symbols=None):
@@ -4271,9 +4307,11 @@ class FractionalPreCloseSweepTests(unittest.TestCase):
         sweep()
 
         self.assertEqual(calls["instrument_types"], {"EQUITY"})
-        # FPE (whole share) and the OPTION leg must be excluded - only the
-        # fractional EQUITY position (MSFT) should ever be targeted.
-        self.assertEqual(calls["exclude_symbols"], {"FPE"})
+        # Every EQUITY position except the profitable fractional one
+        # (MSFT) is excluded - the losing fractional one (BABA) and the
+        # whole-share one (FPE). The option leg is never considered at
+        # all (not an EQUITY position).
+        self.assertEqual(calls["exclude_symbols"], {"BABA", "FPE"})
         self.assertNotIn("MSFT", fake_bot.pending_stock_exits)
         self.assertIn("AAPL", fake_bot.pending_stock_exits)
 
@@ -4281,9 +4319,25 @@ class FractionalPreCloseSweepTests(unittest.TestCase):
         from webull_bot.bot import AutoTrader
 
         positions = [
-            {"instrument_type": "EQUITY", "symbol": "FPE", "quantity": "1"},
+            {"instrument_type": "EQUITY", "symbol": "FPE", "quantity": "1", "cost_price": "17.81"},
         ]
         fake_bot = self._fake_bot(positions)
+
+        def fail_if_called(*a, **k):
+            raise AssertionError("must not attempt to close anything")
+
+        fake_bot.api.close_all_positions = fail_if_called
+        sweep = AutoTrader.close_fractional_positions_before_core_close.__get__(fake_bot)
+
+        sweep()  # must not raise
+
+    def test_noop_when_every_fractional_position_is_underwater(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "BABA", "quantity": "0.109", "cost_price": "128.93"},
+        ]
+        fake_bot = self._fake_bot(positions, {"BABA": "122.20"})
 
         def fail_if_called(*a, **k):
             raise AssertionError("must not attempt to close anything")
@@ -4297,9 +4351,9 @@ class FractionalPreCloseSweepTests(unittest.TestCase):
         from webull_bot.bot import AutoTrader
 
         positions = [
-            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011"},
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011", "cost_price": "493.23"},
         ]
-        fake_bot = self._fake_bot(positions)
+        fake_bot = self._fake_bot(positions, {"MSFT": "497.33"})
         fake_bot.last_fractional_sweep = time.monotonic()
         calls = []
         fake_bot.api.close_all_positions = lambda *a, **k: (calls.append(1), [])[1]
@@ -4313,9 +4367,9 @@ class FractionalPreCloseSweepTests(unittest.TestCase):
         from webull_bot.bot import AutoTrader
 
         positions = [
-            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011"},
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011", "cost_price": "493.23"},
         ]
-        fake_bot = self._fake_bot(positions)
+        fake_bot = self._fake_bot(positions, {"MSFT": "497.33"})
 
         def boom(*a, **k):
             raise RuntimeError("boom")
@@ -4324,6 +4378,34 @@ class FractionalPreCloseSweepTests(unittest.TestCase):
         sweep = AutoTrader.close_fractional_positions_before_core_close.__get__(fake_bot)
 
         sweep()  # must not raise
+
+    def test_survives_a_quote_failure_for_one_symbol(self):
+        """A quote failure for one fractional symbol must not stop the
+        sweep from still closing others that quoted fine.
+        """
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "0.011", "cost_price": "493.23"},
+            {"instrument_type": "EQUITY", "symbol": "BROKEN", "quantity": "0.02", "cost_price": "10.00"},
+        ]
+        fake_bot = self._fake_bot(positions, {"MSFT": "497.33"})
+
+        def flaky_quote(symbol):
+            if symbol == "BROKEN":
+                raise RuntimeError("quote unavailable")
+            return {"symbol": symbol, "price": "497.33"}
+
+        fake_bot.api.stock_quote = flaky_quote
+        calls = {}
+        fake_bot.api.close_all_positions = lambda instrument_types, loss_callback=None, exclude_symbols=None: (
+            calls.update(exclude_symbols=exclude_symbols) or ["order-1"]
+        )
+        sweep = AutoTrader.close_fractional_positions_before_core_close.__get__(fake_bot)
+
+        sweep()
+
+        self.assertEqual(calls["exclude_symbols"], {"BROKEN"})
 
 
 class CloseAllPositionsExclusionTests(unittest.TestCase):

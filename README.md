@@ -361,13 +361,15 @@ situation: once core hours end it can't be bought, sold, stopped out, or
 profit-taken *at all* until the next session opens, so "holding
 overnight" isn't a choice for it, it's a total lockout with zero downside
 protection. `AutoTrader.close_fractional_positions_before_core_close()`
-sweeps and force-closes every fractional equity position a few minutes
-before core session ends (in the same `OPTION_EOD_CLOSE_TIME`-to-
-`OPTION_MARKET_CLOSE_TIME` window the option EOD closeout already uses),
-regardless of bucket or current P&L - it's the only way to actually
-defend one of these positions once the close is bearing down, so it
-closes on principle rather than waiting for a target/stop that might
-never fire before the window shuts.
+sweeps every fractional equity position a few minutes before core
+session ends (in the same `OPTION_EOD_CLOSE_TIME`-to-
+`OPTION_MARKET_CLOSE_TIME` window the option EOD closeout already uses)
+and force-closes the ones currently sitting at a profit, regardless of
+bucket - it's the only way to actually lock in a gain before it becomes
+undefendable for hours. A fractional position sitting at a loss is left
+alone rather than forced out: it's already undefendable either way once
+the window closes, and realizing that loss isn't necessary the way
+capturing a gain is.
 
 **Cash reserve floor.** `MIN_CASH_RESERVE_DOLLARS` (default `10`) is
 subtracted from buying power once, at the start of every account refresh
@@ -569,6 +571,7 @@ STOCK_STOP_LOSS_MIN_PERCENT=0.009
 STOCK_STOP_LOSS_MAX_PERCENT=0.015
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.8
+FRACTIONAL_TARGET_STOP_MULTIPLE=0.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PERCENT=0.75
@@ -624,7 +627,17 @@ and use the plain thresholds all day.
 Every stock's profit target scales with its own adaptive stop
 (`STOCK_TARGET_STOP_MULTIPLE` × the stop distance from
 `STOCK_STOP_LOSS_MIN/MAX_PERCENT`), so exits are already sized to be small
-and quick rather than holding out for a big move. Two settings control how
+and quick rather than holding out for a big move. A fractional (core-
+session dollar-sized) position uses its own, smaller multiplier instead -
+`FRACTIONAL_TARGET_STOP_MULTIPLE` (default `0.8`, vs. `1.8` for a
+whole-share position) - since it can only be exited during core hours at
+all (see the pre-core-close sweep above), it should cycle capital
+quickly within that window rather than sit waiting for the same larger
+move a whole-share position can afford to hold toward. The stop-loss
+distance itself is unchanged between the two - only how far past cost
+counts as "take it."
+
+Two settings control how
 often the bot is willing to re-enter the same symbol:
 `TRADE_COOLDOWN_SECONDS` (minimum gap between orders on one symbol) and
 `STOCK_MAX_TRADES_PER_HOUR` (a per-symbol ceiling on top of the cooldown).
@@ -1470,6 +1483,7 @@ STOCK_STOP_LOSS_MIN_PERCENT=0.009
 STOCK_STOP_LOSS_MAX_PERCENT=0.015
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.8
+FRACTIONAL_TARGET_STOP_MULTIPLE=0.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PERCENT=0.75
