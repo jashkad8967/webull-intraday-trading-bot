@@ -299,7 +299,7 @@ position quantity is read as a decimal everywhere it matters, not truncated
 to a whole number.
 
 **Dollar-sized core-session entries.** `STOCK_CORE_SESSION_POSITION_FRACTION`
-(default `0.15`) changes how the main EMA-scalp strategy sizes a brand new
+(default `0.30`) changes how the main EMA-scalp strategy sizes a brand new
 stock entry during core trading hours (9:30-4:00 ET): instead of only ever
 buying a fixed `STOCK_QUANTITY` number of whole shares, it sizes the entry
 as this fraction of *total account buying power* and places it as a
@@ -318,12 +318,15 @@ computed once at the start of the scan and spent down independently as
 entries land across the cycle - not one style re-trying the same "first
 crack" every candidate and only reaching the other's budget on failure,
 which would let fractional (tried first, and rarely failing outright) claim
-nearly every entry and leave the whole-share slice - a *larger* allocation
-by default - essentially unused:
+nearly every entry and leave the whole-share slice essentially unused. The
+two fractions are sized to sum to `1.0`, not less - together they're the
+entire per-cycle entry budget, so a smaller sum would leave qualifying
+candidates unfunded (and cash sitting idle) even with room left under
+`MIN_CASH_RESERVE_DOLLARS`' floor:
 
 ```dotenv
-STOCK_CORE_SESSION_POSITION_FRACTION=0.15
-STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION=0.35
+STOCK_CORE_SESSION_POSITION_FRACTION=0.30
+STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION=0.70
 ```
 
 Whenever the fractional attempt produces nothing for a candidate (e.g. its
@@ -349,6 +352,17 @@ STOCK_WHOLE_SHARE_CORE_SESSION_FRACTION)` concurrently-open positions (at
 the defaults above, 6 of 20) - the same proportion as its capital share -
 so whole-share entries always have room to keep running into extended
 hours.
+
+**Cash reserve floor.** `MIN_CASH_RESERVE_DOLLARS` (default `10`) is
+subtracted from buying power once, at the start of every account refresh
+(`AutoTrader.account_state()`) - every downstream spending path (stock,
+option, and pairs entries, manual dashboard buys) sees and sizes against
+this already-reduced figure, so nothing plans to spend into the last
+`MIN_CASH_RESERVE_DOLLARS` of the account. This bounds what the bot is
+*willing* to risk spending, not a guarantee that cash will actually reach
+the floor - it still only trades when a candidate clears the normal entry
+gates (spread, EMA, VWAP, extension, etc.); no amount of capital-sizing
+tuning forces a trade into existence when nothing qualifies that cycle.
 
 Fractional orders (both the sizing above and the `FRACTIONAL_SHARES_ENABLED`
 fallback) require the Webull account itself to have agreed to fractional

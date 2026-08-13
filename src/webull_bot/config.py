@@ -195,8 +195,15 @@ class Settings(BaseSettings):
     # dollar_stock_quantity() and README "Fractional shares". ge=0
     # deliberately (not gt=0): 0 is the escape hatch back to fixed-quantity
     # sizing all day, same pattern as OPENING_GRACE_MINUTES=0.
+    #
+    # This and stock_whole_share_core_session_fraction below are sized to
+    # sum to 1.0 (not less) - together they're the entire per-cycle entry
+    # budget, not an extra throttle beneath MIN_CASH_RESERVE_DOLLARS. A
+    # smaller sum here would leave qualifying candidates unfunded (and cash
+    # sitting idle) even when MIN_CASH_RESERVE_DOLLARS' floor has plenty of
+    # room left above it.
     stock_core_session_position_fraction: Decimal = Field(
-        default=Decimal("0.15"),
+        default=Decimal("0.30"),
         ge=0,
         le=1,
     )
@@ -210,10 +217,20 @@ class Settings(BaseSettings):
     # usable then anyway, so whole-share sizing spends against the full
     # remaining entry budget instead of this slice of it.
     stock_whole_share_core_session_fraction: Decimal = Field(
-        default=Decimal("0.35"),
+        default=Decimal("0.70"),
         ge=0,
         le=1,
     )
+    # Hard floor on idle cash: buying_power is reduced by this amount
+    # before any sizing math runs each cycle (see AutoTrader.run()), so
+    # nothing downstream - stock/option/pairs entries, manual dashboard
+    # buys - ever plans to spend into the last MIN_CASH_RESERVE_DOLLARS of
+    # the account. This bounds what the bot is willing to risk spending,
+    # not a promise that cash will actually reach this floor - it still
+    # only trades when a candidate clears the normal entry gates (spread,
+    # EMA, VWAP, extension, etc.); no amount of capital-sizing tuning
+    # forces a trade into existence when nothing qualifies.
+    min_cash_reserve_dollars: Decimal = Field(default=Decimal("10"), ge=0)
     # The opening print is naturally wider/choppier than mid-day trading, so
     # the normal spread/extension gates - tuned for profitable mid-day
     # scalping - reject almost everything in the first few minutes after the
