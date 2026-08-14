@@ -4061,6 +4061,10 @@ class FractionalExitGuardTests(unittest.TestCase):
             def quote_bid(q):
                 return Decimal(str(q["bid"]))
 
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
             def place_stock(self, *a, **k):
                 raise AssertionError("must not place an order outside core hours")
 
@@ -4081,6 +4085,7 @@ class FractionalExitGuardTests(unittest.TestCase):
         fake_bot.cooldown_ready = lambda key: True
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
         fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
+        fake_bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(fake_bot)
         boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
         positions = [
             {
@@ -4116,6 +4121,10 @@ class FractionalExitGuardTests(unittest.TestCase):
             def quote_bid(q):
                 return Decimal(str(q["bid"]))
 
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
             def place_stock(self, *a, **k):
                 raise AssertionError(
                     "must not place a sub-100-share order in the "
@@ -4140,6 +4149,7 @@ class FractionalExitGuardTests(unittest.TestCase):
         fake_bot.cooldown_ready = lambda key: True
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
         fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
+        fake_bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(fake_bot)
         boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
         positions = [
             {
@@ -4177,6 +4187,10 @@ class FractionalExitGuardTests(unittest.TestCase):
             def quote_bid(q):
                 return Decimal(str(q["bid"]))
 
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
             def place_stock(self, *a, **k):
                 return "order-1"
 
@@ -4209,6 +4223,7 @@ class FractionalExitGuardTests(unittest.TestCase):
         fake_bot.record_realized_exit = lambda *a, **k: Decimal("0.05")
         fake_bot.record_trade = lambda *a, **k: None
         fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
+        fake_bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(fake_bot)
         boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
         positions = [
             {
