@@ -4013,7 +4013,11 @@ class FractionalExitGuardTests(unittest.TestCase):
                     {"symbol": s, "bid": "10.00"} for s in symbols
                 ], set()
 
-        now = time.monotonic()
+        # Not a real time.monotonic() reading - last_trade defaults to 0.0
+        # per-symbol below, and the real monotonic clock isn't guaranteed
+        # to already exceed stall_seconds (120) on every CI runner (same
+        # class of flaky-clock bug fixed elsewhere in this file).
+        now = 10_000.0
         fake_bot = SimpleNamespace(
             api=FakeApi(),
             stock_categories={"NVDA": "US_ETF"},
