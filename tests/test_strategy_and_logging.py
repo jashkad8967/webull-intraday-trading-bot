@@ -2658,6 +2658,50 @@ class BrokerConflictTests(unittest.TestCase):
             handle("XHG", RuntimeError("FRACT_TICKER_DONT_SUPPORT_TRADE"))
         warn.assert_not_called()
 
+    def test_is_short_selling_unsupported_matches_sub_2k_equity_rejection(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertTrue(
+            AutoTrader.is_short_selling_unsupported(
+                RuntimeError(
+                    "HTTP Status: 417, Code: "
+                    "OAUTH_OPENAPI_NEW_NO_POSITION_MARGIN_ACCOUNT_CAN_NOT_"
+                    "SELL_SHORT_FOR_LT_2K, Msg: You currently have no open "
+                    "positions in MZZ. Short selling is not permitted for "
+                    "accounts under $2,000 in equity or with an overdue "
+                    "Intraday Margin Deficit (IMD)."
+                )
+            )
+        )
+        self.assertFalse(
+            AutoTrader.is_short_selling_unsupported(RuntimeError("timeout"))
+        )
+        # Distinct from the other account-wide/per-security rejections -
+        # must not cross-match.
+        self.assertFalse(
+            AutoTrader.is_short_selling_unsupported(
+                RuntimeError("FRACT_VERSION2_ACCOUNT_NOT_TRADE")
+            )
+        )
+
+    def test_handle_short_selling_unsupported_disables_it_once(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(short_selling_supported=True)
+        handle = AutoTrader.handle_short_selling_unsupported.__get__(fake_bot)
+
+        handle(RuntimeError("CAN_NOT_SELL_SHORT_FOR_LT_2K"))
+        self.assertFalse(fake_bot.short_selling_supported)
+
+        # A second rejection while already disabled shouldn't re-log/
+        # re-flip anything - just a no-op guard.
+        from webull_bot import bot as bot_module
+
+        with unittest.mock.patch.object(bot_module.log, "error") as err:
+            handle(RuntimeError("CAN_NOT_SELL_SHORT_FOR_LT_2K"))
+        err.assert_not_called()
+        self.assertFalse(fake_bot.short_selling_supported)
+
 
 class StatusWriterTests(unittest.TestCase):
     def test_write_includes_pending_orders_for_the_dashboard(self):
