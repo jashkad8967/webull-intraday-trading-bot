@@ -810,9 +810,11 @@ class StopLossEscalationTests(unittest.TestCase):
                     "key": "STOCK:ASHR",
                     "action": "PROFIT",
                     "cancel_requested_at": None,
+                    "pnl": None,
                 }
             },
         )
+        fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
         escalate = AutoTrader.escalate_stalled_stop_losses.__get__(fake_bot)
 
         with unittest.mock.patch("time.monotonic", return_value=20.0):
@@ -4739,6 +4741,244 @@ class ShortPricingTests(unittest.TestCase):
         quote = {"bid": "10.00", "ask": "10.10", "price": "10.05"}
         # 10.10 * 1.01 = 10.2010, quantized up to the next cent = 10.21.
         self.assertEqual(price_fn(quote, "COVER"), Decimal("10.21"))
+
+
+class PhantomExitReversalTests(unittest.TestCase):
+    """Regression tests: record_realized_exit runs at order SUBMISSION
+    time (an estimate off the limit price), not at confirmed fill - an
+    order that's later found to have never filled must have that
+    estimate reversed, or a cancelled/failed/abandoned exit permanently
+    inflates the daily realized total as if it had actually happened.
+    """
+
+    def test_reverse_phantom_exit_undoes_a_recorded_profit(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            daily_realized_pnl=Decimal("0.50"),
+            daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
+        )
+        reverse = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        reverse(Decimal("0.30"))
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0.20"))
+        self.assertEqual(fake_bot.daily_realized_loss, Decimal("0"))
+
+    def test_reverse_phantom_exit_undoes_a_recorded_loss(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            daily_realized_pnl=Decimal("-0.40"),
+            daily_realized_loss=Decimal("0.40"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
+        )
+        reverse = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        reverse(Decimal("-0.40"))
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0"))
+        self.assertEqual(fake_bot.daily_realized_loss, Decimal("0"))
+
+    def test_reverse_phantom_exit_is_a_noop_for_none_or_zero(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            daily_realized_pnl=Decimal("0.10"),
+            daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
+        )
+        reverse = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        reverse(None)
+        reverse(Decimal("0"))
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0.10"))
+
+    def test_monitor_working_orders_reverses_pnl_for_a_confirmed_cancel(self):
+        """The order dropped out of open_orders (broker-side cancel, not
+        one we requested) - order_detail confirms CANCELLED, so the pnl
+        recorded when the PROFIT order was originally submitted must be
+        reversed, not left counted as a real gain.
+        """
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            def open_orders(self):
+                return []
+
+            @staticmethod
+            def open_order_ids(groups):
+                return []
+
+            def order_detail(self, order_id):
+                return {"status": "CANCELLED"}
+
+            @staticmethod
+            def order_status(detail):
+                return detail.get("status")
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(order_monitor_seconds=Decimal("0")),
+            api=FakeApi(),
+            last_order_monitor=0.0,
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "pnl": Decimal("0.05"),
+                }
+            },
+            pending_stock_exits={"ASHR"},
+            pending_option_exits=set(),
+            daily_realized_pnl=Decimal("0.05"),
+            daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
+            last_account_refresh=0.0,
+        )
+        fake_bot._release_pending_order = AutoTrader._release_pending_order.__get__(fake_bot)
+        fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        fake_bot._reverse_if_never_filled = AutoTrader._reverse_if_never_filled.__get__(fake_bot)
+        monitor = AutoTrader.monitor_working_orders.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            monitor()
+
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0"))
+        self.assertNotIn("order-1", fake_bot.working_orders)
+
+    def test_monitor_working_orders_leaves_pnl_alone_on_a_confirmed_fill(self):
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            def open_orders(self):
+                return []
+
+            @staticmethod
+            def open_order_ids(groups):
+                return []
+
+            def order_detail(self, order_id):
+                return {"status": "FILLED"}
+
+            @staticmethod
+            def order_status(detail):
+                return detail.get("status")
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(order_monitor_seconds=Decimal("0")),
+            api=FakeApi(),
+            last_order_monitor=0.0,
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "pnl": Decimal("0.05"),
+                }
+            },
+            pending_stock_exits={"ASHR"},
+            pending_option_exits=set(),
+            daily_realized_pnl=Decimal("0.05"),
+            daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
+            last_account_refresh=0.0,
+        )
+        fake_bot._release_pending_order = AutoTrader._release_pending_order.__get__(fake_bot)
+        fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        fake_bot._reverse_if_never_filled = AutoTrader._reverse_if_never_filled.__get__(fake_bot)
+        monitor = AutoTrader.monitor_working_orders.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            monitor()
+
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0.05"))
+
+    def test_monitor_working_orders_fails_open_on_unrecognized_status(self):
+        """The status field name isn't confirmed against a live payload -
+        an unrecognized/missing shape must never trigger a reversal (that
+        would be worse than an occasional unconfirmed phantom).
+        """
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            def open_orders(self):
+                return []
+
+            @staticmethod
+            def open_order_ids(groups):
+                return []
+
+            def order_detail(self, order_id):
+                return {}
+
+            @staticmethod
+            def order_status(detail):
+                return None
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(order_monitor_seconds=Decimal("0")),
+            api=FakeApi(),
+            last_order_monitor=0.0,
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "pnl": Decimal("0.05"),
+                }
+            },
+            pending_stock_exits={"ASHR"},
+            pending_option_exits=set(),
+            daily_realized_pnl=Decimal("0.05"),
+            daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
+            last_account_refresh=0.0,
+        )
+        fake_bot._release_pending_order = AutoTrader._release_pending_order.__get__(fake_bot)
+        fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        fake_bot._reverse_if_never_filled = AutoTrader._reverse_if_never_filled.__get__(fake_bot)
+        monitor = AutoTrader.monitor_working_orders.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            monitor()
+
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0.05"))
+
+    def test_escalation_reverses_pnl_of_the_abandoned_order(self):
+        """escalate_stalled_stop_losses deliberately cancels the gentle
+        order and lets a fresh one fire its own PROFIT/STOP decision (and
+        its own pnl) next cycle - the pnl recorded at the abandoned
+        order's original submission must be reversed here, or the daily
+        total double-counts the same logical exit.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(stop_loss_escalate_seconds=15),
+            api=SimpleNamespace(cancel=lambda order_id: None),
+            stop_exit_submitted={"ASHR": 0.0},
+            pending_stock_exits={"ASHR"},
+            stop_loss_escalated=set(),
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "STOCK:ASHR",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "pnl": Decimal("0.07"),
+                }
+            },
+            daily_realized_pnl=Decimal("0.07"),
+            daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
+        )
+        fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        escalate = AutoTrader.escalate_stalled_stop_losses.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=20.0):
+            escalate()
+
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0"))
 
 
 if __name__ == "__main__":

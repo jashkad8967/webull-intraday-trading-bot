@@ -768,6 +768,7 @@ class AutoTrader:
             "action": action,
             "cancel_requested_at": None,
             "limit_price": limit_price,
+            "pnl": pnl,
         }
         instrument_type, symbol = key.split(":", 1)
         self.status.record_trade(
@@ -804,6 +805,41 @@ class AutoTrader:
         elif instrument_type == "OPTION":
             self.pending_option_exits.discard(symbol)
 
+    def _reverse_if_never_filled(
+        self, order_id: str, order: dict, pnl: Decimal
+    ) -> None:
+        """An exit order that dropped out of the open-orders list is
+        usually a fill, but it can also be a cancel/reject the broker
+        processed on its own (e.g. a fat-finger price, a stale quote) -
+        record_realized_exit already counted its pnl as if it filled, at
+        submission time. Confirm via order_detail before trusting that;
+        only reverse on an explicit CANCELLED/FAILED status, and fail
+        open (assume filled, leave the pnl as-is) on any fetch error or
+        an unrecognized/missing status field, since the field name isn't
+        confirmed against a live payload yet - a false reversal would be
+        worse than an occasional unconfirmed phantom.
+        """
+        try:
+            detail = self.api.order_detail(order_id)
+            status = self.api.order_status(detail)
+        except Exception as exc:
+            log.error(
+                "ORDER  | could not confirm fill status | id=%s | %s",
+                order_id,
+                exc,
+            )
+            return
+        if status in ("CANCELLED", "FAILED"):
+            self.reverse_phantom_exit(pnl)
+            log.warning(
+                "ORDER  | %s | never filled (%s) - reversing $%s phantom "
+                "realized pnl | id=%s",
+                order.get("key", ""),
+                status,
+                pnl,
+                order_id,
+            )
+
     def monitor_working_orders(self) -> None:
         now = time.monotonic()
         if (
@@ -833,6 +869,9 @@ class AutoTrader:
                 self._release_pending_order(order)
                 del self.working_orders[order_id]
                 self.last_account_refresh = 0.0
+                pnl = order.get("pnl")
+                if pnl:
+                    self._reverse_if_never_filled(order_id, order, pnl)
                 continue
 
             age = now - float(order["submitted_at"])
@@ -927,6 +966,11 @@ class AutoTrader:
                     "action": action,
                     "cancel_requested_at": None,
                     "limit_price": ask,
+                    # Carry the pnl already recorded at the original PROFIT
+                    # submission forward - this is the same logical exit,
+                    # not a new one, so if the repriced order itself never
+                    # fills it's still the correct amount to reverse.
+                    "pnl": order.get("pnl"),
                 }
                 log.info(
                     "REPRICE| %-8s | %-6s | ask=%s | id=%s",
@@ -1299,6 +1343,24 @@ class AutoTrader:
         self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
         return pnl
 
+    def reverse_phantom_exit(self, pnl: Decimal | None) -> None:
+        """Undo a realized-exit pnl that was recorded at order SUBMISSION
+        time (see record_realized_exit) once it's confirmed the order
+        never actually filled - either it was cancelled/failed outright,
+        or it was deliberately abandoned mid-flight (escalation cancels
+        the gentle order and lets a fresh one fire its own pnl next
+        cycle). Without this, an exit that never fills still permanently
+        inflates the daily realized total as if it had.
+        """
+        if not pnl:
+            return
+        self.daily_realized_pnl -= pnl
+        if pnl < 0:
+            self.daily_realized_loss = max(
+                Decimal("0"), self.daily_realized_loss - (-pnl)
+            )
+        self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
+
     @staticmethod
     def is_fractional_quantity(quantity: Decimal) -> bool:
         return quantity != quantity.to_integral_value()
@@ -1554,7 +1616,15 @@ class AutoTrader:
                         exc,
                     )
                     continue
-                self.working_orders.pop(order_id, None)
+                order = self.working_orders.pop(order_id, None)
+                # This order is being deliberately abandoned mid-flight (it
+                # never filled at the gentler price) - a fresh order fires
+                # its own PROFIT/STOP decision and records its own pnl next
+                # cycle, so the pnl recorded at THIS order's submission has
+                # to be reversed now or it inflates the daily total for an
+                # exit that never actually happened.
+                if order:
+                    self.reverse_phantom_exit(order.get("pnl"))
             self.stop_loss_escalated.add(symbol)
             self.pending_stock_exits.discard(symbol)
             self.stop_exit_submitted.pop(symbol, None)
