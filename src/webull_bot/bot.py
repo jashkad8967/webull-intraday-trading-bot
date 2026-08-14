@@ -2622,6 +2622,36 @@ class AutoTrader:
                 quote_by_symbol[str(quote.get("symbol", "")).upper()] = quote
         return quote_by_symbol
 
+    def _stall_exit_price(
+        self,
+        quote: dict,
+        average_cost: Decimal,
+        min_profit: Decimal,
+        fee_per_share: Decimal,
+    ) -> Decimal | None:
+        """Pick the best available green exit price for a stalled position.
+
+        Prefers the bid (fills immediately) whenever it alone clears cost +
+        min_profit + fee. If the bid doesn't clear but the ask (top of the
+        spread) does, rest a passive limit there instead of giving up - a
+        stalled position sitting inside the spread shouldn't be abandoned
+        just because the aggressive/immediate price isn't green yet. Never
+        prices below cost + min_profit + fee on either side, so this can
+        only ever produce a genuinely profitable exit or no exit at all.
+        """
+        floor = average_cost + min_profit + fee_per_share
+        bid = self.api.quote_bid(quote)
+        if bid is not None:
+            sell_price = bid.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            if sell_price >= floor:
+                return sell_price
+        ask = self.api.quote_ask(quote)
+        if ask is not None:
+            sell_price = ask.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            if sell_price >= floor:
+                return sell_price
+        return None
+
     def boost_stalled_positions(
         self,
         positions: list[dict],
@@ -2682,11 +2712,10 @@ class AutoTrader:
                     if quote is None:
                         continue
                     fee_per_share = self.config.sell_fee_dollars / quantity
-                    bid = self.api.quote_bid(quote)
-                    if bid is None or bid - average_cost < min_profit + fee_per_share:
-                        continue
-                    sell_price = bid.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                    if sell_price - average_cost < min_profit + fee_per_share:
+                    sell_price = self._stall_exit_price(
+                        quote, average_cost, min_profit, fee_per_share
+                    )
+                    if sell_price is None:
                         continue
                     # Same $0.10-$0.999 lot-restricted-band rejection as
                     # trade_stocks' exits - Webull rejects any order under
@@ -2718,11 +2747,10 @@ class AutoTrader:
                         continue
                     fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
                     quote = self.api.option_quote(contract["symbol"])
-                    bid = self.api.quote_bid(quote)
-                    if bid is None or bid - average_cost < min_profit + fee_per_share:
-                        continue
-                    sell_price = bid.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                    if sell_price - average_cost < min_profit + fee_per_share:
+                    sell_price = self._stall_exit_price(
+                        quote, average_cost, min_profit, fee_per_share
+                    )
+                    if sell_price is None:
                         continue
                     order_id = self.api.place_option(
                         contract,
