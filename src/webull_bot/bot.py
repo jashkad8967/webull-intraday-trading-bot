@@ -180,6 +180,7 @@ class AutoTrader:
         self.broker_conflict_symbols: set[str] = set()
         self.fractional_trading_enabled = True
         self.fractional_unsupported_symbols: set[str] = set()
+        self.short_selling_supported = True
         self.iceberg_orders: dict[str, dict] = {}
         self.order_error_times: deque = deque()
         self.pairs = PairsStrategy()
@@ -705,6 +706,30 @@ class AutoTrader:
             "rest of this run | %s",
             symbol,
             symbol,
+            exc,
+        )
+
+    @staticmethod
+    def is_short_selling_unsupported(exc: Exception) -> bool:
+        """True for Webull's OAUTH_OPENAPI_NEW_NO_POSITION_MARGIN_ACCOUNT_
+        CAN_NOT_SELL_SHORT_FOR_LT_2K rejection - short selling requires at
+        least $2,000 in account equity (a standard margin-account
+        minimum, not something specific to one security), so every short
+        attempt keeps failing identically until equity grows past that
+        threshold. Retrying changes nothing here, same reasoning as
+        is_fractional_trading_not_enabled.
+        """
+        return "CAN_NOT_SELL_SHORT_FOR_LT_2K" in str(exc).upper()
+
+    def handle_short_selling_unsupported(self, exc: Exception) -> None:
+        if not self.short_selling_supported:
+            return
+        self.short_selling_supported = False
+        log.error(
+            "SHORT  | short selling rejected - this account is under "
+            "Webull's $2,000 equity minimum for short selling. Disabling "
+            "new short entries for the rest of this run; restart the bot "
+            "once equity clears that minimum to re-enable them. | %s",
             exc,
         )
 
@@ -1847,7 +1872,8 @@ class AutoTrader:
                         price, entry_budget
                     )
                     if (
-                        open_count < self.config.max_open_positions
+                        self.short_selling_supported
+                        and open_count < self.config.max_open_positions
                         and bucket_position_counts.get(bucket, 0)
                         < bucket_slot_limits.get(bucket, 0)
                         and short_quantity > 0
@@ -2036,6 +2062,9 @@ class AutoTrader:
                 if self.is_fractional_ticker_unsupported(exc):
                     self.handle_fractional_ticker_unsupported(symbol, exc)
                     continue
+                if self.is_short_selling_unsupported(exc):
+                    self.handle_short_selling_unsupported(exc)
+                    continue
                 log.error("STOCK  | %s | %s", symbol, exc)
         return buying_power
 
@@ -2081,6 +2110,8 @@ class AutoTrader:
                     "ENTER_LONG_B_SHORT_A",
                 ):
                     continue
+                if not self.short_selling_supported:
+                    continue
                 if len(self.pairs_positions) >= PAIRS_MAX_CONCURRENT:
                     continue
                 key_a, key_b = f"STOCK:{symbol_a}", f"STOCK:{symbol_b}"
@@ -2120,8 +2151,17 @@ class AutoTrader:
                         f"STOCK:{long_symbol}",
                         quote_by_symbol[long_symbol],
                     )
-                    if long_order is None:
-                        continue
+                except Exception as exc:
+                    log.error(
+                        "PAIRS  | %s/%s | long leg entry failed | %s",
+                        symbol_a,
+                        symbol_b,
+                        exc,
+                    )
+                    continue
+                if long_order is None:
+                    continue
+                try:
                     short_order = self.place_stock_scaled(
                         short_symbol,
                         "SHORT",
@@ -2129,10 +2169,26 @@ class AutoTrader:
                         f"STOCK:{short_symbol}",
                         quote_by_symbol[short_symbol],
                     )
-                    if short_order is None:
-                        # The long leg is already working/filled with no
-                        # short hedge behind it - unwind it immediately
-                        # rather than leave a naked, unintended long.
+                except Exception as exc:
+                    # The long leg is already working/filled with no short
+                    # hedge behind it - unwind it immediately rather than
+                    # leave a naked, unintended long. This is not a rare
+                    # path on a sub-$2,000 account: Webull rejects every
+                    # short with CAN_NOT_SELL_SHORT_FOR_LT_2K there, so
+                    # this fires on every pairs entry attempt until equity
+                    # clears that minimum.
+                    if self.is_short_selling_unsupported(exc):
+                        self.handle_short_selling_unsupported(exc)
+                    elif self.is_fractional_ticker_unsupported(exc):
+                        self.handle_fractional_ticker_unsupported(short_symbol, exc)
+                    else:
+                        log.error(
+                            "PAIRS  | %s/%s | short leg entry failed | %s",
+                            symbol_a,
+                            symbol_b,
+                            exc,
+                        )
+                    try:
                         self.api.place_stock(
                             long_symbol,
                             "SELL",
@@ -2141,13 +2197,26 @@ class AutoTrader:
                                 quote_by_symbol[long_symbol], "SELL"
                             ),
                         )
-                        continue
-                except Exception as exc:
-                    log.error(
-                        "PAIRS  | %s/%s | entry failed | %s",
-                        symbol_a,
-                        symbol_b,
-                        exc,
+                    except Exception as unwind_exc:
+                        log.error(
+                            "PAIRS  | %s | failed to unwind orphaned long "
+                            "leg after short leg rejection - check the "
+                            "Webull app for a stuck naked position | %s",
+                            long_symbol,
+                            unwind_exc,
+                        )
+                    continue
+                if short_order is None:
+                    # The long leg is already working/filled with no
+                    # short hedge behind it - unwind it immediately
+                    # rather than leave a naked, unintended long.
+                    self.api.place_stock(
+                        long_symbol,
+                        "SELL",
+                        long_qty,
+                        limit_price=self.api.stock_limit_price(
+                            quote_by_symbol[long_symbol], "SELL"
+                        ),
                     )
                     continue
                 self.record_trade(f"STOCK:{long_symbol}", long_order, "BUY")
