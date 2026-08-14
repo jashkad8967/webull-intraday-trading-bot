@@ -906,6 +906,32 @@ class WebullAPI:
             "order",
         )
 
+    def order_detail(self, client_order_id: str) -> dict:
+        return self._call(
+            lambda: self.trade.order_v3.get_order_detail(
+                self.config.account_id,
+                client_order_id,
+            ),
+            "order",
+        )
+
+    @staticmethod
+    def order_status(detail: dict) -> str | None:
+        """Best-effort terminal status of a fetched order (SUBMITTED,
+        CANCELLED, FAILED, FILLED, PARTIAL_FILLED per the SDK's
+        OrderStatus enum) - the exact JSON field name isn't confirmed
+        against a live response yet, so every reasonable key is tried
+        defensively and an unrecognized/missing shape returns None.
+        Callers must fail open (never treat None as either filled or
+        cancelled) until the real field name is confirmed from a live
+        payload.
+        """
+        for field in ("status", "order_status", "orderStatus"):
+            value = detail.get(field)
+            if value not in (None, ""):
+                return str(value).upper()
+        return None
+
     def cancel_all_orders(self) -> list[str]:
         unique = self.open_order_ids(self.open_orders())
         for order_id in unique:
