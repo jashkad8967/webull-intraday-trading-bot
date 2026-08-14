@@ -919,13 +919,25 @@ class WebullAPI:
     def order_status(detail: dict) -> str | None:
         """Best-effort terminal status of a fetched order (SUBMITTED,
         CANCELLED, FAILED, FILLED, PARTIAL_FILLED per the SDK's
-        OrderStatus enum) - the exact JSON field name isn't confirmed
-        against a live response yet, so every reasonable key is tried
-        defensively and an unrecognized/missing shape returns None.
-        Callers must fail open (never treat None as either filled or
-        cancelled) until the real field name is confirmed from a live
-        payload.
+        OrderStatus enum).
+
+        Confirmed live shape: get_order_detail's top level carries no
+        status field at all - it's nested one level down, inside the
+        first entry of an "orders" list (the same grouped shape
+        open_orders() returns), e.g.
+        {"client_order_id": ..., "orders": [{"status": "CANCELLED",
+        "filled_quantity": "0", ...}]}. The flat top-level keys are kept
+        as a fallback in case a different order type/response variant
+        ever puts it there instead. An unrecognized/missing shape
+        returns None - callers must fail open (never treat None as
+        either filled or cancelled) rather than guess.
         """
+        orders = detail.get("orders") or []
+        if orders and isinstance(orders[0], dict):
+            for field in ("status", "order_status", "orderStatus"):
+                value = orders[0].get(field)
+                if value not in (None, ""):
+                    return str(value).upper()
         for field in ("status", "order_status", "orderStatus"):
             value = detail.get(field)
             if value not in (None, ""):

@@ -4722,6 +4722,45 @@ class CloseAllPositionsExclusionTests(unittest.TestCase):
         self.assertEqual(placed, [("TSLA", "SELL", Decimal("3"))])
 
 
+class OrderStatusExtractionTests(unittest.TestCase):
+    """Regression tests against the confirmed live get_order_detail shape:
+    status is nested inside orders[0], not at the top level - a live
+    account was checked directly to confirm this after order_status's
+    original flat-key-only extraction silently failed open on every real
+    response (no top-level "status" key ever exists), which meant the
+    phantom-pnl reversal in _reverse_if_never_filled never actually
+    fired despite record_realized_exit correctly detecting the
+    cancellation upstream.
+    """
+
+    def test_extracts_status_from_nested_orders_list(self):
+        detail = {
+            "client_order_id": "abc",
+            "orders": [
+                {"symbol": "FPE", "status": "CANCELLED", "filled_quantity": "0"}
+            ],
+        }
+        self.assertEqual(WebullAPI.order_status(detail), "CANCELLED")
+
+    def test_extracts_filled_status_from_nested_orders_list(self):
+        detail = {
+            "client_order_id": "abc",
+            "orders": [
+                {"symbol": "WETO", "status": "FILLED", "filled_quantity": "1"}
+            ],
+        }
+        self.assertEqual(WebullAPI.order_status(detail), "FILLED")
+
+    def test_falls_back_to_flat_top_level_status(self):
+        detail = {"status": "FAILED"}
+        self.assertEqual(WebullAPI.order_status(detail), "FAILED")
+
+    def test_returns_none_for_an_empty_or_unrecognized_shape(self):
+        self.assertIsNone(WebullAPI.order_status({}))
+        self.assertIsNone(WebullAPI.order_status({"orders": []}))
+        self.assertIsNone(WebullAPI.order_status({"orders": [{}]}))
+
+
 class ShortPricingTests(unittest.TestCase):
     def test_short_entry_uses_passive_mid_price(self):
         fake_api = SimpleNamespace(
