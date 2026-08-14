@@ -58,7 +58,6 @@ class StrategyConfigMixin:
             stock_stop_loss_max_percent=Decimal("0.02"),
             stock_stop_loss_range_multiplier=Decimal("0.35"),
             stock_target_stop_multiple=Decimal("1.2"),
-            fractional_target_stop_multiple=Decimal("0.8"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
             stock_core_session_position_fraction=Decimal("0.10"),
@@ -533,8 +532,10 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         """A fractional position can only be exited during core hours at
         all, so it should cycle capital quickly (many trades/hour) rather
         than sit waiting for the same larger move a whole-share position
-        can hold toward - fractional_target_stop_multiple (0.8) is lower
-        than stock_target_stop_multiple (1.2), so at the same elevated
+        can hold toward - a fractional position's target is just the flat
+        cost-recovery floor (stock_min_net_profit_percent +
+        stock_estimated_round_trip_cost_percent), not also scaled by the
+        adaptive stop like whole-share's is, so at the same elevated
         volatility the fractional target is reached first.
         """
         strategy = TradingStrategy(self.config())
@@ -550,6 +551,30 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
             "STOCK:WILD", price, Decimal("0.5"), Decimal("100"), None
         )
         self.assertEqual(fractional.action, "PROFIT")
+
+    def test_fractional_target_ignores_the_adaptive_stop_scaling(self):
+        """Regression test: a fractional target that also scales with
+        stop_percent * FRACTIONAL_TARGET_STOP_MULTIPLE (like whole-share
+        does) combines badly with a tiny fractional quantity's inflated
+        fee-per-share (SELL_FEE_DOLLARS spread over well under 1 share) -
+        together they demanded far more absolute price appreciation than
+        "capture the profit quickly" intends. Confirmed against a real
+        live position (MSFT, 0.0108 shares, cost $493.23): the old target
+        math required ~$498.63 before firing; the position was already
+        genuinely profitable at ~$496.93 and should have sold. Using just
+        the flat cost-recovery floor for a fractional position's target
+        (skipping the stop-scaled term entirely) fixes it.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["MSFT"] = {"range_ratio": 0.10}  # elevated stop_percent
+        decision = strategy.stock_decision(
+            "STOCK:MSFT",
+            Decimal("496.9337037037037037037037037"),
+            Decimal("0.0108"),
+            Decimal("493.23"),
+            None,
+        )
+        self.assertEqual(decision.action, "PROFIT")
 
     def test_option_decision_cuts_loss_before_it_reaches_zero(self):
         strategy = TradingStrategy(self.config())
