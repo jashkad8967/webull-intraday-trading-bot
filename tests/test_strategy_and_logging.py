@@ -4136,7 +4136,12 @@ class FractionalExitGuardTests(unittest.TestCase):
             # "generally active"), but STALE's own last order was 500
             # seconds ago - well past stall_breaker_seconds.
             last_trade={"STOCK:OTHER": now - 10, "STOCK:STALE": now - 500},
-            last_stall_boost=0.0,
+            # Not 0.0 - the real time.monotonic() isn't guaranteed to
+            # already be past stall_breaker_seconds (120) on every CI
+            # runner (same class of flaky-clock bug fixed earlier this
+            # session, reintroduced here since 0.0 is only safe for a
+            # tiny threshold like the other fixtures in this class use).
+            last_stall_boost=now - 999999,
             pending_stock_exits=set(),
             pending_option_exits=set(),
         )
