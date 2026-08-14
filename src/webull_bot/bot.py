@@ -138,7 +138,6 @@ class AutoTrader:
         self.last_account_refresh = 0.0
         self.last_order_monitor = 0.0
         self.last_reprice = 0.0
-        self.last_fill_time = time.monotonic()
         self.last_stall_boost = 0.0
         # See idle_cash_ramp_progress()/record_trade() - tracks how long
         # cash has sat above MIN_CASH_RESERVE_DOLLARS with nothing bought,
@@ -831,8 +830,6 @@ class AutoTrader:
 
         for order_id, order in list(self.working_orders.items()):
             if order_id not in open_ids:
-                if order.get("cancel_requested_at") is None:
-                    self.last_fill_time = now
                 self._release_pending_order(order)
                 del self.working_orders[order_id]
                 self.last_account_refresh = 0.0
@@ -2576,15 +2573,18 @@ class AutoTrader:
         """Free capital stuck in a stalled position at breakeven-plus-a-penny.
 
         This is capital hygiene, not a turnover target: it never sells at a
-        loss and only fires when nothing has filled for a while, so a
-        position isn't held indefinitely waiting on a stalled quote.
+        loss and only fires on a position whose OWN last order activity is
+        stale, so a position isn't held indefinitely waiting on a stalled
+        quote. Deliberately per-symbol, not one global "has anything filled
+        recently" clock - an account that's generally active (new entries
+        landing every minute or two) would otherwise never let this run at
+        all, even though a specific older position has been sitting
+        untouched the whole time.
         """
         if not self.config.stall_breaker_enabled:
             return
         now = time.monotonic()
         stall_seconds = float(self.config.stall_breaker_seconds)
-        if now - self.last_fill_time < stall_seconds:
-            return
         if now - self.last_stall_boost < stall_seconds:
             return
         self.last_stall_boost = now
@@ -2605,6 +2605,11 @@ class AutoTrader:
                         continue
                     key = f"STOCK:{symbol}"
                     if not self.cooldown_ready(key):
+                        continue
+                    # This specific symbol's own last order activity, not
+                    # whether anything else in the account recently
+                    # filled - see the docstring above.
+                    if now - self.last_trade.get(key, 0.0) < stall_seconds:
                         continue
                     # Same fractional/core-hours constraint as trade_stocks'
                     # exits - Webull rejects any order on a non-integer
@@ -2644,6 +2649,8 @@ class AutoTrader:
                         continue
                     key = f"OPTION:{symbol}"
                     if not self.cooldown_ready(key):
+                        continue
+                    if now - self.last_trade.get(key, 0.0) < stall_seconds:
                         continue
                     contract = self.api.contract_from_position(position)
                     if not contract:

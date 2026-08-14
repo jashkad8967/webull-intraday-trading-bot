@@ -4022,7 +4022,7 @@ class FractionalExitGuardTests(unittest.TestCase):
                 sell_fee_dollars=Decimal("0.02"),
             ),
             api=FakeApi(),
-            last_fill_time=0.0,
+            last_trade={},
             last_stall_boost=0.0,
             pending_stock_exits=set(),
             pending_option_exits=set(),
@@ -4077,7 +4077,7 @@ class FractionalExitGuardTests(unittest.TestCase):
             ),
             api=FakeApi(),
             strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
-            last_fill_time=0.0,
+            last_trade={},
             last_stall_boost=0.0,
             pending_stock_exits=set(),
             pending_option_exits=set(),
@@ -4095,6 +4095,69 @@ class FractionalExitGuardTests(unittest.TestCase):
         ]
         boost(positions, options_active=False, core_session_active=True)
         self.assertEqual(calls, ["OPTT"])
+
+    def test_stall_check_is_per_symbol_not_a_global_activity_clock(self):
+        """Regression test: an account that's generally active (new
+        entries landing every minute or two, well under
+        STALL_BREAKER_SECONDS) previously blocked the stall-breaker from
+        running at all, via one global "has ANYTHING filled recently"
+        clock - even though a specific older position had been sitting
+        untouched with no order activity of its own the whole time. The
+        check must be per-symbol (self.last_trade[key]), not global.
+        """
+        from webull_bot.bot import AutoTrader
+        from webull_bot.strategy import TradingStrategy
+
+        calls = []
+
+        class FakeApi:
+            def stock_quote(self, symbol):
+                calls.append(symbol)
+                return {"symbol": symbol, "bid": "101.00", "ask": "101.05"}
+
+            @staticmethod
+            def quote_bid(q):
+                return Decimal(str(q["bid"]))
+
+            def place_stock(self, *a, **k):
+                return "order-1"
+
+        now = time.monotonic()
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                stall_breaker_enabled=True,
+                stall_breaker_seconds=120,
+                stall_breaker_min_profit=Decimal("0.01"),
+                sell_fee_dollars=Decimal("0.02"),
+            ),
+            api=FakeApi(),
+            strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
+            # A different symbol traded 10 seconds ago (the account is
+            # "generally active"), but STALE's own last order was 500
+            # seconds ago - well past stall_breaker_seconds.
+            last_trade={"STOCK:OTHER": now - 10, "STOCK:STALE": now - 500},
+            last_stall_boost=0.0,
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+        )
+        fake_bot.cooldown_ready = lambda key: True
+        fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
+        fake_bot.record_realized_exit = lambda *a, **k: Decimal("0.05")
+        fake_bot.record_trade = lambda *a, **k: None
+        boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "STALE",
+                "quantity": "10",
+                "cost_price": "100.00",
+            }
+        ]
+
+        boost(positions, options_active=False, core_session_active=True)
+
+        self.assertEqual(calls, ["STALE"])
+        self.assertIn("STALE", fake_bot.pending_stock_exits)
 
 
 class EntrySizingSplitTests(unittest.TestCase):

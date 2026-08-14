@@ -862,12 +862,15 @@ re-quoted in between.
 
 ### Stall breaker
 
-When `STALL_BREAKER_ENABLED` is true and no order fills for
-`STALL_BREAKER_SECONDS` (120 by default), the bot places marketable sell orders
-for any held position that can still lock in at least `STALL_BREAKER_MIN_PROFIT`
-per share (1 cent by default) above its average cost. This keeps activity moving
-during quiet stretches. It never sells at a loss, skips positions that already
-have a pending exit, and resets its timer whenever a real fill occurs.
+When `STALL_BREAKER_ENABLED` is true, the bot places a marketable sell order
+for any held position whose *own* last order activity is older than
+`STALL_BREAKER_SECONDS` (120 by default) and can still lock in at least
+`STALL_BREAKER_MIN_PROFIT` per share (1 cent by default) above its average
+cost. This check is per-symbol, not one global "has anything filled recently"
+clock - an account that's generally active (new entries landing every minute
+or two elsewhere) would otherwise never let this run at all, even while a
+specific older position sits completely untouched. It never sells at a loss
+and skips positions that already have a pending exit.
 
 Repository responsibilities are intentionally separated:
 
