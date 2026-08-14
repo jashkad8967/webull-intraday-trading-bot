@@ -669,15 +669,24 @@ class TradingStrategy:
                 quantity if isinstance(quantity, Decimal) else Decimal(quantity)
             )
             is_fractional = quantity_decimal != quantity_decimal.to_integral_value()
-            target_stop_multiple = (
-                self.config.fractional_target_stop_multiple
-                if is_fractional
-                else self.config.stock_target_stop_multiple
-            )
-            target_percent = max(
+            floor_percent = (
                 self.config.stock_min_net_profit_percent
-                + self.config.stock_estimated_round_trip_cost_percent,
-                stop_percent * target_stop_multiple,
+                + self.config.stock_estimated_round_trip_cost_percent
+            )
+            # A tiny fractional position's fee-per-share (the flat
+            # SELL_FEE_DOLLARS spread over a quantity well under 1) is
+            # already a meaningfully larger relative cost than a
+            # whole-share position's - scaling the target off the
+            # adaptive stop on top of that (like whole-share does below)
+            # ends up demanding much more absolute price appreciation
+            # than "capture the profit quickly" intends. A fractional
+            # position's target is just the flat cost-recovery floor -
+            # fires on any solidly fee-covered gain - with no additional
+            # stop-scaled requirement layered on top of it.
+            target_percent = (
+                floor_percent
+                if is_fractional
+                else max(floor_percent, stop_percent * self.config.stock_target_stop_multiple)
             )
             base_target = average_cost * (Decimal("1") + target_percent) + fee_per_share
             stop = average_cost * (Decimal("1") - stop_percent)

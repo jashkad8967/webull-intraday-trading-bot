@@ -571,7 +571,6 @@ STOCK_STOP_LOSS_MIN_PERCENT=0.009
 STOCK_STOP_LOSS_MAX_PERCENT=0.015
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.8
-FRACTIONAL_TARGET_STOP_MULTIPLE=0.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PERCENT=0.75
@@ -624,18 +623,24 @@ and use the plain thresholds all day.
 
 ### Trade cadence and favoring recurring movers
 
-Every stock's profit target scales with its own adaptive stop
+A whole-share stock's profit target scales with its own adaptive stop
 (`STOCK_TARGET_STOP_MULTIPLE` × the stop distance from
 `STOCK_STOP_LOSS_MIN/MAX_PERCENT`), so exits are already sized to be small
 and quick rather than holding out for a big move. A fractional (core-
-session dollar-sized) position uses its own, smaller multiplier instead -
-`FRACTIONAL_TARGET_STOP_MULTIPLE` (default `0.8`, vs. `1.8` for a
-whole-share position) - since it can only be exited during core hours at
-all (see the pre-core-close sweep above), it should cycle capital
-quickly within that window rather than sit waiting for the same larger
-move a whole-share position can afford to hold toward. The stop-loss
-distance itself is unchanged between the two - only how far past cost
-counts as "take it."
+session dollar-sized) position's target skips that scaling entirely and
+uses just the flat cost-recovery floor (`STOCK_MIN_NET_PROFIT_PERCENT` +
+`STOCK_ESTIMATED_ROUND_TRIP_COST_PERCENT`) - it fires on any solidly
+fee-covered gain rather than waiting for a stop-scaled move on top of
+that. This matters more than it sounds: `SELL_FEE_DOLLARS` is a flat
+per-transaction fee, so converting it to a per-share amount
+(`fee/quantity`) inflates fast for a quantity well under 1 share -
+scaling the target off the adaptive stop on top of that (the way
+whole-share sizing does) demands far more absolute price appreciation
+than "capture the profit quickly" intends, since it can only be exited
+during core hours at all (see the pre-core-close sweep above) and should
+cycle capital quickly within that window instead. The stop-loss distance
+itself is unchanged between the two - only how far past cost counts as
+"take it."
 
 Two settings control how
 often the bot is willing to re-enter the same symbol:
@@ -1483,7 +1488,6 @@ STOCK_STOP_LOSS_MIN_PERCENT=0.009
 STOCK_STOP_LOSS_MAX_PERCENT=0.015
 STOCK_STOP_LOSS_RANGE_MULTIPLIER=0.35
 STOCK_TARGET_STOP_MULTIPLE=1.8
-FRACTIONAL_TARGET_STOP_MULTIPLE=0.8
 STOCK_ENTRY_MAX_EXTENSION_PERCENT=0.01
 STOCK_OSCILLATION_WEIGHT=0.5
 OPTION_TAKE_PROFIT_PERCENT=0.75

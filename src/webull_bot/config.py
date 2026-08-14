@@ -179,18 +179,6 @@ class Settings(BaseSettings):
         ge=Decimal("0.5"),
         le=Decimal("5"),
     )
-    # A fractional (core-session dollar-sized) position only trades during
-    # core hours at all, so it should cycle capital quickly within that
-    # window - many trades/hour - rather than sit waiting for the same
-    # larger move a whole-share position can afford to hold toward across
-    # a longer stretch of the day. Lower than stock_target_stop_multiple
-    # on purpose (a smaller required move reached sooner), same bounds/
-    # breakeven-margin reasoning as that field.
-    fractional_target_stop_multiple: Decimal = Field(
-        default=Decimal("0.8"),
-        ge=Decimal("0.5"),
-        le=Decimal("5"),
-    )
     stock_entry_max_spread_percent: Decimal = Field(
         default=Decimal("0.50"),
         gt=0,
