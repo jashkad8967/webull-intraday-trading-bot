@@ -3332,7 +3332,7 @@ class AutoTrader:
                     self.cached_positions = [dict(item) for item in positions]
                     self.submit_agent_research(positions, buying_power)
                 self.write_status_snapshot(positions, buying_power, circuit_active)
-                if time.monotonic() - self.last_status_log >= 30:
+                if time.monotonic() - self.last_status_log >= 10:
                     self.last_status_log = time.monotonic()
                     log.info(
                         "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s | "
