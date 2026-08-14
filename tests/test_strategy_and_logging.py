@@ -3992,6 +3992,54 @@ class FractionalExitGuardTests(unittest.TestCase):
         self.assertFalse(AutoTrader.is_fractional_quantity(Decimal("5")))
         self.assertFalse(AutoTrader.is_fractional_quantity(Decimal("0")))
 
+    def test_stall_equity_quotes_batches_into_one_call_per_category(self):
+        """Regression test: boost_stalled_positions used to call
+        api.stock_quote(symbol) individually inside its loop - which
+        itself makes two API calls per symbol (a category lookup plus a
+        single-symbol quote fetch) - so a held-position count in the
+        teens meant dozens of sequential, individually rate-limited round
+        trips blocking the entire single-threaded main loop for minutes
+        at a stretch. Candidates across two categories must batch into
+        exactly one call per category, not one call per symbol.
+        """
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+
+        class FakeApi:
+            def stock_quotes_resilient(self, symbols, category):
+                calls.append((category, tuple(symbols)))
+                return [
+                    {"symbol": s, "bid": "10.00"} for s in symbols
+                ], set()
+
+        now = time.monotonic()
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            stock_categories={"NVDA": "US_ETF"},
+            pending_stock_exits=set(),
+            last_trade={},
+        )
+        fake_bot.cooldown_ready = lambda key: True
+        fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
+        fetch = AutoTrader._stall_equity_quotes.__get__(fake_bot)
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "AAPL", "quantity": "5", "cost_price": "100"},
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "3", "cost_price": "200"},
+            {"instrument_type": "EQUITY", "symbol": "NVDA", "quantity": "2", "cost_price": "50"},
+            {"instrument_type": "OPTION", "symbol": "AAPL260918C00200000", "quantity": "1", "cost_price": "1"},
+        ]
+
+        quote_by_symbol = fetch(positions, core_session_active=True, stall_seconds=120, now=now)
+
+        # Exactly one call per category (US_STOCK: AAPL+MSFT, US_ETF: NVDA)
+        # - never one call per symbol, and the OPTION leg is never
+        # considered at all.
+        self.assertEqual(len(calls), 2)
+        called_categories = {category for category, _ in calls}
+        self.assertEqual(called_categories, {"US_STOCK", "US_ETF"})
+        self.assertEqual(set(quote_by_symbol), {"AAPL", "MSFT", "NVDA"})
+
     def test_boost_stalled_positions_skips_fractional_position_outside_core_hours(self):
         # Regression test: Webull rejects ANY order (buy or sell) on a
         # non-integer quantity outside core hours regardless of the
@@ -4003,9 +4051,11 @@ class FractionalExitGuardTests(unittest.TestCase):
         calls = []
 
         class FakeApi:
-            def stock_quote(self, symbol):
-                calls.append(symbol)
-                return {"symbol": symbol, "bid": "100.00", "ask": "100.05"}
+            def stock_quotes_resilient(self, symbols, category):
+                calls.append(symbols)
+                return [
+                    {"symbol": s, "bid": "100.00", "ask": "100.05"} for s in symbols
+                ], set()
 
             @staticmethod
             def quote_bid(q):
@@ -4022,6 +4072,7 @@ class FractionalExitGuardTests(unittest.TestCase):
                 sell_fee_dollars=Decimal("0.02"),
             ),
             api=FakeApi(),
+            stock_categories={},
             last_trade={},
             last_stall_boost=0.0,
             pending_stock_exits=set(),
@@ -4029,6 +4080,7 @@ class FractionalExitGuardTests(unittest.TestCase):
         )
         fake_bot.cooldown_ready = lambda key: True
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
+        fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
         boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
         positions = [
             {
@@ -4054,9 +4106,11 @@ class FractionalExitGuardTests(unittest.TestCase):
         calls = []
 
         class FakeApi:
-            def stock_quote(self, symbol):
-                calls.append(symbol)
-                return {"symbol": symbol, "bid": "0.50", "ask": "0.51"}
+            def stock_quotes_resilient(self, symbols, category):
+                calls.extend(symbols)
+                return [
+                    {"symbol": s, "bid": "0.50", "ask": "0.51"} for s in symbols
+                ], set()
 
             @staticmethod
             def quote_bid(q):
@@ -4077,6 +4131,7 @@ class FractionalExitGuardTests(unittest.TestCase):
             ),
             api=FakeApi(),
             strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
+            stock_categories={},
             last_trade={},
             last_stall_boost=0.0,
             pending_stock_exits=set(),
@@ -4084,6 +4139,7 @@ class FractionalExitGuardTests(unittest.TestCase):
         )
         fake_bot.cooldown_ready = lambda key: True
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
+        fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
         boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
         positions = [
             {
@@ -4111,9 +4167,11 @@ class FractionalExitGuardTests(unittest.TestCase):
         calls = []
 
         class FakeApi:
-            def stock_quote(self, symbol):
-                calls.append(symbol)
-                return {"symbol": symbol, "bid": "101.00", "ask": "101.05"}
+            def stock_quotes_resilient(self, symbols, category):
+                calls.extend(symbols)
+                return [
+                    {"symbol": s, "bid": "101.00", "ask": "101.05"} for s in symbols
+                ], set()
 
             @staticmethod
             def quote_bid(q):
@@ -4132,6 +4190,7 @@ class FractionalExitGuardTests(unittest.TestCase):
             ),
             api=FakeApi(),
             strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
+            stock_categories={},
             # A different symbol traded 10 seconds ago (the account is
             # "generally active"), but STALE's own last order was 500
             # seconds ago - well past stall_breaker_seconds.
@@ -4149,6 +4208,7 @@ class FractionalExitGuardTests(unittest.TestCase):
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
         fake_bot.record_realized_exit = lambda *a, **k: Decimal("0.05")
         fake_bot.record_trade = lambda *a, **k: None
+        fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
         boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
         positions = [
             {
