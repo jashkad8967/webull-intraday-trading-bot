@@ -2741,11 +2741,13 @@ class AutoTrader:
                 log.error("STALL  | %s | %s", symbol, exc)
         if boosted:
             self.last_account_refresh = 0.0
-            log.info(
-                "STALL  | no fills for %ss | boosted %s profitable exit(s)",
-                self.config.stall_breaker_seconds,
-                boosted,
-            )
+        log.info(
+            "STALL  | checked %s position(s) idle %ss+ | boosted %s "
+            "profitable exit(s)",
+            len(quote_by_symbol),
+            self.config.stall_breaker_seconds,
+            boosted,
+        )
 
     def write_status_snapshot(
         self,
@@ -3393,7 +3395,7 @@ class AutoTrader:
                     self.cached_positions = [dict(item) for item in positions]
                     self.submit_agent_research(positions, buying_power)
                 self.write_status_snapshot(positions, buying_power, circuit_active)
-                if time.monotonic() - self.last_status_log >= 10:
+                if time.monotonic() - self.last_status_log >= 1:
                     self.last_status_log = time.monotonic()
                     log.info(
                         "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s | "
