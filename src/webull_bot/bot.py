@@ -143,6 +143,12 @@ class AutoTrader:
         # cash has sat above MIN_CASH_RESERVE_DOLLARS with nothing bought,
         # to progressively relax entry quality gates the longer it sits.
         self.last_capital_deployed_at = time.monotonic()
+        # freqtrade-style StoplossGuard - see stop_loss_guard_active().
+        # Tracks recent STOP-exit timestamps to pause new entries (only -
+        # never liquidates, unlike handle_portfolio_circuit_breaker) if
+        # too many fire within a lookback window.
+        self.recent_stop_losses: deque = deque()
+        self.stop_loss_guard_until = 0.0
         self.cached_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
         self.working_orders: dict[str, dict] = {}
@@ -755,6 +761,10 @@ class AutoTrader:
         self.last_trade[key] = submitted_at
         if action in ("PROFIT", "STOP", "MANUAL_SELL"):
             self.last_exit_at[key] = submitted_at
+        if action == "STOP":
+            # Feeds stop_loss_guard_active() - a real stop-loss fill (not a
+            # manual sell or a profit-take), tracked regardless of symbol.
+            self.recent_stop_losses.append(submitted_at)
         if action in ("BUY", "SHORT", "MANUAL_BUY"):
             # Resets the idle-cash gate-relaxation ramp (see
             # idle_cash_ramp_progress) - capital just got deployed, so
@@ -1215,6 +1225,41 @@ class AutoTrader:
             record["signal"] = item["technical_signal"]
         return record
 
+    def stop_loss_guard_active(self) -> bool:
+        """freqtrade-style StoplossGuard: pause NEW entries (stock and
+        short, see trade_stocks) if STOP_LOSS_GUARD_TRADE_LIMIT or more
+        stop-losses have fired within the trailing STOP_LOSS_GUARD_
+        LOOKBACK_SECONDS window - a frequency-based signal that the
+        strategy is currently whipsawing in a bad regime, distinct from
+        the dollar/equity-based breakers in handle_portfolio_circuit_
+        breaker/handle_daily_loss_breaker (which can take much longer to
+        trip, and which liquidate everything when they do). This never
+        liquidates anything - existing positions keep being managed
+        normally; it just declines to add new risk until the recent stop
+        rate cools off, then resumes on its own (no restart needed).
+        """
+        if not self.config.stop_loss_guard_enabled:
+            return False
+        now = time.monotonic()
+        if now < self.stop_loss_guard_until:
+            return True
+        lookback = float(self.config.stop_loss_guard_lookback_seconds)
+        while self.recent_stop_losses and now - self.recent_stop_losses[0] > lookback:
+            self.recent_stop_losses.popleft()
+        if len(self.recent_stop_losses) < self.config.stop_loss_guard_trade_limit:
+            return False
+        self.stop_loss_guard_until = now + float(
+            self.config.stop_loss_guard_cooldown_seconds
+        )
+        log.warning(
+            "GUARD  | stop-loss guard tripped | %s stops in the last %ss | "
+            "pausing new entries for %ss",
+            len(self.recent_stop_losses),
+            self.config.stop_loss_guard_lookback_seconds,
+            self.config.stop_loss_guard_cooldown_seconds,
+        )
+        return True
+
     def handle_portfolio_circuit_breaker(
         self,
         positions: list[dict],
@@ -1656,6 +1701,10 @@ class AutoTrader:
         core_session_active: bool = False,
     ) -> Decimal:
         open_count = self.strategy.open_position_count(positions)
+        # freqtrade-style StoplossGuard: too many recent stop-losses pauses
+        # NEW entries only (unlike handle_portfolio_circuit_breaker, this
+        # never liquidates existing positions) - see stop_loss_guard_active.
+        guard_active = self.stop_loss_guard_active()
         # Keeping cash deployed outranks entry quality, but only
         # progressively - see idle_cash_ramp_progress(). ramp_progress is
         # 0 right after any entry, climbing to 1 the longer buying_power
@@ -1827,6 +1876,11 @@ class AutoTrader:
                             )
                         continue
                     self.wash_skip_logged.discard(symbol)
+                    if guard_active:
+                        self.gate_rejections[
+                            "stop-loss guard active - too many recent stops"
+                        ] += 1
+                        continue
                     bucket = self.strategy.selection_bucket(symbol)
                     entry_budget = min(
                         buying_power,
@@ -1927,6 +1981,11 @@ class AutoTrader:
                             )
                         continue
                     self.wash_skip_logged.discard(symbol)
+                    if guard_active:
+                        self.gate_rejections[
+                            "stop-loss guard active - too many recent stops"
+                        ] += 1
+                        continue
                     bucket = self.strategy.selection_bucket(symbol)
                     entry_budget = min(
                         buying_power,
@@ -2416,6 +2475,9 @@ class AutoTrader:
         if not self.options_enabled:
             return buying_power
         open_count = self.strategy.open_position_count(positions)
+        # See stop_loss_guard_active() / trade_stocks - same freqtrade-
+        # style frequency-based entry pause, applied here too.
+        guard_active = self.stop_loss_guard_active()
         batch, self.option_cursor = self.strategy.rotating_batch(
             self.option_contracts,
             self.option_cursor,
@@ -2535,6 +2597,11 @@ class AutoTrader:
                             )
                         continue
                     self.wash_skip_logged.discard(underlying)
+                    if guard_active:
+                        self.gate_rejections[
+                            "stop-loss guard active - too many recent stops"
+                        ] += 1
+                        continue
                     limit_price = self.api.option_limit_price(quote, "BUY")
                     buy_quantity, contract_cost = (
                         self.strategy.option_order_quantity(
