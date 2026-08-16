@@ -1497,11 +1497,30 @@ In GitHub, add the repository variable:
 GCP_PAPER_DEPLOY_ENABLED=true
 ```
 
-Every push to `paper-trading-lane` then runs the same validate → package →
-deploy flow as `main`, targeting `/opt/webull-bot-paper` instead - `main`'s
-own deploy path, containers, and volumes are never touched by it. View the
-paper dashboard with `ssh -L 8081:localhost:8081 <user>@<host>` and open
-localhost:8081 (the live dashboard stays on 8080).
+Every push to `paper-trading-lane` runs
+[`.github/workflows/paper-sim-gate.yml`](.github/workflows/paper-sim-gate.yml),
+a single self-contained pipeline with five jobs:
+
+```
+validate ─┬─> paper-sim-gate -> merge-to-main -> deploy-live
+           └─> deploy-paper
+```
+
+`validate` compiles and runs the full test suite; `paper-sim-gate` runs
+`scripts/evaluate_paper_sim.py`'s fully synthetic scenario suite (no
+network calls, no market hours dependency - see
+[`tests/paper_sim/scenarios.py`](tests/paper_sim/scenarios.py)). Only on a
+clean pass does `merge-to-main` merge that exact commit into `main` and
+push - no PR, no human approval step, an explicit and deliberate choice -
+after which `deploy-live` deploys it to the live host (gated on
+`GCP_DEPLOY_ENABLED`, the same variable `ci.yml`'s own `deploy-gcp` job
+uses for direct pushes to `main`). `deploy-paper` runs independently of
+that chain, deploying `paper-trading-lane`'s own code (experimental
+features enabled) to `/opt/webull-bot-paper` for live observation - it
+never touches `main` or the live account either way.
+
+View the paper dashboard with `ssh -L 8081:localhost:8081 <user>@<host>`
+and open localhost:8081 (the live dashboard stays on 8080).
 
 ## Complete configuration example
 
