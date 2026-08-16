@@ -1,19 +1,37 @@
-name: Paper-sim gate (auto-merge to main)
+name: Paper-sim gate (auto-merge + deploy)
 
-# Every push to paper-trading-lane runs a fast, fully synthetic edge-case
-# suite (scripts/evaluate_paper_sim.py) - no live market data, no network
-# calls, no broker credentials. If, and only if, every check passes, this
-# workflow merges paper-trading-lane straight into main and pushes it -
-# main's existing deploy-gcp job (ci.yml) then deploys that to the live
-# account exactly as it does for any other push to main. There is no human
-# approval step in this path; the synthetic suite's coverage is the entire
-# safety margin standing before a change reaches real money, on top of
-# main's own always-on live guardrails (stop-loss guard, circuit breakers,
-# wash-sale blocking), which stay in effect regardless of what merges in.
+# One self-contained pipeline for the paper-trading-lane branch - every
+# stage below is a job in THIS SAME workflow run, chained with `needs:`,
+# specifically so the live deploy never depends on a second, separately
+# triggered workflow run. (An earlier version split the merge-to-main step
+# into this workflow and left the deploy to ci.yml's own push-triggered
+# job - but a push made from inside a workflow using the default
+# GITHUB_TOKEN does not trigger other workflow runs, by GitHub's own
+# anti-recursion design, so that deploy never fired. Doing the deploy as
+# a job here instead sidesteps that entirely.)
 #
-# Any single failing check fails the whole gate loudly and leaves main
-# untouched - see scripts/evaluate_paper_sim.py's own docstring for the
-# exact list of checks.
+#   validate ─┬─> paper-sim-gate -> merge-to-main -> deploy-live
+#              └─> deploy-paper
+#
+# validate: compileall, the full test suite, deploy-script syntax, compose
+#   config checks, both Docker images building - no network calls.
+# paper-sim-gate: scripts/evaluate_paper_sim.py - the fully synthetic
+#   scenario suite (see tests/paper_sim/scenarios.py). This is the whole
+#   safety margin before a change reaches real money, on top of main's own
+#   always-on live guardrails (stop-loss guard, circuit breakers, wash-sale
+#   blocking), which stay in effect regardless of what merges in. Any
+#   failure here stops the chain - no merge, no deploy, main untouched.
+# merge-to-main: on a clean pass, merges this exact commit into main and
+#   pushes - no PR, no human approval step. This is a deliberate, explicitly
+#   confirmed choice.
+# deploy-live: deploys that same validated commit to the live host, gated
+#   on GCP_DEPLOY_ENABLED (the same flag ci.yml's own deploy-gcp job uses
+#   for direct pushes to main).
+# deploy-paper: independent of the above chain - deploys paper-trading-
+#   lane's own code (experimental features enabled) to the separate
+#   /opt/webull-bot-paper stack for live observation, gated on
+#   GCP_PAPER_DEPLOY_ENABLED. Runs whether or not the gate passes the
+#   merge chain, since it never touches main or the live account.
 
 on:
   push:
@@ -23,22 +41,32 @@ permissions:
   contents: write
 
 jobs:
-  paper-sim-gate:
+  validate:
     runs-on: ubuntu-latest
-    concurrency:
-      group: paper-sim-gate
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: paper-trading-lane
-          fetch-depth: 0
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q src tests ui scripts
+      - run: PYTHONPATH=src python -m unittest discover -v -s tests
+      - run: bash -n deploy/gcp/bootstrap.sh deploy/gcp/deploy.sh deploy/gcp/deploy-paper.sh
+      - run: BOT_ENV_FILE="$GITHUB_WORKSPACE/.env.example" BOT_IMAGE_TAG=ci docker compose -f deploy/compose.yaml config
+      - run: BOT_ENV_FILE="$GITHUB_WORKSPACE/.env.example" BOT_IMAGE_TAG=ci docker compose -f deploy/compose.paper.yaml config
+      - run: docker build --tag webull-intraday-trading-bot:ci .
+      - run: docker build --tag webull-trading-dashboard:ci ui
 
+  paper-sim-gate:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
       - run: pip install -r requirements.txt
 
       - name: Run the synthetic edge-case gate
@@ -57,8 +85,19 @@ jobs:
             echo "main was NOT updated."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  merge-to-main:
+    needs: paper-sim-gate
+    runs-on: ubuntu-latest
+    concurrency:
+      group: paper-sim-gate-merge
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paper-trading-lane
+          fetch-depth: 0
+
       - name: Merge into main and push
-        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -68,12 +107,115 @@ jobs:
             -m "Auto-merge paper-trading-lane: paper-sim gate passed (${GITHUB_SHA})"
           git push origin main
 
-      - name: Publish job summary on success
-        if: success()
+      - name: Publish job summary
         run: |
           {
             echo "## Paper-sim gate PASSED"
             echo
             echo "Merged paper-trading-lane (\`${GITHUB_SHA}\`) into main."
-            echo "main's deploy-gcp job will now deploy this to the live account."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-live:
+    needs: merge-to-main
+    if: vars.GCP_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gcp-production
+      cancel-in-progress: false
+    env:
+      GCP_HOST: ${{ secrets.GCP_HOST }}
+      GCP_USER: ${{ secrets.GCP_USER }}
+      GCP_SSH_PORT: ${{ secrets.GCP_SSH_PORT || '22' }}
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+      GCP_KNOWN_HOSTS: ${{ secrets.GCP_KNOWN_HOSTS }}
+    steps:
+      # Deliberately no `ref:` override - this checks out GITHUB_SHA, the
+      # exact commit paper-sim-gate already validated. merge-to-main's
+      # fast-forward-style merge (no conflicts are possible on this path)
+      # makes main's tree byte-identical to it, so there's no need to
+      # check out main itself here.
+      - uses: actions/checkout@v4
+
+      - name: Configure verified SSH access
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$GCP_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$GCP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Package release
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude=.venv \
+            --exclude=.webull-skill-venv \
+            --exclude=conf \
+            --exclude=logs \
+            --exclude=__pycache__ \
+            -czf "$RUNNER_TEMP/webull-bot-${GITHUB_SHA}.tar.gz" .
+
+      - name: Upload release
+        run: |
+          scp \
+            -P "$GCP_SSH_PORT" \
+            "$RUNNER_TEMP/webull-bot-${GITHUB_SHA}.tar.gz" \
+            "${GCP_USER}@${GCP_HOST}:/tmp/webull-bot-${GITHUB_SHA}.tar.gz"
+
+      - name: Deploy to the live host
+        run: |
+          ssh \
+            -p "$GCP_SSH_PORT" \
+            "${GCP_USER}@${GCP_HOST}" \
+            "/opt/webull-bot/bin/deploy '/tmp/webull-bot-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"
+
+  deploy-paper:
+    needs: validate
+    if: vars.GCP_PAPER_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gcp-paper
+      cancel-in-progress: false
+    env:
+      GCP_HOST: ${{ secrets.GCP_HOST }}
+      GCP_USER: ${{ secrets.GCP_USER }}
+      GCP_SSH_PORT: ${{ secrets.GCP_SSH_PORT || '22' }}
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+      GCP_KNOWN_HOSTS: ${{ secrets.GCP_KNOWN_HOSTS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure verified SSH access
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$GCP_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$GCP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Package release
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude=.venv \
+            --exclude=.webull-skill-venv \
+            --exclude=conf \
+            --exclude=logs \
+            --exclude=__pycache__ \
+            -czf "$RUNNER_TEMP/webull-bot-paper-${GITHUB_SHA}.tar.gz" .
+
+      - name: Upload release
+        run: |
+          scp \
+            -P "$GCP_SSH_PORT" \
+            "$RUNNER_TEMP/webull-bot-paper-${GITHUB_SHA}.tar.gz" \
+            "${GCP_USER}@${GCP_HOST}:/tmp/webull-bot-paper-${GITHUB_SHA}.tar.gz"
+
+      - name: Deploy to the paper host
+        run: |
+          ssh \
+            -p "$GCP_SSH_PORT" \
+            "${GCP_USER}@${GCP_HOST}" \
+            "/opt/webull-bot-paper/bin/deploy '/tmp/webull-bot-paper-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"

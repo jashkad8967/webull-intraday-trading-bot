@@ -2,7 +2,7 @@ name: Validate trading bot
 
 on:
   push:
-    branches: [main, paper-trading-lane]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -79,56 +79,3 @@ jobs:
             -p "$GCP_SSH_PORT" \
             "${GCP_USER}@${GCP_HOST}" \
             "/opt/webull-bot/bin/deploy '/tmp/webull-bot-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"
-
-  deploy-gcp-paper:
-    if: >-
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-      && github.ref == 'refs/heads/paper-trading-lane'
-      && vars.GCP_PAPER_DEPLOY_ENABLED == 'true'
-    needs: validate
-    runs-on: ubuntu-latest
-    concurrency:
-      group: gcp-paper
-      cancel-in-progress: false
-    env:
-      GCP_HOST: ${{ secrets.GCP_HOST }}
-      GCP_USER: ${{ secrets.GCP_USER }}
-      GCP_SSH_PORT: ${{ secrets.GCP_SSH_PORT || '22' }}
-      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
-      GCP_KNOWN_HOSTS: ${{ secrets.GCP_KNOWN_HOSTS }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure verified SSH access
-        run: |
-          install -m 700 -d "$HOME/.ssh"
-          printf '%s\n' "$GCP_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-          printf '%s\n' "$GCP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 600 "$HOME/.ssh/known_hosts"
-
-      - name: Package release
-        run: |
-          tar \
-            --exclude=.git \
-            --exclude=.env \
-            --exclude=.venv \
-            --exclude=.webull-skill-venv \
-            --exclude=conf \
-            --exclude=logs \
-            --exclude=__pycache__ \
-            -czf "$RUNNER_TEMP/webull-bot-paper-${GITHUB_SHA}.tar.gz" .
-
-      - name: Upload release
-        run: |
-          scp \
-            -P "$GCP_SSH_PORT" \
-            "$RUNNER_TEMP/webull-bot-paper-${GITHUB_SHA}.tar.gz" \
-            "${GCP_USER}@${GCP_HOST}:/tmp/webull-bot-paper-${GITHUB_SHA}.tar.gz"
-
-      - name: Activate one validated instance
-        run: |
-          ssh \
-            -p "$GCP_SSH_PORT" \
-            "${GCP_USER}@${GCP_HOST}" \
-            "/opt/webull-bot-paper/bin/deploy '/tmp/webull-bot-paper-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"
