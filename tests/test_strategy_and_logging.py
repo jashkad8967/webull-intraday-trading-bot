@@ -1744,7 +1744,7 @@ class AllocationAndLoggingTests(unittest.TestCase):
         )
         self.assertEqual(
             config.stock_bucket_slot_limits(),
-            {"POPULAR": 14, "PENNY": 2, "DISCOVERY": 4},
+            {"POPULAR": 35, "PENNY": 5, "DISCOVERY": 10},
         )
         self.assertEqual(config.stock_universe_page_size, 200)
         self.assertEqual(config.stocks(), ["ALL"])
