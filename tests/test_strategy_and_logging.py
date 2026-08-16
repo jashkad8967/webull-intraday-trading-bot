@@ -3612,6 +3612,110 @@ class AccountStateCashReserveTests(unittest.TestCase):
         self.assertEqual(buying_power, Decimal("0"))
 
 
+class StopLossGuardTests(unittest.TestCase):
+    @staticmethod
+    def _fake_bot(recent_stop_losses=None, **config_overrides):
+        from webull_bot.bot import AutoTrader
+
+        defaults = dict(
+            stop_loss_guard_enabled=True,
+            stop_loss_guard_trade_limit=4,
+            stop_loss_guard_lookback_seconds=1200,
+            stop_loss_guard_cooldown_seconds=600,
+        )
+        defaults.update(config_overrides)
+        config = SimpleNamespace(**defaults)
+        fake_bot = SimpleNamespace(
+            config=config,
+            recent_stop_losses=deque(recent_stop_losses or []),
+            stop_loss_guard_until=0.0,
+        )
+        return AutoTrader.stop_loss_guard_active.__get__(fake_bot), fake_bot
+
+    def test_passes_through_below_the_trade_limit(self):
+        now = time.monotonic()
+        guard, _ = self._fake_bot([now - 10, now - 20, now - 30])
+        self.assertFalse(guard())
+
+    def test_trips_at_the_trade_limit_within_lookback(self):
+        now = time.monotonic()
+        guard, fake_bot = self._fake_bot([now - 10, now - 20, now - 30, now - 40])
+
+        self.assertTrue(guard())
+        # Once tripped, stays active for the cooldown even without any new
+        # stop-losses - the whole point is to pause NEW entries, so the
+        # very next call (same cycle or the next one) must still see it.
+        self.assertTrue(guard())
+
+    def test_old_stop_losses_outside_lookback_dont_count(self):
+        now = time.monotonic()
+        guard, _ = self._fake_bot(
+            [now - 5000, now - 4000, now - 3000, now - 2000],
+            stop_loss_guard_lookback_seconds=1200,
+        )
+        self.assertFalse(guard())
+
+    def test_disabled_by_config(self):
+        now = time.monotonic()
+        guard, _ = self._fake_bot(
+            [now - 10, now - 20, now - 30, now - 40],
+            stop_loss_guard_enabled=False,
+        )
+        self.assertFalse(guard())
+
+    def test_resumes_automatically_after_the_cooldown_elapses(self):
+        """Unlike handle_portfolio_circuit_breaker (which stays paused
+        until re-evaluated/manually resumed), the stop-loss guard is a
+        pure rolling-window check - once the tripping stops age out of
+        the lookback (which happens well before a short cooldown elapses
+        in this test), it clears on its own.
+        """
+        from webull_bot.bot import AutoTrader
+
+        config = SimpleNamespace(
+            stop_loss_guard_enabled=True,
+            stop_loss_guard_trade_limit=4,
+            stop_loss_guard_lookback_seconds=1,
+            stop_loss_guard_cooldown_seconds=1,
+        )
+        now = time.monotonic()
+        fake_bot = SimpleNamespace(
+            config=config,
+            recent_stop_losses=deque([now - 0.9, now - 0.8, now - 0.7, now - 0.6]),
+            stop_loss_guard_until=0.0,
+        )
+        guard = AutoTrader.stop_loss_guard_active.__get__(fake_bot)
+        self.assertTrue(guard())
+
+        # Simulate the cooldown having elapsed and the old stops now being
+        # well outside the (short, 1s) lookback window too.
+        fake_bot.stop_loss_guard_until = time.monotonic() - 10
+        fake_bot.recent_stop_losses = deque(
+            t - 20 for t in fake_bot.recent_stop_losses
+        )
+        self.assertFalse(guard())
+
+    def test_record_trade_appends_a_stop_but_not_other_actions(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=0.0,
+            recent_stop_losses=deque(),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade("STOCK:AAPL", "order-1", "PROFIT", Decimal("10"), Decimal("1"), Decimal("9"))
+        self.assertEqual(len(fake_bot.recent_stop_losses), 0)
+
+        record_trade("STOCK:AAPL", "order-2", "STOP", Decimal("9"), Decimal("-1"), Decimal("10"))
+        self.assertEqual(len(fake_bot.recent_stop_losses), 1)
+
+
 class IdleCashRelaxationTests(unittest.TestCase):
     def test_ramp_progress_is_zero_within_the_grace_period(self):
         from webull_bot.bot import AutoTrader

@@ -840,6 +840,35 @@ it does not auto-resume like the loss-spree breaker does. Set
 `DAILY_MAX_LOSS_DOLLARS` to a figure that makes sense for your account size;
 it has no safe universal default.
 
+### Stop-loss guard
+
+Neither breaker above is frequency-aware - the loss-spree breaker only looks
+at simultaneous unrealized loss, and the daily breaker only trips once
+realized losses cross a dollar total, however long that takes to accumulate.
+Neither catches a strategy that's currently whipsawing (a fast string of
+small stop-losses in a choppy regime) *before* enough dollar loss piles up to
+trip either one. `STOP_LOSS_GUARD_ENABLED` (default `true`, this pattern
+borrowed from Freqtrade's `StoplossGuard` protection) closes that gap: once
+`STOP_LOSS_GUARD_TRADE_LIMIT` stop-losses (default `4`) have fired within the
+trailing `STOP_LOSS_GUARD_LOOKBACK_SECONDS` (default `1200`, 20 minutes), new
+stock, short, and option entries are paused for
+`STOP_LOSS_GUARD_COOLDOWN_SECONDS` (default `600`, 10 minutes).
+
+```dotenv
+STOP_LOSS_GUARD_ENABLED=true
+STOP_LOSS_GUARD_TRADE_LIMIT=4
+STOP_LOSS_GUARD_LOOKBACK_SECONDS=1200
+STOP_LOSS_GUARD_COOLDOWN_SECONDS=600
+```
+
+Unlike the two breakers above, this never liquidates anything - existing
+positions keep being managed normally (profit targets, stops, the EOD/
+fractional-pre-close sweeps all keep running) - it only declines to add new
+risk while the recent stop-loss rate is elevated, then resumes automatically
+once the tripping stops age out of the lookback window or the cooldown
+elapses, whichever clears it first. No restart needed, unlike the loss-spree
+breaker's liquidate-and-pause behavior.
+
 ### Stop-loss escalation
 
 Stock sell exits — both profit-take and stop-loss — are submitted at the

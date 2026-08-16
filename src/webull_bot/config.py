@@ -373,6 +373,16 @@ class Settings(BaseSettings):
     loss_spree_position_count: int = Field(default=3, ge=2, le=100)
     loss_spree_total_dollars: Decimal = Field(default=Decimal("1"), gt=0)
     loss_reevaluation_seconds: int = Field(default=120, ge=30, le=3600)
+    # freqtrade-style StoplossGuard (see AutoTrader.stop_loss_guard_active) -
+    # a frequency-based circuit breaker, distinct from the dollar/equity
+    # breakers above: pauses NEW entries only (never liquidates) once
+    # STOP_LOSS_GUARD_TRADE_LIMIT stops have fired within the trailing
+    # STOP_LOSS_GUARD_LOOKBACK_SECONDS window, for STOP_LOSS_GUARD_
+    # COOLDOWN_SECONDS, then resumes automatically.
+    stop_loss_guard_enabled: bool = True
+    stop_loss_guard_trade_limit: int = Field(default=4, ge=1, le=50)
+    stop_loss_guard_lookback_seconds: int = Field(default=1200, ge=60, le=21600)
+    stop_loss_guard_cooldown_seconds: int = Field(default=600, ge=60, le=21600)
 
     trading_timezone: str = "America/New_York"
     market_open_time: str = "04:00"
