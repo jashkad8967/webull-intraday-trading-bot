@@ -12,6 +12,7 @@ from webull_bot.config import settings
 from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.invalid_symbols import InvalidSymbolTracker
 from webull_bot.market_agent import MarketResearchAgent
+from webull_bot.paper_broker import PaperWebullAPI
 from webull_bot.pairs import (
     PAIRS,
     PAIRS_CAPITAL_FRACTION,
@@ -79,7 +80,11 @@ class AutoTrader:
     def __init__(self):
         self.config = settings()
         self.config.validate_runtime()
-        self.api = WebullAPI(self.config)
+        self.api = (
+            PaperWebullAPI(self.config)
+            if self.config.mode == "PAPER"
+            else WebullAPI(self.config)
+        )
         self.strategy = TradingStrategy(self.config)
         self.market_agent = (
             MarketResearchAgent(self.config, log)
@@ -148,6 +153,16 @@ class AutoTrader:
         # too many fire within a lookback window.
         self.recent_stop_losses: deque = deque()
         self.stop_loss_guard_until = 0.0
+        # freqtrade-style LowProfitPairs - see symbol_quarantined(). Same
+        # shape as the stop-loss guard above but partitioned per "key"
+        # (e.g. "STOCK:AAPL") instead of account-wide.
+        self.symbol_pnl_history: dict[str, deque] = defaultdict(deque)
+        self.symbol_quarantine_until: dict[str, float] = {}
+        # Time-aware stop - see TradingStrategy.adaptive_stop_percent and
+        # trade_stocks/trade_options. Set on every BUY/SHORT fill, cleared
+        # on exit, so a fresh entry always starts its own noise-grace
+        # window regardless of how long the symbol was previously held.
+        self.position_opened_at: dict[str, float] = {}
         self.cached_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
         self.working_orders: dict[str, dict] = {}
@@ -760,6 +775,12 @@ class AutoTrader:
         self.last_trade[key] = submitted_at
         if action in ("PROFIT", "STOP", "MANUAL_SELL"):
             self.last_exit_at[key] = submitted_at
+            self.position_opened_at.pop(key, None)
+            if pnl is not None:
+                # Feeds symbol_quarantined() - every realized exit's P&L,
+                # partitioned per-key so one bad symbol can't drag down
+                # another's entry eligibility.
+                self.symbol_pnl_history[key].append((submitted_at, pnl))
         if action == "STOP":
             # Feeds stop_loss_guard_active() - a real stop-loss fill (not a
             # manual sell or a profit-take), tracked regardless of symbol.
@@ -770,6 +791,10 @@ class AutoTrader:
             # quality gates snap back to their normal strictness until
             # cash sits idle above MIN_CASH_RESERVE_DOLLARS again.
             self.last_capital_deployed_at = submitted_at
+        if action in ("BUY", "SHORT"):
+            # Feeds TradingStrategy.adaptive_stop_percent's time-aware
+            # widen window - see position_opened_at.
+            self.position_opened_at[key] = submitted_at
         self.trade_times[key].append(submitted_at)
         self.working_orders[order_id] = {
             "submitted_at": submitted_at,
@@ -1259,6 +1284,45 @@ class AutoTrader:
         )
         return True
 
+    def symbol_quarantined(self, key: str) -> bool:
+        """freqtrade-style LowProfitPairs: same shape as stop_loss_guard_
+        active but scoped to one symbol's own recent realized P&L instead
+        of an account-wide stop count. A symbol that's been a net loser
+        lately pauses new entries on just that symbol - via
+        symbol_pnl_history, fed by record_trade on every PROFIT/STOP/
+        MANUAL_SELL exit - while every other symbol keeps trading
+        normally. Never liquidates the symbol's existing position, if any.
+        """
+        if not self.config.symbol_quarantine_enabled:
+            return False
+        now = time.monotonic()
+        if now < self.symbol_quarantine_until.get(key, 0.0):
+            return True
+        history = self.symbol_pnl_history.get(key)
+        if not history:
+            return False
+        lookback = float(self.config.symbol_quarantine_lookback_seconds)
+        while history and now - history[0][0] > lookback:
+            history.popleft()
+        if len(history) < self.config.symbol_quarantine_min_trades:
+            return False
+        total_pnl = sum((pnl for _, pnl in history), Decimal("0"))
+        if total_pnl > -self.config.symbol_quarantine_loss_dollars:
+            return False
+        self.symbol_quarantine_until[key] = now + float(
+            self.config.symbol_quarantine_cooldown_seconds
+        )
+        log.warning(
+            "GUARD  | symbol quarantined | %s | net $%s over %s trades in "
+            "the last %ss | pausing entries for %ss",
+            key,
+            total_pnl,
+            len(history),
+            self.config.symbol_quarantine_lookback_seconds,
+            self.config.symbol_quarantine_cooldown_seconds,
+        )
+        return True
+
     def handle_portfolio_circuit_breaker(
         self,
         positions: list[dict],
@@ -1704,6 +1768,19 @@ class AutoTrader:
         # NEW entries only (unlike handle_portfolio_circuit_breaker, this
         # never liquidates existing positions) - see stop_loss_guard_active.
         guard_active = self.stop_loss_guard_active()
+        # Generalizes option_market_regime_ok's VIXY-rolling-percentile
+        # gate to stock entries - self.vixy_history is populated by
+        # trade_options (which runs after trade_stocks each cycle), so
+        # this reads one cycle stale; negligible for a slow-moving
+        # market-wide signal. Computed once per cycle, not per symbol -
+        # this is a market-wide read, not a per-symbol one.
+        regime_gate_active = self.config.regime_gate_enabled and not (
+            self.strategy.stock_market_regime_ok(
+                self.vixy_history,
+                self.vixy_history[-1] if self.vixy_history else None,
+                self.config.regime_gate_reject_percentile,
+            )
+        )
         # Keeping cash deployed outranks entry quality, but only
         # progressively - see idle_cash_ramp_progress(). ramp_progress is
         # 0 right after any entry, climbing to 1 the longer buying_power
@@ -1837,6 +1914,10 @@ class AutoTrader:
                 self.strategy.update_stock_snapshot(quote, price)
                 quantity, cost = self.api.stock_position(symbol, positions)
                 key = f"STOCK:{symbol}"
+                opened_at = self.position_opened_at.get(key)
+                seconds_since_entry = (
+                    time.monotonic() - opened_at if opened_at is not None else None
+                )
                 decision = self.strategy.stock_decision(
                     key,
                     price,
@@ -1846,6 +1927,7 @@ class AutoTrader:
                     opening_grace_active,
                     idle_relaxation_multiplier,
                     idle_relaxation_amount,
+                    seconds_since_entry,
                 )
                 if decision.action == "HOLD" and quantity == 0:
                     self.gate_rejections[decision.reason] += 1
@@ -1878,6 +1960,16 @@ class AutoTrader:
                     if guard_active:
                         self.gate_rejections[
                             "stop-loss guard active - too many recent stops"
+                        ] += 1
+                        continue
+                    if self.symbol_quarantined(key):
+                        self.gate_rejections[
+                            "symbol quarantined - recent net losses on this symbol"
+                        ] += 1
+                        continue
+                    if regime_gate_active:
+                        self.gate_rejections[
+                            "regime gate - VIXY elevated vs recent range"
                         ] += 1
                         continue
                     bucket = self.strategy.selection_bucket(symbol)
@@ -1980,6 +2072,16 @@ class AutoTrader:
                             )
                         continue
                     self.wash_skip_logged.discard(symbol)
+                    if self.symbol_quarantined(key):
+                        self.gate_rejections[
+                            "symbol quarantined - recent net losses on this symbol"
+                        ] += 1
+                        continue
+                    if regime_gate_active:
+                        self.gate_rejections[
+                            "regime gate - VIXY elevated vs recent range"
+                        ] += 1
+                        continue
                     if guard_active:
                         self.gate_rejections[
                             "stop-loss guard active - too many recent stops"
@@ -2599,6 +2701,11 @@ class AutoTrader:
                     if guard_active:
                         self.gate_rejections[
                             "stop-loss guard active - too many recent stops"
+                        ] += 1
+                        continue
+                    if self.symbol_quarantined(key):
+                        self.gate_rejections[
+                            "symbol quarantined - recent net losses on this symbol"
                         ] += 1
                         continue
                     limit_price = self.api.option_limit_price(quote, "BUY")

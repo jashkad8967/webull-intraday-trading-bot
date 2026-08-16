@@ -2,7 +2,7 @@ name: Validate trading bot
 
 on:
   push:
-    branches: [main]
+    branches: [main, paper-trading-lane]
   pull_request:
   workflow_dispatch:
 
@@ -19,16 +19,18 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python -m compileall -q src tests ui
+      - run: python -m compileall -q src tests ui scripts
       - run: PYTHONPATH=src python -m unittest discover -v -s tests
-      - run: bash -n deploy/gcp/bootstrap.sh deploy/gcp/deploy.sh
+      - run: bash -n deploy/gcp/bootstrap.sh deploy/gcp/deploy.sh deploy/gcp/deploy-paper.sh
       - run: BOT_ENV_FILE="$GITHUB_WORKSPACE/.env.example" BOT_IMAGE_TAG=ci docker compose -f deploy/compose.yaml config
+      - run: BOT_ENV_FILE="$GITHUB_WORKSPACE/.env.example" BOT_IMAGE_TAG=ci docker compose -f deploy/compose.paper.yaml config
       - run: docker build --tag webull-intraday-trading-bot:ci .
       - run: docker build --tag webull-trading-dashboard:ci ui
 
   deploy-gcp:
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
       && vars.GCP_DEPLOY_ENABLED == 'true'
     needs: validate
     runs-on: ubuntu-latest
@@ -77,3 +79,56 @@ jobs:
             -p "$GCP_SSH_PORT" \
             "${GCP_USER}@${GCP_HOST}" \
             "/opt/webull-bot/bin/deploy '/tmp/webull-bot-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"
+
+  deploy-gcp-paper:
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/paper-trading-lane'
+      && vars.GCP_PAPER_DEPLOY_ENABLED == 'true'
+    needs: validate
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gcp-paper
+      cancel-in-progress: false
+    env:
+      GCP_HOST: ${{ secrets.GCP_HOST }}
+      GCP_USER: ${{ secrets.GCP_USER }}
+      GCP_SSH_PORT: ${{ secrets.GCP_SSH_PORT || '22' }}
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+      GCP_KNOWN_HOSTS: ${{ secrets.GCP_KNOWN_HOSTS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure verified SSH access
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$GCP_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$GCP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Package release
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude=.venv \
+            --exclude=.webull-skill-venv \
+            --exclude=conf \
+            --exclude=logs \
+            --exclude=__pycache__ \
+            -czf "$RUNNER_TEMP/webull-bot-paper-${GITHUB_SHA}.tar.gz" .
+
+      - name: Upload release
+        run: |
+          scp \
+            -P "$GCP_SSH_PORT" \
+            "$RUNNER_TEMP/webull-bot-paper-${GITHUB_SHA}.tar.gz" \
+            "${GCP_USER}@${GCP_HOST}:/tmp/webull-bot-paper-${GITHUB_SHA}.tar.gz"
+
+      - name: Activate one validated instance
+        run: |
+          ssh \
+            -p "$GCP_SSH_PORT" \
+            "${GCP_USER}@${GCP_HOST}" \
+            "/opt/webull-bot-paper/bin/deploy '/tmp/webull-bot-paper-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"

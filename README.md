@@ -1458,6 +1458,51 @@ docker exec webull-trading-bot tail -n 200 /var/data/logs/YYYY/MM/YYYY-MM-DD.log
 docker restart webull-trading-bot
 ```
 
+### Add the paper-trading lane (optional)
+
+The `paper-trading-lane` branch runs a second, fully independent stack
+(`webull-trading-bot-paper` / `webull-trading-dashboard-paper`) on the same
+VM, dry-running experimental strategy features against real market data
+through [`PaperWebullAPI`](src/webull_bot/paper_broker.py) - it never calls
+Webull's trade API, so it's safe to point at the same account credentials as
+the live bot. It has its own release root, Docker volumes, and deploy
+script, so a bad paper build can never touch the live bot's containers or
+state. This is a one-time, manual setup - it is not part of `bootstrap.sh`.
+
+On the VM:
+
+```bash
+sudo install -d -m 0750 -o "$USER" -g "$USER" \
+  /opt/webull-bot-paper /opt/webull-bot-paper/bin \
+  /opt/webull-bot-paper/releases /opt/webull-bot-paper/shared
+sudo install -m 0750 -o "$USER" -g "$USER" \
+  ~/webull-intraday-trading-bot/deploy/gcp/deploy-paper.sh \
+  /opt/webull-bot-paper/bin/deploy
+docker volume create webull-trading-data-paper
+docker volume create webull-trading-commands-paper
+nano /opt/webull-bot-paper/shared/.env
+```
+
+Seed that `.env` with `MODE=PAPER`, the same `WEBULL_APP_KEY`/
+`WEBULL_APP_SECRET`/`ACCOUNT_ID` as the live `.env` (read-only market data
+only - `PaperWebullAPI` never submits a real order), `LIVE_TRADING_ENABLED`
+can stay unset (PAPER mode doesn't require it), and whichever of the
+experimental feature flags you want exercised
+(`SYMBOL_QUARANTINE_ENABLED`, `TIME_AWARE_STOP_ENABLED`,
+`REGIME_GATE_ENABLED`) plus `PAPER_STARTING_BALANCE`.
+
+In GitHub, add the repository variable:
+
+```text
+GCP_PAPER_DEPLOY_ENABLED=true
+```
+
+Every push to `paper-trading-lane` then runs the same validate → package →
+deploy flow as `main`, targeting `/opt/webull-bot-paper` instead - `main`'s
+own deploy path, containers, and volumes are never touched by it. View the
+paper dashboard with `ssh -L 8081:localhost:8081 <user>@<host>` and open
+localhost:8081 (the live dashboard stays on 8080).
+
 ## Complete configuration example
 
 Every value below already matches `config.py`'s built-in default - this is a
@@ -1475,6 +1520,10 @@ WEBULL_API_ENDPOINT=api.webull.com
 WEBULL_ENVIRONMENT=prod
 WEBULL_REGION_ID=us
 LIVE_TRADING_ENABLED=true
+# PAPER mode only (see "Add the paper-trading lane") - ignored in LIVE mode.
+PAPER_STARTING_BALANCE=250
+PAPER_FILL_SLIPPAGE_PERCENT=0
+PAPER_STATE_FILE=conf/paper_ledger.json
 
 STOCK_SYMBOLS=ALL
 OPTION_CONTRACTS=
@@ -1592,6 +1641,18 @@ STOP_LOSS_GUARD_ENABLED=true
 STOP_LOSS_GUARD_TRADE_LIMIT=4
 STOP_LOSS_GUARD_LOOKBACK_SECONDS=1200
 STOP_LOSS_GUARD_COOLDOWN_SECONDS=600
+# The three experimental features below default OFF on main - see the
+# paper-trading-lane branch, where they default on for evaluation.
+SYMBOL_QUARANTINE_ENABLED=false
+SYMBOL_QUARANTINE_LOOKBACK_SECONDS=1800
+SYMBOL_QUARANTINE_MIN_TRADES=3
+SYMBOL_QUARANTINE_LOSS_DOLLARS=0.50
+SYMBOL_QUARANTINE_COOLDOWN_SECONDS=900
+TIME_AWARE_STOP_ENABLED=false
+TIME_AWARE_STOP_WIDEN_SECONDS=60
+TIME_AWARE_STOP_WIDEN_MULTIPLIER=1.5
+REGIME_GATE_ENABLED=false
+REGIME_GATE_REJECT_PERCENTILE=0.85
 
 TRADING_TIMEZONE=America/New_York
 MARKET_OPEN_TIME=04:00
@@ -1611,4 +1672,5 @@ STOCK_LIMIT_OFFSET=0.005
 OPTION_LIMIT_OFFSET=0.03
 LOG_DIRECTORY=logs
 STATUS_FILE=status.json
+COMMAND_FILE=commands.json
 ```
