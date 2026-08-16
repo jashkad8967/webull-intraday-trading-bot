@@ -1,0 +1,63 @@
+services:
+  trader:
+    image: webull-intraday-trading-bot:${BOT_IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: webull-trading-bot-paper
+    restart: unless-stopped
+    env_file:
+      - ${BOT_ENV_FILE:-/opt/webull-bot-paper/shared/.env}
+    environment:
+      LOG_DIRECTORY: /var/data/logs
+      WASH_SALE_STATE_FILE: /var/data/conf/wash_sale_blocks.json
+      INVALID_SYMBOL_STATE_FILE: /var/data/conf/invalid_symbols.json
+      STATUS_FILE: /var/data/status.json
+      COMMAND_FILE: /var/commands/commands.json
+      PAPER_STATE_FILE: /var/data/conf/paper_ledger.json
+      TZ: America/New_York
+    volumes:
+      - trading-data-paper:/var/data
+      - command-data-paper:/var/commands
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  dashboard:
+    image: webull-trading-dashboard:${BOT_IMAGE_TAG:-local}
+    build:
+      context: ../ui
+      dockerfile: Dockerfile
+    container_name: webull-trading-dashboard-paper
+    restart: unless-stopped
+    environment:
+      STATUS_FILE: /var/data/status.json
+      LOG_DIRECTORY: /var/data/logs
+      TRADING_TIMEZONE: America/New_York
+      COMMAND_FILE: /var/commands/commands.json
+      TZ: America/New_York
+    volumes:
+      - trading-data-paper:/var/data:ro
+      - command-data-paper:/var/commands
+    ports:
+      # Loopback-only, and a different host port than the live dashboard's
+      # 8080 - both stacks can run side by side on the same host. View it
+      # with `ssh -L 8081:localhost:8081 <user>@<host>` and open
+      # localhost:8081.
+      - "127.0.0.1:8081:8080"
+    depends_on:
+      - trader
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  trading-data-paper:
+    name: webull-trading-data-paper
+  command-data-paper:
+    name: webull-trading-commands-paper
