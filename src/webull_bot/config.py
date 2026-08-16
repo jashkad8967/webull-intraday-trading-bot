@@ -394,6 +394,36 @@ class Settings(BaseSettings):
     stop_loss_guard_trade_limit: int = Field(default=4, ge=1, le=50)
     stop_loss_guard_lookback_seconds: int = Field(default=1200, ge=60, le=21600)
     stop_loss_guard_cooldown_seconds: int = Field(default=600, ge=60, le=21600)
+    # freqtrade-style LowProfitPairs (see AutoTrader.symbol_quarantined) - the
+    # same idea as the stop-loss guard above but scoped per-symbol instead of
+    # account-wide: once a symbol's own realized P&L over the trailing
+    # SYMBOL_QUARANTINE_LOOKBACK_SECONDS window falls at or below
+    # -SYMBOL_QUARANTINE_LOSS_DOLLARS (and it's had at least SYMBOL_
+    # QUARANTINE_MIN_TRADES exits in that window), new entries on that one
+    # symbol pause for SYMBOL_QUARANTINE_COOLDOWN_SECONDS while every other
+    # symbol keeps trading normally.
+    symbol_quarantine_enabled: bool = False
+    symbol_quarantine_lookback_seconds: int = Field(default=1800, ge=60, le=21600)
+    symbol_quarantine_min_trades: int = Field(default=3, ge=1, le=50)
+    symbol_quarantine_loss_dollars: Decimal = Field(default=Decimal("0.50"), gt=0)
+    symbol_quarantine_cooldown_seconds: int = Field(default=900, ge=60, le=21600)
+    # Widens the stop immediately after entry (avoids getting shaken out by
+    # quote noise right at fill) then tightens back to adaptive_stop_percent's
+    # normal value as the position ages - see AutoTrader.position_opened_at
+    # and TradingStrategy.time_aware_stop_multiplier.
+    time_aware_stop_enabled: bool = False
+    time_aware_stop_widen_seconds: int = Field(default=60, ge=1, le=3600)
+    time_aware_stop_widen_multiplier: Decimal = Field(
+        default=Decimal("1.5"), ge=Decimal("1"), le=Decimal("5")
+    )
+    # Generalizes option_market_regime_ok's VIXY-rolling-percentile gate to
+    # stock entries too (see AutoTrader.trade_stocks) - rejects a fresh EMA
+    # cross when VIXY is spiking into the top of its own recent range,
+    # regardless of how good that one symbol's own setup looks.
+    regime_gate_enabled: bool = False
+    regime_gate_reject_percentile: Decimal = Field(
+        default=Decimal("0.85"), gt=0, le=1
+    )
 
     trading_timezone: str = "America/New_York"
     market_open_time: str = "04:00"

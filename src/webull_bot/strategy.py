@@ -626,13 +626,48 @@ class TradingStrategy:
             OPTION_VIXY_REJECT_PERCENTILE,
         )
 
-    def adaptive_stop_percent(self, symbol: str) -> Decimal:
+    @staticmethod
+    def stock_market_regime_ok(
+        vixy_history,
+        current_vixy: Decimal | None,
+        reject_percentile: Decimal,
+    ) -> bool:
+        """Same VIXY-rolling-percentile regime gate as
+        option_market_regime_ok, generalized to stock entries with their
+        own configurable REGIME_GATE_REJECT_PERCENTILE instead of the
+        options-only hardcoded OPTION_VIXY_REJECT_PERCENTILE - a vol
+        regime that's a reason to skip option premium isn't necessarily
+        the same bar for skipping a stock scalp. Passes through when
+        there's no VIXY quote or not enough history yet.
+        """
+        return TradingStrategy._percentile_reject_ok(
+            vixy_history,
+            current_vixy,
+            OPTION_IV_PERCENTILE_MIN_SAMPLES,
+            reject_percentile,
+        )
+
+    def adaptive_stop_percent(
+        self, symbol: str, seconds_since_entry: float | None = None
+    ) -> Decimal:
         range_ratio = Decimal(str(self.metrics.get(symbol, {}).get("range_ratio", 0)))
         scaled = range_ratio * self.config.stock_stop_loss_range_multiplier
-        return max(
+        percent = max(
             self.config.stock_stop_loss_min_percent,
             min(self.config.stock_stop_loss_max_percent, scaled),
         )
+        if (
+            self.config.time_aware_stop_enabled
+            and seconds_since_entry is not None
+            and seconds_since_entry < self.config.time_aware_stop_widen_seconds
+        ):
+            # Deliberately widens past the normal max - quote noise right
+            # at fill shouldn't stop a position out before the strategy's
+            # real edge has had a chance to play out. Tightens back to the
+            # normal adaptive value once TIME_AWARE_STOP_WIDEN_SECONDS
+            # elapses.
+            percent *= self.config.time_aware_stop_widen_multiplier
+        return percent
 
     def stock_decision(
         self,
@@ -644,6 +679,7 @@ class TradingStrategy:
         opening_grace_active: bool = False,
         idle_relaxation_multiplier: Decimal = Decimal("1"),
         idle_relaxation_amount: Decimal = Decimal("0"),
+        seconds_since_entry: float | None = None,
     ) -> Decision:
         trend = self.trend_signal(key, price)
         symbol = key.split(":", 1)[-1]
@@ -654,7 +690,7 @@ class TradingStrategy:
             # target hit at exactly the percentage-based price would still
             # net a loss once the flat fee comes out of the actual fill.
             fee_per_share = self.config.sell_fee_dollars / quantity
-            stop_percent = self.adaptive_stop_percent(symbol)
+            stop_percent = self.adaptive_stop_percent(symbol, seconds_since_entry)
             # A fractional (core-session dollar-sized) position targets a
             # much smaller move than a whole-share one - it can only be
             # exited during core hours at all (see is_fractional_quantity
@@ -735,7 +771,7 @@ class TradingStrategy:
             # long position's.
             short_quantity = -quantity
             fee_per_share = self.config.sell_fee_dollars / short_quantity
-            stop_percent = self.adaptive_stop_percent(symbol)
+            stop_percent = self.adaptive_stop_percent(symbol, seconds_since_entry)
             target_percent = max(
                 self.config.stock_min_net_profit_percent
                 + self.config.stock_estimated_round_trip_cost_percent,

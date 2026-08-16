@@ -76,6 +76,9 @@ class StrategyConfigMixin:
             agent_runner_bias_threshold=Decimal("0.50"),
             agent_runner_profit_percent=Decimal("0.01"),
             agent_derisk_bias_threshold=Decimal("-0.50"),
+            time_aware_stop_enabled=False,
+            time_aware_stop_widen_seconds=60,
+            time_aware_stop_widen_multiplier=Decimal("1.5"),
         )
 
 
@@ -746,6 +749,8 @@ class StopLossEscalationTests(unittest.TestCase):
             trade_times=defaultdict(deque),
             working_orders={},
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -3706,6 +3711,8 @@ class StopLossGuardTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=0.0,
             recent_stop_losses=deque(),
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -3714,6 +3721,267 @@ class StopLossGuardTests(unittest.TestCase):
 
         record_trade("STOCK:AAPL", "order-2", "STOP", Decimal("9"), Decimal("-1"), Decimal("10"))
         self.assertEqual(len(fake_bot.recent_stop_losses), 1)
+
+
+class SymbolQuarantineTests(unittest.TestCase):
+    KEY = "STOCK:AAPL"
+
+    @classmethod
+    def _fake_bot(cls, pnl_history=None, key=None, **config_overrides):
+        from webull_bot.bot import AutoTrader
+
+        defaults = dict(
+            symbol_quarantine_enabled=True,
+            symbol_quarantine_lookback_seconds=1800,
+            symbol_quarantine_min_trades=3,
+            symbol_quarantine_loss_dollars=Decimal("0.50"),
+            symbol_quarantine_cooldown_seconds=900,
+        )
+        defaults.update(config_overrides)
+        config = SimpleNamespace(**defaults)
+        history = defaultdict(deque)
+        if pnl_history is not None:
+            history[key or cls.KEY] = deque(pnl_history)
+        fake_bot = SimpleNamespace(
+            config=config,
+            symbol_pnl_history=history,
+            symbol_quarantine_until={},
+        )
+        return AutoTrader.symbol_quarantined.__get__(fake_bot), fake_bot
+
+    def test_passes_through_with_no_history(self):
+        quarantined, _ = self._fake_bot(None)
+        self.assertFalse(quarantined(self.KEY))
+
+    def test_passes_through_below_min_trades(self):
+        now = time.monotonic()
+        quarantined, _ = self._fake_bot(
+            [(now - 10, Decimal("-1")), (now - 20, Decimal("-1"))]
+        )
+        self.assertFalse(quarantined(self.KEY))
+
+    def test_trips_when_net_loss_meets_threshold_within_lookback(self):
+        now = time.monotonic()
+        quarantined, _ = self._fake_bot(
+            [
+                (now - 10, Decimal("-0.20")),
+                (now - 20, Decimal("-0.20")),
+                (now - 30, Decimal("-0.20")),
+            ]
+        )
+        self.assertTrue(quarantined(self.KEY))
+        # Once tripped, stays quarantined for the cooldown even without a
+        # new loss - same shape as stop_loss_guard_active.
+        self.assertTrue(quarantined(self.KEY))
+
+    def test_net_loss_under_threshold_does_not_trip(self):
+        now = time.monotonic()
+        quarantined, _ = self._fake_bot(
+            [
+                (now - 10, Decimal("-0.10")),
+                (now - 20, Decimal("-0.10")),
+                (now - 30, Decimal("-0.10")),
+            ]
+        )
+        self.assertFalse(quarantined(self.KEY))
+
+    def test_profitable_trades_dont_trip_even_at_the_trade_count(self):
+        now = time.monotonic()
+        quarantined, _ = self._fake_bot(
+            [
+                (now - 10, Decimal("5")),
+                (now - 20, Decimal("-1")),
+                (now - 30, Decimal("-1")),
+            ]
+        )
+        self.assertFalse(quarantined(self.KEY))
+
+    def test_old_trades_outside_lookback_dont_count(self):
+        now = time.monotonic()
+        quarantined, _ = self._fake_bot(
+            [
+                (now - 5000, Decimal("-1")),
+                (now - 4000, Decimal("-1")),
+                (now - 3000, Decimal("-1")),
+            ],
+            symbol_quarantine_lookback_seconds=1800,
+        )
+        self.assertFalse(quarantined(self.KEY))
+
+    def test_disabled_by_config(self):
+        now = time.monotonic()
+        quarantined, _ = self._fake_bot(
+            [
+                (now - 10, Decimal("-1")),
+                (now - 20, Decimal("-1")),
+                (now - 30, Decimal("-1")),
+            ],
+            symbol_quarantine_enabled=False,
+        )
+        self.assertFalse(quarantined(self.KEY))
+
+    def test_other_symbols_are_unaffected(self):
+        now = time.monotonic()
+        quarantined, _ = self._fake_bot(
+            [
+                (now - 10, Decimal("-1")),
+                (now - 20, Decimal("-1")),
+                (now - 30, Decimal("-1")),
+            ]
+        )
+        self.assertTrue(quarantined(self.KEY))
+        self.assertFalse(quarantined("STOCK:MSFT"))
+
+    def test_record_trade_partitions_pnl_history_per_key(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=0.0,
+            recent_stop_losses=deque(),
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade(
+            "STOCK:AAPL", "order-1", "STOP", Decimal("9"),
+            pnl=Decimal("-1"), entry_price=Decimal("10"),
+        )
+        record_trade(
+            "STOCK:MSFT", "order-2", "PROFIT", Decimal("11"),
+            pnl=Decimal("2"), entry_price=Decimal("10"),
+        )
+
+        self.assertEqual(len(fake_bot.symbol_pnl_history["STOCK:AAPL"]), 1)
+        self.assertEqual(fake_bot.symbol_pnl_history["STOCK:AAPL"][0][1], Decimal("-1"))
+        self.assertEqual(len(fake_bot.symbol_pnl_history["STOCK:MSFT"]), 1)
+        self.assertEqual(fake_bot.symbol_pnl_history["STOCK:MSFT"][0][1], Decimal("2"))
+
+
+class TimeAwareStopTests(StrategyConfigMixin, unittest.TestCase):
+    def test_disabled_leaves_the_normal_adaptive_percent_unchanged(self):
+        strategy = TradingStrategy(self.config())
+        normal = strategy.adaptive_stop_percent("AAPL")
+        widened = strategy.adaptive_stop_percent("AAPL", seconds_since_entry=1)
+        self.assertEqual(normal, widened)
+
+    def test_widens_within_the_grace_window_when_enabled(self):
+        config = self.config()
+        config.time_aware_stop_enabled = True
+        config.time_aware_stop_widen_seconds = 60
+        config.time_aware_stop_widen_multiplier = Decimal("2")
+        strategy = TradingStrategy(config)
+
+        normal = strategy.adaptive_stop_percent("AAPL")
+        widened = strategy.adaptive_stop_percent("AAPL", seconds_since_entry=10)
+
+        self.assertEqual(widened, normal * Decimal("2"))
+
+    def test_tightens_back_to_normal_after_the_grace_window(self):
+        config = self.config()
+        config.time_aware_stop_enabled = True
+        config.time_aware_stop_widen_seconds = 60
+        config.time_aware_stop_widen_multiplier = Decimal("2")
+        strategy = TradingStrategy(config)
+
+        normal = strategy.adaptive_stop_percent("AAPL")
+        aged = strategy.adaptive_stop_percent("AAPL", seconds_since_entry=120)
+
+        self.assertEqual(aged, normal)
+
+    def test_a_fresh_entry_survives_a_dip_that_would_otherwise_stop_it_out(self):
+        config = self.config()
+        config.time_aware_stop_enabled = True
+        config.time_aware_stop_widen_seconds = 60
+        config.time_aware_stop_widen_multiplier = Decimal("3")
+        strategy = TradingStrategy(config)
+        strategy.metrics["AAPL"] = {"range_ratio": Decimal("0")}
+
+        cost = Decimal("100")
+        # Exactly at the *normal* (unwidened) stop line - trips a normal
+        # stop, but sits comfortably inside a 3x-widened one.
+        stop_percent = strategy.adaptive_stop_percent("AAPL")
+        dip_price = cost * (Decimal("1") - stop_percent)
+
+        fresh = strategy.stock_decision(
+            "STOCK:AAPL", dip_price, 10, cost, seconds_since_entry=5
+        )
+        aged = strategy.stock_decision(
+            "STOCK:AAPL", dip_price, 10, cost, seconds_since_entry=120
+        )
+
+        self.assertNotEqual(fresh.action, "LOSS")
+        self.assertEqual(aged.action, "LOSS")
+
+
+class RegimeGateTests(unittest.TestCase):
+    def test_passes_through_with_no_current_reading(self):
+        history = deque([Decimal(x) for x in range(1, 21)])
+        self.assertTrue(
+            TradingStrategy.stock_market_regime_ok(history, None, Decimal("0.85"))
+        )
+
+    def test_passes_through_without_enough_history(self):
+        history = deque([Decimal("1"), Decimal("2")])
+        self.assertTrue(
+            TradingStrategy.stock_market_regime_ok(
+                history, Decimal("2"), Decimal("0.85")
+            )
+        )
+
+    def test_rejects_when_current_is_in_the_top_of_its_own_range(self):
+        history = deque([Decimal(x) for x in range(1, 21)])
+        self.assertFalse(
+            TradingStrategy.stock_market_regime_ok(
+                history, Decimal("20"), Decimal("0.85")
+            )
+        )
+
+    def test_allows_when_current_is_mid_range(self):
+        history = deque([Decimal(x) for x in range(1, 21)])
+        self.assertTrue(
+            TradingStrategy.stock_market_regime_ok(
+                history, Decimal("5"), Decimal("0.85")
+            )
+        )
+
+    def test_uses_its_own_configurable_percentile_distinct_from_options(self):
+        # 15th of 20 samples => rank 0.75 - rejected at a strict 0.70 gate,
+        # allowed at a looser 0.90 one, proving the threshold is genuinely
+        # parameterized rather than hardcoded to OPTION_VIXY_REJECT_PERCENTILE.
+        history = deque([Decimal(x) for x in range(1, 21)])
+        self.assertFalse(
+            TradingStrategy.stock_market_regime_ok(
+                history, Decimal("15"), Decimal("0.70")
+            )
+        )
+        self.assertTrue(
+            TradingStrategy.stock_market_regime_ok(
+                history, Decimal("15"), Decimal("0.90")
+            )
+        )
+
+    def test_disabled_regime_gate_active_is_always_false(self):
+        """AutoTrader.trade_stocks only computes regime_gate_active at all
+        when REGIME_GATE_ENABLED is set - mirrors guard_active's own
+        config-gated pattern.
+        """
+        config = SimpleNamespace(
+            regime_gate_enabled=False,
+            regime_gate_reject_percentile=Decimal("0.85"),
+        )
+        vixy_history = deque([Decimal(x) for x in range(1, 21)])
+        regime_gate_active = config.regime_gate_enabled and not (
+            TradingStrategy.stock_market_regime_ok(
+                vixy_history, vixy_history[-1], config.regime_gate_reject_percentile
+            )
+        )
+        self.assertFalse(regime_gate_active)
 
 
 class IdleCashRelaxationTests(unittest.TestCase):
@@ -3790,6 +4058,8 @@ class IdleCashRelaxationTests(unittest.TestCase):
             working_orders={},
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=time.monotonic() - 999999,
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -3808,6 +4078,8 @@ class IdleCashRelaxationTests(unittest.TestCase):
             working_orders={},
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=stale,
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
