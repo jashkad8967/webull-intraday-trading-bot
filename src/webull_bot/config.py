@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     stock_symbols: str = "ALL"
     option_contracts: str = ""
-    option_underlyings: str = "ALL"
+    option_underlyings: str = ""
     option_type: str = Field(default="BOTH", pattern="^(CALL|PUT|BOTH)$")
     option_min_dte: int = Field(default=7, ge=0, le=730)
     option_max_dte: int = Field(default=45, ge=0, le=730)
@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # trend. Off by default - opt in once you've confirmed it fits your
     # symbol mix (a strict trend filter can meaningfully cut entry
     # frequency on a chop-heavy universe).
-    sma_trend_filter_enabled: bool = False
+    sma_trend_filter_enabled: bool = True
     sma_trend_days: int = Field(default=50, ge=5, le=250)
     # Directional short-selling in the main EMA/SMA stock strategy - a
     # fresh bearish EMA cross opens a short instead of just being skipped.
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # flatten same-day regardless of OVERNIGHT_HOLD_ENABLED - overnight
     # gap/squeeze risk on a short is asymmetric (unbounded loss) unlike a
     # long's overnight risk.
-    short_selling_enabled: bool = False
+    short_selling_enabled: bool = True
     popular_stock_symbols: str = (
         "NVDA,TSLA,AMD,AAPL,AMZN,META,MSFT,GOOGL,NFLX,AVGO,"
         "COIN,PLTR,MSTR,HOOD,SOFI,RIVN,GME,AMC,NIO,BABA,F,SNAP,UBER,"
@@ -98,30 +98,30 @@ class Settings(BaseSettings):
         le=1,
     )
     top_gainers_limit: int = Field(default=200, ge=0, le=5000)
-    fractional_shares_enabled: bool = False
-    fractional_shares_min_notional: Decimal = Field(default=Decimal("5"), ge=Decimal("5"))
+    fractional_shares_enabled: bool = True
+    fractional_shares_min_notional: Decimal = Field(default=Decimal("25"), ge=Decimal("5"))
     option_batch_size: int = Field(default=20, ge=1, le=20)
     option_discovery_per_cycle: int = Field(default=1, ge=1, le=10)
     option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)
 
     stock_quantity: int = Field(default=1, ge=1)
     option_quantity: int = Field(default=1, ge=1)
-    max_open_positions: int = Field(default=20, ge=1)
+    max_open_positions: int = Field(default=50, ge=1)
     max_order_notional: Decimal = Field(default=Decimal("1000"), gt=0)
 
     poll_seconds: Decimal = Field(
-        default=Decimal("1"), ge=Decimal("0.25"), le=Decimal("3600")
+        default=Decimal("0.25"), ge=Decimal("0.25"), le=Decimal("3600")
     )
-    trade_cooldown_seconds: Decimal = Field(default=Decimal("15"), ge=0, le=Decimal("21600"))
+    trade_cooldown_seconds: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("21600"))
     # TRADE_COOLDOWN_SECONDS is just an order-submission debounce (avoids
     # resubmitting within seconds of the last order); this is a separate,
     # much longer gate specifically on re-entering a symbol right after a
     # position in it just closed (profit, stop, or manual sell) - it
     # doesn't apply to the exit itself, only to the next BUY.
     stock_reentry_cooldown_seconds: Decimal = Field(
-        default=Decimal("600"), ge=0, le=Decimal("21600")
+        default=Decimal("0"), ge=0, le=Decimal("21600")
     )
-    stock_max_trades_per_hour: int = Field(default=12, ge=0, le=1000)
+    stock_max_trades_per_hour: int = Field(default=0, ge=0, le=1000)
     stock_oscillation_weight: Decimal = Field(
         default=Decimal("0.5"),
         ge=0,
@@ -310,7 +310,7 @@ class Settings(BaseSettings):
         le=Decimal("10"),
     )
 
-    agent_enabled: bool = False
+    agent_enabled: bool = True
     groq_api_key: str = ""
     # A plain (non-agentic) model, not one of Groq's Compound systems -
     # research is scored entirely from provided STATE data with no web

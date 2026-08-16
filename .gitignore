@@ -14,3 +14,4 @@ logs/
 status.json
 tests/.generated_logs/
 .claude/
+freqtrade-develop/
