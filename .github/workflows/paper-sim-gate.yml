@@ -1,0 +1,79 @@
+name: Paper-sim gate (auto-merge to main)
+
+# Every push to paper-trading-lane runs a fast, fully synthetic edge-case
+# suite (scripts/evaluate_paper_sim.py) - no live market data, no network
+# calls, no broker credentials. If, and only if, every check passes, this
+# workflow merges paper-trading-lane straight into main and pushes it -
+# main's existing deploy-gcp job (ci.yml) then deploys that to the live
+# account exactly as it does for any other push to main. There is no human
+# approval step in this path; the synthetic suite's coverage is the entire
+# safety margin standing before a change reaches real money, on top of
+# main's own always-on live guardrails (stop-loss guard, circuit breakers,
+# wash-sale blocking), which stay in effect regardless of what merges in.
+#
+# Any single failing check fails the whole gate loudly and leaves main
+# untouched - see scripts/evaluate_paper_sim.py's own docstring for the
+# exact list of checks.
+
+on:
+  push:
+    branches: [paper-trading-lane]
+
+permissions:
+  contents: write
+
+jobs:
+  paper-sim-gate:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: paper-sim-gate
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paper-trading-lane
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run the synthetic edge-case gate
+        run: python scripts/evaluate_paper_sim.py | tee "$RUNNER_TEMP/gate-output.txt"
+
+      - name: Publish job summary on failure
+        if: failure()
+        run: |
+          {
+            echo "## Paper-sim gate FAILED"
+            echo
+            echo '```'
+            tail -n 60 "$RUNNER_TEMP/gate-output.txt"
+            echo '```'
+            echo
+            echo "main was NOT updated."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Merge into main and push
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+          git merge --no-ff "${GITHUB_SHA}" \
+            -m "Auto-merge paper-trading-lane: paper-sim gate passed (${GITHUB_SHA})"
+          git push origin main
+
+      - name: Publish job summary on success
+        if: success()
+        run: |
+          {
+            echo "## Paper-sim gate PASSED"
+            echo
+            echo "Merged paper-trading-lane (\`${GITHUB_SHA}\`) into main."
+            echo "main's deploy-gcp job will now deploy this to the live account."
+          } >> "$GITHUB_STEP_SUMMARY"
