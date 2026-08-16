@@ -9,7 +9,6 @@ from rich.logging import RichHandler
 
 from webull_bot.commands import CommandQueue
 from webull_bot.config import settings
-from webull_bot.daily_logging import add_daily_file_logging
 from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.invalid_symbols import InvalidSymbolTracker
 from webull_bot.market_agent import MarketResearchAgent
