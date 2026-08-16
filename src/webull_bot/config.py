@@ -10,7 +10,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    mode: str = Field(default="LIVE", pattern="^LIVE$")
+    # PAPER simulates every account/trading call against an in-memory
+    # ledger instead of Webull's trade API (see PaperWebullAPI) - real
+    # market data (quotes, screeners, depth) is still used, so it's a
+    # meaningful dry run, not a mock. LIVE_TRADING_ENABLED is only
+    # required in LIVE mode - see validate_runtime.
+    mode: str = Field(default="LIVE", pattern="^(LIVE|PAPER)$")
     webull_app_key: str = ""
     webull_app_secret: str = ""
     account_id: str = ""
@@ -18,6 +23,12 @@ class Settings(BaseSettings):
     webull_environment: str = Field(default="prod", pattern="^prod$")
     webull_region_id: str = Field(default="us", pattern="^us$")
     live_trading_enabled: bool = True
+    # PAPER mode only - see PaperWebullAPI. Ignored in LIVE mode.
+    paper_starting_balance: Decimal = Field(default=Decimal("250"), gt=0)
+    paper_fill_slippage_percent: Decimal = Field(
+        default=Decimal("0"), ge=0, le=Decimal("0.05")
+    )
+    paper_state_file: str = "conf/paper_ledger.json"
 
     stock_symbols: str = "ALL"
     option_contracts: str = ""
@@ -470,7 +481,7 @@ class Settings(BaseSettings):
                 "Option session times must be ordered: OPTION_MARKET_OPEN_TIME, "
                 "OPTION_EOD_CLOSE_TIME, OPTION_MARKET_CLOSE_TIME"
             )
-        if not self.live_trading_enabled:
+        if self.mode == "LIVE" and not self.live_trading_enabled:
             raise ValueError("Production mode requires LIVE_TRADING_ENABLED=true")
         if self.agent_enabled and not self.groq_api_key:
             raise ValueError("GROQ_API_KEY is required when AGENT_ENABLED=true")
