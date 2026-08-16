@@ -26,12 +26,15 @@ class PaperWebullAPI(WebullAPI):
     its very next poll, matching this simulation's semantics.
     """
 
-    def __init__(self, config: Settings, market_data: WebullAPI | None = None):
-        # market_data is accepted for API-documentation clarity (the paper
-        # broker "wraps" a market-data source) but WebullAPI.__init__ is
-        # cheap to call again here (client construction, no network I/O) -
-        # inheriting directly keeps every market-data/pricing helper method
-        # working unmodified without needing to proxy each one by hand.
+    def __init__(self, config: Settings):
+        # Inheriting from WebullAPI (rather than wrapping/delegating to an
+        # instance of it) keeps every market-data/pricing helper method
+        # working unmodified without proxying each one by hand.
+        # WebullAPI.__init__ does perform a real network call here (the
+        # Webull SDK's TradeClient authenticates on construction) even
+        # though this class never uses self.trade afterward - see
+        # PaperWebullAPITests, which mocks that SDK client construction to
+        # keep its own tests network-free.
         super().__init__(config)
         self._state_path = Path(config.paper_state_file)
         self._cash = Decimal("0")
