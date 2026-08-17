@@ -179,6 +179,22 @@ class Settings(BaseSettings):
         ge=Decimal("0.5"),
         le=Decimal("5"),
     )
+    # Under this strategy's own stop discipline, a held position's live
+    # price should never legitimately drift this far from its cost basis -
+    # the adaptive stop (stock_stop_loss_max_percent, at most ~1.5%) would
+    # have already closed it out long before a real move got anywhere near
+    # 15%. If average_cost and the live quote diverge by more than this,
+    # treat average_cost as untrustworthy (a bad broker read, not a real
+    # price move) rather than deriving a target/stop from it - see
+    # TradingStrategy.stock_decision. Found via a live incident where a
+    # single stuck position (FPE) kept computing an exit target 13-60%
+    # above market, repeatedly submitting a limit order that could never
+    # fill.
+    stock_cost_price_sanity_percent: Decimal = Field(
+        default=Decimal("0.15"),
+        gt=0,
+        le=1,
+    )
     stock_entry_max_spread_percent: Decimal = Field(
         default=Decimal("0.50"),
         gt=0,

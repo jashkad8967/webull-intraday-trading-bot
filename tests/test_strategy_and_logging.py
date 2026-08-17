@@ -58,6 +58,7 @@ class StrategyConfigMixin:
             stock_stop_loss_max_percent=Decimal("0.02"),
             stock_stop_loss_range_multiplier=Decimal("0.35"),
             stock_target_stop_multiple=Decimal("1.2"),
+            stock_cost_price_sanity_percent=Decimal("0.15"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
             stock_core_session_position_fraction=Decimal("0.10"),
@@ -278,6 +279,51 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         strategy.stock_decision(key, Decimal("10.4"), 0, Decimal("0"))
         decision = strategy.stock_decision(key, Decimal("10.3"), 0, Decimal("0"))
         self.assertEqual(decision.action, "HOLD")
+
+    def test_stock_decision_holds_when_cost_diverges_implausibly_from_price(self):
+        """Regression test for a live incident: a held position (FPE) kept
+        computing a PROFIT target 13-60% above the live market price and
+        repeatedly submitting a limit order that could never fill, because
+        the broker-reported average_cost it was derived from had drifted
+        far from reality. This strategy's own adaptive stop tops out
+        around stock_stop_loss_max_percent - a real position should never
+        legitimately survive a divergence this large without having
+        already stopped out, so it's treated as bad data instead of a
+        real price move.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:FPE"
+        # average_cost (20) is 60%+ above the live price (~12.3) - far
+        # beyond anything this strategy's own stop discipline would ever
+        # let a real position reach.
+        decision = strategy.stock_decision(key, Decimal("12.32"), 1, Decimal("20"))
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(
+            decision.reason, "cost basis diverges implausibly from live price"
+        )
+
+    def test_stock_decision_short_position_also_guards_against_implausible_cost(self):
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:SHORTBAD"
+        decision = strategy.stock_decision(key, Decimal("20"), -1, Decimal("12.32"))
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(
+            decision.reason, "cost basis diverges implausibly from live price"
+        )
+
+    def test_stock_decision_tolerates_a_normal_divergence_within_the_sanity_band(self):
+        """A real, if unusually large, intraday move shouldn't trip the
+        guard - only a divergence beyond what this strategy's own stop
+        discipline would ever let survive should.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:MOVED"
+        # ~10% divergence - well under the 15% sanity band but still much
+        # larger than a normal scalp - should reach real stop/target math,
+        # not the sanity guard (the stop fires here since 10% down blows
+        # through even a widened adaptive stop).
+        decision = strategy.stock_decision(key, Decimal("90"), 1, Decimal("100"))
+        self.assertEqual(decision.action, "LOSS")
 
     def test_stock_decision_short_position_stop_and_profit_are_mirrored(self):
         strategy = TradingStrategy(self.config())
