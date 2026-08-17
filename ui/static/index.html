@@ -228,14 +228,24 @@
   .scroll-tall::-webkit-scrollbar-thumb:hover, .scroll-pending::-webkit-scrollbar-thumb:hover, .logs::-webkit-scrollbar-thumb:hover {
     background: var(--muted);
   }
-  .chart-wrap { height: 18rem; }
-  #balance-chart { width: 100%; height: 100%; display: block; overflow: visible; }
+  .chart-wrap { height: 18rem; display: flex; flex-direction: column; }
+  .chart-row { flex: 1; min-height: 0; display: flex; gap: var(--sp-2); }
+  #balance-chart { flex: 1; min-width: 0; height: 100%; display: block; overflow: visible; }
   .chart-line { fill: none; stroke-width: 0.5; vector-effect: non-scaling-stroke; }
   .chart-line.up { stroke: var(--green); }
   .chart-line.down { stroke: var(--red); }
   .chart-area.up { fill: var(--green); opacity: 0.12; }
   .chart-area.down { fill: var(--red); opacity: 0.12; }
+  .chart-gridline { stroke: var(--border); stroke-width: 0.3; vector-effect: non-scaling-stroke; opacity: 0.7; }
   .chart-empty-text { font-size: 3px; fill: var(--muted); text-anchor: middle; }
+  .chart-yaxis {
+    flex: none; width: 3.6rem; display: flex; flex-direction: column; justify-content: space-between;
+    padding: 0.1rem 0; font-size: var(--fs-xs); color: var(--muted); text-align: right;
+  }
+  .chart-xaxis {
+    display: flex; justify-content: space-between; margin-top: 0.3rem;
+    padding-right: calc(3.6rem + var(--sp-2)); font-size: var(--fs-xs); color: var(--muted);
+  }
 </style>
 </head>
 <body>
@@ -271,7 +281,11 @@
         <span class="sub" id="balance-chart-range"></span>
       </div>
       <div class="chart-wrap">
-        <svg id="balance-chart" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
+        <div class="chart-row">
+          <svg id="balance-chart" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
+          <div class="chart-yaxis" id="balance-chart-yaxis"></div>
+        </div>
+        <div class="chart-xaxis" id="balance-chart-xaxis"></div>
       </div>
     </div>
   </div>
@@ -331,6 +345,16 @@ function fmtNum(value) {
 function fmtTime(seconds) {
   if (!seconds) return "—";
   return new Date(seconds * 1000).toLocaleTimeString();
+}
+function fmtAxisTime(seconds) {
+  if (!seconds) return "—";
+  return new Date(seconds * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+function fmtAxisMoney(value) {
+  const n = Number(value);
+  if (Number.isNaN(n)) return "—";
+  const sign = n < 0 ? "-" : "";
+  return sign + "$" + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
 }
 function pnlClass(value) {
   if (value == null) return "";
@@ -462,9 +486,13 @@ async function refresh() {
 function renderBalanceChart(history) {
   const svg = document.getElementById("balance-chart");
   const rangeEl = document.getElementById("balance-chart-range");
+  const yAxisEl = document.getElementById("balance-chart-yaxis");
+  const xAxisEl = document.getElementById("balance-chart-xaxis");
   if (!history || history.length < 2) {
     svg.innerHTML = '<text x="50" y="16" class="chart-empty-text">Waiting for balance history…</text>';
     rangeEl.textContent = "";
+    yAxisEl.innerHTML = "";
+    xAxisEl.innerHTML = "";
     return;
   }
   const values = history.map(p => Number(p.balance));
@@ -485,9 +513,31 @@ function renderBalanceChart(history) {
   const cls = up ? "up" : "down";
   const linePoints = points.join(" ");
   const areaPoints = `0,${H} ${linePoints} ${W},${H}`;
+
+  const Y_TICKS = 4;
+  let gridlines = "";
+  const yLabels = [];
+  for (let i = 0; i < Y_TICKS; i++) {
+    const frac = i / (Y_TICKS - 1);
+    const value = yMax - (yMax - yMin) * frac;
+    const y = H * frac;
+    gridlines += `<line class="chart-gridline" x1="0" y1="${y.toFixed(2)}" x2="${W}" y2="${y.toFixed(2)}"></line>`;
+    yLabels.push(`<span>${fmtAxisMoney(value)}</span>`);
+  }
+  yAxisEl.innerHTML = yLabels.join("");
+
   svg.innerHTML =
+    gridlines +
     `<polygon class="chart-area ${cls}" points="${areaPoints}"></polygon>` +
     `<polyline class="chart-line ${cls}" points="${linePoints}"></polyline>`;
+
+  const X_TICKS = 3;
+  const xLabels = [];
+  for (let i = 0; i < X_TICKS; i++) {
+    const idx = Math.round((i / (X_TICKS - 1)) * (history.length - 1));
+    xLabels.push(`<span>${fmtAxisTime(history[idx].time)}</span>`);
+  }
+  xAxisEl.innerHTML = xLabels.join("");
 
   const change = last - first;
   const changePct = first !== 0 ? (change / Math.abs(first)) * 100 : 0;
