@@ -78,6 +78,7 @@ class StatusWriter:
         unrealized_pnl_total: Decimal = Decimal("0"),
         user_watchlist: list[str] | None = None,
         pending_orders: list[dict] | None = None,
+        gate_rejections: dict[str, int] | None = None,
     ) -> None:
         payload = {
             "updated_at": time.time(),
@@ -91,6 +92,7 @@ class StatusWriter:
             "universe": {"stocks": stock_count, "options": option_count},
             "recent_trades": list(self.trades),
             "pending_orders": pending_orders or [],
+            "gate_rejections": gate_rejections or {},
             "pnl_today": {
                 "realized": str(realized_pnl_today),
                 "unrealized": str(unrealized_pnl_total),

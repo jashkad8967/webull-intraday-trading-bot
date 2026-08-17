@@ -38,6 +38,7 @@ services:
       LOG_DIRECTORY: /var/data/logs
       TRADING_TIMEZONE: America/New_York
       COMMAND_FILE: /var/commands/commands.json
+      GIT_SHA: ${BOT_IMAGE_TAG:-local}
       TZ: America/New_York
     volumes:
       - trading-data-paper:/var/data:ro
