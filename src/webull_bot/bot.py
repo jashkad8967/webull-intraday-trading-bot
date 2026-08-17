@@ -111,6 +111,9 @@ class AutoTrader:
             state_file=self.config.trade_history_state_file,
         )
         self.last_status_write = 0.0
+        # Coarser than last_status_write on purpose - a chart doesn't need
+        # a point every poll cycle (0.25s), just enough to look live.
+        self.last_balance_history_write = 0.0
         self.stock_symbols: list[str] = []
         self.reserve_symbols: list[str] = []
         self.stock_categories: dict[str, str] = {}
@@ -3066,6 +3069,20 @@ class AutoTrader:
             Decimal("0"),
         )
         now = time.monotonic()
+        if now - self.last_balance_history_write >= 20:
+            self.last_balance_history_write = now
+            # Signed quantity (negative for shorts) makes this the same
+            # cash + market-value equity formula for both directions - a
+            # short's proceeds already sit in buying_power, and its
+            # negative position value nets out the buy-back liability.
+            total_equity = buying_power + sum(
+                (
+                    Decimal(row["quantity"]) * Decimal(row["last_price"])
+                    for row in position_rows
+                ),
+                Decimal("0"),
+            )
+            self.status.record_balance(total_equity)
         pending_order_rows = [
             {
                 "order_id": order_id,

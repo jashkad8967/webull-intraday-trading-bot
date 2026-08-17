@@ -225,6 +225,14 @@
   .scroll-tall::-webkit-scrollbar-thumb:hover, .scroll-pending::-webkit-scrollbar-thumb:hover, .logs::-webkit-scrollbar-thumb:hover {
     background: var(--muted);
   }
+  .chart-wrap { height: 8.75rem; }
+  #balance-chart { width: 100%; height: 100%; display: block; overflow: visible; }
+  .chart-line { fill: none; stroke-width: 0.5; vector-effect: non-scaling-stroke; }
+  .chart-line.up { stroke: var(--green); }
+  .chart-line.down { stroke: var(--red); }
+  .chart-area.up { fill: var(--green); opacity: 0.12; }
+  .chart-area.down { fill: var(--red); opacity: 0.12; }
+  .chart-empty-text { font-size: 3px; fill: var(--muted); text-anchor: middle; }
 </style>
 </head>
 <body>
@@ -259,6 +267,15 @@
   </div>
 
   <div class="panels">
+    <div class="panel span3 accent-blue">
+      <div class="toolbar" style="margin-bottom: var(--sp-2);">
+        <h2 style="margin:0">Account Balance</h2>
+        <span class="sub" id="balance-chart-range"></span>
+      </div>
+      <div class="chart-wrap">
+        <svg id="balance-chart" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
     <div class="panel span2 accent-teal">
       <div class="toolbar">
         <h2 style="margin:0">Open Positions</h2>
@@ -433,9 +450,52 @@ async function refresh() {
       { label: "Reason", render: r => r[0] },
       { label: "Count", render: r => fmtNum(r[1]), num: true },
     ], rejections, [78, 22]);
+
+    renderBalanceChart(data.balance_history || []);
   } catch (err) {
     dot.className = "dot";
   }
+}
+
+function renderBalanceChart(history) {
+  const svg = document.getElementById("balance-chart");
+  const rangeEl = document.getElementById("balance-chart-range");
+  if (!history || history.length < 2) {
+    svg.innerHTML = '<text x="50" y="16" class="chart-empty-text">Waiting for balance history…</text>';
+    rangeEl.textContent = "";
+    return;
+  }
+  const values = history.map(p => Number(p.balance));
+  const first = values[0];
+  const last = values[values.length - 1];
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const pad = (max - min) * 0.12 || Math.abs(first) * 0.01 || 1;
+  const yMin = min - pad;
+  const yMax = max + pad;
+  const W = 100, H = 30;
+  const points = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * W;
+    const y = H - ((v - yMin) / (yMax - yMin)) * H;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  });
+  const up = last >= first;
+  const cls = up ? "up" : "down";
+  const linePoints = points.join(" ");
+  const areaPoints = `0,${H} ${linePoints} ${W},${H}`;
+  svg.innerHTML =
+    `<polygon class="chart-area ${cls}" points="${areaPoints}"></polygon>` +
+    `<polyline class="chart-line ${cls}" points="${linePoints}"></polyline>`;
+
+  const change = last - first;
+  const changePct = first !== 0 ? (change / Math.abs(first)) * 100 : 0;
+  const sign = change >= 0 ? "+" : "";
+  const spanSeconds = history[history.length - 1].time - history[0].time;
+  const spanLabel = spanSeconds >= 3600
+    ? `${(spanSeconds / 3600).toFixed(1)}h`
+    : `${Math.round(spanSeconds / 60)}m`;
+  rangeEl.textContent =
+    `${fmtMoney(first)} → ${fmtMoney(last)} (${sign}${fmtMoney(change)} / ${sign}${changePct.toFixed(2)}%) · last ${spanLabel}`;
 }
 
 async function postAction(url, body, msgEl, busyLabel, doneLabel) {
