@@ -128,6 +128,10 @@
 
   /* — top row: compact stat list + pending orders side by side — */
   .top-row { display: flex; gap: var(--sp-4); align-items: stretch; margin-bottom: var(--sp-4); }
+  .stack-col { display: flex; flex-direction: column; gap: var(--sp-4); }
+  .balance-panel { display: flex; flex-direction: column; }
+  .balance-panel .chart-wrap { flex: 1; }
+  .headline-value { font-weight: 700; font-variant-numeric: tabular-nums; margin-top: var(--sp-1); }
   .stat-list {
     flex: 1; min-width: 0;
     background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
@@ -225,7 +229,7 @@
   .scroll-tall::-webkit-scrollbar-thumb:hover, .scroll-pending::-webkit-scrollbar-thumb:hover, .logs::-webkit-scrollbar-thumb:hover {
     background: var(--muted);
   }
-  .chart-wrap { height: 13rem; }
+  .chart-wrap { height: 18rem; }
   #balance-chart { width: 100%; height: 100%; display: block; overflow: visible; }
   .chart-line { fill: none; stroke-width: 0.5; vector-effect: non-scaling-stroke; }
   .chart-line.up { stroke: var(--green); }
@@ -245,8 +249,35 @@
   </div>
 
   <div class="top-row">
+    <div class="stack-col" style="flex: 1; min-width: 0;">
+      <div class="panel accent-blue">
+        <h2>Buying Power</h2>
+        <div class="headline-value" id="buying-power" style="font-size: var(--fs-xl);">—</div>
+      </div>
+      <div class="panel accent-amber" style="flex: 1;">
+        <h2>Watchlist</h2>
+        <div class="watchlist-add">
+          <input type="text" id="watchlist-input" placeholder="Add symbol (e.g. AAPL)" onkeydown="if(event.key==='Enter') addToWatchlist()">
+          <button class="btn" onclick="addToWatchlist()">Add</button>
+        </div>
+        <div class="action-msg" id="watchlist-msg"></div>
+        <div class="scroll-tall" id="watchlist"></div>
+      </div>
+    </div>
+
+    <div class="panel accent-blue balance-panel" style="flex: 2.3; min-width: 0;">
+      <div class="toolbar" style="margin-bottom: var(--sp-2);">
+        <h2 style="margin:0">Account Balance</h2>
+        <span class="sub" id="balance-chart-range"></span>
+      </div>
+      <div class="chart-wrap">
+        <svg id="balance-chart" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+  </div>
+
+  <div class="top-row">
     <div class="stat-list">
-      <div class="stat-row"><span class="label">Buying Power</span><span class="value" id="buying-power">—</span></div>
       <div class="stat-row">
         <span class="label">P&amp;L Today</span>
         <span class="value-stack">
@@ -264,16 +295,6 @@
       <div class="action-msg" id="pending-orders-msg"></div>
       <div class="scroll-pending" id="pending-orders"></div>
     </div>
-
-    <div class="panel accent-blue" style="flex: 1.1; min-width: 0;">
-      <div class="toolbar" style="margin-bottom: var(--sp-2);">
-        <h2 style="margin:0">Account Balance</h2>
-      </div>
-      <div class="chart-wrap">
-        <svg id="balance-chart" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
-      </div>
-      <div class="sub" id="balance-chart-range" style="margin-top: var(--sp-2); text-align: center;"></div>
-    </div>
   </div>
 
   <div class="panels">
@@ -288,15 +309,6 @@
     <div class="panel span2 accent-violet">
       <h2>Recent Trades</h2>
       <div class="scroll-tall" id="trades"></div>
-    </div>
-    <div class="panel accent-amber">
-      <h2>Watchlist</h2>
-      <div class="watchlist-add">
-        <input type="text" id="watchlist-input" placeholder="Add symbol (e.g. AAPL)" onkeydown="if(event.key==='Enter') addToWatchlist()">
-        <button class="btn" onclick="addToWatchlist()">Add</button>
-      </div>
-      <div class="action-msg" id="watchlist-msg"></div>
-      <div class="scroll-tall" id="watchlist"></div>
     </div>
     <div class="panel accent-rose">
       <h2>Research Agent</h2>
