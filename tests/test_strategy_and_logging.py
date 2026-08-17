@@ -2786,6 +2786,65 @@ class StatusWriterTests(unittest.TestCase):
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
+    def test_record_balance_appears_in_the_written_payload(self):
+        path = Path("tests/.generated_status/status5.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(path))
+            writer.record_balance(Decimal("1234.56"))
+            writer.write(
+                mode="LIVE",
+                buying_power=Decimal("1000"),
+                positions=[],
+                watchlist=[],
+                agent_summary=None,
+                paused=False,
+                stock_count=10,
+                option_count=0,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["balance_history"]), 1)
+            self.assertEqual(payload["balance_history"][0]["balance"], "1234.56")
+            self.assertIn("time", payload["balance_history"][0])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_balance_history_survives_a_new_statuswriter_instance(self):
+        status_path = Path("tests/.generated_status/status6.json")
+        state_path = Path("tests/.generated_status/trade_history6.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path), state_file=str(state_path))
+            writer.record_balance(Decimal("500.25"))
+
+            restarted = StatusWriter(str(status_path), state_file=str(state_path))
+            self.assertEqual(len(restarted.balance_history), 1)
+            self.assertEqual(restarted.balance_history[0]["balance"], "500.25")
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
+    def test_pre_existing_plain_list_state_file_still_loads_as_trades(self):
+        """The state file predates balance history and may already exist on
+        a running deployment as a bare JSON list of trades (the old
+        format) - it must keep loading correctly, just with no balance
+        history yet, rather than erroring or silently discarding trades.
+        """
+        status_path = Path("tests/.generated_status/status7.json")
+        state_path = Path("tests/.generated_status/trade_history7.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps([{"symbol": "OLDFMT", "instrument_type": "STOCK"}]),
+                encoding="utf-8",
+            )
+            writer = StatusWriter(str(status_path), state_file=str(state_path))
+            self.assertEqual(len(writer.trades), 1)
+            self.assertEqual(writer.trades[0]["symbol"], "OLDFMT")
+            self.assertEqual(list(writer.balance_history), [])
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
     def test_recorded_trade_history_survives_a_new_statuswriter_instance(self):
         status_path = Path("tests/.generated_status/status3.json")
         state_path = Path("tests/.generated_status/trade_history3.json")

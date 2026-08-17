@@ -11,32 +11,59 @@ log = logging.getLogger("webull-bot")
 class StatusWriter:
     """Writes a small JSON snapshot the dashboard UI polls; read-only for trading."""
 
-    def __init__(self, path: str, trade_history: int = 50, state_file: str | None = None):
+    def __init__(
+        self,
+        path: str,
+        trade_history: int = 50,
+        state_file: str | None = None,
+        balance_history_length: int = 1440,
+    ):
         self.path = Path(path)
         self.trade_history = trade_history
         self.state_path = Path(state_file) if state_file else None
-        self.trades: deque = deque(self._load_trades(), maxlen=trade_history)
+        loaded_trades, loaded_balance_history = self._load_state()
+        self.trades: deque = deque(loaded_trades, maxlen=trade_history)
+        self.balance_history: deque = deque(
+            loaded_balance_history, maxlen=balance_history_length
+        )
 
-    def _load_trades(self) -> list[dict]:
+    def _load_state(self) -> tuple[list[dict], list[dict]]:
         if self.state_path is None:
-            return []
+            return [], []
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return []
+            return [], []
         except Exception as exc:
-            log.warning("STATUS | trade history read failed | %s", exc)
-            return []
-        if not isinstance(payload, list):
-            return []
-        return payload
+            log.warning("STATUS | state read failed | %s", exc)
+            return [], []
+        if isinstance(payload, list):
+            # Pre-existing state file from before balance history existed -
+            # just a plain list of trades.
+            return payload, []
+        if isinstance(payload, dict):
+            trades = payload.get("trades", [])
+            balance_history = payload.get("balance_history", [])
+            return (
+                trades if isinstance(trades, list) else [],
+                balance_history if isinstance(balance_history, list) else [],
+            )
+        return [], []
 
-    def _save_trades(self) -> None:
+    def _save_state(self) -> None:
         if self.state_path is None:
             return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(list(self.trades)), encoding="utf-8")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "trades": list(self.trades),
+                    "balance_history": list(self.balance_history),
+                }
+            ),
+            encoding="utf-8",
+        )
         temporary.replace(self.state_path)
 
     def record_trade(
@@ -61,7 +88,16 @@ class StatusWriter:
                 "entry_price": str(entry_price) if entry_price is not None else None,
             }
         )
-        self._save_trades()
+        self._save_state()
+
+    def record_balance(self, balance: Decimal) -> None:
+        """Appends one point to the account-equity history the dashboard
+        charts - see AutoTrader.write_status_snapshot for the throttling
+        (this is called far less often than every status write; a point
+        every few seconds is already more than a chart needs).
+        """
+        self.balance_history.append({"time": time.time(), "balance": str(balance)})
+        self._save_state()
 
     def write(
         self,
@@ -93,6 +129,7 @@ class StatusWriter:
             "recent_trades": list(self.trades),
             "pending_orders": pending_orders or [],
             "gate_rejections": gate_rejections or {},
+            "balance_history": list(self.balance_history),
             "pnl_today": {
                 "realized": str(realized_pnl_today),
                 "unrealized": str(unrealized_pnl_total),
