@@ -12,7 +12,6 @@ from webull_bot.config import settings
 from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.invalid_symbols import InvalidSymbolTracker
 from webull_bot.market_agent import MarketResearchAgent
-from webull_bot.paper_broker import PaperWebullAPI
 from webull_bot.pairs import (
     PAIRS,
     PAIRS_CAPITAL_FRACTION,
@@ -80,11 +79,7 @@ class AutoTrader:
     def __init__(self):
         self.config = settings()
         self.config.validate_runtime()
-        self.api = (
-            PaperWebullAPI(self.config)
-            if self.config.mode == "PAPER"
-            else WebullAPI(self.config)
-        )
+        self.api = WebullAPI(self.config)
         self.strategy = TradingStrategy(self.config)
         self.market_agent = (
             MarketResearchAgent(self.config, log)
