@@ -502,9 +502,15 @@ class MarketResearchAgent:
                 {"role": "user", "content": prompt},
             ],
             "response_format": {"type": "json_object"},
-            # 8000 leaves a small margin under Groq's typical 8192-token
-            # output ceiling rather than requesting the max itself.
-            "max_completion_tokens": 8000,
+            # This account's on-demand tier caps combined prompt+completion
+            # tokens at 8000 per request (Groq's admission control rejects
+            # the request outright, before the model even runs, once
+            # prompt_tokens + max_completion_tokens exceeds that). 4000
+            # leaves comfortable room for STATE to grow while still being
+            # far more than a real response has needed in testing (under
+            # 900 completion tokens, reasoning included, for a 5-symbol
+            # payload).
+            "max_completion_tokens": 4000,
             # Low, not zero: keeps numeric fields consistent/reproducible run
             # to run instead of drifting, while still leaving enough room for
             # the model to weigh conflicting signals rather than collapsing
@@ -524,6 +530,16 @@ class MarketResearchAgent:
             # the truncated/malformed/empty responses _parse_response's
             # fallback kept having to catch, not the output schema itself.
             request_kwargs["compound_custom"] = {"tools": {"enabled_tools": []}}
+        if "gpt-oss" in self.config.groq_model.lower():
+            # gpt-oss is a reasoning model - it spends hidden "reasoning"
+            # tokens (counted against max_completion_tokens) before writing
+            # the actual JSON answer. Left uncapped this reintroduces the
+            # same category of risk Compound caused (unpredictable
+            # non-answer overhead crowding out the real response); "low"
+            # keeps it small (~15-200 tokens observed) instead of unbounded.
+            # Only sent for gpt-oss - Groq rejects this param outright for
+            # Compound, and other model families use a different enum.
+            request_kwargs["reasoning_effort"] = self.config.groq_reasoning_effort
         # Exactly one Groq call per research cycle, deliberately no retry -
         # a retry-with-different-params here would count a second time
         # against both AGENT_DAILY_REQUEST_LIMIT and the rolling token

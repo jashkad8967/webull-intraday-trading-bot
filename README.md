@@ -704,11 +704,11 @@ request throttles remain enforced.
 ## Optional web-research agent
 
 The strategy and execution loop do not wait for the agent. A background worker
-uses a plain Groq model (`llama-3.3-70b-versatile` by default - deliberately
-*not* one of Groq's agentic Compound systems, see below) to score held
-positions and EMA entry candidates purely from the numeric STATE data the bot
-already has (price/change/volume/spread, plus `STATE.market_pulse` - today's
-actual top gainers/losers/most-active from Webull's own screeners, see
+uses a Groq model (`openai/gpt-oss-120b` by default - deliberately *not* one
+of Groq's agentic Compound systems, see below) to score held positions and
+EMA entry candidates purely from the numeric STATE data the bot already has
+(price/change/volume/spread, plus `STATE.market_pulse` - today's actual top
+gainers/losers/most-active from Webull's own screeners, see
 `AutoTrader.refresh_market_pulse`). Its output changes which symbols are
 scanned most often; it cannot approve, reject, or submit an order.
 
@@ -722,10 +722,20 @@ the model to keep JSON compact, then disabling the tool outright via
 Compound's orchestration layer itself was the actual source of the problem,
 not anything in the prompt or schema. Since assessment was always computed
 purely from STATE's numeric data - it never needed search to begin with -
-switching to a plain, non-agentic model removes that whole layer rather than
-trying to keep working around it. If `GROQ_MODEL` is still set to a Compound
-system, `compound_custom` is only sent in that case (a plain model doesn't
+switching off Compound removes that whole layer rather than trying to keep
+working around it. If `GROQ_MODEL` is still set to a Compound system,
+`compound_custom` is only sent in that case (a non-Compound model doesn't
 understand the parameter).
+
+The original replacement, `llama-3.3-70b-versatile`, was a genuinely plain
+(non-reasoning) model - Groq has since removed it and every other plain chat
+model from its catalog. Every general-purpose model left is a reasoning
+model, which reintroduces a smaller version of the same risk Compound had:
+hidden "thinking" tokens, counted against `max_completion_tokens`, spent
+before the actual JSON answer. `GROQ_REASONING_EFFORT` (only sent to
+`gpt-oss` models, same conditional pattern as `compound_custom`) keeps that
+overhead small and bounded - `low` measured at roughly 15-200 tokens in
+testing - rather than the unbounded, unpredictable overhead Compound had.
 
 Create a free Groq developer key at
 [console.groq.com/keys](https://console.groq.com/keys), then add it to `.env`:
@@ -733,7 +743,8 @@ Create a free Groq developer key at
 ```dotenv
 AGENT_ENABLED=true
 GROQ_API_KEY=your_groq_api_key
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-120b
+GROQ_REASONING_EFFORT=low
 AGENT_CORE_RESEARCH_SECONDS=360
 AGENT_EXTENDED_RESEARCH_SECONDS=1866
 AGENT_DAILY_TOKEN_BUDGET=90000
@@ -775,11 +786,16 @@ between calls.
 Groq's real cap, though, is tokens per day (TPD) on the model itself, not
 request count - a quiet account can hit `rate_limit_exceeded` well under the
 83-request budget above. `AGENT_DAILY_TOKEN_BUDGET` must match your actual
-Groq model/tier TPD limit (see
-[console.groq.com/settings/billing](https://console.groq.com/settings/billing))
-with some margin - the default assumes the free/on-demand
-`llama-3.3-70b-versatile` tier (100000 TPD). The bot tracks its own rolling
-24-hour usage from each response's real token count and stops submitting
+Groq model/tier TPD limit with some margin - check
+[console.groq.com/settings/billing](https://console.groq.com/settings/billing)
+for the real number, since Groq doesn't report it in response headers and it
+varies by account/tier/model. There's a separate, tighter per-minute cap
+(TPM) too, enforced up front against `prompt_tokens + max_completion_tokens`
+before the model even runs - a free/on-demand account measured at 8000 TPM
+regardless of which model was used, which is why `max_completion_tokens` is
+4000 rather than higher (see `market_agent.py`); a bigger `AGENT_MAX_SYMBOLS`
+grows the prompt side of that same 8000-token ceiling. The bot tracks its own
+rolling 24-hour usage from each response's real token count and stops submitting
 before it would hit that ceiling. If it still 429s anyway, the bot stops
 all research for the rest of the session instead of retrying after Groq's
 own "try again in Nm" hint - that hint is only
@@ -1599,7 +1615,8 @@ DAILY_MAX_LOSS_DOLLARS=50
 
 AGENT_ENABLED=true
 GROQ_API_KEY=
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-120b
+GROQ_REASONING_EFFORT=low
 AGENT_CORE_RESEARCH_SECONDS=360
 AGENT_EXTENDED_RESEARCH_SECONDS=1866
 AGENT_DAILY_TOKEN_BUDGET=90000
