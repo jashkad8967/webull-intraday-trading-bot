@@ -188,7 +188,7 @@
 <body>
 <div class="page">
   <div class="header-bar">
-    <h1><span class="dot" id="live-dot"></span> Webull Scalping Bot <span class="badge" id="mode-badge"></span></h1>
+    <h1><span class="dot" id="live-dot"></span> Webull Scalping Bot <span class="badge" id="mode-badge"></span> <span class="badge" id="build-badge" title="Currently deployed git commit"></span></h1>
     <div class="header-right">
       <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode" aria-label="Toggle dark/light mode">◐</button>
     </div>
@@ -241,6 +241,10 @@
     <div class="panel">
       <h2>Research Agent</h2>
       <div id="agent"></div>
+    </div>
+    <div class="panel span2">
+      <h2>Entry Gates</h2>
+      <div id="gate-rejections"></div>
     </div>
     <div class="panel span3">
       <h2>Live Logs</h2>
@@ -297,6 +301,7 @@ async function refresh() {
   try {
     const res = await fetch("/api/status", { cache: "no-store" });
     const data = await res.json();
+    document.getElementById("build-badge").textContent = data.git_sha ? `build ${data.git_sha}` : "";
 
     if (!data.updated_at) {
       dot.className = "dot";
@@ -380,6 +385,12 @@ async function refresh() {
         `<div style="margin-top:0.4rem"><strong>Most active:</strong> ${pulseList(pulse.most_active)}</div>` +
         `<div style="margin-top:0.4rem"><strong>Boosted priority:</strong> ${popular}</div>`;
     }
+
+    const rejections = Object.entries(data.gate_rejections || {});
+    document.getElementById("gate-rejections").innerHTML = table([
+      { label: "Reason", render: r => r[0] },
+      { label: "Count", render: r => fmtNum(r[1]), num: true },
+    ], rejections, [78, 22]);
   } catch (err) {
     dot.className = "dot";
   }

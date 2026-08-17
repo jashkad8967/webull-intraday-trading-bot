@@ -3087,6 +3087,11 @@ class AutoTrader:
             }
             for order_id, order in self.working_orders.items()
         ]
+        top_gate_rejections = dict(
+            sorted(
+                self.gate_rejections.items(), key=lambda item: item[1], reverse=True
+            )[:5]
+        )
         self.status.write(
             mode=self.config.mode,
             buying_power=buying_power,
@@ -3100,6 +3105,7 @@ class AutoTrader:
             unrealized_pnl_total=unrealized_total,
             user_watchlist=sorted(self.user_watchlist),
             pending_orders=pending_order_rows,
+            gate_rejections=top_gate_rejections,
         )
 
     def overnight_hold_symbols(self) -> set[str]:

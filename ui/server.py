@@ -16,6 +16,7 @@ STATUS_FILE = Path(os.environ.get("STATUS_FILE", "status.json"))
 LOG_DIRECTORY = Path(os.environ.get("LOG_DIRECTORY", "logs"))
 TRADING_TIMEZONE = os.environ.get("TRADING_TIMEZONE", "America/New_York")
 COMMAND_FILE = Path(os.environ.get("COMMAND_FILE", "commands.json"))
+GIT_SHA = os.environ.get("GIT_SHA", "local")[:8]
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI()
@@ -128,6 +129,7 @@ def status() -> JSONResponse:
         payload = {"updated_at": None, "message": "Waiting for the bot to write its first status update."}
     except (json.JSONDecodeError, OSError):
         payload = {"updated_at": None, "message": "Status file is mid-write, try again shortly."}
+    payload["git_sha"] = GIT_SHA
     return JSONResponse(payload)
 
 
