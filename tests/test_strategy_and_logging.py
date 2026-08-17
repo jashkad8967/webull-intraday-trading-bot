@@ -2760,29 +2760,6 @@ class StatusWriterTests(unittest.TestCase):
             )
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(payload["pending_orders"], [])
-            self.assertEqual(payload["gate_rejections"], {})
-        finally:
-            shutil.rmtree(path.parent, ignore_errors=True)
-
-    def test_write_includes_gate_rejections_for_the_dashboard(self):
-        path = Path("tests/.generated_status/status4.json")
-        shutil.rmtree(path.parent, ignore_errors=True)
-        try:
-            writer = StatusWriter(str(path))
-            writer.write(
-                mode="LIVE",
-                buying_power=Decimal("1000"),
-                positions=[],
-                watchlist=[],
-                agent_summary=None,
-                paused=False,
-                stock_count=10,
-                option_count=0,
-                gate_rejections={"price below session VWAP": 12, "spread too wide": 3},
-            )
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["gate_rejections"]["price below session VWAP"], 12)
-            self.assertEqual(payload["gate_rejections"]["spread too wide"], 3)
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 

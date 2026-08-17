@@ -174,8 +174,6 @@
   .panel.accent-amber h2 { color: var(--amber); }
   .panel.accent-rose { border-left-color: var(--rose); }
   .panel.accent-rose h2 { color: var(--rose); }
-  .panel.accent-green { border-left-color: var(--green); }
-  .panel.accent-green h2 { color: var(--green); }
   .panel.span2 { grid-column: span 2; }
   .panel.span3 { grid-column: span 3; }
 
@@ -251,8 +249,9 @@
   <div class="top-row">
     <div class="stack-col" style="flex: 1; min-width: 0;">
       <div class="panel accent-blue">
-        <h2>Buying Power</h2>
-        <div class="headline-value" id="buying-power" style="font-size: var(--fs-xl);">—</div>
+        <h2>P&amp;L Today</h2>
+        <div class="headline-value" id="pnl-today" style="font-size: var(--fs-xl);">—</div>
+        <div class="sub" id="pnl-breakdown"></div>
       </div>
       <div class="panel accent-amber" style="flex: 1;">
         <h2>Watchlist</h2>
@@ -278,33 +277,27 @@
 
   <div class="top-row">
     <div class="stat-list">
-      <div class="stat-row">
-        <span class="label">P&amp;L Today</span>
-        <span class="value-stack">
-          <span class="value" id="pnl-today">—</span>
-          <span class="sub" id="pnl-breakdown"></span>
-        </span>
-      </div>
+      <div class="stat-row"><span class="label">Buying Power</span><span class="value" id="buying-power">—</span></div>
       <div class="stat-row"><span class="label">Open Positions</span><span class="value" id="position-count">—</span></div>
       <div class="stat-row"><span class="label">Universe</span><span class="value" id="universe">—</span></div>
       <div class="stat-row"><span class="label">Last Update</span><span class="value" id="last-update">—</span></div>
     </div>
 
-    <div class="panel accent-blue" style="flex: 2; min-width: 0;">
-      <h2>Pending Orders</h2>
-      <div class="action-msg" id="pending-orders-msg"></div>
-      <div class="scroll-pending" id="pending-orders"></div>
-    </div>
-  </div>
-
-  <div class="panels">
-    <div class="panel span2 accent-teal">
+    <div class="panel accent-teal" style="flex: 2; min-width: 0;">
       <div class="toolbar">
         <h2 style="margin:0">Open Positions</h2>
         <button class="btn danger" id="close-all-btn" onclick="closeAll()">Close All</button>
       </div>
       <div class="action-msg" id="positions-msg"></div>
       <div class="scroll-tall" id="positions"></div>
+    </div>
+  </div>
+
+  <div class="panels">
+    <div class="panel span2 accent-blue">
+      <h2>Pending Orders</h2>
+      <div class="action-msg" id="pending-orders-msg"></div>
+      <div class="scroll-pending" id="pending-orders"></div>
     </div>
     <div class="panel span2 accent-violet">
       <h2>Recent Trades</h2>
@@ -313,10 +306,6 @@
     <div class="panel accent-rose">
       <h2>Research Agent</h2>
       <div id="agent"></div>
-    </div>
-    <div class="panel span2 accent-green">
-      <h2>Entry Gates</h2>
-      <div id="gate-rejections"></div>
     </div>
     <div class="panel span3">
       <h2>Live Logs</h2>
@@ -386,7 +375,7 @@ async function refresh() {
     const pnl = data.pnl_today || {};
     const pnlEl = document.getElementById("pnl-today");
     pnlEl.textContent = fmtMoney(pnl.total ?? 0);
-    pnlEl.className = "value pnl-pill " + pnlClass(pnl.total ?? 0);
+    pnlEl.className = "headline-value pnl-pill " + pnlClass(pnl.total ?? 0);
     document.getElementById("pnl-breakdown").textContent =
       `realized ${fmtMoney(pnl.realized ?? 0)} · unrealized ${fmtMoney(pnl.unrealized ?? 0)}`;
     document.getElementById("position-count").textContent = (data.positions || []).length;
@@ -457,12 +446,6 @@ async function refresh() {
         `<div style="margin-top:0.4rem"><strong>Most active:</strong> ${pulseList(pulse.most_active)}</div>` +
         `<div style="margin-top:0.4rem"><strong>Boosted priority:</strong> ${popular}</div>`;
     }
-
-    const rejections = Object.entries(data.gate_rejections || {});
-    document.getElementById("gate-rejections").innerHTML = table([
-      { label: "Reason", render: r => r[0] },
-      { label: "Count", render: r => fmtNum(r[1]), num: true },
-    ], rejections, [78, 22]);
 
     renderBalanceChart(data.balance_history || []);
   } catch (err) {
