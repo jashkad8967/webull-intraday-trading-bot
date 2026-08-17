@@ -195,8 +195,10 @@
   .logs {
     background: #0a0d13; color: #c9d1d9; border-radius: 12px; padding: var(--sp-3);
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: var(--fs-xs);
-    line-height: 1.4; max-height: 3rem; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+    line-height: 1.4; max-height: 14rem; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
   }
+  .panel.fill { display: flex; flex-direction: column; }
+  .panel.fill .logs, .panel.fill .scroll-pending { flex: 1; max-height: none; }
   .btn {
     font: inherit; font-size: var(--fs-xs); font-weight: 650; padding: 0.4rem 0.85rem; border-radius: 999px;
     border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer;
@@ -294,11 +296,6 @@
   </div>
 
   <div class="panels">
-    <div class="panel span2 accent-blue">
-      <h2>Pending Orders</h2>
-      <div class="action-msg" id="pending-orders-msg"></div>
-      <div class="scroll-pending" id="pending-orders"></div>
-    </div>
     <div class="panel span2 accent-violet">
       <h2>Recent Trades</h2>
       <div class="scroll-tall" id="trades"></div>
@@ -307,7 +304,12 @@
       <h2>Research Agent</h2>
       <div id="agent"></div>
     </div>
-    <div class="panel span3">
+    <div class="panel span2 accent-blue fill">
+      <h2>Pending Orders</h2>
+      <div class="action-msg" id="pending-orders-msg"></div>
+      <div class="scroll-pending" id="pending-orders"></div>
+    </div>
+    <div class="panel fill">
       <h2>Live Logs</h2>
       <div class="logs" id="logs"></div>
     </div>
@@ -335,6 +337,13 @@ function pnlClass(value) {
   if (value == null) return "";
   const n = Number(value);
   return n > 0 ? "pos" : n < 0 ? "neg" : "";
+}
+function orderSide(action) {
+  // SHORT opens a position by selling first; PROFIT/STOP/MANUAL_SELL close
+  // one by selling (the common long case) - everything else here is an
+  // order that buys.
+  const sells = ["SHORT", "PROFIT", "STOP", "MANUAL_SELL"];
+  return sells.includes(action) ? "SELL" : "BUY";
 }
 
 function table(headers, rows, colWidths) {
@@ -395,19 +404,17 @@ async function refresh() {
     ], data.positions);
 
     document.getElementById("pending-orders").innerHTML = table([
-      { label: "Symbol", render: r => r.symbol ?? "—" },
-      { label: "Action", render: r => r.action ?? "—" },
+      { label: "Time", render: r => r.age_seconds != null ? fmtTime(Date.now() / 1000 - r.age_seconds) : "—" },
+      { label: "Stock", render: r => r.symbol ?? "—" },
+      { label: "Buy/Sell", render: r => orderSide(r.action) },
       { label: "Price", render: r => r.limit_price != null ? fmtMoney(r.limit_price) : "market", num: true },
-      { label: "P&L", render: r => "—", num: true },
-      { label: "Placed", render: r => r.age_seconds != null ? fmtTime(Date.now() / 1000 - r.age_seconds) : "—" },
-      { label: "Age", render: r => r.age_seconds != null ? `${r.age_seconds}s` : "—", num: true },
       {
         label: "",
         render: r => r.cancel_requested
           ? '<span class="pill">cancelling…</span>'
           : `<button class="btn danger" onclick="cancelOrder('${r.order_id}','${r.symbol}')">Cancel</button>`,
       },
-    ], data.pending_orders, [16, 12, 14, 12, 16, 12, 18]);
+    ], data.pending_orders, [24, 22, 18, 16, 20]);
 
     document.getElementById("trades").innerHTML = table([
       { label: "Time", render: r => fmtTime(r.time) },
