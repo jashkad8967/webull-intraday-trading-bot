@@ -195,10 +195,9 @@
   .logs {
     background: #0a0d13; color: #c9d1d9; border-radius: 12px; padding: var(--sp-3);
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: var(--fs-xs);
-    line-height: 1.4; max-height: 14rem; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+    line-height: 1.4; max-height: 16rem; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
   }
-  .panel.fill { display: flex; flex-direction: column; }
-  .panel.fill .logs, .panel.fill .scroll-pending { flex: 1; max-height: none; }
+  .panel.shrink { align-self: start; }
   .btn {
     font: inherit; font-size: var(--fs-xs); font-weight: 650; padding: 0.4rem 0.85rem; border-radius: 999px;
     border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer;
@@ -304,12 +303,12 @@
       <h2>Research Agent</h2>
       <div id="agent"></div>
     </div>
-    <div class="panel span2 accent-blue fill">
+    <div class="panel accent-blue shrink">
       <h2>Pending Orders</h2>
       <div class="action-msg" id="pending-orders-msg"></div>
       <div class="scroll-pending" id="pending-orders"></div>
     </div>
-    <div class="panel fill">
+    <div class="panel span2">
       <h2>Live Logs</h2>
       <div class="logs" id="logs"></div>
     </div>
