@@ -10,7 +10,7 @@ name: Paper-sim gate (auto-merge + deploy)
 # anti-recursion design, so that deploy never fired. Doing the deploy as
 # a job here instead sidesteps that entirely.)
 #
-#   validate -> paper-sim-gate -> deploy-paper -> merge-to-main -> deploy-live
+#   validate -> paper-sim-gate -> merge-to-main -> deploy-live
 #
 # validate: compileall, the full test suite, deploy-script syntax, compose
 #   config checks, both Docker images building - no network calls.
@@ -20,13 +20,6 @@ name: Paper-sim gate (auto-merge + deploy)
 #   always-on live guardrails (stop-loss guard, circuit breakers, wash-sale
 #   blocking), which stay in effect regardless of what merges in. Any
 #   failure here stops the chain - no merge, no deploy, main untouched.
-# deploy-paper: deploys paper-trading-lane's own code (experimental
-#   features enabled) to the separate /opt/webull-bot-paper stack for live
-#   observation, gated on GCP_PAPER_DEPLOY_ENABLED. Runs after the gate
-#   passes and before the live merge, but is best-effort with respect to
-#   the rest of the chain - merge-to-main proceeds whether this job is
-#   skipped (flag not set) or fails (a paper-stack infra hiccup is not a
-#   reason to block a change that already passed the real safety gate).
 # merge-to-main: on a clean pass, merges this exact commit into main and
 #   pushes - no PR, no human approval step. This is a deliberate, explicitly
 #   confirmed choice.
@@ -53,9 +46,8 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m compileall -q src tests ui scripts
       - run: PYTHONPATH=src python -m unittest discover -v -s tests
-      - run: bash -n deploy/gcp/bootstrap.sh deploy/gcp/deploy.sh deploy/gcp/deploy-paper.sh
+      - run: bash -n deploy/gcp/bootstrap.sh deploy/gcp/deploy.sh
       - run: BOT_ENV_FILE="$GITHUB_WORKSPACE/.env.example" BOT_IMAGE_TAG=ci docker compose -f deploy/compose.yaml config
-      - run: BOT_ENV_FILE="$GITHUB_WORKSPACE/.env.example" BOT_IMAGE_TAG=ci docker compose -f deploy/compose.paper.yaml config
       - run: docker build --tag webull-intraday-trading-bot:ci .
       - run: docker build --tag webull-trading-dashboard:ci ui
 
@@ -86,61 +78,8 @@ jobs:
             echo "main was NOT updated."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  deploy-paper:
-    needs: paper-sim-gate
-    if: vars.GCP_PAPER_DEPLOY_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    concurrency:
-      group: gcp-paper
-      cancel-in-progress: false
-    env:
-      GCP_HOST: ${{ secrets.GCP_HOST }}
-      GCP_USER: ${{ secrets.GCP_USER }}
-      GCP_SSH_PORT: ${{ secrets.GCP_SSH_PORT || '22' }}
-      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
-      GCP_KNOWN_HOSTS: ${{ secrets.GCP_KNOWN_HOSTS }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure verified SSH access
-        run: |
-          install -m 700 -d "$HOME/.ssh"
-          printf '%s\n' "$GCP_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-          printf '%s\n' "$GCP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 600 "$HOME/.ssh/known_hosts"
-
-      - name: Package release
-        run: |
-          tar \
-            --exclude=.git \
-            --exclude=.env \
-            --exclude=.venv \
-            --exclude=.webull-skill-venv \
-            --exclude=conf \
-            --exclude=logs \
-            --exclude=__pycache__ \
-            -czf "$RUNNER_TEMP/webull-bot-paper-${GITHUB_SHA}.tar.gz" .
-
-      - name: Upload release
-        run: |
-          scp \
-            -P "$GCP_SSH_PORT" \
-            "$RUNNER_TEMP/webull-bot-paper-${GITHUB_SHA}.tar.gz" \
-            "${GCP_USER}@${GCP_HOST}:/tmp/webull-bot-paper-${GITHUB_SHA}.tar.gz"
-
-      - name: Deploy to the paper host
-        run: |
-          ssh \
-            -p "$GCP_SSH_PORT" \
-            "${GCP_USER}@${GCP_HOST}" \
-            "/opt/webull-bot-paper/bin/deploy '/tmp/webull-bot-paper-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"
-
   merge-to-main:
-    needs: [paper-sim-gate, deploy-paper]
-    if: |
-      always() &&
-      needs.paper-sim-gate.result == 'success'
+    needs: paper-sim-gate
     runs-on: ubuntu-latest
     concurrency:
       group: paper-sim-gate-merge

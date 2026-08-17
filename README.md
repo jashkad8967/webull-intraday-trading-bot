@@ -1458,69 +1458,33 @@ docker exec webull-trading-bot tail -n 200 /var/data/logs/YYYY/MM/YYYY-MM-DD.log
 docker restart webull-trading-bot
 ```
 
-### Add the paper-trading lane (optional)
-
-The `paper-trading-lane` branch runs a second, fully independent stack
-(`webull-trading-bot-paper` / `webull-trading-dashboard-paper`) on the same
-VM, dry-running experimental strategy features against real market data
-through [`PaperWebullAPI`](src/webull_bot/paper_broker.py) - it never calls
-Webull's trade API, so it's safe to point at the same account credentials as
-the live bot. It has its own release root, Docker volumes, and deploy
-script, so a bad paper build can never touch the live bot's containers or
-state. This is a one-time, manual setup - it is not part of `bootstrap.sh`.
-
-On the VM:
-
-```bash
-sudo install -d -m 0750 -o "$USER" -g "$USER" \
-  /opt/webull-bot-paper /opt/webull-bot-paper/bin \
-  /opt/webull-bot-paper/releases /opt/webull-bot-paper/shared
-sudo install -m 0750 -o "$USER" -g "$USER" \
-  ~/webull-intraday-trading-bot/deploy/gcp/deploy-paper.sh \
-  /opt/webull-bot-paper/bin/deploy
-docker volume create webull-trading-data-paper
-docker volume create webull-trading-commands-paper
-nano /opt/webull-bot-paper/shared/.env
-```
-
-Seed that `.env` with `MODE=PAPER`, the same `WEBULL_APP_KEY`/
-`WEBULL_APP_SECRET`/`ACCOUNT_ID` as the live `.env` (read-only market data
-only - `PaperWebullAPI` never submits a real order), `LIVE_TRADING_ENABLED`
-can stay unset (PAPER mode doesn't require it), and whichever of the
-experimental feature flags you want exercised
-(`SYMBOL_QUARANTINE_ENABLED`, `TIME_AWARE_STOP_ENABLED`,
-`REGIME_GATE_ENABLED`) plus `PAPER_STARTING_BALANCE`.
-
-In GitHub, add the repository variable:
-
-```text
-GCP_PAPER_DEPLOY_ENABLED=true
-```
+### The paper-trading-lane auto-merge gate
 
 Every push to `paper-trading-lane` runs
 [`.github/workflows/paper-sim-gate.yml`](.github/workflows/paper-sim-gate.yml),
-a single self-contained pipeline with five jobs:
+a single self-contained pipeline:
 
 ```
-validate ─┬─> paper-sim-gate -> merge-to-main -> deploy-live
-           └─> deploy-paper
+validate -> paper-sim-gate -> merge-to-main -> deploy-live
 ```
 
 `validate` compiles and runs the full test suite; `paper-sim-gate` runs
 `scripts/evaluate_paper_sim.py`'s fully synthetic scenario suite (no
-network calls, no market hours dependency - see
-[`tests/paper_sim/scenarios.py`](tests/paper_sim/scenarios.py)). Only on a
-clean pass does `merge-to-main` merge that exact commit into `main` and
-push - no PR, no human approval step, an explicit and deliberate choice -
-after which `deploy-live` deploys it to the live host (gated on
-`GCP_DEPLOY_ENABLED`, the same variable `ci.yml`'s own `deploy-gcp` job
-uses for direct pushes to `main`). `deploy-paper` runs independently of
-that chain, deploying `paper-trading-lane`'s own code (experimental
-features enabled) to `/opt/webull-bot-paper` for live observation - it
-never touches `main` or the live account either way.
+network calls, no market hours dependency, done in well under a couple of
+minutes - see [`tests/paper_sim/scenarios.py`](tests/paper_sim/scenarios.py)
+for the full scenario list: gap opens, volatility whipsaws, spread
+extremes, the fractional lot-size boundary, the stop-loss guard, each
+experimental strategy feature, the day-boundary sweep, idle-cash
+relaxation). Only on a clean pass does `merge-to-main` merge that exact
+commit into `main` and push - no PR, no human approval step, an explicit
+and deliberate choice - after which `deploy-live` deploys it to the live
+host (gated on `GCP_DEPLOY_ENABLED`, the same variable `ci.yml`'s own
+`deploy-gcp` job uses for direct pushes to `main`).
 
-View the paper dashboard with `ssh -L 8081:localhost:8081 <user>@<host>`
-and open localhost:8081 (the live dashboard stays on 8080).
+This is the entire safety margin standing between an experimental change
+and the live account, on top of `main`'s own always-on guardrails
+(stop-loss guard, circuit breakers, wash-sale blocking). Any single
+failing check fails the gate loudly and leaves `main` untouched.
 
 ## Complete configuration example
 
