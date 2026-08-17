@@ -1725,6 +1725,141 @@ class ResearchDiscoveryTests(unittest.TestCase):
 
         self.assertNotIn("compound_custom", captured)
 
+    def test_research_includes_reasoning_effort_for_a_gpt_oss_model(self):
+        """gpt-oss is a reasoning model - its hidden "thinking" tokens are
+        counted against max_completion_tokens, so reasoning_effort must be
+        sent to keep that overhead small and bounded instead of unbounded
+        (the same category of risk Compound's orchestration overhead was,
+        just smaller - see groq_model's default in config.py).
+        """
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250,
+            groq_model="openai/gpt-oss-120b",
+            groq_reasoning_effort="low",
+        )
+        agent.log = logging.getLogger("test-agent")
+        agent._requests_today = 0
+        agent._assessments = {}
+        agent._lock = threading.Lock()
+
+        captured = {}
+
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return FakeResponse("{}")
+
+        agent.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=fake_create)
+            )
+        )
+
+        agent._research({"positions": [], "candidates": []})
+
+        self.assertEqual(captured["reasoning_effort"], "low")
+        self.assertNotIn("compound_custom", captured)
+
+    def test_research_omits_reasoning_effort_for_a_non_gpt_oss_model(self):
+        """reasoning_effort is a gpt-oss-specific parameter - Groq rejects
+        it outright for Compound, and other model families use a different
+        enum, so it must only be sent when groq_model is actually gpt-oss.
+        """
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250,
+            groq_model="groq/compound-mini",
+        )
+        agent.log = logging.getLogger("test-agent")
+        agent._requests_today = 0
+        agent._assessments = {}
+        agent._lock = threading.Lock()
+
+        captured = {}
+
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return FakeResponse("{}")
+
+        agent.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=fake_create)
+            )
+        )
+
+        agent._research({"positions": [], "candidates": []})
+
+        self.assertNotIn("reasoning_effort", captured)
+
+    def test_research_requests_a_tpm_safe_completion_budget(self):
+        """This account's on-demand tier caps prompt_tokens +
+        max_completion_tokens at 8000 per request, enforced before the
+        model runs - requesting the old 8000 ceiling here would always be
+        rejected outright once any real STATE prompt is added on top of it.
+        """
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250,
+            groq_model="openai/gpt-oss-120b",
+            groq_reasoning_effort="low",
+        )
+        agent.log = logging.getLogger("test-agent")
+        agent._requests_today = 0
+        agent._assessments = {}
+        agent._lock = threading.Lock()
+
+        captured = {}
+
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return FakeResponse("{}")
+
+        agent.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=fake_create)
+            )
+        )
+
+        agent._research({"positions": [], "candidates": []})
+
+        self.assertLessEqual(captured["max_completion_tokens"], 4000)
+
     def test_normalize_no_longer_produces_a_discoveries_key(self):
         """Discovery of new symbols moved out of the model entirely (see
         AutoTrader.refresh_market_pulse) - _normalize's output shape

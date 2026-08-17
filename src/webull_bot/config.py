@@ -312,12 +312,20 @@ class Settings(BaseSettings):
 
     agent_enabled: bool = True
     groq_api_key: str = ""
-    # A plain (non-agentic) model, not one of Groq's Compound systems -
-    # research is scored entirely from provided STATE data with no web
-    # search (see market_agent.py), so Compound's tool-orchestration layer
-    # was pure overhead: the actual source of the truncated/malformed/
-    # empty responses _parse_response kept having to work around.
-    groq_model: str = "llama-3.3-70b-versatile"
+    # Not one of Groq's Compound systems - research is scored entirely from
+    # provided STATE data with no web search (see market_agent.py), so
+    # Compound's tool-orchestration layer was pure overhead: the actual
+    # source of the truncated/malformed/empty responses _parse_response
+    # kept having to work around. Groq has since removed every plain
+    # (non-reasoning) chat model from its catalog - gpt-oss-120b is a
+    # reasoning model too, but its hidden "thinking" tokens are small and
+    # bounded (unlike Compound's orchestration overhead) and controllable
+    # via groq_reasoning_effort below, so it's the closer match.
+    groq_model: str = "openai/gpt-oss-120b"
+    # Only meaningful for a gpt-oss model (see market_agent.py's request
+    # builder) - "low" keeps hidden reasoning-token spend small so it
+    # doesn't crowd out the actual JSON answer within max_completion_tokens.
+    groq_reasoning_effort: str = "low"
     # Groq's own usage dashboard attributes each compound-mini call to 3
     # underlying model rows (the compound orchestration plus its 2 backing
     # models - see console.groq.com's per-key usage table), so the real
@@ -333,8 +341,8 @@ class Settings(BaseSettings):
     # Groq's real cap is tokens per day (TPD), not request count - a quiet
     # account can exhaust TPD in well under agent_daily_request_limit
     # requests. This must match your actual Groq model/tier TPD limit (see
-    # console.groq.com/settings/billing) with some margin - the default
-    # assumes the free/on-demand llama-3.3-70b-versatile tier (100000 TPD).
+    # console.groq.com/settings/billing, which is the only place Groq
+    # reports it - it isn't in any response header) with some margin.
     agent_daily_token_budget: int = Field(default=90000, ge=1000)
     # Smaller on purpose, trading research breadth for reliability: fewer
     # STATE symbols means a smaller expected response, which means a much
