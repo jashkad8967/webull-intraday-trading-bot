@@ -195,6 +195,9 @@ class AutoTrader:
         self.user_watchlist: set[str] = set(self.config.default_watchlist())
         self.gate_rejections: dict[str, int] = defaultdict(int)
         self.broker_conflict_symbols: set[str] = set()
+        # Throttles the SANITY warning below so a persistently bad broker
+        # read logs a periodic reminder instead of one line per scan cycle.
+        self.cost_sanity_warned_at: dict[str, float] = {}
         self.fractional_trading_enabled = True
         self.fractional_unsupported_symbols: set[str] = set()
         self.short_selling_supported = True
@@ -1929,6 +1932,28 @@ class AutoTrader:
                 )
                 if decision.action == "HOLD" and quantity == 0:
                     self.gate_rejections[decision.reason] += 1
+                if (
+                    decision.action == "HOLD"
+                    and quantity != 0
+                    and decision.reason == "cost basis diverges implausibly from live price"
+                ):
+                    # Rare and serious enough to warrant its own periodic
+                    # line rather than folding into gate_rejections' entry-
+                    # side summary - see stock_cost_price_sanity_percent.
+                    last_warned = self.cost_sanity_warned_at.get(symbol, 0.0)
+                    now_monotonic = time.monotonic()
+                    if now_monotonic - last_warned >= 300:
+                        self.cost_sanity_warned_at[symbol] = now_monotonic
+                        log.warning(
+                            "SANITY | %s | average_cost=%s diverges from "
+                            "live price=%s by more than %s%% - broker data "
+                            "looks wrong, skipping exit math until it "
+                            "recovers",
+                            symbol,
+                            cost,
+                            price,
+                            self.config.stock_cost_price_sanity_percent * 100,
+                        )
                 if decision.action == "BUY":
                     self.agent_candidates[symbol] = {
                         "symbol": symbol,

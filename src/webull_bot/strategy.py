@@ -683,6 +683,22 @@ class TradingStrategy:
     ) -> Decision:
         trend = self.trend_signal(key, price)
         symbol = key.split(":", 1)[-1]
+        if quantity != 0 and average_cost > 0 and price > 0:
+            # Every target/stop below is derived from average_cost - if the
+            # broker's reported cost basis has drifted implausibly far from
+            # the live quote (a bad read, not a real price move: this
+            # strategy's own adaptive stop would already have closed a
+            # position long before a real move reached this far), deriving
+            # a target from it produces an unreachable price that just
+            # churns failed orders forever instead of ever exiting. Holding
+            # is the safe default - it neither sells at a nonsense price
+            # nor buys more on bad data, and retries with fresh data next
+            # cycle instead of repeating the same bad order indefinitely.
+            divergence = abs(average_cost - price) / price
+            if divergence > self.config.stock_cost_price_sanity_percent:
+                return Decision(
+                    "HOLD", "cost basis diverges implausibly from live price", price
+                )
         if quantity > 0:
             # The flat per-sell fee doesn't scale with share count, so it
             # has to be converted to a per-share amount before it can be
