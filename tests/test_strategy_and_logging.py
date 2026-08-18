@@ -322,19 +322,17 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         """Regression test for a live incident: a held position (FPE) kept
         computing a PROFIT target 13-60% above the live market price and
         repeatedly submitting a limit order that could never fill, because
-        the broker-reported average_cost it was derived from had drifted
-        far from reality. This strategy's own adaptive stop tops out
-        around stock_stop_loss_max_percent - a real position should never
-        legitimately survive a divergence this large without having
-        already stopped out, so it's treated as bad data instead of a
-        real price move.
+        a quote field the target derived from had drifted far from
+        reality. The guard only needs to suppress that unreachable-target
+        path - a price implausibly *above* cost, not below (see the
+        sibling test confirming a stop still fires on a real, large
+        decline - the guard must never block that).
         """
         strategy = TradingStrategy(self.config())
         key = "STOCK:FPE"
-        # average_cost (20) is 60%+ above the live price (~12.3) - far
-        # beyond anything this strategy's own stop discipline would ever
-        # let a real position reach.
-        decision = strategy.stock_decision(key, Decimal("12.32"), 1, Decimal("20"))
+        # price (12) is 20% above cost (10) - without the guard this fires
+        # PROFIT off a suspect gain (target maxes ~2.7% above cost here).
+        decision = strategy.stock_decision(key, Decimal("12"), 1, Decimal("10"))
         self.assertEqual(decision.action, "HOLD")
         self.assertEqual(
             decision.reason, "cost basis diverges implausibly from live price"
@@ -343,11 +341,28 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_stock_decision_short_position_also_guards_against_implausible_cost(self):
         strategy = TradingStrategy(self.config())
         key = "STOCK:SHORTBAD"
-        decision = strategy.stock_decision(key, Decimal("20"), -1, Decimal("12.32"))
+        # price (8) is 20% below cost (10) - the mirror of the long case:
+        # a suspiciously large paper gain for a short, not a loss.
+        decision = strategy.stock_decision(key, Decimal("8"), -1, Decimal("10"))
         self.assertEqual(decision.action, "HOLD")
         self.assertEqual(
             decision.reason, "cost basis diverges implausibly from live price"
         )
+
+    def test_stock_decision_stop_loss_still_fires_despite_implausible_cost_divergence(self):
+        """Regression test for a live incident: a real, large decline
+        (AZI, ~31% since entry - a genuinely volatile stock, not bad
+        data: bid/ask were tight and consistent with the last-trade price)
+        sat with no working stop at all, because the sanity guard used to
+        run before the stop check too, not just before the profit target.
+        A stop-loss must always be able to fire regardless of how
+        implausible the divergence looks - failing to protect capital is
+        worse than a hypothetical bad cost reading.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:AZI"
+        decision = strategy.stock_decision(key, Decimal("1.21"), 1, Decimal("1.75"))
+        self.assertEqual(decision.action, "LOSS")
 
     def test_stock_decision_tolerates_a_normal_divergence_within_the_sanity_band(self):
         """A real, if unusually large, intraday move shouldn't trip the

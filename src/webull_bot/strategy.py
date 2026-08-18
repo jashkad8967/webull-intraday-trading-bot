@@ -690,22 +690,6 @@ class TradingStrategy:
     ) -> Decision:
         trend = self.trend_signal(key, price)
         symbol = key.split(":", 1)[-1]
-        if quantity != 0 and average_cost > 0 and price > 0:
-            # Every target/stop below is derived from average_cost - if the
-            # broker's reported cost basis has drifted implausibly far from
-            # the live quote (a bad read, not a real price move: this
-            # strategy's own adaptive stop would already have closed a
-            # position long before a real move reached this far), deriving
-            # a target from it produces an unreachable price that just
-            # churns failed orders forever instead of ever exiting. Holding
-            # is the safe default - it neither sells at a nonsense price
-            # nor buys more on bad data, and retries with fresh data next
-            # cycle instead of repeating the same bad order indefinitely.
-            divergence = abs(average_cost - price) / price
-            if divergence > self.config.stock_price_sanity_percent:
-                return Decision(
-                    "HOLD", "cost basis diverges implausibly from live price", price
-                )
         if quantity > 0:
             # The flat per-sell fee doesn't scale with share count, so it
             # has to be converted to a per-share amount before it can be
@@ -751,6 +735,24 @@ class TradingStrategy:
             stop = average_cost * (Decimal("1") - stop_percent)
             if average_cost > 0 and price <= stop:
                 return Decision("LOSS", "percentage stop reached", price)
+            if average_cost > 0 and price > 0:
+                # Checked here, not before the stop check above: a stop-
+                # loss must still fire even when average_cost has drifted
+                # a lot from the live price (a real, if large, move over
+                # several days is a legitimate reason for a stop to
+                # trigger - live incident: AZI, down ~30% since entry, sat
+                # completely unprotected because this used to gate the
+                # stop check too, not just the target below). Only
+                # deriving a PROFIT target from a suspect average_cost is
+                # the actual risk (an unreachable target that just churns
+                # failed orders forever - see stock_price_sanity_percent).
+                divergence = abs(average_cost - price) / price
+                if divergence > self.config.stock_price_sanity_percent:
+                    return Decision(
+                        "HOLD",
+                        "cost basis diverges implausibly from live price",
+                        price,
+                    )
             bias = self._exit_bias(assessment)
             target = base_target
             if (
@@ -804,6 +806,17 @@ class TradingStrategy:
             stop = average_cost * (Decimal("1") + stop_percent)
             if average_cost > 0 and price >= stop:
                 return Decision("LOSS", "percentage stop reached (short)", price)
+            if average_cost > 0 and price > 0:
+                # See the mirrored long-side comment above - a stop must
+                # still fire on a real, large move; only the profit target
+                # below needs protecting from a suspect average_cost.
+                divergence = abs(average_cost - price) / price
+                if divergence > self.config.stock_price_sanity_percent:
+                    return Decision(
+                        "HOLD",
+                        "cost basis diverges implausibly from live price",
+                        price,
+                    )
             bias = self._exit_bias(assessment)
             target = base_target
             if (
