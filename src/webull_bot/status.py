@@ -90,6 +90,21 @@ class StatusWriter:
         )
         self._save_state()
 
+    def discard_trade(self, order_id: str) -> None:
+        """Removes a trade-log entry that record_trade wrote optimistically
+        at order submission time, once AutoTrader.reverse_phantom_exit has
+        confirmed the order never actually filled. Without this, a
+        cancelled order stays on the dashboard's Recent Trades list
+        forever, labeled as a completed profit that never happened.
+        """
+        before = len(self.trades)
+        self.trades = deque(
+            (trade for trade in self.trades if trade.get("order_id") != order_id),
+            maxlen=self.trade_history,
+        )
+        if len(self.trades) != before:
+            self._save_state()
+
     def record_balance(self, balance: Decimal) -> None:
         """Appends one point to the account-equity history the dashboard
         charts - see AutoTrader.write_status_snapshot for the throttling

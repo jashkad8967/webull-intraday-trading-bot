@@ -695,7 +695,7 @@ class TradingStrategy:
             # nor buys more on bad data, and retries with fresh data next
             # cycle instead of repeating the same bad order indefinitely.
             divergence = abs(average_cost - price) / price
-            if divergence > self.config.stock_cost_price_sanity_percent:
+            if divergence > self.config.stock_price_sanity_percent:
                 return Decision(
                     "HOLD", "cost basis diverges implausibly from live price", price
                 )

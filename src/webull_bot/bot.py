@@ -865,7 +865,7 @@ class AutoTrader:
             )
             return
         if status in ("CANCELLED", "FAILED"):
-            self.reverse_phantom_exit(pnl)
+            self.reverse_phantom_exit(pnl, order_id)
             log.warning(
                 "ORDER  | %s | never filled (%s) - reversing $%s phantom "
                 "realized pnl | id=%s",
@@ -1452,7 +1452,9 @@ class AutoTrader:
         self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
         return pnl
 
-    def reverse_phantom_exit(self, pnl: Decimal | None) -> None:
+    def reverse_phantom_exit(
+        self, pnl: Decimal | None, order_id: str | None = None
+    ) -> None:
         """Undo a realized-exit pnl that was recorded at order SUBMISSION
         time (see record_realized_exit) once it's confirmed the order
         never actually filled - either it was cancelled/failed outright,
@@ -1460,7 +1462,15 @@ class AutoTrader:
         the gentle order and lets a fresh one fire its own pnl next
         cycle). Without this, an exit that never fills still permanently
         inflates the daily realized total as if it had.
+
+        Also discards the matching entry from the dashboard's trade log
+        (see StatusWriter.discard_trade) - record_trade wrote it
+        optimistically at the same submission time as the phantom pnl, so
+        without this a cancelled order stays visible on Recent Trades
+        forever, labeled as a completed profit that never happened.
         """
+        if order_id:
+            self.status.discard_trade(order_id)
         if not pnl:
             return
         self.daily_realized_pnl -= pnl
@@ -1733,7 +1743,7 @@ class AutoTrader:
                 # to be reversed now or it inflates the daily total for an
                 # exit that never actually happened.
                 if order:
-                    self.reverse_phantom_exit(order.get("pnl"))
+                    self.reverse_phantom_exit(order.get("pnl"), order_id)
             self.stop_loss_escalated.add(symbol)
             self.pending_stock_exits.discard(symbol)
             self.stop_exit_submitted.pop(symbol, None)
@@ -1939,7 +1949,7 @@ class AutoTrader:
                 ):
                     # Rare and serious enough to warrant its own periodic
                     # line rather than folding into gate_rejections' entry-
-                    # side summary - see stock_cost_price_sanity_percent.
+                    # side summary - see stock_price_sanity_percent.
                     last_warned = self.cost_sanity_warned_at.get(symbol, 0.0)
                     now_monotonic = time.monotonic()
                     if now_monotonic - last_warned >= 300:
@@ -1952,7 +1962,7 @@ class AutoTrader:
                             symbol,
                             cost,
                             price,
-                            self.config.stock_cost_price_sanity_percent * 100,
+                            self.config.stock_price_sanity_percent * 100,
                         )
                 if decision.action == "BUY":
                     self.agent_candidates[symbol] = {

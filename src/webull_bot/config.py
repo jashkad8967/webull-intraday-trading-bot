@@ -186,12 +186,25 @@ class Settings(BaseSettings):
     # 15%. If average_cost and the live quote diverge by more than this,
     # treat average_cost as untrustworthy (a bad broker read, not a real
     # price move) rather than deriving a target/stop from it - see
-    # TradingStrategy.stock_decision. Found via a live incident where a
-    # single stuck position (FPE) kept computing an exit target 13-60%
-    # above market, repeatedly submitting a limit order that could never
-    # fill.
-    stock_cost_price_sanity_percent: Decimal = Field(
+    # TradingStrategy.stock_decision. See quote_price_sanity_percent below
+    # for the related but separately-calibrated bid/ask check.
+    stock_price_sanity_percent: Decimal = Field(
         default=Decimal("0.15"),
+        gt=0,
+        le=1,
+    )
+    # A quote's bid/ask diverging this far from that SAME quote's own
+    # last-trade price - not over time, one snapshot - means distrust it
+    # (see WebullAPI._sane_bid_or_ask) rather than pricing an order off
+    # it. Deliberately much tighter than stock_price_sanity_percent: this
+    # account's own real quotes, including its thinnest PENNY-bucket
+    # names, never showed a spread-side divergence anywhere near this
+    # (worst observed ~5%), so 8% has real margin above genuine illiquid
+    # spreads while still catching the live incident that motivated this -
+    # FPE's ask sat 13-60% above its own last-trade price for hours,
+    # repeatedly pricing an exit order that could never fill.
+    quote_price_sanity_percent: Decimal = Field(
+        default=Decimal("0.08"),
         gt=0,
         le=1,
     )
