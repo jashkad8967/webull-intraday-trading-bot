@@ -2223,7 +2223,7 @@ class AutoTrader:
                     # be exited by a normal order at all until price moves
                     # back out of the band. Retrying every cycle just spams
                     # the same rejection, so skip (and count it) instead.
-                    if exit_quantity < self.strategy.minimum_lot_size(price):
+                    if self.strategy.exit_blocked_by_lot_restriction(exit_quantity, price):
                         self.gate_rejections[
                             "sub-$1 lot-restricted band - exit waits for "
                             "price to clear it"
@@ -2276,7 +2276,7 @@ class AutoTrader:
                             "fractional position - exit waits for core hours"
                         ] += 1
                         continue
-                    if exit_quantity < self.strategy.minimum_lot_size(price):
+                    if self.strategy.exit_blocked_by_lot_restriction(exit_quantity, price):
                         self.gate_rejections[
                             "sub-$1 lot-restricted band - exit waits for "
                             "price to clear it"
@@ -3005,7 +3005,7 @@ class AutoTrader:
                     # trade_stocks' exits - Webull rejects any order under
                     # 100 shares while price sits in that band, regardless
                     # of side or how many shares are actually held.
-                    if quantity < self.strategy.minimum_lot_size(sell_price):
+                    if self.strategy.exit_blocked_by_lot_restriction(quantity, sell_price):
                         continue
                     order_id = self.api.place_stock(
                         symbol,
