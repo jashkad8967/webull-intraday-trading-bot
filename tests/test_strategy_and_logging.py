@@ -2091,6 +2091,47 @@ class FractionalSharesTests(StrategyConfigMixin, unittest.TestCase):
         self.assertEqual(TradingStrategy.minimum_lot_size(Decimal("1.00")), 1)
         self.assertEqual(TradingStrategy.minimum_lot_size(Decimal("50.00")), 1)
 
+    def test_exit_blocked_by_lot_restriction_allows_a_fractional_exit_at_a_normal_price(self):
+        """Regression test for a live incident: every fractional position
+        (quantity < 1 share) at an ordinarily-priced stock - the common
+        case, not a rare one, since fractional entries are dollar-sized
+        slices of normal stocks - had every PROFIT/LOSS/stall-breaker exit
+        silently rejected, indefinitely, by the old bare `quantity <
+        minimum_lot_size(price)` comparison: minimum_lot_size returns 1
+        outside the $0.10-$0.999 band, and a fractional quantity is by
+        definition under 1, so that comparison was true for practically
+        every fractional position regardless of price. Confirmed against a
+        real live position (CVX, 0.1268 shares at ~$205) that couldn't
+        stop out despite a real, ordinary ~1% adverse move.
+        """
+        self.assertFalse(
+            TradingStrategy.exit_blocked_by_lot_restriction(
+                Decimal("0.1268"), Decimal("204.86")
+            )
+        )
+        self.assertFalse(
+            TradingStrategy.exit_blocked_by_lot_restriction(
+                Decimal("0.0356"), Decimal("768.24")
+            )
+        )
+
+    def test_exit_blocked_by_lot_restriction_still_blocks_the_real_sub_dollar_band(self):
+        self.assertTrue(
+            TradingStrategy.exit_blocked_by_lot_restriction(
+                Decimal("1"), Decimal("0.50")
+            )
+        )
+        self.assertTrue(
+            TradingStrategy.exit_blocked_by_lot_restriction(
+                Decimal("0.5"), Decimal("0.50")
+            )
+        )
+        self.assertFalse(
+            TradingStrategy.exit_blocked_by_lot_restriction(
+                Decimal("100"), Decimal("0.50")
+            )
+        )
+
     def test_stock_order_quantity_rounds_up_to_100_when_affordable(self):
         config = SimpleNamespace(stock_quantity=1, max_order_notional=Decimal("1000"))
         strategy = TradingStrategy.__new__(TradingStrategy)
@@ -4929,7 +4970,10 @@ class FractionalExitGuardTests(unittest.TestCase):
                 sell_fee_dollars=Decimal("0.02"),
             ),
             api=FakeApi(),
-            strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
+            strategy=SimpleNamespace(
+                minimum_lot_size=TradingStrategy.minimum_lot_size,
+                exit_blocked_by_lot_restriction=TradingStrategy.exit_blocked_by_lot_restriction,
+            ),
             stock_categories={},
             last_trade={},
             last_stall_boost=0.0,
@@ -4993,7 +5037,10 @@ class FractionalExitGuardTests(unittest.TestCase):
                 sell_fee_dollars=Decimal("0.02"),
             ),
             api=FakeApi(),
-            strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
+            strategy=SimpleNamespace(
+                minimum_lot_size=TradingStrategy.minimum_lot_size,
+                exit_blocked_by_lot_restriction=TradingStrategy.exit_blocked_by_lot_restriction,
+            ),
             stock_categories={},
             # A different symbol traded 10 seconds ago (the account is
             # "generally active"), but STALE's own last order was 500

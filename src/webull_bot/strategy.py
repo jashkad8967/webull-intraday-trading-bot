@@ -1033,6 +1033,25 @@ class TradingStrategy:
             return 100
         return 1
 
+    @classmethod
+    def exit_blocked_by_lot_restriction(cls, quantity: Decimal, price: Decimal) -> bool:
+        """True only when price sits in the $0.10-$0.999 band AND quantity
+        can't clear that band's 100-share minimum - NOT whenever quantity
+        is merely less than minimum_lot_size's return value.
+
+        minimum_lot_size returns 1 (a no-op floor) for every price outside
+        that band, so a bare `quantity < minimum_lot_size(price)` comparison
+        - three separate call sites in bot.py used to write it exactly that
+        way - reads as "true for practically every fractional position at
+        a normal price", since a fractional quantity is by definition under
+        1. That silently blocked every fractional position's PROFIT/LOSS/
+        stall-breaker exit at a normal price, indefinitely: not a rare
+        edge case, the common one, since fractional entries are dollar-
+        sized slices of ordinarily-priced stocks, not usually penny stocks.
+        """
+        min_lot = cls.minimum_lot_size(price)
+        return min_lot > 1 and quantity < min_lot
+
     def stock_order_quantity(
         self,
         price: Decimal,
