@@ -70,6 +70,7 @@ def _strategy_config(**overrides) -> SimpleNamespace:
         stock_priority_fraction=0.6,
         stock_penny_fraction=0.2,
         stock_oscillation_weight=Decimal("0.5"),
+        most_active_priority_bonus=Decimal("15"),
         penny_stock_max_price=Decimal("5"),
         popular_stock_min_volume=1_000_000,
         popular_stock_max_spread_percent=Decimal("0.50"),
