@@ -168,6 +168,8 @@
   .panel.accent-blue h2 { color: var(--accent); }
   .panel.accent-teal { border-left-color: var(--teal); }
   .panel.accent-teal h2 { color: var(--teal); }
+  .panel.accent-violet { border-left-color: var(--accent-2); }
+  .panel.accent-violet h2 { color: var(--accent-2); }
   .panel.accent-amber { border-left-color: var(--amber); }
   .panel.accent-amber h2 { color: var(--amber); }
   .panel.accent-rose { border-left-color: var(--rose); }
@@ -307,6 +309,14 @@
   </div>
 
   <div class="panels">
+    <div class="panel span2 accent-violet">
+      <h2>Recent Trades</h2>
+      <div class="scroll-tall" id="trades"></div>
+    </div>
+    <div class="panel accent-rose">
+      <h2>Research Agent</h2>
+      <div id="agent"></div>
+    </div>
     <div class="panel accent-blue shrink">
       <h2>Pending Orders</h2>
       <div class="action-msg" id="pending-orders-msg"></div>
@@ -315,10 +325,6 @@
     <div class="panel span2">
       <h2>Live Logs</h2>
       <div class="logs" id="logs"></div>
-    </div>
-    <div class="panel span3 accent-rose">
-      <h2>Research Agent</h2>
-      <div id="agent"></div>
     </div>
   </div>
 </div>
@@ -432,6 +438,16 @@ async function refresh() {
           : `<button class="btn danger" onclick="cancelOrder('${r.order_id}','${r.symbol}')">Cancel</button>`,
       },
     ], data.pending_orders, [24, 22, 18, 16, 20]);
+
+    document.getElementById("trades").innerHTML = table([
+      { label: "Time", render: r => fmtTime(r.time) },
+      { label: "Type", render: r => r.instrument_type ?? "—" },
+      { label: "Action", render: r => r.action ?? "—" },
+      { label: "Symbol", render: r => r.symbol ?? "—" },
+      { label: "Entry", render: r => r.entry_price != null ? fmtMoney(r.entry_price) : "—", num: true },
+      { label: "Exit", render: r => r.limit_price != null ? fmtMoney(r.limit_price) : "—", num: true },
+      { label: "P&L", render: r => r.pnl != null ? fmtMoney(r.pnl) : "—", cls: r => pnlClass(r.pnl), num: true },
+    ], data.recent_trades);
 
     document.getElementById("watchlist").innerHTML = table([
       { label: "Symbol", render: r => r.symbol ?? "—" },
