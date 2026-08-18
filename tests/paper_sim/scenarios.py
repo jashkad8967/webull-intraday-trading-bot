@@ -86,7 +86,7 @@ def _strategy_config(**overrides) -> SimpleNamespace:
         stock_stop_loss_max_percent=Decimal("0.02"),
         stock_stop_loss_range_multiplier=Decimal("0.35"),
         stock_target_stop_multiple=Decimal("1.2"),
-        stock_cost_price_sanity_percent=Decimal("0.15"),
+        stock_price_sanity_percent=Decimal("0.15"),
         stock_entry_max_spread_percent=Decimal("0.15"),
         stock_entry_max_extension_percent=Decimal("0.01"),
         stock_core_session_position_fraction=Decimal("0.10"),

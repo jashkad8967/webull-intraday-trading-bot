@@ -58,7 +58,7 @@ class StrategyConfigMixin:
             stock_stop_loss_max_percent=Decimal("0.02"),
             stock_stop_loss_range_multiplier=Decimal("0.35"),
             stock_target_stop_multiple=Decimal("1.2"),
-            stock_cost_price_sanity_percent=Decimal("0.15"),
+            stock_price_sanity_percent=Decimal("0.15"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
             stock_core_session_position_fraction=Decimal("0.10"),
@@ -852,6 +852,7 @@ class StopLossEscalationTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(stop_loss_escalate_seconds=15),
             api=SimpleNamespace(cancel=lambda order_id: cancelled.append(order_id)),
+            status=SimpleNamespace(discard_trade=lambda order_id: None),
             stop_exit_submitted={"ASHR": 0.0},
             pending_stock_exits={"ASHR"},
             stop_loss_escalated=set(),
@@ -3067,6 +3068,61 @@ class StatusWriterTests(unittest.TestCase):
             writer = StatusWriter(str(status_path))
             writer.record_trade("STOCK", "TSLA", "BUY", Decimal("100.00"), "order-1")
             self.assertIsNone(writer.trades[0]["entry_price"])
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
+    def test_discard_trade_removes_only_the_matching_order(self):
+        """Regression test for a live incident: a cancelled order's
+        optimistically-recorded trade-log entry stayed on the dashboard's
+        Recent Trades list forever, shown as a completed profit that never
+        happened - see AutoTrader.reverse_phantom_exit.
+        """
+        status_path = Path("tests/.generated_status/status7.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path))
+            writer.record_trade(
+                "STOCK", "TSLA", "PROFIT", Decimal("101.00"), "order-1",
+                pnl=Decimal("5.00"),
+            )
+            writer.record_trade(
+                "STOCK", "AAPL", "PROFIT", Decimal("201.00"), "order-2",
+                pnl=Decimal("3.00"),
+            )
+            writer.discard_trade("order-1")
+            self.assertEqual(len(writer.trades), 1)
+            self.assertEqual(writer.trades[0]["order_id"], "order-2")
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
+    def test_discard_trade_for_an_unknown_order_id_is_a_safe_noop(self):
+        status_path = Path("tests/.generated_status/status8.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path))
+            writer.record_trade(
+                "STOCK", "TSLA", "PROFIT", Decimal("101.00"), "order-1",
+                pnl=Decimal("5.00"),
+            )
+            writer.discard_trade("order-does-not-exist")
+            self.assertEqual(len(writer.trades), 1)
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
+    def test_discarded_trade_stays_gone_after_a_new_statuswriter_instance(self):
+        status_path = Path("tests/.generated_status/status9.json")
+        state_path = Path("tests/.generated_status/trade_history9.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path), state_file=str(state_path))
+            writer.record_trade(
+                "STOCK", "TSLA", "PROFIT", Decimal("101.00"), "order-1",
+                pnl=Decimal("5.00"),
+            )
+            writer.discard_trade("order-1")
+
+            restarted = StatusWriter(str(status_path), state_file=str(state_path))
+            self.assertEqual(len(restarted.trades), 0)
         finally:
             shutil.rmtree(status_path.parent, ignore_errors=True)
 
@@ -5377,25 +5433,75 @@ class OrderStatusExtractionTests(unittest.TestCase):
         self.assertIsNone(WebullAPI.order_status({"orders": [{}]}))
 
 
+def _fake_webull_api(**config_overrides):
+    """A SimpleNamespace standing in for WebullAPI, with the real
+    _quote_decimal/_sane_bid_or_ask implementations bound to it - lets
+    tests exercise the real pricing methods (stock_limit_price etc.)
+    without a real WebullAPI/SDK instance. _sane_bid_or_ask needs self
+    (it reads self.config and calls self._quote_decimal), so it's bound
+    via __get__ after fake_api exists rather than assigned directly like
+    _quote_decimal (a plain @staticmethod, callable either way).
+    """
+    config = SimpleNamespace(
+        quote_price_sanity_percent=Decimal("0.08"), **config_overrides
+    )
+    fake_api = SimpleNamespace(config=config, _quote_decimal=WebullAPI._quote_decimal)
+    fake_api._sane_bid_or_ask = WebullAPI._sane_bid_or_ask.__get__(fake_api)
+    return fake_api
+
+
 class ShortPricingTests(unittest.TestCase):
     def test_short_entry_uses_passive_mid_price(self):
-        fake_api = SimpleNamespace(
-            config=SimpleNamespace(stock_limit_offset=Decimal("0.005")),
-            _quote_decimal=WebullAPI._quote_decimal,
-        )
+        fake_api = _fake_webull_api(stock_limit_offset=Decimal("0.005"))
         price_fn = WebullAPI.stock_limit_price.__get__(fake_api)
         quote = {"bid": "10.00", "ask": "10.10"}
         self.assertEqual(price_fn(quote, "SHORT"), Decimal("10.05"))
 
     def test_cover_crosses_above_the_ask(self):
-        fake_api = SimpleNamespace(
-            config=SimpleNamespace(stock_limit_offset=Decimal("0.01")),
-            _quote_decimal=WebullAPI._quote_decimal,
-        )
+        fake_api = _fake_webull_api(stock_limit_offset=Decimal("0.01"))
         price_fn = WebullAPI.stock_limit_price.__get__(fake_api)
         quote = {"bid": "10.00", "ask": "10.10", "price": "10.05"}
         # 10.10 * 1.01 = 10.2010, quantized up to the next cent = 10.21.
         self.assertEqual(price_fn(quote, "COVER"), Decimal("10.21"))
+
+    def test_sell_side_falls_back_to_price_when_bid_is_a_broken_quote(self):
+        """Regression test for a live incident: FPE's ask sat at $20.08
+        while its last-trade price stayed ~$17.7-17.8 for hours, and every
+        exit-pricing path that trusted the raw ask submitted a limit order
+        that could never fill. bid/ask readers must fall through to the
+        quote's own last-trade price instead of trusting a bid/ask that
+        diverges implausibly from it.
+        """
+        fake_api = _fake_webull_api(stock_limit_offset=Decimal("0.01"))
+        price_fn = WebullAPI.stock_limit_price.__get__(fake_api)
+        # bid (2.00) is wildly below price (10.00) - an insane read, not a
+        # real market. Falls through to price, not the broken bid.
+        quote = {"bid": "2.00", "ask": "10.10", "price": "10.00"}
+        # 10.00 * (1 - 0.01) = 9.90.
+        self.assertEqual(price_fn(quote, "SELL"), Decimal("9.90"))
+
+    def test_cover_falls_back_to_price_when_ask_is_a_broken_quote(self):
+        fake_api = _fake_webull_api(stock_limit_offset=Decimal("0.01"))
+        price_fn = WebullAPI.stock_limit_price.__get__(fake_api)
+        # ask (20.08) is wildly above price (17.81) - the exact FPE shape.
+        quote = {"bid": "17.70", "ask": "20.08", "price": "17.81"}
+        # 17.81 * 1.01 = 17.9881, quantized up to the next cent = 17.99.
+        self.assertEqual(price_fn(quote, "COVER"), Decimal("17.99"))
+
+    def test_quote_ask_returns_none_for_a_quote_that_diverges_from_price(self):
+        fake_api = _fake_webull_api()
+        ask_fn = WebullAPI.quote_ask.__get__(fake_api)
+        self.assertIsNone(ask_fn({"ask": "20.08", "price": "17.81"}))
+
+    def test_quote_bid_returns_none_for_a_quote_that_diverges_from_price(self):
+        fake_api = _fake_webull_api()
+        bid_fn = WebullAPI.quote_bid.__get__(fake_api)
+        self.assertIsNone(bid_fn({"bid": "16.11", "price": "17.81"}))
+
+    def test_quote_ask_passes_through_a_normal_quote(self):
+        fake_api = _fake_webull_api()
+        ask_fn = WebullAPI.quote_ask.__get__(fake_api)
+        self.assertEqual(ask_fn({"ask": "17.85", "price": "17.81"}), Decimal("17.85"))
 
 
 class PhantomExitReversalTests(unittest.TestCase):
@@ -5468,9 +5574,11 @@ class PhantomExitReversalTests(unittest.TestCase):
             def order_status(detail):
                 return detail.get("status")
 
+        discarded_trades = []
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(order_monitor_seconds=Decimal("0")),
             api=FakeApi(),
+            status=SimpleNamespace(discard_trade=discarded_trades.append),
             last_order_monitor=0.0,
             working_orders={
                 "order-1": {
@@ -5498,6 +5606,10 @@ class PhantomExitReversalTests(unittest.TestCase):
 
         self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0"))
         self.assertNotIn("order-1", fake_bot.working_orders)
+        # Regression coverage for a live incident: a cancelled order's
+        # trade-log entry stayed on the dashboard's Recent Trades list
+        # forever, labeled as a completed profit that never happened.
+        self.assertEqual(discarded_trades, ["order-1"])
 
     def test_monitor_working_orders_leaves_pnl_alone_on_a_confirmed_fill(self):
         from webull_bot.bot import AutoTrader
@@ -5608,9 +5720,11 @@ class PhantomExitReversalTests(unittest.TestCase):
         """
         from webull_bot.bot import AutoTrader
 
+        discarded_trades = []
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(stop_loss_escalate_seconds=15),
             api=SimpleNamespace(cancel=lambda order_id: None),
+            status=SimpleNamespace(discard_trade=discarded_trades.append),
             stop_exit_submitted={"ASHR": 0.0},
             pending_stock_exits={"ASHR"},
             stop_loss_escalated=set(),
@@ -5634,6 +5748,7 @@ class PhantomExitReversalTests(unittest.TestCase):
             escalate()
 
         self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0"))
+        self.assertEqual(discarded_trades, ["order-1"])
 
 
 if __name__ == "__main__":

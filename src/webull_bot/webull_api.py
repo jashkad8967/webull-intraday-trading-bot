@@ -1014,8 +1014,8 @@ class WebullAPI:
             # exit, so it shouldn't use the aggressive crossing price the
             # `else` branch below is tuned for (that one's for buy-to-cover
             # unwinds and stop/profit exits that need a fast fill).
-            bid = self._quote_decimal(quote, "bid")
-            ask = self._quote_decimal(quote, "ask")
+            bid = self._sane_bid_or_ask(quote, "bid")
+            ask = self._sane_bid_or_ask(quote, "ask")
             if not bid or not ask or bid > ask:
                 raise QuoteUnavailableError(
                     "stock quote has no valid bid/ask spread for a buy"
@@ -1032,8 +1032,10 @@ class WebullAPI:
             # for a BUY that needs to guarantee a fast fill). Cross above
             # the ask instead, mirroring the same offset/urgency the SELL
             # branch uses on the other side of the book.
-            base = Decimal(
-                str(quote.get("ask") or quote.get("price") or quote.get("bid"))
+            base = (
+                self._sane_bid_or_ask(quote, "ask")
+                or self._quote_decimal(quote, "price")
+                or self._sane_bid_or_ask(quote, "bid")
             )
             price = base * (Decimal("1") + offset)
             return max(Decimal("0.01"), price).quantize(
@@ -1041,8 +1043,10 @@ class WebullAPI:
                 rounding=ROUND_UP,
             )
         else:
-            base = Decimal(
-                str(quote.get("bid") or quote.get("price") or quote.get("ask"))
+            base = (
+                self._sane_bid_or_ask(quote, "bid")
+                or self._quote_decimal(quote, "price")
+                or self._sane_bid_or_ask(quote, "ask")
             )
             price = base * (Decimal("1") - offset)
         return max(Decimal("0.01"), price).quantize(
@@ -1059,8 +1063,8 @@ class WebullAPI:
         immediate fill, since overshooting the bid on a fast-moving or
         thin quote is what turns a bounded stop into a much larger loss.
         """
-        bid = self._quote_decimal(quote, "bid")
-        ask = self._quote_decimal(quote, "ask")
+        bid = self._sane_bid_or_ask(quote, "bid")
+        ask = self._sane_bid_or_ask(quote, "ask")
         if not bid or not ask or bid > ask:
             raise QuoteUnavailableError(
                 "stock quote has no valid bid/ask spread for a stop exit"
@@ -1074,8 +1078,8 @@ class WebullAPI:
     def option_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.option_limit_offset
         if side == "BUY":
-            bid = self._quote_decimal(quote, "bid")
-            ask = self._quote_decimal(quote, "ask")
+            bid = self._sane_bid_or_ask(quote, "bid")
+            ask = self._sane_bid_or_ask(quote, "ask")
             if not bid or not ask or bid > ask:
                 raise QuoteUnavailableError(
                     "option quote has no valid bid/ask spread for a buy"
@@ -1086,8 +1090,10 @@ class WebullAPI:
                 rounding=ROUND_DOWN,
             )
         else:
-            base = Decimal(
-                str(quote.get("bid") or quote.get("price") or quote.get("ask"))
+            base = (
+                self._sane_bid_or_ask(quote, "bid")
+                or self._quote_decimal(quote, "price")
+                or self._sane_bid_or_ask(quote, "ask")
             )
             price = base * (Decimal("1") - offset)
         return max(Decimal("0.01"), price).quantize(Decimal("0.01"), rounding=ROUND_UP)
@@ -1102,6 +1108,32 @@ class WebullAPI:
         except Exception:
             return None
         return number if number.is_finite() and number > 0 else None
+
+    def _sane_bid_or_ask(self, quote: dict, field: str) -> Decimal | None:
+        """bid/ask extraction with a sanity check against the same quote's
+        own last-trade price.
+
+        Live incident: FPE's ask sat at $20.08 (once even $28.49) while
+        every other field on the same quote snapshot - last-trade price,
+        open/high/low, the broker's own cost basis - was consistently
+        ~$17.7-17.8. Every bid/ask consumer in this file went through
+        _quote_decimal directly or a raw quote["bid"]/quote["ask"] read,
+        so that one broken field fed a limit price no real order could
+        ever fill, repeatedly, for hours. Routing every bid/ask read
+        through here instead means a broken quote is treated as
+        unavailable (falls through to the price-based fallback already in
+        each caller) everywhere at once, rather than needing to be caught
+        at each call site individually.
+        """
+        value = self._quote_decimal(quote, field)
+        if value is None:
+            return None
+        reference = self._quote_decimal(quote, "price")
+        if reference is None:
+            return value
+        if abs(value - reference) / reference > self.config.quote_price_sanity_percent:
+            return None
+        return value
 
     def option_delta(self, quote: dict) -> Decimal | None:
         """Best-effort delta extraction. Webull's option snapshot response
@@ -1140,10 +1172,10 @@ class WebullAPI:
         return None
 
     def quote_bid(self, quote: dict) -> Decimal | None:
-        return self._quote_decimal(quote, "bid")
+        return self._sane_bid_or_ask(quote, "bid")
 
     def quote_ask(self, quote: dict) -> Decimal | None:
-        return self._quote_decimal(quote, "ask")
+        return self._sane_bid_or_ask(quote, "ask")
 
     @staticmethod
     def quote_price(quote: dict) -> Decimal:
