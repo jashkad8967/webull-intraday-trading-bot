@@ -410,6 +410,14 @@ class AutoTrader:
             "losers": self._market_pulse_entries(losers),
             "most_active": self._market_pulse_entries(most_active),
         }
+        # Feeds a direct priority_score bonus (see
+        # TradingStrategy.most_active_priority_bonus) - distinct from
+        # agent_popular_symbols below, which just marks a symbol eligible
+        # for the POPULAR bucket without weighting most-active names any
+        # higher than a gainer/loser inside it.
+        self.strategy.most_active_symbols = {
+            str(symbol).upper() for symbol in most_active
+        }
 
     def resolve_targets(self, moment: datetime) -> None:
         if self.resolved_date == moment.date():

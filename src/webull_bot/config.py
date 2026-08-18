@@ -127,6 +127,22 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("5"),
     )
+    # Flat priority_score bonus for a symbol currently on Webull's
+    # most-active screener (see AutoTrader.refresh_market_pulse and
+    # TradingStrategy.most_active_symbols) - most-active names see the
+    # heaviest order flow and tend to produce the most (and fastest)
+    # scalp setups, so this pushes them to the front of the scan batch
+    # instead of competing on equal footing with everything else in
+    # priority_score. Scaled against that function's typical range (a
+    # strong oscillation bonus alone tops out around 10, a strong
+    # research-assisted score around 25-30) - large enough to reliably
+    # win ties, not so large it drowns out a genuinely bad setup's low
+    # research/activity score.
+    most_active_priority_bonus: Decimal = Field(
+        default=Decimal("15"),
+        ge=0,
+        le=Decimal("100"),
+    )
     ema_fast_period: int = Field(default=3, ge=2, le=500)
     ema_slow_period: int = Field(default=8, ge=3, le=1000)
     reenter_on_trend: bool = True

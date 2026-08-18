@@ -71,6 +71,11 @@ class TradingStrategy:
         # clear_market_state's once-daily reset so a failed refresh keeps
         # yesterday's (still roughly valid) SMA rather than going empty.
         self.sma_trend: dict[str, Decimal] = {}
+        # Webull's most-active screener, refreshed independently every
+        # MARKET_PULSE_REFRESH_SECONDS by AutoTrader.refresh_market_pulse -
+        # not tied to clear_market_state's once-daily reset, same as
+        # market_pulse_cache itself isn't.
+        self.most_active_symbols: set[str] = set()
 
     def clear_market_state(self) -> None:
         self.activity.clear()
@@ -211,6 +216,8 @@ class TradingStrategy:
         # already made their one move for the day.
         oscillation = min(20, self.crossover_counts.get(symbol, 0))
         score += oscillation * float(self.config.stock_oscillation_weight)
+        if symbol in self.most_active_symbols:
+            score += float(self.config.most_active_priority_bonus)
         if not assessment:
             return score
         confidence = float(assessment.get("confidence", 0))

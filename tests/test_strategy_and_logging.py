@@ -42,6 +42,7 @@ class StrategyConfigMixin:
             stock_priority_fraction=0.6,
             stock_penny_fraction=0.2,
             stock_oscillation_weight=Decimal("0.5"),
+            most_active_priority_bonus=Decimal("15"),
             penny_stock_max_price=Decimal("5"),
             popular_stock_min_volume=1_000_000,
             popular_stock_max_spread_percent=Decimal("0.50"),
@@ -114,6 +115,43 @@ class StrategySelectionTests(StrategyConfigMixin, unittest.TestCase):
         self.assertEqual(strategy.selection_bucket("NVDA"), "POPULAR")
         self.assertIn("CHEAP", batch)
         self.assertIn("NEXT", batch)
+
+    def test_priority_score_boosts_a_symbol_on_the_most_active_screener(self):
+        strategy = TradingStrategy(self.config())
+        strategy.activity["TSLA"] = 5.0
+        without_boost = strategy.priority_score("TSLA", None)
+        strategy.most_active_symbols = {"TSLA"}
+        with_boost = strategy.priority_score("TSLA", None)
+        self.assertEqual(
+            with_boost - without_boost, float(self.config().most_active_priority_bonus)
+        )
+
+    def test_most_active_symbol_is_prioritized_over_an_otherwise_equal_one(self):
+        """Regression coverage for "focus more on most-active for
+        volatility": two symbols with identical activity/research inputs
+        must still rank most-active first once
+        TradingStrategy.most_active_symbols marks one of them.
+        """
+        strategy = TradingStrategy(self.config())
+        symbols = ["ACTIVE", "TWIN", "FILLER1", "FILLER2"]
+        strategy.prices.update(
+            {
+                "ACTIVE": Decimal("20"),
+                "TWIN": Decimal("20"),
+            }
+        )
+        strategy.activity.update({"ACTIVE": 5.0, "TWIN": 5.0})
+        strategy.most_active_symbols = {"ACTIVE"}
+
+        batch, _ = strategy.prioritized_stock_batch(
+            symbols,
+            0,
+            [],
+            lambda symbol: None,
+            {"ACTIVE", "TWIN"},
+        )
+
+        self.assertEqual(batch[0], "ACTIVE")
 
     def test_strong_research_can_assist_but_missing_research_does_not_veto_ema(self):
         strategy = TradingStrategy(self.config())
@@ -2679,6 +2717,7 @@ class StockScreenerTests(StrategyConfigMixin, unittest.TestCase):
         fake_bot.config = SimpleNamespace(agent_market_pulse_symbols=2)
         fake_bot.last_market_pulse_refresh = now - 999
         fake_bot.market_pulse_cache = {"gainers": [], "losers": [], "most_active": []}
+        fake_bot.strategy = SimpleNamespace(most_active_symbols=set())
         calls = []
         fake_bot.safe_top_gainers = lambda limit, page: (
             calls.append("gainers"),
@@ -2700,6 +2739,11 @@ class StockScreenerTests(StrategyConfigMixin, unittest.TestCase):
         self.assertEqual(fake_bot.market_pulse_cache["gainers"][0]["symbol"], "G1")
         self.assertEqual(fake_bot.market_pulse_cache["losers"][0]["symbol"], "L1")
         self.assertEqual(fake_bot.market_pulse_cache["most_active"][0]["symbol"], "A1")
+        # Regression coverage: safe_market_pulse_active returns a dict
+        # keyed by symbol (not a list of {"symbol": ...} dicts) - reading
+        # it the wrong way here would raise instead of silently no-op'ing,
+        # since a bare string has no .get().
+        self.assertEqual(fake_bot.strategy.most_active_symbols, {"A1"})
 
         # A second call within MARKET_PULSE_REFRESH_SECONDS makes no new
         # screener calls - this must stay off the ~4x/second poll loop.
