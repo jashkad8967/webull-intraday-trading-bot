@@ -285,25 +285,28 @@ class Settings(BaseSettings):
     idle_cash_relaxation_enabled: bool = True
     # No relaxation at all for this long after the last entry - a burst of
     # trading shouldn't immediately start loosening gates again just
-    # because the very next cycle still has leftover cash.
-    idle_cash_grace_seconds: int = Field(default=300, ge=0, le=21600)
+    # because the very next cycle still has leftover cash. Short on
+    # purpose: keeping cash deployed outranks entry quality (see below),
+    # so idle capital should barely get a breather before gates start
+    # loosening again.
+    idle_cash_grace_seconds: int = Field(default=60, ge=0, le=21600)
     # After the grace period, gates linearly loosen toward their max
     # multiplier/relaxation over this many additional seconds, then hold
     # at the max for as long as cash keeps sitting idle.
-    idle_cash_ramp_seconds: int = Field(default=1800, ge=1, le=21600)
+    idle_cash_ramp_seconds: int = Field(default=600, ge=1, le=21600)
     # Shared ceiling for every multiplicative gate (max spread, extension
     # from today's high/low, VWAP band) at full ramp - one knob, not three,
     # since there's no real reason to relax these three at different rates
     # and a fake extra layer of granularity is worse than none.
     idle_cash_max_gate_multiplier: Decimal = Field(
-        default=Decimal("3"), ge=1, le=10
+        default=Decimal("5"), ge=1, le=10
     )
     # Subtracted from tick_direction_veto_threshold at full ramp (e.g. the
-    # default threshold 0 becomes -0.5 fully relaxed) - allows a slightly
+    # default threshold 0 becomes -1.0 fully relaxed) - allows a
     # tick-negative entry through rather than requiring purely non-negative
     # recent tape direction.
     idle_cash_max_tick_relaxation: Decimal = Field(
-        default=Decimal("0.5"), ge=0, le=2
+        default=Decimal("1.0"), ge=0, le=2
     )
     # The opening print is naturally wider/choppier than mid-day trading, so
     # the normal spread/extension gates - tuned for profitable mid-day
