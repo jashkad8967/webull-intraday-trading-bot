@@ -2892,6 +2892,44 @@ class BrokerConflictTests(unittest.TestCase):
         self.assertFalse(fake_bot.short_selling_supported)
 
 
+class PositionPnlTests(StrategyConfigMixin, unittest.TestCase):
+    """position_unrealized_pnl is since cost (accumulates for as long as a
+    position is held); position_day_pnl is since yesterday's 4pm ET close
+    (Webull's day_profit_loss), independent of when the position was
+    originally opened - the dashboard's "P&L Today" panel wants the
+    latter, not the former, or a position held across several days
+    misreports days-old drift as if it happened today.
+    """
+
+    def test_unrealized_pnl_uses_the_reported_field_net_of_the_sell_fee(self):
+        strategy = TradingStrategy(self.config())
+        position = {"unrealized_profit_loss": "5.00"}
+        self.assertEqual(strategy.position_unrealized_pnl(position), Decimal("4.98"))
+
+    def test_day_pnl_uses_the_reported_field_net_of_the_sell_fee(self):
+        strategy = TradingStrategy(self.config())
+        position = {"day_profit_loss": "5.00"}
+        self.assertEqual(strategy.position_day_pnl(position), Decimal("4.98"))
+
+    def test_day_pnl_and_unrealized_pnl_diverge_for_a_multi_day_hold(self):
+        """The exact shape of the live incident this was built for: a
+        position bought several days ago sits on a since-cost gain, but
+        was flat today.
+        """
+        strategy = TradingStrategy(self.config())
+        position = {
+            "unrealized_profit_loss": "2.32",
+            "day_profit_loss": "0.00",
+        }
+        self.assertEqual(strategy.position_unrealized_pnl(position), Decimal("2.30"))
+        self.assertEqual(strategy.position_day_pnl(position), Decimal("-0.02"))
+
+    def test_day_pnl_is_zero_when_unreported_rather_than_a_since_cost_guess(self):
+        strategy = TradingStrategy(self.config())
+        position = {"unrealized_profit_loss": "5.00", "cost_price": "100", "last_price": "105"}
+        self.assertEqual(strategy.position_day_pnl(position), Decimal("0"))
+
+
 class StatusWriterTests(unittest.TestCase):
     def test_write_includes_pending_orders_for_the_dashboard(self):
         path = Path("tests/.generated_status/status.json")
@@ -2942,6 +2980,36 @@ class StatusWriterTests(unittest.TestCase):
             )
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(payload["pending_orders"], [])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_pnl_today_total_is_realized_plus_open_not_since_cost_unrealized(self):
+        """Regression test: pnl_today used to blend the daily-reset
+        realized total with a since-cost unrealized figure that could
+        span several days for a position held that long - both fields
+        under a write() call must actually be "today" scoped.
+        """
+        path = Path("tests/.generated_status/status10.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(path))
+            writer.write(
+                mode="LIVE",
+                buying_power=Decimal("1000"),
+                positions=[],
+                watchlist=[],
+                agent_summary=None,
+                paused=False,
+                stock_count=10,
+                option_count=0,
+                realized_pnl_today=Decimal("3.00"),
+                open_pnl_total=Decimal("-1.25"),
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["pnl_today"]["realized"], "3.00")
+            self.assertEqual(payload["pnl_today"]["open"], "-1.25")
+            self.assertEqual(payload["pnl_today"]["total"], "1.75")
+            self.assertNotIn("unrealized", payload["pnl_today"])
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
