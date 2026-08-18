@@ -117,9 +117,11 @@ class Settings(BaseSettings):
     # resubmitting within seconds of the last order); this is a separate,
     # much longer gate specifically on re-entering a symbol right after a
     # position in it just closed (profit, stop, or manual sell) - it
-    # doesn't apply to the exit itself, only to the next BUY.
+    # doesn't apply to the exit itself, only to the next BUY. Not 0: with
+    # no cooldown at all, a symbol that just stopped out could be bought
+    # right back into the same whipsaw on the very next scan.
     stock_reentry_cooldown_seconds: Decimal = Field(
-        default=Decimal("0"), ge=0, le=Decimal("21600")
+        default=Decimal("180"), ge=0, le=Decimal("21600")
     )
     stock_max_trades_per_hour: int = Field(default=0, ge=0, le=1000)
     stock_oscillation_weight: Decimal = Field(
@@ -455,8 +457,13 @@ class Settings(BaseSettings):
     # Widens the stop immediately after entry (avoids getting shaken out by
     # quote noise right at fill) then tightens back to adaptive_stop_percent's
     # normal value as the position ages - see AutoTrader.position_opened_at
-    # and TradingStrategy.time_aware_stop_multiplier.
-    time_aware_stop_enabled: bool = False
+    # and TradingStrategy.time_aware_stop_multiplier. On: a live incident
+    # showed several positions (PFSA, XOS, WFF) stopped out 19s-7min after
+    # entry, well within ordinary tick-to-tick noise for a low-priced
+    # stock at this account's tight (0.9-1.5%) base stop - this widens
+    # that window right when a fresh entry needs it most instead of
+    # cutting it before the setup has any real chance to play out.
+    time_aware_stop_enabled: bool = True
     time_aware_stop_widen_seconds: int = Field(default=60, ge=1, le=3600)
     time_aware_stop_widen_multiplier: Decimal = Field(
         default=Decimal("1.5"), ge=Decimal("1"), le=Decimal("5")
