@@ -126,7 +126,7 @@ class StatusWriter:
         stock_count: int,
         option_count: int,
         realized_pnl_today: Decimal = Decimal("0"),
-        unrealized_pnl_total: Decimal = Decimal("0"),
+        open_pnl_total: Decimal = Decimal("0"),
         user_watchlist: list[str] | None = None,
         pending_orders: list[dict] | None = None,
     ) -> None:
@@ -144,9 +144,17 @@ class StatusWriter:
             "pending_orders": pending_orders or [],
             "balance_history": list(self.balance_history),
             "pnl_today": {
+                # realized: closed trades since the start of today (resets
+                # at market open - see AutoTrader.resolve_targets). open:
+                # today's mark-to-market move on currently-held positions,
+                # since yesterday's 4pm ET close (Webull's day_profit_loss -
+                # see TradingStrategy.position_day_pnl), not since
+                # whenever each position was originally bought. Both are
+                # genuinely "today" figures, unlike a since-cost unrealized
+                # total would be for a position held across several days.
                 "realized": str(realized_pnl_today),
-                "unrealized": str(unrealized_pnl_total),
-                "total": str(realized_pnl_today + unrealized_pnl_total),
+                "open": str(open_pnl_total),
+                "total": str(realized_pnl_today + open_pnl_total),
             },
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)

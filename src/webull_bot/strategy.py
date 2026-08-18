@@ -1151,6 +1151,11 @@ class TradingStrategy:
         still open, but closing it will cost that fee, so showing the raw
         pre-fee mark-to-market number would overstate what selling right
         now actually nets.
+
+        Since cost, not since today - a position held across several
+        sessions accumulates this the whole time it's open. See
+        position_day_pnl for the today-only figure the dashboard's "P&L
+        Today" panel actually wants.
         """
         reported = position.get("unrealized_profit_loss")
         if reported not in (None, ""):
@@ -1174,6 +1179,26 @@ class TradingStrategy:
                 else Decimal("1")
             )
             return (price - cost) * quantity * multiplier - self.config.sell_fee_dollars
+        except Exception:
+            return Decimal("0")
+
+    def position_day_pnl(self, position: dict) -> Decimal:
+        """This position's mark-to-market move since the prior session's
+        4pm ET close, net of the flat sell fee not yet paid - Webull's own
+        day_profit_loss field, which resets independently of when the
+        position was originally opened (unlike unrealized_profit_loss,
+        which accumulates since cost for as long as the position is held).
+
+        A position opened before today has no local record of yesterday's
+        close to fall back to, so an unreported field returns 0 (unknown)
+        rather than silently substituting the since-cost figure under a
+        "today" label.
+        """
+        reported = position.get("day_profit_loss")
+        if reported in (None, ""):
+            return Decimal("0")
+        try:
+            return Decimal(str(reported)) - self.config.sell_fee_dollars
         except Exception:
             return Decimal("0")
 

@@ -3078,6 +3078,7 @@ class AutoTrader:
                         self.strategy.prices.get(symbol, position.get("cost_price", "0"))
                     ),
                     "unrealized_pnl": str(self.strategy.position_unrealized_pnl(position)),
+                    "day_pnl": str(self.strategy.position_day_pnl(position)),
                     "bucket": self.position_buckets.get(symbol, "DISCOVERY"),
                 }
             )
@@ -3099,8 +3100,8 @@ class AutoTrader:
                 "market_pulse": self.market_pulse_cache,
                 "popular_symbols": sorted(self.agent_popular_symbols),
             }
-        unrealized_total = sum(
-            (Decimal(row["unrealized_pnl"]) for row in position_rows),
+        day_pnl_total = sum(
+            (Decimal(row["day_pnl"]) for row in position_rows),
             Decimal("0"),
         )
         now = time.monotonic()
@@ -3144,7 +3145,7 @@ class AutoTrader:
             stock_count=len(self.stock_symbols),
             option_count=len(self.option_contracts),
             realized_pnl_today=self.daily_realized_pnl,
-            unrealized_pnl_total=unrealized_total,
+            open_pnl_total=day_pnl_total,
             user_watchlist=sorted(self.user_watchlist),
             pending_orders=pending_order_rows,
         )
