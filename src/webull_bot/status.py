@@ -105,6 +105,24 @@ class StatusWriter:
         if len(self.trades) != before:
             self._save_state()
 
+    def rekey_trade(self, old_order_id: str, new_order_id: str) -> None:
+        """Repoints a trade-log entry's order_id after AutoTrader.
+        reprice_resting_exits cancels the resting order and places a new
+        one for the same logical exit, without calling record_trade again
+        (see that function's docstring for why - it would double-count
+        the pnl). Without this, discard_trade later looks for new_order_id
+        (the only id reverse_phantom_exit ever sees, since old_order_id
+        was never passed anywhere past this point) and finds nothing to
+        remove, since the visible entry is still filed under old_order_id
+        - leaving a cancelled order's phantom profit on the dashboard
+        forever, same symptom as a missing discard_trade call entirely.
+        """
+        for trade in self.trades:
+            if trade.get("order_id") == old_order_id:
+                trade["order_id"] = new_order_id
+                self._save_state()
+                return
+
     def record_balance(self, balance: Decimal) -> None:
         """Appends one point to the account-equity history the dashboard
         charts - see AutoTrader.write_status_snapshot for the throttling
