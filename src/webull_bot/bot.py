@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from rich.logging import RichHandler
 
+from webull_bot.analyst_data import AnalystDataService
 from webull_bot.commands import CommandQueue
 from webull_bot.config import settings
 from webull_bot.daily_pnl import DailyPnlTracker
@@ -84,6 +85,11 @@ class AutoTrader:
         self.market_agent = (
             MarketResearchAgent(self.config, log)
             if self.config.agent_enabled
+            else None
+        )
+        self.analyst_service = (
+            AnalystDataService(self.api, self.config, log)
+            if self.config.analyst_priority_enabled
             else None
         )
         self.timezone = ZoneInfo(self.config.trading_timezone)
@@ -1892,6 +1898,13 @@ class AutoTrader:
         )
         idle_relaxation_amount = ramp_progress * self.config.idle_cash_max_tick_relaxation
         self.refresh_agent_discoveries()
+        if self.analyst_service is not None:
+            # One cycle stale relative to any fetch a symbol's own
+            # request() call below just queued - same acceptable
+            # staleness as regime_gate_active's vixy_history read above,
+            # and more so here since analyst data moves far slower than
+            # VIXY. Cheap, in-memory only - see AnalystDataService.snapshot.
+            self.strategy.analyst_priority = self.analyst_service.snapshot()
         batch, self.stock_cursor = self.strategy.prioritized_stock_batch(
             self.stock_symbols,
             self.stock_cursor,
@@ -2013,6 +2026,8 @@ class AutoTrader:
                     continue
                 price = self.api.quote_price(quote)
                 self.strategy.update_stock_snapshot(quote, price)
+                if self.analyst_service is not None:
+                    self.analyst_service.request(symbol, price)
                 quantity, cost = self.api.stock_position(symbol, positions)
                 key = f"STOCK:{symbol}"
                 opened_at = self.position_opened_at.get(key)

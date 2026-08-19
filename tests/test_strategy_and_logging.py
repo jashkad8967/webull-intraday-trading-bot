@@ -1,5 +1,6 @@
 import json
 import logging
+import queue
 import shutil
 import statistics
 import sys
@@ -126,6 +127,14 @@ class StrategySelectionTests(StrategyConfigMixin, unittest.TestCase):
             with_boost - without_boost, float(self.config().most_active_priority_bonus)
         )
 
+    def test_priority_score_adds_the_analyst_priority_bonus(self):
+        strategy = TradingStrategy(self.config())
+        strategy.activity["TSLA"] = 5.0
+        without_bonus = strategy.priority_score("TSLA", None)
+        strategy.analyst_priority["TSLA"] = 3.5
+        with_bonus = strategy.priority_score("TSLA", None)
+        self.assertAlmostEqual(with_bonus - without_bonus, 3.5)
+
     def test_most_active_symbol_is_prioritized_over_an_otherwise_equal_one(self):
         """Regression coverage for "focus more on most-active for
         volatility": two symbols with identical activity/research inputs
@@ -198,6 +207,177 @@ class StrategySelectionTests(StrategyConfigMixin, unittest.TestCase):
             for price in prices
         ]
         self.assertIn("BUY", [item.action for item in decisions])
+
+
+class AnalystPriorityBonusTests(unittest.TestCase):
+    """TradingStrategy.analyst_priority_bonus is a pure, two-sided nudge -
+    see priority_score. Must default to neutral (0) whenever coverage is
+    missing, since many of this bot's penny/micro-cap names simply aren't
+    covered by analysts at all - that must read as "no signal", never as
+    a de facto exclusion.
+    """
+
+    def test_no_rating_and_no_target_is_neutral(self):
+        bonus = TradingStrategy.analyst_priority_bonus(
+            Decimal("10"), None, None, Decimal("5")
+        )
+        self.assertEqual(bonus, Decimal("0"))
+
+    def test_bullish_rating_and_price_well_below_target_is_positive(self):
+        bonus = TradingStrategy.analyst_priority_bonus(
+            Decimal("10"),
+            Decimal("15"),
+            {"strong_buy": 10, "buy": 0, "hold": 0, "sell": 0, "under_perform": 0},
+            Decimal("5"),
+        )
+        self.assertEqual(bonus, Decimal("5"))
+
+    def test_bearish_rating_and_price_above_target_is_negative(self):
+        bonus = TradingStrategy.analyst_priority_bonus(
+            Decimal("15"),
+            Decimal("10"),
+            {"strong_buy": 0, "buy": 0, "hold": 0, "sell": 0, "under_perform": 10},
+            Decimal("5"),
+        )
+        self.assertEqual(bonus, Decimal("-5"))
+
+    def test_evenly_split_rating_at_target_price_is_neutral(self):
+        bonus = TradingStrategy.analyst_priority_bonus(
+            Decimal("10"),
+            Decimal("10"),
+            {"strong_buy": 5, "buy": 0, "hold": 0, "sell": 5, "under_perform": 0},
+            Decimal("5"),
+        )
+        self.assertEqual(bonus, Decimal("0"))
+
+    def test_extreme_upside_is_clipped_not_unbounded(self):
+        # target 10x the current price - the +-50% clip must cap this the
+        # same as a merely 50%-undervalued price would, not scale further.
+        extreme = TradingStrategy.analyst_priority_bonus(
+            Decimal("10"), Decimal("100"), None, Decimal("5")
+        )
+        moderate = TradingStrategy.analyst_priority_bonus(
+            Decimal("10"), Decimal("15"), None, Decimal("5")
+        )
+        self.assertEqual(extreme, moderate)
+
+    def test_non_positive_price_is_neutral(self):
+        bonus = TradingStrategy.analyst_priority_bonus(
+            Decimal("0"),
+            Decimal("15"),
+            {"strong_buy": 10, "buy": 0, "hold": 0, "sell": 0, "under_perform": 0},
+            Decimal("5"),
+        )
+        self.assertEqual(bonus, Decimal("0"))
+
+
+class AnalystDataServiceTests(unittest.TestCase):
+    """Constructed via __new__ throughout - never calls __init__, so no
+    real background thread ever starts in these tests. request()/
+    snapshot() are the only two methods the main trading thread actually
+    touches; _fetch() is exercised directly, standing in for what the
+    (untested-here) worker thread does with a dequeued item.
+    """
+
+    def _service(self, **config_overrides):
+        from webull_bot.analyst_data import AnalystDataService
+
+        service = AnalystDataService.__new__(AnalystDataService)
+        defaults = dict(
+            analyst_priority_enabled=True,
+            analyst_data_cache_seconds=43200,
+            analyst_priority_bonus_max=Decimal("5"),
+        )
+        defaults.update(config_overrides)
+        service.config = SimpleNamespace(**defaults)
+        service.log = logging.getLogger("test-analyst-data")
+        service._lock = threading.Lock()
+        service._bonus = {}
+        service._fetched_at = {}
+        service._queued = set()
+        service._queue = queue.Queue(maxsize=50)
+        return service
+
+    def test_request_enqueues_a_never_seen_symbol(self):
+        service = self._service()
+        service.request("AAPL", Decimal("100"))
+        self.assertIn("AAPL", service._queued)
+        self.assertEqual(service._queue.qsize(), 1)
+
+    def test_request_enqueues_a_never_seen_symbol_even_when_monotonic_is_small(self):
+        """Regression test: time.monotonic() is relative to an arbitrary
+        reference point (often host boot), not the epoch - on a
+        freshly-booted host it can be well under
+        ANALYST_DATA_CACHE_SECONDS. A never-fetched symbol must still be
+        eligible in that case; treating "never fetched" as "fetched at
+        monotonic time zero" (a 0.0 default) silently broke every
+        first-ever fetch on a fresh CI runner.
+        """
+        service = self._service()
+        with unittest.mock.patch("time.monotonic", return_value=5.0):
+            service.request("AAPL", Decimal("100"))
+        self.assertIn("AAPL", service._queued)
+        self.assertEqual(service._queue.qsize(), 1)
+
+    def test_request_skips_a_symbol_already_queued(self):
+        service = self._service()
+        service.request("AAPL", Decimal("100"))
+        service.request("AAPL", Decimal("101"))
+        self.assertEqual(service._queue.qsize(), 1)
+
+    def test_request_skips_a_symbol_still_within_the_cache_window(self):
+        service = self._service()
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            service._fetched_at["AAPL"] = 100.0
+        with unittest.mock.patch("time.monotonic", return_value=200.0):
+            service.request("AAPL", Decimal("100"))
+        self.assertEqual(service._queue.qsize(), 0)
+
+    def test_request_refetches_once_the_cache_window_elapses(self):
+        service = self._service(analyst_data_cache_seconds=50)
+        service._fetched_at["AAPL"] = 100.0
+        with unittest.mock.patch("time.monotonic", return_value=200.0):
+            service.request("AAPL", Decimal("100"))
+        self.assertEqual(service._queue.qsize(), 1)
+
+    def test_request_disabled_is_a_full_noop(self):
+        service = self._service(analyst_priority_enabled=False)
+        service.request("AAPL", Decimal("100"))
+        self.assertEqual(service._queue.qsize(), 0)
+        self.assertNotIn("AAPL", service._queued)
+
+    def test_fetch_populates_the_bonus_and_snapshot_reflects_it(self):
+        service = self._service()
+        # 50% upside (the formula's clip boundary) + unanimous strong_buy:
+        # both signals max out at 1.0, so bonus == bonus_max exactly -
+        # see AnalystPriorityBonusTests for the formula itself.
+        service.api = SimpleNamespace(
+            analyst_target_price=lambda symbol: Decimal("150"),
+            analyst_rating=lambda symbol: {
+                "strong_buy": 10,
+                "buy": 0,
+                "hold": 0,
+                "sell": 0,
+                "under_perform": 0,
+            },
+        )
+        service._fetch("AAPL", Decimal("100"))
+        self.assertEqual(service.snapshot(), {"AAPL": 5.0})
+
+    def test_fetch_failure_is_swallowed_by_the_worker_not_fetch_itself(self):
+        # _fetch() itself propagates - the worker loop (not under test
+        # here) is what catches it, matching MarketResearchAgent's
+        # _worker/_research split.
+        service = self._service()
+        service.api = SimpleNamespace(
+            analyst_target_price=lambda symbol: (_ for _ in ()).throw(
+                RuntimeError("no coverage")
+            ),
+            analyst_rating=lambda symbol: None,
+        )
+        with self.assertRaises(RuntimeError):
+            service._fetch("AAPL", Decimal("100"))
+        self.assertEqual(service.snapshot(), {})
 
 
 class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
