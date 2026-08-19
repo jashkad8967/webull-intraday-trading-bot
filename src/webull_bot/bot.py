@@ -198,6 +198,13 @@ class AutoTrader:
         # which structurally ends the loop instead of hoping a better
         # price eventually clears. Reset to 0 on a fresh BUY/SHORT.
         self.consecutive_exit_failures: dict[str, int] = defaultdict(int)
+        # Monotonic timestamp of when a symbol's price first crossed into
+        # stop-loss territory, continuously - see stop_loss_confirmed and
+        # STOP_LOSS_CONFIRMATION_SECONDS. Popped the instant price recovers
+        # above the stop level or the position closes, so a wick that
+        # reverses never accumulates confirmation time toward a later,
+        # unrelated breach.
+        self.stop_condition_since: dict[str, float] = {}
         self.daily_realized_loss = self.daily_pnl.realized_loss
         self.daily_realized_pnl = self.daily_pnl.realized_pnl
         self.daily_loss_breaker_triggered = False
@@ -671,6 +678,24 @@ class AutoTrader:
             return False
         return symbol in self.stop_loss_escalated or self.cooldown_ready(key)
 
+    def stop_loss_confirmed(self, symbol: str) -> bool:
+        """True once price has sat continuously at/below the stop level for
+        STOP_LOSS_CONFIRMATION_SECONDS - see stop_condition_since. An
+        escalated stop (already submitted, just resubmitting at a more
+        aggressive price after sitting unfilled) skips this: the breach
+        was already confirmed once, and escalation is itself a response to
+        elapsed time, not a fresh signal that could be a single bad tick.
+        """
+        if not self.config.stop_loss_confirmation_enabled or symbol in self.stop_loss_escalated:
+            return True
+        since = self.stop_condition_since.get(symbol)
+        if since is None:
+            return False
+        return (
+            time.monotonic() - since
+            >= float(self.config.stop_loss_confirmation_seconds)
+        )
+
     def should_force_market_exit(
         self, symbol: str, exit_is_fractional: bool, core_session_active: bool
     ) -> bool:
@@ -717,6 +742,7 @@ class AutoTrader:
         self.pending_option_exits.discard(symbol)
         self.stop_exit_submitted.pop(symbol, None)
         self.stop_loss_escalated.discard(symbol)
+        self.stop_condition_since.pop(symbol, None)
         log.error(
             "CONFLICT | %-8s | broker rejected order as a position reverse "
             "- our view of this position doesn't match the account. Pausing "
@@ -1626,6 +1652,7 @@ class AutoTrader:
             self.pending_option_exits.discard(symbol)
             self.stop_exit_submitted.pop(symbol, None)
             self.stop_loss_escalated.discard(symbol)
+            self.stop_condition_since.pop(symbol, None)
             if not already_blacklisted:
                 log.critical(
                     "GUARD  | %s order errors in %ss (last: %s | %s) | "
@@ -2003,6 +2030,11 @@ class AutoTrader:
                     idle_relaxation_amount,
                     seconds_since_entry,
                 )
+                if decision.action == "LOSS":
+                    if symbol not in self.stop_condition_since:
+                        self.stop_condition_since[symbol] = time.monotonic()
+                else:
+                    self.stop_condition_since.pop(symbol, None)
                 if decision.action == "HOLD" and quantity == 0:
                     self.gate_rejections[decision.reason] += 1
                 if (
@@ -2039,6 +2071,7 @@ class AutoTrader:
                     self.pending_stock_exits.discard(symbol)
                     self.stop_exit_submitted.pop(symbol, None)
                     self.stop_loss_escalated.discard(symbol)
+                    self.stop_condition_since.pop(symbol, None)
                     self.short_symbols.discard(symbol)
                 if decision.action == "BUY" and quantity == 0:
                     blocked_until = self.wash_sales.blocked_until(symbol)
@@ -2350,6 +2383,12 @@ class AutoTrader:
                     self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
                     exit_is_fractional = self.is_fractional_quantity(exit_quantity)
+                    if not self.stop_loss_confirmed(symbol):
+                        self.gate_rejections[
+                            "stop breach not yet confirmed - waiting out a "
+                            "possible single-tick wick"
+                        ] += 1
+                        continue
                     if exit_is_fractional and not core_session_active:
                         self.gate_rejections[
                             "fractional position - exit waits for core hours"

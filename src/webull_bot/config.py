@@ -350,6 +350,20 @@ class Settings(BaseSettings):
     consecutive_exit_failure_market_threshold: int = Field(
         default=3, ge=1, le=20
     )
+    # Live complaint: a position dips through its stop on a single noisy
+    # print (the bot polls every POLL_INTERVAL_SECONDS, as fast as 0.25s)
+    # and gets sold at the exact worst tick, then recovers moments later.
+    # stock_decision still detects a stop breach the instant it happens
+    # (unchanged - a real fast decline must still be caught quickly), but
+    # AutoTrader now waits for price to stay at/below the stop level for
+    # this long, continuously, before actually submitting the exit. Any
+    # recovery above the stop level resets the timer. Short by design -
+    # this filters out single-tick wicks without meaningfully slowing
+    # down protection against a genuine move.
+    stop_loss_confirmation_enabled: bool = True
+    stop_loss_confirmation_seconds: Decimal = Field(
+        default=Decimal("2"), ge=0, le=30
+    )
     daily_loss_circuit_breaker_enabled: bool = False
     daily_max_loss_dollars: Decimal = Field(default=Decimal("50"), gt=0)
     market_requests_per_minute: int = Field(default=240, ge=1, le=300)

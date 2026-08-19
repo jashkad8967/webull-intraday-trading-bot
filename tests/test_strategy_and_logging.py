@@ -934,6 +934,65 @@ class StopLossEscalationTests(unittest.TestCase):
         self.assertNotIn("ASHR", fake_bot.stop_exit_submitted)
         self.assertEqual(fake_bot.consecutive_exit_failures["ASHR"], 1)
 
+
+class StopLossConfirmationTests(unittest.TestCase):
+    """Live complaint: a position dips through its stop on a single noisy
+    tick (the bot polls as fast as every 0.25s) and gets sold at the exact
+    worst moment, then recovers. stop_loss_confirmed requires the breach to
+    hold continuously for STOP_LOSS_CONFIRMATION_SECONDS before AutoTrader
+    will actually submit the exit - see trade_stocks' LOSS branch.
+    """
+
+    def _fake_bot(self, **overrides):
+        from webull_bot.bot import AutoTrader
+
+        defaults = dict(
+            config=SimpleNamespace(
+                stop_loss_confirmation_enabled=True,
+                stop_loss_confirmation_seconds=Decimal("2"),
+            ),
+            stop_condition_since={},
+            stop_loss_escalated=set(),
+        )
+        defaults.update(overrides)
+        fake_bot = SimpleNamespace(**defaults)
+        fake_bot.stop_loss_confirmed = AutoTrader.stop_loss_confirmed.__get__(fake_bot)
+        return fake_bot
+
+    def test_unconfirmed_breach_is_not_yet_actionable(self):
+        fake_bot = self._fake_bot(stop_condition_since={"ASHR": 10.0})
+        with unittest.mock.patch("time.monotonic", return_value=11.0):
+            self.assertFalse(fake_bot.stop_loss_confirmed("ASHR"))
+
+    def test_breach_confirmed_once_it_holds_the_full_window(self):
+        fake_bot = self._fake_bot(stop_condition_since={"ASHR": 10.0})
+        with unittest.mock.patch("time.monotonic", return_value=12.0):
+            self.assertTrue(fake_bot.stop_loss_confirmed("ASHR"))
+
+    def test_symbol_never_seen_in_breach_is_not_confirmed(self):
+        fake_bot = self._fake_bot()
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            self.assertFalse(fake_bot.stop_loss_confirmed("ASHR"))
+
+    def test_disabled_skips_the_wait_entirely(self):
+        fake_bot = self._fake_bot(
+            config=SimpleNamespace(
+                stop_loss_confirmation_enabled=False,
+                stop_loss_confirmation_seconds=Decimal("2"),
+            ),
+        )
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            self.assertTrue(fake_bot.stop_loss_confirmed("ASHR"))
+
+    def test_already_escalated_skips_the_wait(self):
+        # An escalated stop was already confirmed once, before its first
+        # (now-cancelled) submission - re-requiring a fresh dwell here
+        # would just leave it unprotected for longer with no benefit.
+        fake_bot = self._fake_bot(stop_loss_escalated={"ASHR"})
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            self.assertTrue(fake_bot.stop_loss_confirmed("ASHR"))
+
+
 class RepriceRestingExitsTests(unittest.TestCase):
     def test_reprice_cancels_and_replaces_at_new_ask_without_recording_pnl_again(self):
         """The continuous re-quote loop must cancel + resubmit the resting
@@ -2871,6 +2930,7 @@ class BrokerConflictTests(unittest.TestCase):
             pending_option_exits=set(),
             stop_exit_submitted={"ASHR": 123.0},
             stop_loss_escalated={"ASHR"},
+            stop_condition_since={"ASHR": 100.0},
         )
         handle = AutoTrader.handle_broker_conflict.__get__(fake_bot)
 
@@ -2880,6 +2940,7 @@ class BrokerConflictTests(unittest.TestCase):
         self.assertNotIn("ASHR", fake_bot.pending_stock_exits)
         self.assertNotIn("ASHR", fake_bot.stop_exit_submitted)
         self.assertNotIn("ASHR", fake_bot.stop_loss_escalated)
+        self.assertNotIn("ASHR", fake_bot.stop_condition_since)
 
     def test_is_fractional_trading_not_enabled_matches_account_agreement_rejection(self):
         from webull_bot.bot import AutoTrader
@@ -4636,6 +4697,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
             pending_option_exits=set(),
             stop_exit_submitted={},
             stop_loss_escalated=set(),
+            stop_condition_since={},
         )
 
     def test_record_order_error_blacklists_only_the_offending_symbol(self):
