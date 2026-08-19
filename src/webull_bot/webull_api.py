@@ -140,6 +140,21 @@ class WebullAPI:
         except Exception:
             return None
 
+    @staticmethod
+    def account_value_from_balance(balance: dict) -> Decimal | None:
+        """Total net liquidation value (cash + market value of every
+        held position) - the account's actual full worth, distinct from
+        buying_power (spendable cash only). Sourced from the same
+        balance() call account_state already makes every cycle.
+        """
+        reported = balance.get("total_net_liquidation_value")
+        if reported in (None, ""):
+            return None
+        try:
+            return Decimal(str(reported))
+        except Exception:
+            return None
+
     def positions(self) -> list[dict]:
         return self._call(
             lambda: self.trade.account_v2.get_account_position(self.config.account_id),

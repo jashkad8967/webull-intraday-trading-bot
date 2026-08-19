@@ -168,12 +168,17 @@ class AutoTrader:
         # window regardless of how long the symbol was previously held.
         self.position_opened_at: dict[str, float] = {}
         self.cached_buying_power = Decimal("0")
+        self.cached_raw_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
         # Webull's own account-level today's total P&L, refreshed
         # alongside cached_buying_power/cached_positions in account_state
         # - see account_day_pnl_from_balance and write_status_snapshot's
         # dashboard total.
         self.cached_account_day_pnl: Decimal | None = None
+        # Total net liquidation value (cash + market value of every held
+        # position) - the dashboard's "Account Value" figure, distinct
+        # from buying_power (spendable cash only).
+        self.cached_account_value: Decimal | None = None
         self.working_orders: dict[str, dict] = {}
         self.agent_candidates: dict[str, dict] = {}
         self.entries_paused = False
@@ -857,6 +862,7 @@ class AutoTrader:
         limit_price: Decimal | None = None,
         pnl: Decimal | None = None,
         entry_price: Decimal | None = None,
+        quantity: Decimal | None = None,
     ) -> None:
         submitted_at = time.monotonic()
         self.last_trade[key] = submitted_at
@@ -905,6 +911,7 @@ class AutoTrader:
             order_id,
             pnl,
             entry_price=entry_price,
+            quantity=quantity,
         )
         limit_text = (
             f" | limit={limit_price}"
@@ -1144,14 +1151,23 @@ class AutoTrader:
             # would compound each cycle and drive spendable capital to
             # zero almost immediately.
             balance = self.api.balance()
+            # Raw, before MIN_CASH_RESERVE_DOLLARS - the dashboard should
+            # show the account's real buying power (what Webull's own app
+            # shows), not the internally-reserved figure trading logic
+            # actually sizes against below. The reserve is a real safety
+            # margin for order sizing, not something the display should
+            # silently subtract and show as a gap against Webull's app.
+            self.cached_raw_buying_power = self.api.buying_power_from_balance(
+                balance
+            )
             self.cached_buying_power = max(
                 Decimal("0"),
-                self.api.buying_power_from_balance(balance)
-                - self.config.min_cash_reserve_dollars,
+                self.cached_raw_buying_power - self.config.min_cash_reserve_dollars,
             )
             self.cached_account_day_pnl = self.api.account_day_pnl_from_balance(
                 balance
             )
+            self.cached_account_value = self.api.account_value_from_balance(balance)
             self.cached_positions = self.api.positions()
             self.last_account_refresh = now
         return self.cached_buying_power, [dict(item) for item in self.cached_positions]
@@ -1799,7 +1815,9 @@ class AutoTrader:
                 log.error("ICEBERG| %s | slice failed | %s", symbol, exc)
                 entry["last_slice_at"] = now
                 continue
-            self.record_trade(entry["key"], order_id, side, entry_price=limit_price)
+            self.record_trade(
+                entry["key"], order_id, side, entry_price=limit_price, quantity=clip
+            )
             entry["remaining"] -= clip
             entry["last_slice_at"] = now
             log.info(
@@ -2265,6 +2283,7 @@ class AutoTrader:
                             order_id,
                             "BUY",
                             entry_price=self.api.stock_limit_price(quote, "BUY"),
+                            quantity=buy_quantity,
                         )
                         buying_power = max(
                             Decimal("0"),
@@ -2365,6 +2384,7 @@ class AutoTrader:
                             order_id,
                             "SHORT",
                             entry_price=self.api.stock_limit_price(quote, "SHORT"),
+                            quantity=short_quantity,
                         )
                         # Not exact margin accounting (Webull's actual short
                         # margin requirement isn't modeled here) - same
@@ -2482,7 +2502,10 @@ class AutoTrader:
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     realized_price = limit_price if limit_price is not None else price
                     pnl = self.record_realized_exit(cost, realized_price, quantity)
-                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
+                    self.record_trade(
+                        key, order_id, "PROFIT", limit_price, pnl=pnl,
+                        entry_price=cost, quantity=exit_quantity,
+                    )
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
                     exit_is_fractional = self.is_fractional_quantity(exit_quantity)
                     if not self.stop_loss_confirmed(symbol):
@@ -2543,7 +2566,10 @@ class AutoTrader:
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     realized_price = limit_price if limit_price is not None else price
                     pnl = self.record_realized_exit(cost, realized_price, quantity)
-                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl, entry_price=cost)
+                    self.record_trade(
+                        key, order_id, "STOP", limit_price, pnl=pnl,
+                        entry_price=cost, quantity=exit_quantity,
+                    )
             except Exception as exc:
                 self.stop_loss_escalated.discard(symbol)
                 if isinstance(exc, QuoteUnavailableError):
@@ -2728,6 +2754,7 @@ class AutoTrader:
                     entry_price=self.api.stock_limit_price(
                         quote_by_symbol[long_symbol], "BUY"
                     ),
+                    quantity=long_qty,
                 )
                 self.record_trade(
                     f"STOCK:{short_symbol}",
@@ -2736,6 +2763,7 @@ class AutoTrader:
                     entry_price=self.api.stock_limit_price(
                         quote_by_symbol[short_symbol], "SHORT"
                     ),
+                    quantity=short_qty,
                 )
                 self.position_buckets[long_symbol] = "PAIRS_LONG"
                 self.position_buckets[short_symbol] = "PAIRS_SHORT"
@@ -2786,6 +2814,7 @@ class AutoTrader:
                         sell_price,
                         pnl=pnl,
                         entry_price=long_cost,
+                        quantity=long_qty,
                     )
                 if short_qty > 0:
                     # Covering submits as a plain "BUY" order (Webull has
@@ -2806,6 +2835,7 @@ class AutoTrader:
                         cover_price,
                         pnl=pnl,
                         entry_price=short_cost,
+                        quantity=short_qty,
                     )
             except Exception as exc:
                 log.error(
@@ -3019,7 +3049,11 @@ class AutoTrader:
                             "BUY_TO_OPEN",
                         )
                         self.record_trade(
-                            key, order_id, "BUY", entry_price=limit_price
+                            key,
+                            order_id,
+                            "BUY",
+                            entry_price=limit_price,
+                            quantity=buy_quantity,
                         )
                         buying_power = max(
                             Decimal("0"),
@@ -3061,7 +3095,10 @@ class AutoTrader:
                     )
                     self.pending_option_exits.add(option_symbol)
                     pnl = self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
-                    self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
+                    self.record_trade(
+                        key, order_id, "PROFIT", limit_price, pnl=pnl,
+                        entry_price=cost, quantity=quantity,
+                    )
                 if (
                     decision.action == "LOSS"
                     and option_symbol not in self.pending_option_exits
@@ -3081,7 +3118,10 @@ class AutoTrader:
                     )
                     self.pending_option_exits.add(option_symbol)
                     pnl = self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
-                    self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl, entry_price=cost)
+                    self.record_trade(
+                        key, order_id, "STOP", limit_price, pnl=pnl,
+                        entry_price=cost, quantity=quantity,
+                    )
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
                     continue
@@ -3266,7 +3306,10 @@ class AutoTrader:
                     )
                     self.pending_stock_exits.add(symbol)
                     pnl = self.record_realized_exit(average_cost, sell_price, quantity)
-                    self.record_trade(key, order_id, "PROFIT", sell_price, pnl=pnl, entry_price=average_cost)
+                    self.record_trade(
+                        key, order_id, "PROFIT", sell_price, pnl=pnl,
+                        entry_price=average_cost, quantity=quantity,
+                    )
                     boosted += 1
                 elif instrument_type == "OPTION" and options_active:
                     if symbol in self.pending_option_exits:
@@ -3295,7 +3338,10 @@ class AutoTrader:
                     )
                     self.pending_option_exits.add(symbol)
                     pnl = self.record_realized_exit(average_cost, sell_price, quantity, multiplier=100)
-                    self.record_trade(key, order_id, "PROFIT", sell_price, pnl=pnl, entry_price=average_cost)
+                    self.record_trade(
+                        key, order_id, "PROFIT", sell_price, pnl=pnl,
+                        entry_price=average_cost, quantity=quantity,
+                    )
                     boosted += 1
             except Exception as exc:
                 if isinstance(exc, QuoteUnavailableError):
@@ -3369,7 +3415,10 @@ class AutoTrader:
             # cash + market-value equity formula for both directions - a
             # short's proceeds already sit in buying_power, and its
             # negative position value nets out the buy-back liability.
-            total_equity = buying_power + sum(
+            # cached_raw_buying_power (not the buying_power parameter,
+            # which is reserved-down for trading sizing) so this doesn't
+            # understate real equity by MIN_CASH_RESERVE_DOLLARS.
+            total_equity = self.cached_raw_buying_power + sum(
                 (
                     Decimal(row["quantity"]) * Decimal(row["last_price"])
                     for row in position_rows
@@ -3395,7 +3444,12 @@ class AutoTrader:
         ]
         self.status.write(
             mode=self.config.mode,
-            buying_power=buying_power,
+            # Real, un-reserved buying power (what Webull's own app
+            # shows), not the buying_power parameter this function also
+            # received - that one is reserved down by
+            # MIN_CASH_RESERVE_DOLLARS for trading sizing and showing it
+            # here reads as a silent gap against the account's real cash.
+            buying_power=self.cached_raw_buying_power,
             positions=position_rows,
             watchlist=watchlist_rows,
             agent_summary=agent_summary,
@@ -3405,6 +3459,7 @@ class AutoTrader:
             realized_pnl_today=self.daily_realized_pnl,
             open_pnl_total=day_pnl_total,
             account_day_pnl_total=self.cached_account_day_pnl,
+            account_value=self.cached_account_value,
             user_watchlist=sorted(self.user_watchlist),
             pending_orders=pending_order_rows,
         )
@@ -3695,7 +3750,10 @@ class AutoTrader:
             )
             self.pending_stock_exits.add(symbol)
             pnl = self.record_realized_exit(cost, sell_price, quantity)
-            self.record_trade(f"STOCK:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl, entry_price=cost)
+            self.record_trade(
+                f"STOCK:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl,
+                entry_price=cost, quantity=quantity,
+            )
             if pnl < 0:
                 self.wash_sales.block(symbol, "manual sell at a loss")
         elif instrument_type == "OPTION":
@@ -3725,7 +3783,10 @@ class AutoTrader:
             )
             self.pending_option_exits.add(symbol)
             pnl = self.record_realized_exit(cost, sell_price, quantity, multiplier=100)
-            self.record_trade(f"OPTION:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl, entry_price=cost)
+            self.record_trade(
+                f"OPTION:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl,
+                entry_price=cost, quantity=quantity,
+            )
             if pnl < 0:
                 self.wash_sales.block(
                     contract["underlying_symbol"],
@@ -3846,7 +3907,11 @@ class AutoTrader:
                 log.error("CMD    | manual buy failed | %-8s | %s", symbol, exc)
             return buying_power
         self.record_trade(
-            f"STOCK:{symbol}", order_id, "MANUAL_BUY", entry_price=entry_price
+            f"STOCK:{symbol}",
+            order_id,
+            "MANUAL_BUY",
+            entry_price=entry_price,
+            quantity=buy_quantity,
         )
         self.position_buckets[symbol] = "MANUAL"
         log.warning(
