@@ -145,6 +145,27 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("100"),
     )
+    # Soft, two-sided priority_score nudge from analyst target price/rating
+    # consensus (see TradingStrategy.analyst_priority_bonus and
+    # AnalystDataService) - re-ranks candidates that already cleared every
+    # other gate, never blocks or forces an entry on its own. Scaled well
+    # below MOST_ACTIVE_PRIORITY_BONUS: real-time order flow (most-active)
+    # is a much stronger scalp signal than a slow-moving analyst consensus,
+    # so this should nudge ties, not override activity-driven ranking.
+    analyst_priority_enabled: bool = True
+    analyst_priority_bonus_max: Decimal = Field(
+        default=Decimal("5"),
+        ge=0,
+        le=Decimal("50"),
+    )
+    # How long a symbol's fetched target price/rating is trusted before
+    # AnalystDataService fetches it again - deliberately long. Analyst
+    # revisions are a same-day-rare event, not an intraday one, and this
+    # also bounds how often the two-call Webull fundamentals lookup runs
+    # per symbol against the shared STOCK_INSTRUMENT rate bucket.
+    analyst_data_cache_seconds: int = Field(
+        default=43200, ge=300, le=604800
+    )
     ema_fast_period: int = Field(default=3, ge=2, le=500)
     ema_slow_period: int = Field(default=8, ge=3, le=1000)
     reenter_on_trend: bool = True
