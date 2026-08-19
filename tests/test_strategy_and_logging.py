@@ -2537,6 +2537,31 @@ class FractionalSharesTests(StrategyConfigMixin, unittest.TestCase):
         self.assertEqual(cost, Decimal("250.00"))
 
 
+class AccountDayPnlExtractionTests(unittest.TestCase):
+    def test_extracts_total_day_profit_loss(self):
+        balance = {"total_day_profit_loss": "-0.22"}
+        self.assertEqual(
+            WebullAPI.account_day_pnl_from_balance(balance), Decimal("-0.22")
+        )
+
+    def test_none_when_unreported(self):
+        self.assertIsNone(WebullAPI.account_day_pnl_from_balance({}))
+
+    def test_none_on_a_malformed_value(self):
+        balance = {"total_day_profit_loss": "not-a-number"}
+        self.assertIsNone(WebullAPI.account_day_pnl_from_balance(balance))
+
+    def test_buying_power_from_balance_matches_the_prior_buying_power_behavior(self):
+        balance = {
+            "account_currency_assets": [
+                {"currency": "USD", "day_buying_power": "120.00", "buying_power": "100.00"}
+            ]
+        }
+        self.assertEqual(
+            WebullAPI.buying_power_from_balance(balance), Decimal("120.00")
+        )
+
+
 class StopExitPricingTests(unittest.TestCase):
     def test_stop_exit_uses_bid_ask_midpoint_not_aggressive_crossing(self):
         api = WebullAPI.__new__(WebullAPI)
@@ -3386,6 +3411,64 @@ class StatusWriterTests(unittest.TestCase):
             self.assertEqual(payload["pnl_today"]["open"], "-1.25")
             self.assertEqual(payload["pnl_today"]["total"], "1.75")
             self.assertNotIn("unrealized", payload["pnl_today"])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_pnl_today_total_prefers_webulls_own_account_day_pnl(self):
+        """Live incident: the bot's own realized+open estimate drifted
+        from what Webull's app showed, worst for fractional holdings.
+        realized_pnl_today is only ever an at-submission-time estimate
+        (record_realized_exit's own docstring: "actual fill price can
+        differ slightly"), and drift compounds over many trades on a
+        high-frequency account - Webull's own account_day_pnl_total, when
+        available, is ground truth and must win over the local sum.
+        """
+        path = Path("tests/.generated_status/status11.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(path))
+            writer.write(
+                mode="LIVE",
+                buying_power=Decimal("1000"),
+                positions=[],
+                watchlist=[],
+                agent_summary=None,
+                paused=False,
+                stock_count=10,
+                option_count=0,
+                realized_pnl_today=Decimal("3.00"),
+                open_pnl_total=Decimal("-1.25"),
+                account_day_pnl_total=Decimal("-0.22"),
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            # realized/open still show the bot's own local breakdown -
+            # only the headline total is overridden.
+            self.assertEqual(payload["pnl_today"]["realized"], "3.00")
+            self.assertEqual(payload["pnl_today"]["open"], "-1.25")
+            self.assertEqual(payload["pnl_today"]["total"], "-0.22")
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_pnl_today_total_falls_back_to_local_sum_when_webull_unreported(self):
+        path = Path("tests/.generated_status/status12.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(path))
+            writer.write(
+                mode="LIVE",
+                buying_power=Decimal("1000"),
+                positions=[],
+                watchlist=[],
+                agent_summary=None,
+                paused=False,
+                stock_count=10,
+                option_count=0,
+                realized_pnl_today=Decimal("3.00"),
+                open_pnl_total=Decimal("-1.25"),
+                account_day_pnl_total=None,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["pnl_today"]["total"], "1.75")
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
@@ -4336,10 +4419,13 @@ class AccountStateCashReserveTests(unittest.TestCase):
                 min_cash_reserve_dollars=Decimal("10"),
             ),
             api=SimpleNamespace(
-                buying_power=lambda: Decimal("120.00"),
+                balance=lambda: {},
+                buying_power_from_balance=lambda balance: Decimal("120.00"),
+                account_day_pnl_from_balance=lambda balance: Decimal("-1.50"),
                 positions=lambda: [{"symbol": "AAPL"}],
             ),
             cached_buying_power=Decimal("0"),
+            cached_account_day_pnl=None,
             cached_positions=[],
             last_account_refresh=0.0,
         )
@@ -4349,6 +4435,7 @@ class AccountStateCashReserveTests(unittest.TestCase):
 
         self.assertEqual(buying_power, Decimal("110.00"))
         self.assertEqual(positions, [{"symbol": "AAPL"}])
+        self.assertEqual(fake_bot.cached_account_day_pnl, Decimal("-1.50"))
 
     def test_cache_hit_does_not_subtract_the_reserve_again(self):
         """Regression test: account_state() only re-fetches from the
@@ -4390,10 +4477,13 @@ class AccountStateCashReserveTests(unittest.TestCase):
                 min_cash_reserve_dollars=Decimal("10"),
             ),
             api=SimpleNamespace(
-                buying_power=lambda: Decimal("3.00"),
+                balance=lambda: {},
+                buying_power_from_balance=lambda balance: Decimal("3.00"),
+                account_day_pnl_from_balance=lambda balance: None,
                 positions=lambda: [],
             ),
             cached_buying_power=Decimal("0"),
+            cached_account_day_pnl=None,
             cached_positions=[],
             last_account_refresh=0.0,
         )
@@ -6295,11 +6385,25 @@ class OrderHistoryReconciliationTests(unittest.TestCase):
         )
         return fake_bot
 
+    @staticmethod
+    def _today_place_time():
+        # reconcile_order_history filters to orders placed today by
+        # matching place_time_at's (UTC) date prefix - match that here so
+        # fixtures aren't filtered out by the day-boundary check itself.
+        return datetime.now(timezone.utc).date().isoformat() + "T12:00:00.000Z"
+
     def test_a_bot_submitted_order_is_not_flagged(self):
         history = [
             {
                 "client_order_id": "abc123",
-                "orders": [{"symbol": "AAPL", "side": "BUY", "status": "FILLED"}],
+                "orders": [
+                    {
+                        "symbol": "AAPL",
+                        "side": "BUY",
+                        "status": "FILLED",
+                        "place_time_at": self._today_place_time(),
+                    }
+                ],
             }
         ]
         fake_bot = self._fake_bot(history, submitted_order_ids_today={"abc123"})
@@ -6325,6 +6429,7 @@ class OrderHistoryReconciliationTests(unittest.TestCase):
                         "status": "FILLED",
                         "total_quantity": "5",
                         "filled_quantity": "5",
+                        "place_time_at": self._today_place_time(),
                     }
                 ],
             }

@@ -1,7 +1,7 @@
 import logging
 import time
 from collections import defaultdict, deque
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
@@ -169,6 +169,11 @@ class AutoTrader:
         self.position_opened_at: dict[str, float] = {}
         self.cached_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
+        # Webull's own account-level today's total P&L, refreshed
+        # alongside cached_buying_power/cached_positions in account_state
+        # - see account_day_pnl_from_balance and write_status_snapshot's
+        # dashboard total.
+        self.cached_account_day_pnl: Decimal | None = None
         self.working_orders: dict[str, dict] = {}
         self.agent_candidates: dict[str, dict] = {}
         self.entries_paused = False
@@ -1138,9 +1143,14 @@ class AutoTrader:
             # the reserve again on every cache hit within that window
             # would compound each cycle and drive spendable capital to
             # zero almost immediately.
+            balance = self.api.balance()
             self.cached_buying_power = max(
                 Decimal("0"),
-                self.api.buying_power() - self.config.min_cash_reserve_dollars,
+                self.api.buying_power_from_balance(balance)
+                - self.config.min_cash_reserve_dollars,
+            )
+            self.cached_account_day_pnl = self.api.account_day_pnl_from_balance(
+                balance
             )
             self.cached_positions = self.api.positions()
             self.last_account_refresh = now
@@ -1881,15 +1891,34 @@ class AutoTrader:
         if now - self.last_order_history_reconcile < self.config.order_history_reconcile_seconds:
             return
         self.last_order_history_reconcile = now
-        today = self.now().date().isoformat()
+        today = self.now().date()
         try:
-            history = self.api.order_history(today, today)
+            # Webull rejects a same-day start_date/end_date pair outright
+            # (417 OAUTH_OPENAPI_PARAM_ERR) - a 1-day lookback is the
+            # smallest range it accepts. Yesterday's orders are filtered
+            # back out below (placed_today), so this doesn't widen what
+            # actually gets flagged.
+            history = self.api.order_history(
+                (today - timedelta(days=1)).isoformat(), today.isoformat()
+            )
         except Exception as exc:
             log.warning("RECON  | order history fetch failed | %s", exc)
             return
+        # place_time_at is UTC (a trailing "Z"), not the bot's trading
+        # timezone - comparing it against today's ET-local date string
+        # would misclassify anything placed in the last few hours of ET
+        # extended trading (already the next UTC calendar date) as
+        # "yesterday" and silently skip it.
+        today_prefix = datetime.now(timezone.utc).date().isoformat()
         for combo in history:
             client_order_id = combo.get("client_order_id")
             if not client_order_id:
+                continue
+            placed_today = any(
+                str(order.get("place_time_at", "")).startswith(today_prefix)
+                for order in combo.get("orders", [])
+            )
+            if not placed_today:
                 continue
             if client_order_id in self.submitted_order_ids_today:
                 continue
@@ -3375,6 +3404,7 @@ class AutoTrader:
             option_count=len(self.option_contracts),
             realized_pnl_today=self.daily_realized_pnl,
             open_pnl_total=day_pnl_total,
+            account_day_pnl_total=self.cached_account_day_pnl,
             user_watchlist=sorted(self.user_watchlist),
             pending_orders=pending_order_rows,
         )

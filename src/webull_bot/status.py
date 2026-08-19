@@ -145,6 +145,7 @@ class StatusWriter:
         option_count: int,
         realized_pnl_today: Decimal = Decimal("0"),
         open_pnl_total: Decimal = Decimal("0"),
+        account_day_pnl_total: Decimal | None = None,
         user_watchlist: list[str] | None = None,
         pending_orders: list[dict] | None = None,
     ) -> None:
@@ -170,9 +171,24 @@ class StatusWriter:
                 # whenever each position was originally bought. Both are
                 # genuinely "today" figures, unlike a since-cost unrealized
                 # total would be for a position held across several days.
+                #
+                # total: Webull's own account-level total_day_profit_loss
+                # when available (see WebullAPI.account_day_pnl_from_
+                # balance), not realized+open added together locally.
+                # Live incident: the bot's own realized/open estimates
+                # drifted from what Webull's app showed - realized is only
+                # ever an at-submission-time estimate (record_realized_
+                # exit's own docstring: "actual fill price can differ
+                # slightly"), and drift compounds over many trades on a
+                # high-frequency account. Falls back to the local sum only
+                # when Webull doesn't report a total (e.g. paper mode).
                 "realized": str(realized_pnl_today),
                 "open": str(open_pnl_total),
-                "total": str(realized_pnl_today + open_pnl_total),
+                "total": str(
+                    account_day_pnl_total
+                    if account_day_pnl_total is not None
+                    else realized_pnl_today + open_pnl_total
+                ),
             },
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
