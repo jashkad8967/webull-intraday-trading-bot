@@ -432,6 +432,7 @@ def idle_cash_ramp_reaches_a_relaxed_entry_and_resets_on_a_fill():
     fake_bot.position_opened_at = {}
     fake_bot.symbol_pnl_history = defaultdict(deque)
     fake_bot.consecutive_exit_failures = defaultdict(int)
+    fake_bot.submitted_order_ids_today = set()
     record_trade = AutoTrader.record_trade.__get__(fake_bot)
     record_trade("STOCK:AAPL", "order-1", "BUY")
 

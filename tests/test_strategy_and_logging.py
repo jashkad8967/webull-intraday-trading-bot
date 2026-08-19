@@ -1031,6 +1031,7 @@ class StopLossEscalationTests(unittest.TestCase):
             position_opened_at={},
             symbol_pnl_history=defaultdict(deque),
             consecutive_exit_failures=defaultdict(int),
+            submitted_order_ids_today=set(),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -4478,6 +4479,7 @@ class StopLossGuardTests(unittest.TestCase):
             recent_stop_losses=deque(),
             position_opened_at={},
             symbol_pnl_history=defaultdict(deque),
+            submitted_order_ids_today=set(),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -4610,6 +4612,7 @@ class SymbolQuarantineTests(unittest.TestCase):
             recent_stop_losses=deque(),
             position_opened_at={},
             symbol_pnl_history=defaultdict(deque),
+            submitted_order_ids_today=set(),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -4826,6 +4829,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             position_opened_at={},
             symbol_pnl_history=defaultdict(deque),
             consecutive_exit_failures=defaultdict(int),
+            submitted_order_ids_today=set(),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -4846,6 +4850,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             last_capital_deployed_at=stale,
             position_opened_at={},
             symbol_pnl_history=defaultdict(deque),
+            submitted_order_ids_today=set(),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -6240,6 +6245,120 @@ class PhantomExitReversalTests(unittest.TestCase):
         self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0"))
         self.assertEqual(discarded_trades, ["order-1"])
         self.assertEqual(fake_bot.consecutive_exit_failures["ASHR"], 1)
+
+
+class OrderHistoryReconciliationTests(unittest.TestCase):
+    """reconcile_order_history is a log-only audit - it must never touch
+    pnl, positions, or gating state, only log once per unrecognized
+    order per day.
+    """
+
+    def _fake_bot(self, history, **overrides):
+        from webull_bot.bot import AutoTrader
+
+        defaults = dict(
+            config=SimpleNamespace(
+                order_history_reconcile_enabled=True,
+                order_history_reconcile_seconds=1800,
+            ),
+            api=SimpleNamespace(order_history=lambda start, end: history),
+            submitted_order_ids_today=set(),
+            reconciliation_flagged_order_ids=set(),
+            last_order_history_reconcile=0.0,
+            now=lambda: datetime(2026, 8, 19, tzinfo=timezone.utc),
+        )
+        defaults.update(overrides)
+        fake_bot = SimpleNamespace(**defaults)
+        fake_bot.reconcile_order_history = AutoTrader.reconcile_order_history.__get__(
+            fake_bot
+        )
+        return fake_bot
+
+    def test_a_bot_submitted_order_is_not_flagged(self):
+        history = [
+            {
+                "client_order_id": "abc123",
+                "orders": [{"symbol": "AAPL", "side": "BUY", "status": "FILLED"}],
+            }
+        ]
+        fake_bot = self._fake_bot(history, submitted_order_ids_today={"abc123"})
+        # Real time.monotonic() is relative to an arbitrary reference
+        # point (often host boot) - on a freshly-booted CI runner it can
+        # read under ORDER_HISTORY_RECONCILE_SECONDS, making
+        # last_order_history_reconcile=0.0 look "still within the
+        # throttle window" and skip the call under test entirely. Pin it
+        # well above the threshold so the throttle check behaves the
+        # same regardless of host uptime.
+        with unittest.mock.patch("time.monotonic", return_value=1_000_000.0):
+            with self.assertNoLogs("webull-bot", level="WARNING"):
+                fake_bot.reconcile_order_history()
+
+    def test_an_unrecognized_order_is_logged_once(self):
+        history = [
+            {
+                "client_order_id": "manual-order-1",
+                "orders": [
+                    {
+                        "symbol": "TSLA",
+                        "side": "SELL",
+                        "status": "FILLED",
+                        "total_quantity": "5",
+                        "filled_quantity": "5",
+                    }
+                ],
+            }
+        ]
+        fake_bot = self._fake_bot(history)
+        with unittest.mock.patch("time.monotonic", return_value=1_000_000.0):
+            with self.assertLogs("webull-bot", level="WARNING") as logs:
+                fake_bot.reconcile_order_history()
+        self.assertIn("manual-order-1", logs.output[0])
+        self.assertIn("manual-order-1", fake_bot.reconciliation_flagged_order_ids)
+
+        # A second run within the throttle window must not re-fetch or
+        # re-log the same order.
+        with unittest.mock.patch("time.monotonic", return_value=1_000_010.0):
+            with self.assertNoLogs("webull-bot", level="WARNING"):
+                fake_bot.reconcile_order_history()
+
+    def test_disabled_never_calls_the_api(self):
+        fake_bot = self._fake_bot(
+            [{"client_order_id": "x", "orders": []}],
+            config=SimpleNamespace(
+                order_history_reconcile_enabled=False,
+                order_history_reconcile_seconds=1800,
+            ),
+        )
+        fake_bot.api.order_history = lambda start, end: (_ for _ in ()).throw(
+            AssertionError("must not fetch when disabled")
+        )
+        fake_bot.reconcile_order_history()
+
+    def test_a_fetch_failure_is_swallowed_and_logged(self):
+        fake_bot = self._fake_bot([])
+        fake_bot.api = SimpleNamespace(
+            order_history=lambda start, end: (_ for _ in ()).throw(
+                RuntimeError("boom")
+            )
+        )
+        with unittest.mock.patch("time.monotonic", return_value=1_000_000.0):
+            with self.assertLogs("webull-bot", level="WARNING") as logs:
+                fake_bot.reconcile_order_history()
+        self.assertIn("boom", logs.output[0])
+
+    def test_throttled_within_the_interval(self):
+        history = [
+            {
+                "client_order_id": "manual-order-2",
+                "orders": [{"symbol": "MSFT", "side": "BUY", "status": "FILLED"}],
+            }
+        ]
+        fake_bot = self._fake_bot(history)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.last_order_history_reconcile = 100.0
+        with unittest.mock.patch("time.monotonic", return_value=200.0):
+            with self.assertNoLogs("webull-bot", level="WARNING"):
+                fake_bot.reconcile_order_history()
 
 
 if __name__ == "__main__":
