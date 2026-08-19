@@ -338,6 +338,18 @@ class Settings(BaseSettings):
     # of) OPTION_QUANTITY and MAX_ORDER_NOTIONAL.
     option_capital_fraction: Decimal = Field(default=Decimal("0.05"), gt=0, le=1)
     stop_loss_escalate_seconds: int = Field(default=15, ge=5, le=120)
+    # Live incident: CTRM resubmitted the same never-fillable PROFIT limit
+    # order for 3+ hours (40+ attempts) - escalate_stalled_stop_losses is
+    # meant to prevent exactly this, but a symbol whose escalated order
+    # also never fills (or whose escalation itself doesn't fire) has no
+    # other backstop. After this many consecutive never-filled exit
+    # attempts for one symbol (see AutoTrader.consecutive_exit_failures),
+    # the next one forces a genuine MARKET order instead of another
+    # limit - guaranteed to fill and end the loop, rather than hoping a
+    # better price eventually clears.
+    consecutive_exit_failure_market_threshold: int = Field(
+        default=3, ge=1, le=20
+    )
     daily_loss_circuit_breaker_enabled: bool = False
     daily_max_loss_dollars: Decimal = Field(default=Decimal("50"), gt=0)
     market_requests_per_minute: int = Field(default=240, ge=1, le=300)
