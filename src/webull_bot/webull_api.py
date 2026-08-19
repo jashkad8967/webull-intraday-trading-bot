@@ -98,7 +98,10 @@ class WebullAPI:
         )
 
     def buying_power(self) -> Decimal:
-        balance = self.balance()
+        return self.buying_power_from_balance(self.balance())
+
+    @staticmethod
+    def buying_power_from_balance(balance: dict) -> Decimal:
         usd = next(
             (
                 item
@@ -119,6 +122,23 @@ class WebullAPI:
             return max(Decimal("0"), *buying_power_values)
         cash = usd.get("cash_balance")
         return Decimal(str(cash)) if cash not in (None, "") else Decimal("0")
+
+    @staticmethod
+    def account_day_pnl_from_balance(balance: dict) -> Decimal | None:
+        """Webull's own account-level today's total P&L (realized +
+        unrealized since the prior session's close) - see
+        total_day_profit_loss. Ground truth for the dashboard's headline
+        P&L Today total, sourced from the same balance() call
+        account_state already makes every cycle for buying_power (no
+        extra network call). None if unreported.
+        """
+        reported = balance.get("total_day_profit_loss")
+        if reported in (None, ""):
+            return None
+        try:
+            return Decimal(str(reported))
+        except Exception:
+            return None
 
     def positions(self) -> list[dict]:
         return self._call(
