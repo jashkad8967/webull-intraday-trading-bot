@@ -3422,6 +3422,13 @@ class StatusWriterTests(unittest.TestCase):
         differ slightly"), and drift compounds over many trades on a
         high-frequency account - Webull's own account_day_pnl_total, when
         available, is ground truth and must win over the local sum.
+
+        Second live incident, same day: showing the bot's own
+        realized_pnl_today next to a Webull-sourced total produced a
+        headline total that visibly didn't match its own breakdown
+        (0 + 0.11 != -0.46 in the wild). realized must be backed out as
+        total - open instead, so the breakdown always sums to the total
+        exactly.
         """
         path = Path("tests/.generated_status/status11.json")
         shutil.rmtree(path.parent, ignore_errors=True)
@@ -3441,11 +3448,18 @@ class StatusWriterTests(unittest.TestCase):
                 account_day_pnl_total=Decimal("-0.22"),
             )
             payload = json.loads(path.read_text(encoding="utf-8"))
-            # realized/open still show the bot's own local breakdown -
-            # only the headline total is overridden.
-            self.assertEqual(payload["pnl_today"]["realized"], "3.00")
+            # open still shows the bot's own (largely Webull-sourced)
+            # per-position breakdown; realized is backed out from the
+            # authoritative total instead of the bot's own drifting
+            # estimate, so open + realized == total always holds.
             self.assertEqual(payload["pnl_today"]["open"], "-1.25")
             self.assertEqual(payload["pnl_today"]["total"], "-0.22")
+            self.assertEqual(payload["pnl_today"]["realized"], "1.03")
+            self.assertEqual(
+                Decimal(payload["pnl_today"]["realized"])
+                + Decimal(payload["pnl_today"]["open"]),
+                Decimal(payload["pnl_today"]["total"]),
+            )
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
@@ -4422,9 +4436,11 @@ class AccountStateCashReserveTests(unittest.TestCase):
                 balance=lambda: {},
                 buying_power_from_balance=lambda balance: Decimal("120.00"),
                 account_day_pnl_from_balance=lambda balance: Decimal("-1.50"),
+                account_value_from_balance=lambda balance: Decimal("500.00"),
                 positions=lambda: [{"symbol": "AAPL"}],
             ),
             cached_buying_power=Decimal("0"),
+            cached_raw_buying_power=Decimal("0"),
             cached_account_day_pnl=None,
             cached_positions=[],
             last_account_refresh=0.0,
@@ -4436,6 +4452,12 @@ class AccountStateCashReserveTests(unittest.TestCase):
         self.assertEqual(buying_power, Decimal("110.00"))
         self.assertEqual(positions, [{"symbol": "AAPL"}])
         self.assertEqual(fake_bot.cached_account_day_pnl, Decimal("-1.50"))
+        self.assertEqual(fake_bot.cached_account_value, Decimal("500.00"))
+        # The reserve reduces cached_buying_power (used for trading
+        # sizing) but not cached_raw_buying_power (used for the
+        # dashboard's displayed figures) - showing the reserved-down
+        # number there reads as a silent gap against Webull's own app.
+        self.assertEqual(fake_bot.cached_raw_buying_power, Decimal("120.00"))
 
     def test_cache_hit_does_not_subtract_the_reserve_again(self):
         """Regression test: account_state() only re-fetches from the
@@ -4480,9 +4502,11 @@ class AccountStateCashReserveTests(unittest.TestCase):
                 balance=lambda: {},
                 buying_power_from_balance=lambda balance: Decimal("3.00"),
                 account_day_pnl_from_balance=lambda balance: None,
+                account_value_from_balance=lambda balance: None,
                 positions=lambda: [],
             ),
             cached_buying_power=Decimal("0"),
+            cached_raw_buying_power=Decimal("0"),
             cached_account_day_pnl=None,
             cached_positions=[],
             last_account_refresh=0.0,
@@ -5170,7 +5194,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
         recorded = []
         fake_bot.record_trade = (
-            lambda key, order_id, action, entry_price=None: recorded.append(
+            lambda key, order_id, action, entry_price=None, quantity=None: recorded.append(
                 (key, order_id, action, entry_price)
             )
         )

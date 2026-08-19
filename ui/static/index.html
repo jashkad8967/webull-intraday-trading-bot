@@ -292,6 +292,7 @@
 
   <div class="top-row">
     <div class="stat-list">
+      <div class="stat-row"><span class="label">Account Value</span><span class="value" id="account-value">—</span></div>
       <div class="stat-row"><span class="label">Buying Power</span><span class="value" id="buying-power">—</span></div>
       <div class="stat-row"><span class="label">Open Positions</span><span class="value" id="position-count">—</span></div>
       <div class="stat-row"><span class="label">Universe</span><span class="value" id="universe">—</span></div>
@@ -404,6 +405,7 @@ async function refresh() {
     dot.className = "dot " + (data.paused ? "paused" : "live");
     document.getElementById("mode-badge").textContent = data.mode ? `mode=${data.mode}` + (data.paused ? " · PAUSED" : "") : "";
     document.getElementById("buying-power").textContent = fmtMoney(data.buying_power);
+    document.getElementById("account-value").textContent = fmtMoney(data.account_value);
     const pnl = data.pnl_today || {};
     const pnlEl = document.getElementById("pnl-today");
     pnlEl.textContent = fmtMoney(pnl.total ?? 0);
@@ -444,6 +446,7 @@ async function refresh() {
       { label: "Type", render: r => r.instrument_type ?? "—" },
       { label: "Action", render: r => r.action ?? "—" },
       { label: "Symbol", render: r => r.symbol ?? "—" },
+      { label: "Qty", render: r => r.quantity != null ? fmtNum(r.quantity) : "—", num: true },
       { label: "Entry", render: r => r.entry_price != null ? fmtMoney(r.entry_price) : "—", num: true },
       { label: "Exit", render: r => r.limit_price != null ? fmtMoney(r.limit_price) : "—", num: true },
       { label: "P&L", render: r => r.pnl != null ? fmtMoney(r.pnl) : "—", cls: r => pnlClass(r.pnl), num: true },

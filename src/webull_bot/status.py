@@ -75,6 +75,7 @@ class StatusWriter:
         order_id: str,
         pnl: Decimal | None = None,
         entry_price: Decimal | None = None,
+        quantity: Decimal | None = None,
     ) -> None:
         self.trades.appendleft(
             {
@@ -86,6 +87,7 @@ class StatusWriter:
                 "order_id": order_id,
                 "pnl": str(pnl) if pnl is not None else None,
                 "entry_price": str(entry_price) if entry_price is not None else None,
+                "quantity": str(quantity) if quantity is not None else None,
             }
         )
         self._save_state()
@@ -132,6 +134,44 @@ class StatusWriter:
         self.balance_history.append({"time": time.time(), "balance": str(balance)})
         self._save_state()
 
+    @staticmethod
+    def _pnl_today_payload(
+        realized_pnl_today: Decimal,
+        open_pnl_total: Decimal,
+        account_day_pnl_total: Decimal | None,
+    ) -> dict:
+        """open: today's mark-to-market move on currently-held positions
+        (Webull's own day_profit_loss per position, net of fee - see
+        TradingStrategy.position_day_pnl), already largely Webull-sourced.
+
+        total: Webull's own account-level total_day_profit_loss when
+        available (see WebullAPI.account_day_pnl_from_balance) - ground
+        truth for the account's actual today P&L, not a locally-summed
+        estimate.
+
+        realized: backed out as total - open when total is available, so
+        the three figures are always internally consistent (realized +
+        open == total, exactly). Live incident: showing the bot's own
+        separately-tracked realized_pnl_today here (only ever an at-
+        submission-time estimate - see record_realized_exit's own
+        docstring) alongside a Webull-sourced total produced a headline
+        total that visibly didn't match its own breakdown, on top of the
+        drift the total-sourcing fix already addressed. Falls back to
+        the bot's local realized_pnl_today/sum only when Webull doesn't
+        report a total (e.g. paper mode).
+        """
+        if account_day_pnl_total is not None:
+            total = account_day_pnl_total
+            realized = total - open_pnl_total
+        else:
+            realized = realized_pnl_today
+            total = realized_pnl_today + open_pnl_total
+        return {
+            "realized": str(realized),
+            "open": str(open_pnl_total),
+            "total": str(total),
+        }
+
     def write(
         self,
         *,
@@ -146,6 +186,7 @@ class StatusWriter:
         realized_pnl_today: Decimal = Decimal("0"),
         open_pnl_total: Decimal = Decimal("0"),
         account_day_pnl_total: Decimal | None = None,
+        account_value: Decimal | None = None,
         user_watchlist: list[str] | None = None,
         pending_orders: list[dict] | None = None,
     ) -> None:
@@ -154,6 +195,11 @@ class StatusWriter:
             "mode": mode,
             "paused": paused,
             "buying_power": str(buying_power),
+            # Total net liquidation value (cash + market value of every
+            # held position) - the account's actual full worth, distinct
+            # from buying_power (spendable cash only). None (and shown
+            # as "—") when Webull doesn't report it (e.g. paper mode).
+            "account_value": str(account_value) if account_value is not None else None,
             "positions": positions,
             "watchlist": watchlist,
             "user_watchlist": user_watchlist or [],
@@ -162,34 +208,9 @@ class StatusWriter:
             "recent_trades": list(self.trades),
             "pending_orders": pending_orders or [],
             "balance_history": list(self.balance_history),
-            "pnl_today": {
-                # realized: closed trades since the start of today (resets
-                # at market open - see AutoTrader.resolve_targets). open:
-                # today's mark-to-market move on currently-held positions,
-                # since yesterday's 4pm ET close (Webull's day_profit_loss -
-                # see TradingStrategy.position_day_pnl), not since
-                # whenever each position was originally bought. Both are
-                # genuinely "today" figures, unlike a since-cost unrealized
-                # total would be for a position held across several days.
-                #
-                # total: Webull's own account-level total_day_profit_loss
-                # when available (see WebullAPI.account_day_pnl_from_
-                # balance), not realized+open added together locally.
-                # Live incident: the bot's own realized/open estimates
-                # drifted from what Webull's app showed - realized is only
-                # ever an at-submission-time estimate (record_realized_
-                # exit's own docstring: "actual fill price can differ
-                # slightly"), and drift compounds over many trades on a
-                # high-frequency account. Falls back to the local sum only
-                # when Webull doesn't report a total (e.g. paper mode).
-                "realized": str(realized_pnl_today),
-                "open": str(open_pnl_total),
-                "total": str(
-                    account_day_pnl_total
-                    if account_day_pnl_total is not None
-                    else realized_pnl_today + open_pnl_total
-                ),
-            },
+            "pnl_today": self._pnl_today_payload(
+                realized_pnl_today, open_pnl_total, account_day_pnl_total
+            ),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
