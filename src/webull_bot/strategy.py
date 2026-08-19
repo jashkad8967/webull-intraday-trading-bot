@@ -1284,18 +1284,34 @@ class TradingStrategy:
         position was originally opened (unlike unrealized_profit_loss,
         which accumulates since cost for as long as the position is held).
 
-        A position opened before today has no local record of yesterday's
-        close to fall back to, so an unreported field returns 0 (unknown)
-        rather than silently substituting the since-cost figure under a
-        "today" label.
+        A whole-share position opened before today has no local record of
+        yesterday's close to fall back to, so an unreported field returns
+        0 (unknown) rather than silently substituting the since-cost
+        figure under a "today" label. A fractional position is the one
+        exception: Webull's fractional order type is core-hours-only and
+        cannot be held overnight, so a fractional position was, by
+        construction, always opened earlier the same day - "since cost"
+        and "since today" are the same number for it, making the
+        since-cost fallback exact rather than a guess. Live complaint:
+        the dashboard's open/daily P&L read wrong specifically for
+        fractional holdings - this is the gap that explains it, since
+        Webull doesn't always report day_profit_loss for a fractional
+        position, and the unconditional-0 fallback silently understated
+        (or hid entirely) exactly those positions' contribution.
         """
         reported = position.get("day_profit_loss")
-        if reported in (None, ""):
-            return Decimal("0")
+        if reported not in (None, ""):
+            try:
+                return Decimal(str(reported)) - self.config.sell_fee_dollars
+            except Exception:
+                return Decimal("0")
         try:
-            return Decimal(str(reported)) - self.config.sell_fee_dollars
+            quantity = Decimal(str(position.get("quantity", "0")))
         except Exception:
             return Decimal("0")
+        if quantity != quantity.to_integral_value():
+            return self.position_unrealized_pnl(position)
+        return Decimal("0")
 
     @staticmethod
     def portfolio_decision(
