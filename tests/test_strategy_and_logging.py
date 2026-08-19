@@ -3284,6 +3284,27 @@ class PositionPnlTests(StrategyConfigMixin, unittest.TestCase):
         position = {"unrealized_profit_loss": "5.00", "cost_price": "100", "last_price": "105"}
         self.assertEqual(strategy.position_day_pnl(position), Decimal("0"))
 
+    def test_day_pnl_still_zero_unreported_for_an_explicit_whole_quantity(self):
+        strategy = TradingStrategy(self.config())
+        position = {"quantity": "3", "unrealized_profit_loss": "5.00"}
+        self.assertEqual(strategy.position_day_pnl(position), Decimal("0"))
+
+    def test_day_pnl_falls_back_to_since_cost_for_an_unreported_fractional_position(self):
+        """Live complaint: open/daily P&L read wrong for fractional
+        holdings. Webull's fractional order type is core-hours-only and
+        cannot be held overnight, so a fractional position was always
+        opened earlier the same day - since-cost and since-today are the
+        same number for it, unlike the multi-day-hold case above where
+        that substitution would be wrong.
+        """
+        strategy = TradingStrategy(self.config())
+        position = {"quantity": "0.5", "unrealized_profit_loss": "1.00"}
+        self.assertEqual(
+            strategy.position_day_pnl(position),
+            strategy.position_unrealized_pnl(position),
+        )
+        self.assertEqual(strategy.position_day_pnl(position), Decimal("0.98"))
+
 
 class StatusWriterTests(unittest.TestCase):
     def test_write_includes_pending_orders_for_the_dashboard(self):
