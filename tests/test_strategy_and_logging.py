@@ -6282,8 +6282,16 @@ class OrderHistoryReconciliationTests(unittest.TestCase):
             }
         ]
         fake_bot = self._fake_bot(history, submitted_order_ids_today={"abc123"})
-        with self.assertNoLogs("webull-bot", level="WARNING"):
-            fake_bot.reconcile_order_history()
+        # Real time.monotonic() is relative to an arbitrary reference
+        # point (often host boot) - on a freshly-booted CI runner it can
+        # read under ORDER_HISTORY_RECONCILE_SECONDS, making
+        # last_order_history_reconcile=0.0 look "still within the
+        # throttle window" and skip the call under test entirely. Pin it
+        # well above the threshold so the throttle check behaves the
+        # same regardless of host uptime.
+        with unittest.mock.patch("time.monotonic", return_value=1_000_000.0):
+            with self.assertNoLogs("webull-bot", level="WARNING"):
+                fake_bot.reconcile_order_history()
 
     def test_an_unrecognized_order_is_logged_once(self):
         history = [
@@ -6301,15 +6309,17 @@ class OrderHistoryReconciliationTests(unittest.TestCase):
             }
         ]
         fake_bot = self._fake_bot(history)
-        with self.assertLogs("webull-bot", level="WARNING") as logs:
-            fake_bot.reconcile_order_history()
+        with unittest.mock.patch("time.monotonic", return_value=1_000_000.0):
+            with self.assertLogs("webull-bot", level="WARNING") as logs:
+                fake_bot.reconcile_order_history()
         self.assertIn("manual-order-1", logs.output[0])
         self.assertIn("manual-order-1", fake_bot.reconciliation_flagged_order_ids)
 
         # A second run within the throttle window must not re-fetch or
         # re-log the same order.
-        with self.assertNoLogs("webull-bot", level="WARNING"):
-            fake_bot.reconcile_order_history()
+        with unittest.mock.patch("time.monotonic", return_value=1_000_010.0):
+            with self.assertNoLogs("webull-bot", level="WARNING"):
+                fake_bot.reconcile_order_history()
 
     def test_disabled_never_calls_the_api(self):
         fake_bot = self._fake_bot(
@@ -6331,8 +6341,9 @@ class OrderHistoryReconciliationTests(unittest.TestCase):
                 RuntimeError("boom")
             )
         )
-        with self.assertLogs("webull-bot", level="WARNING") as logs:
-            fake_bot.reconcile_order_history()
+        with unittest.mock.patch("time.monotonic", return_value=1_000_000.0):
+            with self.assertLogs("webull-bot", level="WARNING") as logs:
+                fake_bot.reconcile_order_history()
         self.assertIn("boom", logs.output[0])
 
     def test_throttled_within_the_interval(self):
