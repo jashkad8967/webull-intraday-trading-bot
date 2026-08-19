@@ -40,8 +40,13 @@ class AnalystDataService:
         with self._lock:
             if symbol in self._queued:
                 return
-            last = self._fetched_at.get(symbol, 0.0)
-            if now - last < self.config.analyst_data_cache_seconds:
+            last = self._fetched_at.get(symbol)
+            # last is None for a genuinely never-fetched symbol - treating
+            # that as "fetched at monotonic time zero" instead (a 0.0
+            # default) would read as recent on a freshly-booted host where
+            # monotonic() itself hasn't reached ANALYST_DATA_CACHE_SECONDS
+            # yet, silently skipping every symbol's first-ever fetch.
+            if last is not None and now - last < self.config.analyst_data_cache_seconds:
                 return
             self._queued.add(symbol)
         try:

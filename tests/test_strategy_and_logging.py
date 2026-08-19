@@ -304,6 +304,21 @@ class AnalystDataServiceTests(unittest.TestCase):
         self.assertIn("AAPL", service._queued)
         self.assertEqual(service._queue.qsize(), 1)
 
+    def test_request_enqueues_a_never_seen_symbol_even_when_monotonic_is_small(self):
+        """Regression test: time.monotonic() is relative to an arbitrary
+        reference point (often host boot), not the epoch - on a
+        freshly-booted host it can be well under
+        ANALYST_DATA_CACHE_SECONDS. A never-fetched symbol must still be
+        eligible in that case; treating "never fetched" as "fetched at
+        monotonic time zero" (a 0.0 default) silently broke every
+        first-ever fetch on a fresh CI runner.
+        """
+        service = self._service()
+        with unittest.mock.patch("time.monotonic", return_value=5.0):
+            service.request("AAPL", Decimal("100"))
+        self.assertIn("AAPL", service._queued)
+        self.assertEqual(service._queue.qsize(), 1)
+
     def test_request_skips_a_symbol_already_queued(self):
         service = self._service()
         service.request("AAPL", Decimal("100"))
