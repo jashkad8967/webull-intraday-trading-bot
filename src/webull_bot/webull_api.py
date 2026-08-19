@@ -1047,6 +1047,36 @@ class WebullAPI:
         )
         return client_order_id
 
+    def order_history(self, start_date: str, end_date: str) -> list[dict]:
+        """Every combo-order entry Webull has on record for the account
+        in [start_date, end_date] (each "YYYY-MM-DD") - feeds
+        AutoTrader.reconcile_order_history's log-only audit. Webull
+        rejects a page_size under 10 outright, so this always requests
+        the max useful page and paginates via last_client_order_id.
+        """
+        orders: list[dict] = []
+        cursor = None
+        while True:
+            page = self._call(
+                lambda: self.trade.order_v3.get_order_history(
+                    self.config.account_id,
+                    page_size=100,
+                    start_date=start_date,
+                    end_date=end_date,
+                    last_client_order_id=cursor,
+                ),
+                "order",
+            )
+            if not page:
+                break
+            orders.extend(page)
+            if len(page) < 100:
+                break
+            cursor = page[-1].get("client_order_id")
+            if not cursor:
+                break
+        return orders
+
     def stock_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.stock_limit_offset
         if side in ("BUY", "SHORT"):

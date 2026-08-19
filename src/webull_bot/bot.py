@@ -211,6 +211,17 @@ class AutoTrader:
         # reverses never accumulates confirmation time toward a later,
         # unrelated breach.
         self.stop_condition_since: dict[str, float] = {}
+        # Every order_id the bot has itself submitted today (reset daily
+        # in resolve_targets) - see reconcile_order_history. Deliberately
+        # separate from status.trades, which is a fixed-size ring buffer
+        # (TRADE_HISTORY, default 50) far too short to cover a full day's
+        # worth of orders on a high-frequency account.
+        self.submitted_order_ids_today: set[str] = set()
+        # An order_id already logged as an unrecognized (likely manual)
+        # order today - reconcile_order_history logs each one once per
+        # day, not every reconciliation cycle.
+        self.reconciliation_flagged_order_ids: set[str] = set()
+        self.last_order_history_reconcile = 0.0
         self.daily_realized_loss = self.daily_pnl.realized_loss
         self.daily_realized_pnl = self.daily_pnl.realized_pnl
         self.daily_loss_breaker_triggered = False
@@ -594,6 +605,8 @@ class AutoTrader:
         self.daily_realized_pnl = Decimal("0")
         self.daily_pnl.reset()
         self.daily_loss_breaker_triggered = False
+        self.submitted_order_ids_today.clear()
+        self.reconciliation_flagged_order_ids.clear()
         if self.broker_conflict_symbols:
             log.info(
                 "CONFLICT | daily reset | resuming automated action on | %s",
@@ -842,6 +855,7 @@ class AutoTrader:
     ) -> None:
         submitted_at = time.monotonic()
         self.last_trade[key] = submitted_at
+        self.submitted_order_ids_today.add(order_id)
         if action in ("PROFIT", "STOP", "MANUAL_SELL"):
             self.last_exit_at[key] = submitted_at
             self.position_opened_at.pop(key, None)
@@ -1850,6 +1864,50 @@ class AutoTrader:
                 (action or "pending").lower(),
                 threshold,
             )
+
+    def reconcile_order_history(self) -> None:
+        """Log-only audit: cross-checks today's Webull order history
+        against every order_id the bot itself submitted today (see
+        submitted_order_ids_today). An order in Webull's history the bot
+        never recorded is very likely a manual action taken directly in
+        the Webull app - this never changes any bot state (sizing, pnl,
+        gates), purely a visibility signal. Each unrecognized order is
+        logged once per day (reconciliation_flagged_order_ids), not every
+        cycle this runs.
+        """
+        if not self.config.order_history_reconcile_enabled:
+            return
+        now = time.monotonic()
+        if now - self.last_order_history_reconcile < self.config.order_history_reconcile_seconds:
+            return
+        self.last_order_history_reconcile = now
+        today = self.now().date().isoformat()
+        try:
+            history = self.api.order_history(today, today)
+        except Exception as exc:
+            log.warning("RECON  | order history fetch failed | %s", exc)
+            return
+        for combo in history:
+            client_order_id = combo.get("client_order_id")
+            if not client_order_id:
+                continue
+            if client_order_id in self.submitted_order_ids_today:
+                continue
+            if client_order_id in self.reconciliation_flagged_order_ids:
+                continue
+            self.reconciliation_flagged_order_ids.add(client_order_id)
+            for order in combo.get("orders", []):
+                log.warning(
+                    "RECON  | %-8s | order not recognized by the bot - "
+                    "likely a manual action outside it | side=%s status=%s "
+                    "qty=%s filled=%s id=%s",
+                    order.get("symbol", "?"),
+                    order.get("side"),
+                    order.get("status"),
+                    order.get("total_quantity"),
+                    order.get("filled_quantity"),
+                    client_order_id,
+                )
 
     def backfill_stock_symbols(self, count: int) -> int:
         active = set(self.stock_symbols)
@@ -3858,6 +3916,7 @@ class AutoTrader:
                 self.process_iceberg_orders()
                 self.reprice_resting_exits(self.cached_positions, core_session_active)
                 self.escalate_stalled_stop_losses()
+                self.reconcile_order_history()
                 buying_power, positions = self.account_state()
                 buying_power = self.process_ui_commands(
                     positions, buying_power, core_session_active

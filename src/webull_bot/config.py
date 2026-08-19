@@ -385,6 +385,17 @@ class Settings(BaseSettings):
     stop_loss_confirmation_seconds: Decimal = Field(
         default=Decimal("2"), ge=0, le=30
     )
+    # Log-only audit: how often AutoTrader.reconcile_order_history cross-
+    # checks today's Webull order history against every order_id the bot
+    # itself submitted today. An order in Webull's history the bot never
+    # recorded is very likely a manual action taken directly in the
+    # Webull app - this never changes any bot state (position sizing,
+    # pnl, gates), purely a visibility signal logged once per unrecognized
+    # order per day.
+    order_history_reconcile_enabled: bool = True
+    order_history_reconcile_seconds: int = Field(
+        default=1800, ge=60, le=86400
+    )
     daily_loss_circuit_breaker_enabled: bool = False
     daily_max_loss_dollars: Decimal = Field(default=Decimal("50"), gt=0)
     market_requests_per_minute: int = Field(default=240, ge=1, le=300)
