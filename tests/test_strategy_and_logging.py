@@ -974,9 +974,13 @@ class RepriceRestingExitsTests(unittest.TestCase):
                 placed.append((symbol, side, quantity, limit_price))
                 return "order-2"
 
+        rekeyed = []
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
             api=FakeApi(),
+            status=SimpleNamespace(
+                rekey_trade=lambda old, new: rekeyed.append((old, new))
+            ),
             last_reprice=0.0,
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
@@ -1022,6 +1026,11 @@ class RepriceRestingExitsTests(unittest.TestCase):
         self.assertEqual(fake_bot.stop_exit_submitted["ASHR"], 12345.0)
         self.assertIn("ASHR", fake_bot.pending_stock_exits)
         self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0"))
+        # Regression coverage for a live incident: the dashboard's trade-
+        # log entry must follow the order to its new id, or a later
+        # cancellation can't find it to discard - see StatusWriter.
+        # rekey_trade.
+        self.assertEqual(rekeyed, [("order-1", "order-2")])
 
     def test_reprice_skips_when_ask_unchanged(self):
         from webull_bot.bot import AutoTrader
@@ -3291,6 +3300,48 @@ class StatusWriterTests(unittest.TestCase):
 
             restarted = StatusWriter(str(status_path), state_file=str(state_path))
             self.assertEqual(len(restarted.trades), 0)
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
+    def test_rekey_trade_lets_a_later_discard_find_the_repriced_entry(self):
+        """Regression test for a live incident: CTRM's PROFIT order was
+        cancelled and repriced (see AutoTrader.reprice_resting_exits) -
+        the visible Recent Trades entry was still filed under the
+        original (now-cancelled) order_id, but the eventual "never
+        filled" reversal only ever learns the newest order_id. Without
+        rekey_trade, discard_trade(new_order_id) finds nothing to remove,
+        and the cancelled order's phantom profit stays on the dashboard
+        forever - it sat there for 2.5+ hours before this fix.
+        """
+        status_path = Path("tests/.generated_status/status11.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path))
+            writer.record_trade(
+                "STOCK", "CTRM", "PROFIT", Decimal("2.38"), "order-1",
+                pnl=Decimal("0.05"),
+            )
+            # Two reprices, matching the live incident's cancel-and-
+            # replace chain: order-1 -> order-2 -> order-3.
+            writer.rekey_trade("order-1", "order-2")
+            writer.rekey_trade("order-2", "order-3")
+            writer.discard_trade("order-3")
+            self.assertEqual(len(writer.trades), 0)
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
+    def test_rekey_trade_for_an_unknown_order_id_is_a_safe_noop(self):
+        status_path = Path("tests/.generated_status/status12.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path))
+            writer.record_trade(
+                "STOCK", "CTRM", "PROFIT", Decimal("2.38"), "order-1",
+                pnl=Decimal("0.05"),
+            )
+            writer.rekey_trade("order-does-not-exist", "order-2")
+            self.assertEqual(len(writer.trades), 1)
+            self.assertEqual(writer.trades[0]["order_id"], "order-1")
         finally:
             shutil.rmtree(status_path.parent, ignore_errors=True)
 

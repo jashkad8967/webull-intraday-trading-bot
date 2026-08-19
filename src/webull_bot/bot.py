@@ -1015,6 +1015,12 @@ class AutoTrader:
                     # fills it's still the correct amount to reverse.
                     "pnl": order.get("pnl"),
                 }
+                # The dashboard's trade-log entry is still filed under the
+                # cancelled order_id - repoint it, or a later reversal
+                # (which only ever learns new_order_id) can't find it to
+                # discard, leaving a cancelled order's phantom profit
+                # visible forever. See StatusWriter.rekey_trade.
+                self.status.rekey_trade(order_id, new_order_id)
                 log.info(
                     "REPRICE| %-8s | %-6s | ask=%s | id=%s",
                     symbol,
