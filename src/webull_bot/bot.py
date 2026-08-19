@@ -188,6 +188,16 @@ class AutoTrader:
         self.position_buckets: dict[str, str] = {}
         self.stop_exit_submitted: dict[str, float] = {}
         self.stop_loss_escalated: set[str] = set()
+        # Counts consecutive never-filled exit attempts per symbol (see
+        # reverse_phantom_exit's callers) - independent of, and a backstop
+        # for, stop_loss_escalated: a symbol whose escalated order also
+        # never fills (or whose escalation itself never fires) would
+        # otherwise resubmit at the same or a slightly-repriced level
+        # forever. At CONSECUTIVE_EXIT_FAILURE_MARKET_THRESHOLD, the next
+        # attempt forces a genuine MARKET order - guaranteed to fill,
+        # which structurally ends the loop instead of hoping a better
+        # price eventually clears. Reset to 0 on a fresh BUY/SHORT.
+        self.consecutive_exit_failures: dict[str, int] = defaultdict(int)
         self.daily_realized_loss = self.daily_pnl.realized_loss
         self.daily_realized_pnl = self.daily_pnl.realized_pnl
         self.daily_loss_breaker_triggered = False
@@ -661,6 +671,24 @@ class AutoTrader:
             return False
         return symbol in self.stop_loss_escalated or self.cooldown_ready(key)
 
+    def should_force_market_exit(
+        self, symbol: str, exit_is_fractional: bool, core_session_active: bool
+    ) -> bool:
+        """True once a symbol's exit has failed to fill
+        CONSECUTIVE_EXIT_FAILURE_MARKET_THRESHOLD times in a row (see
+        consecutive_exit_failures) - the next attempt should use a
+        genuine MARKET order instead of another limit, guaranteed to
+        fill and end the loop. Same MARKET-order eligibility constraints
+        as a manual sell: whole-share, core hours, account supports it.
+        """
+        return (
+            self.consecutive_exit_failures.get(symbol, 0)
+            >= self.config.consecutive_exit_failure_market_threshold
+            and core_session_active
+            and not exit_is_fractional
+            and self.fractional_trading_enabled
+        )
+
     @staticmethod
     def is_fractional_trading_not_enabled(exc: Exception) -> bool:
         """True for Webull's OAUTH_OPENAPI_OPENAPI_FRACT_VERSION2_ACCOUNT_
@@ -804,6 +832,10 @@ class AutoTrader:
             # Feeds TradingStrategy.adaptive_stop_percent's time-aware
             # widen window - see position_opened_at.
             self.position_opened_at[key] = submitted_at
+            # A fresh position starts with a clean exit-failure count -
+            # see consecutive_exit_failures.
+            if key.startswith("STOCK:"):
+                self.consecutive_exit_failures.pop(key.split(":", 1)[1], None)
         self.trade_times[key].append(submitted_at)
         self.working_orders[order_id] = {
             "submitted_at": submitted_at,
@@ -848,6 +880,21 @@ class AutoTrader:
         elif instrument_type == "OPTION":
             self.pending_option_exits.discard(symbol)
 
+    def _note_exit_failure(self, key: str) -> None:
+        """Tracks a confirmed never-filled exit attempt - see
+        consecutive_exit_failures and CONSECUTIVE_EXIT_FAILURE_MARKET_
+        THRESHOLD. Stock-only: this class of endless-retry loop was seen
+        for stocks specifically, and options' own defined-risk sizing
+        already bounds the exposure a stuck options exit represents
+        differently enough that folding it into the same counter isn't
+        clearly right without its own evidence.
+        """
+        if not key.startswith("STOCK:"):
+            return
+        symbol = key.split(":", 1)[1]
+        if symbol:
+            self.consecutive_exit_failures[symbol] += 1
+
     def _reverse_if_never_filled(
         self, order_id: str, order: dict, pnl: Decimal
     ) -> None:
@@ -874,6 +921,7 @@ class AutoTrader:
             return
         if status in ("CANCELLED", "FAILED"):
             self.reverse_phantom_exit(pnl, order_id)
+            self._note_exit_failure(order.get("key", ""))
             log.warning(
                 "ORDER  | %s | never filled (%s) - reversing $%s phantom "
                 "realized pnl | id=%s",
@@ -1694,7 +1742,7 @@ class AutoTrader:
                 log.error("ICEBERG| %s | slice failed | %s", symbol, exc)
                 entry["last_slice_at"] = now
                 continue
-            self.record_trade(entry["key"], order_id, side)
+            self.record_trade(entry["key"], order_id, side, entry_price=limit_price)
             entry["remaining"] -= clip
             entry["last_slice_at"] = now
             log.info(
@@ -1758,6 +1806,7 @@ class AutoTrader:
                 # exit that never actually happened.
                 if order:
                     self.reverse_phantom_exit(order.get("pnl"), order_id)
+                    self._note_exit_failure(key)
             self.stop_loss_escalated.add(symbol)
             self.pending_stock_exits.discard(symbol)
             self.stop_exit_submitted.pop(symbol, None)
@@ -2076,7 +2125,12 @@ class AutoTrader:
                         )
                         if order_id is None:
                             continue
-                        self.record_trade(key, order_id, "BUY")
+                        self.record_trade(
+                            key,
+                            order_id,
+                            "BUY",
+                            entry_price=self.api.stock_limit_price(quote, "BUY"),
+                        )
                         buying_power = max(
                             Decimal("0"),
                             buying_power - buffered_price * buy_quantity,
@@ -2171,7 +2225,12 @@ class AutoTrader:
                         )
                         if order_id is None:
                             continue
-                        self.record_trade(key, order_id, "SHORT")
+                        self.record_trade(
+                            key,
+                            order_id,
+                            "SHORT",
+                            entry_price=self.api.stock_limit_price(quote, "SHORT"),
+                        )
                         # Not exact margin accounting (Webull's actual short
                         # margin requirement isn't modeled here) - same
                         # rough capital-pool tracking the rest of this
@@ -2238,7 +2297,12 @@ class AutoTrader:
                     target = decision.target_price
                     if target is None:
                         continue
-                    if is_short_position:
+                    force_market = self.should_force_market_exit(
+                        symbol, exit_is_fractional, core_session_active
+                    )
+                    if force_market:
+                        limit_price = None
+                    elif is_short_position:
                         bid = self.api.quote_bid(quote)
                         # Mirror of the long case below: never cover above
                         # the target that triggered this, but also don't
@@ -2264,16 +2328,25 @@ class AutoTrader:
                             if symbol in self.stop_loss_escalated
                             else (max(ask, target) if ask else target)
                         )
+                    if force_market:
+                        log.warning(
+                            "ORDER  | %s | never filled %s times in a row - "
+                            "forcing a market order to end the loop",
+                            symbol,
+                            self.consecutive_exit_failures.get(symbol, 0),
+                        )
                     order_id = self.api.place_stock(
                         symbol,
                         exit_side,
                         exit_quantity,
                         limit_price=limit_price,
                         fractional=exit_is_fractional,
+                        market=force_market,
                     )
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
-                    pnl = self.record_realized_exit(cost, limit_price, quantity)
+                    realized_price = limit_price if limit_price is not None else price
+                    pnl = self.record_realized_exit(cost, realized_price, quantity)
                     self.record_trade(key, order_id, "PROFIT", limit_price, pnl=pnl, entry_price=cost)
                 if decision.action == "LOSS" and self.stop_ready_to_submit(key, symbol):
                     exit_is_fractional = self.is_fractional_quantity(exit_quantity)
@@ -2297,24 +2370,38 @@ class AutoTrader:
                     # unfilled" for either direction - only escalation
                     # (after 15s unfilled) should cross the market harder
                     # than that.
-                    limit_price = (
-                        self.api.stock_limit_price(
-                            quote, "COVER" if is_short_position else "SELL"
-                        )
-                        if symbol in self.stop_loss_escalated
-                        else self.api.stock_stop_exit_price(quote)
+                    force_market = self.should_force_market_exit(
+                        symbol, exit_is_fractional, core_session_active
                     )
+                    if force_market:
+                        limit_price = None
+                        log.warning(
+                            "ORDER  | %s | never filled %s times in a row - "
+                            "forcing a market order to end the loop",
+                            symbol,
+                            self.consecutive_exit_failures.get(symbol, 0),
+                        )
+                    else:
+                        limit_price = (
+                            self.api.stock_limit_price(
+                                quote, "COVER" if is_short_position else "SELL"
+                            )
+                            if symbol in self.stop_loss_escalated
+                            else self.api.stock_stop_exit_price(quote)
+                        )
                     order_id = self.api.place_stock(
                         symbol,
                         exit_side,
                         exit_quantity,
                         limit_price=limit_price,
                         fractional=exit_is_fractional,
+                        market=force_market,
                     )
                     self.wash_sales.block(symbol, "stop-loss exit submitted")
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
-                    pnl = self.record_realized_exit(cost, limit_price, quantity)
+                    realized_price = limit_price if limit_price is not None else price
+                    pnl = self.record_realized_exit(cost, realized_price, quantity)
                     self.record_trade(key, order_id, "STOP", limit_price, pnl=pnl, entry_price=cost)
             except Exception as exc:
                 self.stop_loss_escalated.discard(symbol)
@@ -2493,8 +2580,22 @@ class AutoTrader:
                         ),
                     )
                     continue
-                self.record_trade(f"STOCK:{long_symbol}", long_order, "BUY")
-                self.record_trade(f"STOCK:{short_symbol}", short_order, "BUY")
+                self.record_trade(
+                    f"STOCK:{long_symbol}",
+                    long_order,
+                    "BUY",
+                    entry_price=self.api.stock_limit_price(
+                        quote_by_symbol[long_symbol], "BUY"
+                    ),
+                )
+                self.record_trade(
+                    f"STOCK:{short_symbol}",
+                    short_order,
+                    "BUY",
+                    entry_price=self.api.stock_limit_price(
+                        quote_by_symbol[short_symbol], "SHORT"
+                    ),
+                )
                 self.position_buckets[long_symbol] = "PAIRS_LONG"
                 self.position_buckets[short_symbol] = "PAIRS_SHORT"
                 self.pairs_positions[pair] = {"long": long_symbol, "short": short_symbol}
@@ -2776,7 +2877,9 @@ class AutoTrader:
                             limit_price,
                             "BUY_TO_OPEN",
                         )
-                        self.record_trade(key, order_id, "BUY")
+                        self.record_trade(
+                            key, order_id, "BUY", entry_price=limit_price
+                        )
                         buying_power = max(
                             Decimal("0"),
                             buying_power - contract_cost * buy_quantity,
@@ -3583,12 +3686,13 @@ class AutoTrader:
                 symbol,
             )
             return buying_power
+        entry_price = self.api.stock_limit_price(quote, "BUY")
         try:
             order_id = self.api.place_stock(
                 symbol,
                 "BUY",
                 buy_quantity,
-                limit_price=self.api.stock_limit_price(quote, "BUY"),
+                limit_price=entry_price,
                 fractional=fractional,
             )
         except Exception as exc:
@@ -3599,7 +3703,9 @@ class AutoTrader:
             else:
                 log.error("CMD    | manual buy failed | %-8s | %s", symbol, exc)
             return buying_power
-        self.record_trade(f"STOCK:{symbol}", order_id, "MANUAL_BUY")
+        self.record_trade(
+            f"STOCK:{symbol}", order_id, "MANUAL_BUY", entry_price=entry_price
+        )
         self.position_buckets[symbol] = "MANUAL"
         log.warning(
             "CMD    | manual buy executed | %-8s | qty=%s",

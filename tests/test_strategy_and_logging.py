@@ -850,6 +850,7 @@ class StopLossEscalationTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             position_opened_at={},
             symbol_pnl_history=defaultdict(deque),
+            consecutive_exit_failures=defaultdict(int),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -909,6 +910,7 @@ class StopLossEscalationTests(unittest.TestCase):
             stop_exit_submitted={"ASHR": 0.0},
             pending_stock_exits={"ASHR"},
             stop_loss_escalated=set(),
+            consecutive_exit_failures=defaultdict(int),
             working_orders={
                 "order-1": {
                     "submitted_at": 0.0,
@@ -920,6 +922,7 @@ class StopLossEscalationTests(unittest.TestCase):
             },
         )
         fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        fake_bot._note_exit_failure = AutoTrader._note_exit_failure.__get__(fake_bot)
         escalate = AutoTrader.escalate_stalled_stop_losses.__get__(fake_bot)
 
         with unittest.mock.patch("time.monotonic", return_value=20.0):
@@ -929,6 +932,7 @@ class StopLossEscalationTests(unittest.TestCase):
         self.assertIn("ASHR", fake_bot.stop_loss_escalated)
         self.assertNotIn("ASHR", fake_bot.pending_stock_exits)
         self.assertNotIn("ASHR", fake_bot.stop_exit_submitted)
+        self.assertEqual(fake_bot.consecutive_exit_failures["ASHR"], 1)
 
 class RepriceRestingExitsTests(unittest.TestCase):
     def test_reprice_cancels_and_replaces_at_new_ask_without_recording_pnl_again(self):
@@ -3479,7 +3483,8 @@ class DashboardCommandTests(unittest.TestCase):
                 ),
             ),
         )
-        fake_bot.record_trade = lambda *a, **k: None
+        recorded = []
+        fake_bot.record_trade = lambda *a, **k: recorded.append((a, k))
         manual_buy = AutoTrader._manual_buy.__get__(fake_bot)
 
         remaining = manual_buy(
@@ -3495,6 +3500,10 @@ class DashboardCommandTests(unittest.TestCase):
         self.assertGreater(quantity, Decimal("1"))
         self.assertLess(remaining, Decimal("1000"))
         self.assertEqual(fake_bot.position_buckets.get("MSFT"), "MANUAL")
+        # Regression coverage: a manual buy's dashboard row must show the
+        # price paid, not a blank Entry column.
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0][1].get("entry_price"), Decimal("50.00"))
 
     def test_manual_buy_skips_when_already_holding_a_position(self):
         from webull_bot.bot import AutoTrader
@@ -4575,6 +4584,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             last_capital_deployed_at=time.monotonic() - 999999,
             position_opened_at={},
             symbol_pnl_history=defaultdict(deque),
+            consecutive_exit_failures=defaultdict(int),
         )
         record_trade = AutoTrader.record_trade.__get__(fake_bot)
 
@@ -4801,8 +4811,10 @@ class ExecutionGuardrailTests(unittest.TestCase):
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
         recorded = []
-        fake_bot.record_trade = lambda key, order_id, action: recorded.append(
-            (key, order_id, action)
+        fake_bot.record_trade = (
+            lambda key, order_id, action, entry_price=None: recorded.append(
+                (key, order_id, action, entry_price)
+            )
         )
         process = AutoTrader.process_iceberg_orders.__get__(fake_bot)
         process()
@@ -4812,7 +4824,11 @@ class ExecutionGuardrailTests(unittest.TestCase):
             fake_bot.iceberg_orders["AAA:BUY"]["remaining"],
             Decimal("15") - Decimal(ICEBERG_SLICE_SHARES),
         )
-        self.assertEqual(recorded, [("STOCK:AAA", "order-2", "BUY")])
+        # Regression coverage: an iceberg slice's dashboard row must show
+        # the price paid, not a blank Entry column.
+        self.assertEqual(
+            recorded, [("STOCK:AAA", "order-2", "BUY", Decimal("10.01"))]
+        )
 
     def test_process_iceberg_orders_skips_before_interval_elapses(self):
         from webull_bot.bot import AutoTrader
@@ -5820,9 +5836,11 @@ class PhantomExitReversalTests(unittest.TestCase):
             daily_realized_loss=Decimal("0"),
             daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
             last_account_refresh=0.0,
+            consecutive_exit_failures=defaultdict(int),
         )
         fake_bot._release_pending_order = AutoTrader._release_pending_order.__get__(fake_bot)
         fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        fake_bot._note_exit_failure = AutoTrader._note_exit_failure.__get__(fake_bot)
         fake_bot._reverse_if_never_filled = AutoTrader._reverse_if_never_filled.__get__(fake_bot)
         monitor = AutoTrader.monitor_working_orders.__get__(fake_bot)
 
@@ -5835,6 +5853,9 @@ class PhantomExitReversalTests(unittest.TestCase):
         # trade-log entry stayed on the dashboard's Recent Trades list
         # forever, labeled as a completed profit that never happened.
         self.assertEqual(discarded_trades, ["order-1"])
+        # And for the endless-retry loop: a confirmed never-filled exit
+        # must count toward should_force_market_exit's threshold.
+        self.assertEqual(fake_bot.consecutive_exit_failures["ASHR"], 1)
 
     def test_monitor_working_orders_leaves_pnl_alone_on_a_confirmed_fill(self):
         from webull_bot.bot import AutoTrader
@@ -5965,8 +5986,10 @@ class PhantomExitReversalTests(unittest.TestCase):
             daily_realized_pnl=Decimal("0.07"),
             daily_realized_loss=Decimal("0"),
             daily_pnl=SimpleNamespace(record=lambda *a, **k: None),
+            consecutive_exit_failures=defaultdict(int),
         )
         fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
+        fake_bot._note_exit_failure = AutoTrader._note_exit_failure.__get__(fake_bot)
         escalate = AutoTrader.escalate_stalled_stop_losses.__get__(fake_bot)
 
         with unittest.mock.patch("time.monotonic", return_value=20.0):
@@ -5974,6 +5997,7 @@ class PhantomExitReversalTests(unittest.TestCase):
 
         self.assertEqual(fake_bot.daily_realized_pnl, Decimal("0"))
         self.assertEqual(discarded_trades, ["order-1"])
+        self.assertEqual(fake_bot.consecutive_exit_failures["ASHR"], 1)
 
 
 if __name__ == "__main__":
