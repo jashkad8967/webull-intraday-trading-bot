@@ -30,6 +30,12 @@ from webull_bot.pairs import (
 )
 from webull_bot.status import StatusWriter
 from webull_bot.strategy import TradingStrategy
+from webull_bot.strategy_tuning import (
+    LEVER_SPECS,
+    SAFETY_DENYLIST,
+    StrategyTuningState,
+    apply_lever_adjustment,
+)
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import QuoteUnavailableError, WebullAPI
 
@@ -6688,6 +6694,187 @@ class OrderHistoryReconciliationTests(unittest.TestCase):
         with unittest.mock.patch("time.monotonic", return_value=200.0):
             with self.assertNoLogs("webull-bot", level="WARNING"):
                 fake_bot.reconcile_order_history()
+
+
+class StrategyTuningLeverTests(unittest.TestCase):
+    """apply_lever_adjustment is pure - no file I/O, no config mutation
+    itself (the caller is responsible for actually editing config.py and
+    running the full verification suite before committing). See
+    strategy_tuning.py's own module docstring/comments for why each
+    lever maps to the field it does.
+    """
+
+    def test_safety_denylist_has_no_overlap_with_any_lever_field(self):
+        lever_fields = {spec.field for spec in LEVER_SPECS.values()}
+        lever_fields.update(
+            spec.enabled_field
+            for spec in LEVER_SPECS.values()
+            if spec.enabled_field
+        )
+        lever_fields.update(
+            {
+                "stock_core_session_position_fraction",
+                "stock_whole_share_core_session_fraction",
+            }
+        )
+        self.assertEqual(lever_fields & SAFETY_DENYLIST, set())
+
+    def test_increase_moves_toward_the_maximum_for_a_direct_lever(self):
+        # profit-target distance: increase_raises=True.
+        result = apply_lever_adjustment(
+            "profit-target distance",
+            "increase",
+            {"stock_target_stop_multiple": Decimal("2.0")},
+            Decimal("0.10"),
+        )
+        # span = 5 - 0.5 = 4.5; step = 0.45.
+        self.assertEqual(result.field, "stock_target_stop_multiple")
+        self.assertEqual(result.new_value, Decimal("2.45"))
+
+    def test_increase_moves_toward_the_minimum_for_an_inverted_lever(self):
+        # stop-loss tightness: increase_raises=False (tighter = smaller
+        # multiplier), so "increase" (tightness) LOWERS the field.
+        result = apply_lever_adjustment(
+            "stop-loss tightness",
+            "increase",
+            {"stock_stop_loss_range_multiplier": Decimal("1.0")},
+            Decimal("0.10"),
+        )
+        # span = 5 - 0 = 5; step = 0.5.
+        self.assertEqual(result.new_value, Decimal("0.5"))
+
+    def test_decrease_is_the_exact_opposite_of_increase(self):
+        result = apply_lever_adjustment(
+            "entry selectivity",
+            "decrease",
+            {"reenter_confirmation_polls": Decimal("10")},
+            Decimal("0.10"),
+        )
+        # span = 20 - 1 = 19; step = 1.9.
+        self.assertEqual(result.new_value, Decimal("8.1"))
+
+    def test_clamps_at_the_maximum_instead_of_overshooting(self):
+        result = apply_lever_adjustment(
+            "profit-target distance",
+            "increase",
+            {"stock_target_stop_multiple": Decimal("4.9")},
+            Decimal("0.10"),
+        )
+        self.assertEqual(result.new_value, Decimal("5"))
+
+    def test_returns_none_when_already_at_the_bound(self):
+        result = apply_lever_adjustment(
+            "profit-target distance",
+            "increase",
+            {"stock_target_stop_multiple": Decimal("5")},
+            Decimal("0.10"),
+        )
+        self.assertIsNone(result)
+
+    def test_enable_disable_direction_never_produces_a_numeric_adjustment(self):
+        result = apply_lever_adjustment(
+            "time-aware-stop widen window",
+            "enable",
+            {"time_aware_stop_widen_seconds": Decimal("60")},
+            Decimal("0.10"),
+        )
+        self.assertIsNone(result)
+
+    def test_unknown_lever_is_a_safe_noop(self):
+        result = apply_lever_adjustment(
+            "made up lever", "increase", {}, Decimal("0.10")
+        )
+        self.assertIsNone(result)
+
+    def test_fractional_whole_share_balance_shifts_both_fields_preserving_the_sum(self):
+        result = apply_lever_adjustment(
+            "fractional-vs-whole-share balance",
+            "increase",
+            {
+                "stock_core_session_position_fraction": Decimal("0.30"),
+                "stock_whole_share_core_session_fraction": Decimal("0.70"),
+            },
+            Decimal("0.10"),
+        )
+        self.assertEqual(result.new_value, Decimal("0.40"))
+        self.assertEqual(result.paired_new_value, Decimal("0.60"))
+        self.assertEqual(result.new_value + result.paired_new_value, Decimal("1"))
+
+    def test_fractional_whole_share_balance_decrease_shifts_toward_whole_share(self):
+        result = apply_lever_adjustment(
+            "fractional-vs-whole-share balance",
+            "decrease",
+            {
+                "stock_core_session_position_fraction": Decimal("0.30"),
+                "stock_whole_share_core_session_fraction": Decimal("0.70"),
+            },
+            Decimal("0.10"),
+        )
+        self.assertEqual(result.new_value, Decimal("0.20"))
+        self.assertEqual(result.paired_new_value, Decimal("0.80"))
+
+    def test_fractional_whole_share_balance_clamps_and_still_sums_to_one(self):
+        result = apply_lever_adjustment(
+            "fractional-vs-whole-share balance",
+            "increase",
+            {
+                "stock_core_session_position_fraction": Decimal("0.95"),
+                "stock_whole_share_core_session_fraction": Decimal("0.05"),
+            },
+            Decimal("0.10"),
+        )
+        self.assertEqual(result.new_value, Decimal("1"))
+        self.assertEqual(result.paired_new_value, Decimal("0"))
+
+
+class StrategyTuningStateTests(unittest.TestCase):
+    def test_a_never_adjusted_lever_is_ready_immediately(self):
+        path = Path("tests/.generated_status/strategy_tuning.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            state = StrategyTuningState(str(path))
+            self.assertTrue(state.ready("profit-target distance", 24))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_a_recently_adjusted_lever_is_not_ready_within_the_cooldown(self):
+        path = Path("tests/.generated_status/strategy_tuning2.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            state = StrategyTuningState(str(path))
+            state.record("profit-target distance")
+            self.assertFalse(state.ready("profit-target distance", 24))
+            # A different lever is unaffected.
+            self.assertTrue(state.ready("entry selectivity", 24))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_ready_again_after_the_cooldown_elapses(self):
+        path = Path("tests/.generated_status/strategy_tuning3.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            state = StrategyTuningState(str(path))
+            state._last_applied["profit-target distance"] = (
+                time.time() - 25 * 3600
+            )
+            state.path.parent.mkdir(parents=True, exist_ok=True)
+            state.path.write_text(
+                json.dumps(state._last_applied), encoding="utf-8"
+            )
+            reloaded = StrategyTuningState(str(path))
+            self.assertTrue(reloaded.ready("profit-target distance", 24))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_state_persists_across_instances(self):
+        path = Path("tests/.generated_status/strategy_tuning4.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            StrategyTuningState(str(path)).record("position size")
+            reloaded = StrategyTuningState(str(path))
+            self.assertFalse(reloaded.ready("position size", 24))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
 
 
 if __name__ == "__main__":
