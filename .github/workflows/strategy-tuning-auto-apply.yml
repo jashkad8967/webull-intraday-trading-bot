@@ -1,0 +1,103 @@
+name: Strategy-tuning auto-apply
+
+# Fully-automatic apply step for the strategy-review agent's suggestions
+# (see scripts/apply_strategy_review.py and src/webull_bot/strategy_tuning.py
+# for the full design - explicitly confirmed by the user, twice, after
+# being shown the risk of zero human review before a change reaches the
+# live account).
+#
+# Runs independently of any Claude Code session (the point of using
+# GitHub Actions here instead of a session-scoped scheduled task) on a
+# fixed interval matching STRATEGY_REVIEW_INTERVAL_SECONDS (15 min).
+# Every adjustment this produces still goes through the exact same
+# validate -> paper-sim-gate -> merge-to-main -> deploy-live pipeline as
+# every other change - "automatic" removes the human click that starts
+# it, not the safety net that gates it.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: vars.STRATEGY_TUNING_AUTO_APPLY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: strategy-tuning-auto-apply
+      cancel-in-progress: false
+    env:
+      GCP_HOST: ${{ secrets.GCP_HOST }}
+      GCP_USER: ${{ secrets.GCP_USER }}
+      GCP_SSH_PORT: ${{ secrets.GCP_SSH_PORT || '22' }}
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+      GCP_KNOWN_HOSTS: ${{ secrets.GCP_KNOWN_HOSTS }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: paper-trading-lane
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Configure verified SSH access
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$GCP_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$GCP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Fetch the live strategy-review suggestion and .env
+        run: |
+          ssh -p "$GCP_SSH_PORT" "${GCP_USER}@${GCP_HOST}" \
+            "curl -sf http://127.0.0.1:8080/api/status" > "$RUNNER_TEMP/status.json"
+          ssh -p "$GCP_SSH_PORT" "${GCP_USER}@${GCP_HOST}" \
+            "cat /opt/webull-bot/shared/.env" > "$RUNNER_TEMP/live.env"
+
+      - name: Compute the adjustment (no git/verification here yet)
+        id: apply
+        run: |
+          python scripts/apply_strategy_review.py \
+            --status "$RUNNER_TEMP/status.json" \
+            --live-env "$RUNNER_TEMP/live.env"
+
+      - name: Verify (only if a lever actually changed)
+        if: steps.apply.outputs.changed == 'true'
+        run: |
+          python -m compileall -q src tests ui scripts
+          PYTHONPATH=src python -m unittest discover -s tests
+          python scripts/evaluate_paper_sim.py
+
+      - name: Commit and push (only after verification passes)
+        if: steps.apply.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/webull_bot/config.py conf/strategy_tuning_cooldown.json conf/strategy_tuning_last_seen.json
+          git commit -m "${{ steps.apply.outputs.commit_message }}"
+          git push origin paper-trading-lane
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          {
+            echo "## Strategy-tuning auto-apply"
+            echo
+            if [ "${{ steps.apply.outputs.changed }}" == "true" ]; then
+              echo "Applied and pushed - paper-sim-gate.yml's own pipeline takes it from here."
+              echo
+              echo '```'
+              echo "${{ steps.apply.outputs.commit_message }}"
+              echo '```'
+            else
+              echo "No adjustment this cycle (no actionable suggestion, cooldown active, or already at a bound)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
