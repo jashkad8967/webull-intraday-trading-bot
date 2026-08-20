@@ -442,29 +442,30 @@ class Settings(BaseSettings):
     # builder) - "low" keeps hidden reasoning-token spend small so it
     # doesn't crowd out the actual JSON answer within max_completion_tokens.
     groq_reasoning_effort: str = "low"
+    # Fixed cadence, no core/extended split (the agent reviews account
+    # performance, not per-symbol setups, so there's no reason to research
+    # more often just because the market's more active).
+    strategy_review_enabled: bool = True
+    strategy_review_interval_seconds: int = Field(default=900, ge=60, le=3600)
+    # How many of the most recent StatusWriter.trades entries go into each
+    # review's payload - small and fixed on purpose: this runs 4x/hour,
+    # so the prompt has to stay bounded regardless of how many trades a
+    # high-frequency account racks up between reviews.
+    strategy_review_trade_history_limit: int = Field(default=15, ge=1, le=50)
     # Groq's own usage dashboard attributes each compound-mini call to 3
     # underlying model rows (the compound orchestration plus its 2 backing
     # models - see console.groq.com's per-key usage table), so the real
-    # cost of one "successful" research cycle is ~3x its nominal request
-    # weight. Intervals below are tuned for AGENT_DAILY_REQUEST_LIMIT=83
-    # (250/3) spent across the MARKET_OPEN_TIME-to-EOD_CLOSE_TIME trading
-    # day, weighted toward core hours the same way the original 250-budget
-    # tuning was: ~65 core-hour calls (23400s / 360s) + ~18 extended-hour
-    # calls (33600s / 1866s) = ~83.
-    agent_core_research_seconds: int = Field(default=360, ge=15, le=3600)
-    agent_extended_research_seconds: int = Field(default=1866, ge=15, le=3600)
-    agent_daily_request_limit: int = Field(default=83, ge=1, le=250)
+    # cost of one "successful" cycle can be ~3x its nominal request
+    # weight. Sized for STRATEGY_REVIEW_INTERVAL_SECONDS=900 across the
+    # MARKET_OPEN_TIME-to-EOD_CLOSE_TIME trading day (~16h / 900s ≈ 64
+    # reviews/day), with margin.
+    agent_daily_request_limit: int = Field(default=75, ge=1, le=250)
     # Groq's real cap is tokens per day (TPD), not request count - a quiet
     # account can exhaust TPD in well under agent_daily_request_limit
     # requests. This must match your actual Groq model/tier TPD limit (see
     # console.groq.com/settings/billing, which is the only place Groq
     # reports it - it isn't in any response header) with some margin.
     agent_daily_token_budget: int = Field(default=90000, ge=1000)
-    # Smaller on purpose, trading research breadth for reliability: fewer
-    # STATE symbols means a smaller expected response, which means a much
-    # higher chance the model finishes the full JSON within budget every
-    # single cycle rather than needing the truncation-salvage fallback.
-    agent_max_symbols: int = Field(default=3, ge=1, le=50)
     # Per-list cap (gainers/losers/most-active each) for the deterministic
     # market-pulse context fed to the research agent - see
     # AutoTrader.refresh_market_pulse(). Small and fixed on purpose: this

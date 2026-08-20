@@ -315,8 +315,12 @@
       <div class="scroll-tall" id="trades"></div>
     </div>
     <div class="panel accent-rose">
-      <h2>Research Agent</h2>
+      <h2>Market Pulse</h2>
       <div id="agent"></div>
+    </div>
+    <div class="panel accent-rose">
+      <h2>Strategy Review</h2>
+      <div id="strategy-review"></div>
     </div>
     <div class="panel accent-blue shrink">
       <h2>Pending Orders</h2>
@@ -468,7 +472,7 @@ async function refresh() {
 
     const agent = data.agent;
     if (!agent) {
-      document.getElementById("agent").innerHTML = '<div class="empty">Research agent disabled</div>';
+      document.getElementById("agent").innerHTML = '<div class="empty">Agent disabled</div>';
     } else {
       const pulse = agent.market_pulse || {};
       const pulseList = list => (list || []).map(e => `${e.symbol} (${e.chg > 0 ? "+" : ""}${e.chg}%)`).join(", ") || "none yet";
@@ -478,6 +482,21 @@ async function refresh() {
         `<div style="margin-top:0.4rem"><strong>Losers:</strong> ${pulseList(pulse.losers)}</div>` +
         `<div style="margin-top:0.4rem"><strong>Most active:</strong> ${pulseList(pulse.most_active)}</div>` +
         `<div style="margin-top:0.4rem"><strong>Boosted priority:</strong> ${popular}</div>`;
+    }
+
+    const review = agent && agent.strategy_review;
+    const reviewEl = document.getElementById("strategy-review");
+    if (!review) {
+      reviewEl.innerHTML = '<div class="empty">No suggestion yet</div>';
+    } else {
+      const severityClass = { minor: "", moderate: "neg", severe: "neg" }[review.severity] || "";
+      const changes = (review.suggested_changes || []).map(c =>
+        `<div style="margin-top:0.3rem"><strong>${c.lever}</strong> (${c.direction}) - ${c.reasoning}</div>`
+      ).join("") || "";
+      reviewEl.innerHTML =
+        `<div class="${severityClass}"><strong>${(review.severity || "none").toUpperCase()}</strong> · confidence ${fmtNum(review.confidence)}</div>` +
+        `<div style="margin-top:0.4rem">${review.assessment || "—"}</div>` +
+        changes;
     }
 
     renderBalanceChart(data.balance_history || []);
