@@ -1112,6 +1112,22 @@ class WebullAPI:
                 break
         return orders
 
+    def _bid_ask_last_midpoint(self, quote: dict, bid: Decimal, ask: Decimal) -> Decimal:
+        """bid/ask midpoint, blended with the last-trade print when it
+        actually falls within the current spread - a passive mid-price
+        that only ever looked at the top of the book ignored where the
+        market was actually trading a moment ago. Last-trade is a print
+        from BEFORE this quote's bid/ask, though, so it's only trusted
+        when it's still consistent with the current spread (inside
+        [bid, ask]) - a stale or off-spread print pulling the price
+        outside the real market would be worse than not using it at all,
+        so that case falls back to the plain midpoint.
+        """
+        last = self._quote_decimal(quote, "price")
+        if last is not None and bid <= last <= ask:
+            return (bid + ask + last) / 3
+        return (bid + ask) / 2
+
     def stock_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.stock_limit_offset
         if side in ("BUY", "SHORT"):
@@ -1126,7 +1142,7 @@ class WebullAPI:
                 raise QuoteUnavailableError(
                     "stock quote has no valid bid/ask spread for a buy"
                 )
-            price = (bid + ask) / 2
+            price = self._bid_ask_last_midpoint(quote, bid, ask)
             return max(Decimal("0.01"), price).quantize(
                 Decimal("0.01"),
                 rounding=ROUND_DOWN,
@@ -1175,7 +1191,7 @@ class WebullAPI:
             raise QuoteUnavailableError(
                 "stock quote has no valid bid/ask spread for a stop exit"
             )
-        price = (bid + ask) / 2
+        price = self._bid_ask_last_midpoint(quote, bid, ask)
         return max(Decimal("0.01"), price).quantize(
             Decimal("0.01"),
             rounding=ROUND_DOWN,

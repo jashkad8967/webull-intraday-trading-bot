@@ -2700,6 +2700,57 @@ class StopExitPricingTests(unittest.TestCase):
         with self.assertRaises(QuoteUnavailableError):
             api.stock_stop_exit_price({"bid": "0", "ask": "99.20"})
 
+    def test_stop_exit_blends_in_the_last_trade_when_inside_the_spread(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(quote_price_sanity_percent=Decimal("0.08"))
+        # bid=99.00, ask=99.20, last=99.18 -> (99.00+99.20+99.18)/3 = 99.1267
+        quote = {"bid": "99.00", "ask": "99.20", "price": "99.18"}
+        self.assertEqual(api.stock_stop_exit_price(quote), Decimal("99.12"))
+
+    def test_stop_exit_ignores_a_last_trade_outside_the_current_spread(self):
+        """A last-trade print from before the spread moved shouldn't pull
+        the price outside the current, real market - falls back to the
+        plain midpoint exactly like no price were reported at all.
+        """
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(quote_price_sanity_percent=Decimal("0.08"))
+        quote = {"bid": "99.00", "ask": "99.20", "price": "95.00"}
+        self.assertEqual(api.stock_stop_exit_price(quote), Decimal("99.10"))
+
+
+class BidAskLastMidpointTests(unittest.TestCase):
+    """stock_limit_price's passive BUY/SHORT branch shares
+    _bid_ask_last_midpoint with stock_stop_exit_price - see
+    StopExitPricingTests for the shared formula's own coverage.
+    """
+
+    def test_buy_blends_in_the_last_trade_when_inside_the_spread(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            quote_price_sanity_percent=Decimal("0.08"),
+            stock_limit_offset=Decimal("0.001"),
+        )
+        quote = {"bid": "99.00", "ask": "99.20", "price": "99.18"}
+        self.assertEqual(api.stock_limit_price(quote, "BUY"), Decimal("99.12"))
+
+    def test_short_uses_the_same_passive_midpoint_as_buy(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            quote_price_sanity_percent=Decimal("0.08"),
+            stock_limit_offset=Decimal("0.001"),
+        )
+        quote = {"bid": "99.00", "ask": "99.20", "price": "99.18"}
+        self.assertEqual(api.stock_limit_price(quote, "SHORT"), Decimal("99.12"))
+
+    def test_buy_falls_back_to_the_plain_midpoint_with_no_last_trade(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            quote_price_sanity_percent=Decimal("0.08"),
+            stock_limit_offset=Decimal("0.001"),
+        )
+        quote = {"bid": "99.00", "ask": "99.20"}
+        self.assertEqual(api.stock_limit_price(quote, "BUY"), Decimal("99.10"))
+
     def test_close_all_positions_flags_option_losses_for_wash_sale(self):
         api = WebullAPI.__new__(WebullAPI)
         contract = {
@@ -6197,6 +6248,7 @@ def _fake_webull_api(**config_overrides):
     )
     fake_api = SimpleNamespace(config=config, _quote_decimal=WebullAPI._quote_decimal)
     fake_api._sane_bid_or_ask = WebullAPI._sane_bid_or_ask.__get__(fake_api)
+    fake_api._bid_ask_last_midpoint = WebullAPI._bid_ask_last_midpoint.__get__(fake_api)
     return fake_api
 
 
