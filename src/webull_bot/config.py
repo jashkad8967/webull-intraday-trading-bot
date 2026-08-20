@@ -558,6 +558,18 @@ class Settings(BaseSettings):
     daily_pnl_state_file: str = "conf/daily_pnl.json"
     trade_history_state_file: str = "conf/trade_history.json"
     invalid_symbol_state_file: str = "conf/invalid_symbols.json"
+    # Fully-automatic strategy-review apply loop (explicitly confirmed by
+    # the user, twice, after being shown the risk - see
+    # src/webull_bot/strategy_tuning.py for the bounded lever table this
+    # gates). Not read by the live bot process itself - the autonomous
+    # apply script reads these to decide how aggressively to move a
+    # lever and how long to wait before touching the same one again.
+    strategy_tuning_auto_apply_enabled: bool = True
+    strategy_tuning_cooldown_hours: int = Field(default=24, ge=1, le=168)
+    strategy_tuning_step_fraction: Decimal = Field(
+        default=Decimal("0.10"), gt=0, le=Decimal("0.5")
+    )
+    strategy_tuning_state_file: str = "conf/strategy_tuning.json"
     stock_limit_offset: Decimal = Field(
         default=Decimal("0.005"),
         ge=0,
