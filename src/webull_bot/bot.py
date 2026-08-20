@@ -21,6 +21,7 @@ from webull_bot.pairs import (
 )
 from webull_bot.status import StatusWriter
 from webull_bot.strategy import OBI_DEPTH_LEVELS, OPTION_VIXY_SYMBOL, TradingStrategy
+from webull_bot.trade_events import TradeEventStreamService
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import (
     MarketDataPermissionError,
@@ -90,6 +91,11 @@ class AutoTrader:
         self.analyst_service = (
             AnalystDataService(self.api, self.config, log)
             if self.config.analyst_priority_enabled
+            else None
+        )
+        self.trade_event_service = (
+            TradeEventStreamService(self.config, log)
+            if self.config.event_stream_enabled
             else None
         )
         self.timezone = ZoneInfo(self.config.trading_timezone)
@@ -1955,6 +1961,25 @@ class AutoTrader:
                     order.get("filled_quantity"),
                     client_order_id,
                 )
+
+    def log_trade_events(self) -> None:
+        """Phase 0 of the polling-to-streaming migration (see the plan):
+        drains and logs whatever TradeEventStreamService received since
+        the last cycle. Purely observational - no trading state is
+        touched here. The goal is to document the real payload schema
+        from live traffic (the SDK source only confirms one field,
+        request_id) before any later phase parses these events for
+        anything that matters.
+        """
+        if self.trade_event_service is None:
+            return
+        for event_type, subscribe_type, payload in self.trade_event_service.drain():
+            log.info(
+                "EVENTS | event_type=%s | subscribe_type=%s | %s",
+                event_type,
+                subscribe_type,
+                payload,
+            )
 
     def backfill_stock_symbols(self, count: int) -> int:
         active = set(self.stock_symbols)
@@ -4012,6 +4037,7 @@ class AutoTrader:
                 self.reprice_resting_exits(self.cached_positions, core_session_active)
                 self.escalate_stalled_stop_losses()
                 self.reconcile_order_history()
+                self.log_trade_events()
                 buying_power, positions = self.account_state()
                 buying_power = self.process_ui_commands(
                     positions, buying_power, core_session_active

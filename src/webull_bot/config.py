@@ -18,6 +18,14 @@ class Settings(BaseSettings):
     webull_environment: str = Field(default="prod", pattern="^prod$")
     webull_region_id: str = Field(default="us", pattern="^us$")
     live_trading_enabled: bool = True
+    # Phase 0 of the polling-to-streaming migration (see the plan) - a
+    # read-only observer that subscribes to Webull's gRPC order/position
+    # event stream (TradeEventStreamService) and only logs what it
+    # receives. Default off: this opens a new authenticated network
+    # connection and background thread with an SDK whose exact event
+    # payload schema hasn't been confirmed from real traffic yet: no
+    # trading behavior depends on it until that's verified live.
+    event_stream_enabled: bool = False
 
     stock_symbols: str = "ALL"
     option_contracts: str = ""

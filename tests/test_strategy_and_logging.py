@@ -380,6 +380,77 @@ class AnalystDataServiceTests(unittest.TestCase):
         self.assertEqual(service.snapshot(), {})
 
 
+class TradeEventStreamServiceTests(unittest.TestCase):
+    """Phase 0 of the polling-to-streaming migration (see the plan) -
+    constructed via __new__ throughout, so no real gRPC connection or
+    background thread ever starts in these tests. _on_events_message()/
+    drain() are the only two touchpoints the rest of the bot actually
+    uses; the SDK-facing pieces (_run, _silence_sdk_prints) aren't
+    exercised here.
+    """
+
+    def _service(self):
+        from webull_bot.trade_events import TradeEventStreamService
+
+        service = TradeEventStreamService.__new__(TradeEventStreamService)
+        service.config = SimpleNamespace(
+            webull_app_key="key", webull_app_secret="secret",
+            webull_region_id="us", account_id="acct-1",
+        )
+        service.log = logging.getLogger("test-trade-events")
+        service._queue = queue.Queue(maxsize=3)
+        return service
+
+    def test_on_events_message_enqueues(self):
+        service = self._service()
+        service._on_events_message(1024, 1, {"a": 1}, raw_message=None)
+        self.assertEqual(service.drain(), [(1024, 1, {"a": 1})])
+
+    def test_drain_returns_events_in_order_and_clears_the_queue(self):
+        service = self._service()
+        service._on_events_message(1024, 1, {"n": 1}, raw_message=None)
+        service._on_events_message(1028, 2, {"n": 2}, raw_message=None)
+        self.assertEqual(
+            service.drain(), [(1024, 1, {"n": 1}), (1028, 2, {"n": 2})]
+        )
+        self.assertEqual(service.drain(), [])
+
+    def test_a_full_queue_drops_the_oldest_not_the_newest(self):
+        service = self._service()
+        for n in range(4):
+            service._on_events_message(1024, 1, {"n": n}, raw_message=None)
+        # maxsize=3: the oldest (n=0) must be the one dropped.
+        self.assertEqual(
+            service.drain(), [(1024, 1, {"n": 1}), (1024, 1, {"n": 2}), (1024, 1, {"n": 3})]
+        )
+
+
+class TradeEventLoggingTests(unittest.TestCase):
+    """AutoTrader.log_trade_events is purely observational (Phase 0) -
+    it must never touch trading state, only log.
+    """
+
+    def test_noop_when_the_service_is_disabled(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(trade_event_service=None)
+        log_trade_events = AutoTrader.log_trade_events.__get__(fake_bot)
+        log_trade_events()  # must not raise
+
+    def test_drains_and_logs_every_event(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            trade_event_service=SimpleNamespace(
+                drain=lambda: [(1024, 1, {"order_id": "abc"})]
+            )
+        )
+        log_trade_events = AutoTrader.log_trade_events.__get__(fake_bot)
+        with self.assertLogs("webull-bot", level="INFO") as logs:
+            log_trade_events()
+        self.assertIn("abc", logs.output[0])
+
+
 class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_vwap_gate_blocks_entry_below_session_vwap(self):
         strategy = TradingStrategy(self.config())
