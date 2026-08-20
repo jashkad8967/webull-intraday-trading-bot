@@ -7,7 +7,25 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 class MarketResearchAgent:
-    """Non-blocking web/news research. It never submits broker orders."""
+    """Periodic account-performance review, review-gated: this only ever
+    produces a structured suggestion (assessment/severity/suggested
+    changes from a fixed, named lever list) for a human or a later
+    Claude session to review and implement as a normal tested code
+    change - it never submits broker orders, and nothing here mutates
+    trading behavior at runtime.
+    """
+
+    _VALID_LEVERS = {
+        "stop-loss tightness",
+        "profit-target distance",
+        "position size",
+        "entry selectivity",
+        "symbol-quarantine aggressiveness",
+        "time-aware-stop widen window",
+        "fractional-vs-whole-share balance",
+    }
+    _VALID_SEVERITIES = {"none", "minor", "moderate", "severe"}
+    _VALID_DIRECTIONS = {"increase", "decrease", "disable", "enable"}
 
     def __init__(self, config, log):
         try:
@@ -23,7 +41,7 @@ class MarketResearchAgent:
         )
         self._work: queue.Queue[dict] = queue.Queue(maxsize=1)
         self._lock = threading.Lock()
-        self._assessments: dict[str, dict] = {}
+        self._latest_strategy_review: dict | None = None
         self._last_submitted = 0.0
         self._request_date = None
         self._requests_today = 0
@@ -39,44 +57,28 @@ class MarketResearchAgent:
         # exhausted for the day - retrying mid-day (even after Groq's own
         # "try again in Nm" hint elapses) just spends more of an already-
         # exhausted budget and risks hitting it again. So this blocks all
-        # research for the rest of the current session, cleared only when
-        # submit() rolls over to a new _session_date (start of the next
-        # extended trading day), not after a short backoff.
+        # review for the rest of the current session, cleared only when
+        # submit_strategy_review() rolls over to a new _session_date
+        # (start of the next extended trading day), not after a short
+        # backoff.
         self._rate_limit_blocked = False
         self._token_limit_logged_at = 0.0
         threading.Thread(target=self._worker, daemon=True).start()
         self.log.info(
-            "AGENT  | enabled | model=%s | core=%ss | extended=%ss | budget=%s/day | "
-            "tokens=%s/day | symbols=%s",
+            "AGENT  | enabled | model=%s | interval=%ss | budget=%s/day | "
+            "tokens=%s/day",
             config.groq_model,
-            config.agent_core_research_seconds,
-            config.agent_extended_research_seconds,
+            config.strategy_review_interval_seconds,
             config.agent_daily_request_limit,
             config.agent_daily_token_budget,
-            min(config.agent_max_symbols, 10),
         )
-
-    def _interval_seconds(self) -> int:
-        current = datetime.now(self._timezone).time()
-        core_open = self.config.session_time(
-            self.config.option_market_open_time
-        )
-        core_close = self.config.session_time(
-            self.config.option_market_close_time
-        )
-        if core_open <= current < core_close:
-            return self.config.agent_core_research_seconds
-        return self.config.agent_extended_research_seconds
 
     def _session_date(self, moment: datetime):
         """The AGENT_DAILY_REQUEST_LIMIT budget resets at the start of the
         extended trading day (MARKET_OPEN_TIME), not calendar midnight - a
         moment before that boundary still belongs to the previous session
         (the tail end of the prior day's after-hours idle stretch), not a
-        fresh one. AGENT_CORE_RESEARCH_SECONDS/AGENT_EXTENDED_RESEARCH_SECONDS
-        are tuned so the budget is spent across exactly this window (roughly
-        195 core-hour requests + 54 extended-hour requests ~= 250), weighted
-        toward core hours where research matters most.
+        fresh one.
         """
         session_open = self.config.session_time(self.config.market_open_time)
         if moment.time() >= session_open:
@@ -107,12 +109,13 @@ class MarketResearchAgent:
         # +30s margin - Groq's own estimate can undershoot slightly.
         return total + 30 if total > 0 else default
 
-    def submit(self, state: dict, force: bool = False) -> None:
-        """force=True (e.g. a post-liquidation reevaluation) bypasses only
-        the interval throttle below, not the daily request budget, the
-        rolling token budget, or a rate-limit block above - a forced call
-        still counts against and can still be blocked by all three, since
-        those are hard cost/availability caps, not pacing mechanisms.
+    def submit_strategy_review(self, state: dict, force: bool = False) -> None:
+        """force=True (e.g. a post-circuit-breaker reevaluation) bypasses
+        only the interval throttle below, not the daily request budget,
+        the rolling token budget, or a rate-limit block above - a forced
+        call still counts against and can still be blocked by all three,
+        since those are hard cost/availability caps, not pacing
+        mechanisms.
         """
         today = self._session_date(datetime.now(self._timezone))
         if self._request_date != today:
@@ -144,8 +147,7 @@ class MarketResearchAgent:
             return
         if not force:
             elapsed = now - self._last_submitted
-            interval = self._interval_seconds()
-            if elapsed < interval:
+            if elapsed < self.config.strategy_review_interval_seconds:
                 return
         self._last_submitted = now
         try:
@@ -157,13 +159,13 @@ class MarketResearchAgent:
                 pass
             self._work.put_nowait(state)
 
-    def assessment(self, symbol: str) -> dict | None:
+    def strategy_review(self) -> dict | None:
         with self._lock:
-            result = self._assessments.get(symbol)
+            result = self._latest_strategy_review
             if not result:
                 return None
             if time.monotonic() - result["updated_at"] > (
-                self._interval_seconds() * 3
+                self.config.strategy_review_interval_seconds * 3
             ):
                 return None
             return dict(result)
@@ -172,29 +174,29 @@ class MarketResearchAgent:
         while True:
             state = self._work.get()
             try:
-                self._research(state)
+                self._review_strategy(state)
             except Exception as exc:
-                self._handle_research_error(exc)
+                self._handle_review_error(exc)
 
-    def _handle_research_error(self, exc: Exception) -> None:
+    def _handle_review_error(self, exc: Exception) -> None:
         message = str(exc)
         if "rate_limit_exceeded" in message or (
             "429" in message and "rate_limit" in message.lower()
         ):
             # A real 429 means the account is exhausted for the day - our
-            # own rolling budget check in submit() should normally catch
-            # this first, but the server-side web search on an agentic
-            # model can consume tokens we can't see ahead of time, so this
-            # is the reactive backstop. Block research for the rest of the
-            # session rather than retrying after Groq's own "try again in
-            # Nm" hint - that hint is when the *next* token would free up
-            # on the rolling window, not when the account is safely clear
-            # of the cap again, so retrying at it tends to just hit the
-            # same 429 a second time.
+            # own rolling budget check in submit_strategy_review() should
+            # normally catch this first, but the server-side web search
+            # on an agentic model can consume tokens we can't see ahead
+            # of time, so this is the reactive backstop. Block review for
+            # the rest of the session rather than retrying after Groq's
+            # own "try again in Nm" hint - that hint is when the *next*
+            # token would free up on the rolling window, not when the
+            # account is safely clear of the cap again, so retrying at it
+            # tends to just hit the same 429 a second time.
             self._rate_limit_blocked = True
             self.log.warning(
                 "AGENT  | Groq daily token limit hit | pausing "
-                "research until the next session (Groq's own "
+                "strategy review until the next session (Groq's own "
                 "estimate was %.0fs, but that's just when the next "
                 "token frees up on the rolling window, not when "
                 "the account is clear of the cap) | %s",
@@ -202,24 +204,23 @@ class MarketResearchAgent:
                 message,
             )
         elif "request_too_large" in message or "413" in message:
-            # STATE itself is small and fixed-size (see _research) - this is
-            # compound-mini's own server-side web search/retrieval growing
-            # the effective prompt, not our payload. Skipped for this cycle
-            # only; the next scheduled cycle tries again fresh.
+            # STATE itself is small and fixed-size (see _review_strategy) -
+            # this is the model's own reasoning/search overhead growing
+            # the effective prompt, not our payload. Skipped for this
+            # cycle only; the next scheduled cycle tries again fresh.
             self.log.warning(
-                "AGENT  | research skipped | Groq request too large "
-                "(compound-mini's own web search results, not our fixed-"
-                "size payload) | %s",
+                "AGENT  | strategy review skipped | Groq request too "
+                "large (not our fixed-size payload) | %s",
                 exc,
             )
         elif isinstance(exc, json.JSONDecodeError):
             self.log.warning(
-                "AGENT  | research skipped | Groq returned invalid "
-                "JSON (truncated or malformed) | %s",
+                "AGENT  | strategy review skipped | Groq returned "
+                "invalid JSON (truncated or malformed) | %s",
                 exc,
             )
         else:
-            self.log.warning("AGENT  | research failed | %s", exc)
+            self.log.warning("AGENT  | strategy review failed | %s", exc)
 
     @staticmethod
     def _number(value, minimum: float, maximum: float, default: float) -> float:
@@ -257,18 +258,17 @@ class MarketResearchAgent:
         return None
 
     @staticmethod
-    def _salvage_assessments(text: str) -> list[dict]:
-        """Last-resort recovery for a genuinely truncated response (cut off
-        mid-string with no balanced top-level object anywhere in it, so
-        _extract_json_object can't find anything): scan for every
-        individually-balanced {...} object at any nesting depth, parse each
-        standalone, and keep the ones shaped like an assessment (a dict
-        with a "symbol" key). An assessment object is self-contained - it
-        doesn't reference anything outside itself - so whatever the model
-        finished writing before the cutoff is still valid, parseable data;
-        only the incomplete tail object (which never gets a closing brace)
-        is correctly left out. Better to keep N-1 real assessments than
-        discard the whole cycle over the Nth one being cut off.
+    def _salvage_json_objects(text: str, required_key: str) -> list[dict]:
+        """Last-resort recovery for a genuinely truncated response (cut
+        off mid-string with no balanced top-level object anywhere in it,
+        so _extract_json_object can't find anything): scan for every
+        individually-balanced {...} object at any nesting depth, parse
+        each standalone, and keep the ones carrying required_key (e.g.
+        "lever" for a suggested_changes[] entry). A well-formed entry is
+        self-contained - it doesn't reference anything outside itself -
+        so whatever the model finished writing before the cutoff is
+        still valid, parseable data; only the incomplete tail object
+        (which never gets a closing brace) is correctly left out.
         """
         found: list[dict] = []
         stack: list[int] = []
@@ -295,7 +295,7 @@ class MarketResearchAgent:
                     parsed = json.loads(text[start : index + 1])
                 except json.JSONDecodeError:
                     continue
-                if isinstance(parsed, dict) and "symbol" in parsed:
+                if isinstance(parsed, dict) and required_key in parsed:
                     found.append(parsed)
         return found
 
@@ -323,165 +323,105 @@ class MarketResearchAgent:
                 # json.loads can raise too, and that used to propagate
                 # uncaught here, skipping the salvage path entirely for
                 # exactly the "balanced braces, broken inside" case.
-                salvaged = self._salvage_assessments(text)
+                salvaged = self._salvage_json_objects(text, "lever")
                 if not salvaged:
                     raise exc
                 self.log.warning(
                     "AGENT  | response was truncated/malformed - salvaged "
-                    "%s complete assessment(s) instead of discarding the "
-                    "whole cycle",
+                    "%s complete suggested_changes entr(y/ies) instead of "
+                    "discarding the whole cycle",
                     len(salvaged),
                 )
-                return {"assessments": salvaged}
+                return {"suggested_changes": salvaged}
         return parsed if isinstance(parsed, dict) else {}
 
-    def _normalize(self, payload, expected_symbols: set[str]) -> dict:
+    def _normalize_review(self, payload) -> dict:
         if not isinstance(payload, dict):
             payload = {}
-        by_symbol = {}
-        assessments = payload.get("assessments", [])
-        if isinstance(assessments, list):
-            for raw in assessments:
+        severity = str(payload.get("severity", "none") or "none").strip().lower()
+        if severity not in self._VALID_SEVERITIES:
+            severity = "none"
+        raw_changes = payload.get("suggested_changes", [])
+        changes = []
+        if isinstance(raw_changes, list):
+            for raw in raw_changes:
                 if not isinstance(raw, dict):
                     continue
-                symbol = str(raw.get("symbol", "")).strip().upper()
-                if symbol not in expected_symbols:
+                lever = str(raw.get("lever", "") or "").strip().lower()
+                if lever not in self._VALID_LEVERS:
                     continue
-                by_symbol[symbol] = {
-                    "symbol": symbol,
-                    "priority": self._number(
-                        raw.get("priority"), 0, 1, 0
-                    ),
-                    "spread_opportunity": self._number(
-                        raw.get("spread_opportunity"), 0, 1, 0
-                    ),
-                    "quick_trade_score": self._number(
-                        raw.get("quick_trade_score"), 0, 1, 0
-                    ),
-                    "symbol_volatility": self._number(
-                        raw.get("symbol_volatility"), 0, 1, 0
-                    ),
-                    "confidence": self._number(
-                        raw.get("confidence"), 0, 1, 0
-                    ),
-                    "catalyst_strength": self._number(
-                        raw.get("catalyst_strength"), -1, 1, 0
-                    ),
-                    "expected_move_percent": self._number(
-                        raw.get("expected_move_percent"), -100, 100, 0
-                    ),
-                    "horizon_minutes": int(
-                        self._number(raw.get("horizon_minutes"), 1, 390, 60)
-                    ),
-                    "downside_risk": self._number(
-                        raw.get("downside_risk"), 0, 1, 1
-                    ),
-                    "liquidity_risk": self._number(
-                        raw.get("liquidity_risk"), 0, 1, 1
-                    ),
-                    "exit_bias": self._number(
-                        raw.get("exit_bias"), -1, 1, 0
-                    ),
-                }
-
-        for symbol in expected_symbols - by_symbol.keys():
-            by_symbol[symbol] = {
-                "symbol": symbol,
-                "priority": 0,
-                "spread_opportunity": 0,
-                "quick_trade_score": 0,
-                "symbol_volatility": 0,
-                "confidence": 0,
-                "catalyst_strength": 0,
-                "expected_move_percent": 0,
-                "horizon_minutes": 60,
-                "downside_risk": 1,
-                "liquidity_risk": 1,
-                "exit_bias": 0,
-            }
-
+                direction = str(raw.get("direction", "") or "").strip().lower()
+                if direction not in self._VALID_DIRECTIONS:
+                    continue
+                changes.append(
+                    {
+                        "lever": lever,
+                        "direction": direction,
+                        "reasoning": str(raw.get("reasoning", "") or "").strip()[
+                            :300
+                        ],
+                    }
+                )
         return {
-            "market_direction": self._number(
-                payload.get("market_direction"), -1, 1, 0
-            ),
-            "market_volatility": self._number(
-                payload.get("market_volatility"), 0, 1, 1
-            ),
-            "assessments": [by_symbol[symbol] for symbol in sorted(by_symbol)],
+            "assessment": str(payload.get("assessment", "") or "").strip()[:400],
+            "severity": severity,
+            "confidence": self._number(payload.get("confidence"), 0, 1, 0),
+            "suggested_changes": changes[:10],
         }
 
-    def _research(self, state: dict) -> None:
+    def _review_strategy(self, state: dict) -> None:
         if self._requests_today >= self.config.agent_daily_request_limit:
             return
         self._requests_today += 1
-        expected_symbols = {
-            str(item.get("symbol", "")).upper()
-            for group in ("positions", "candidates")
-            for item in state.get(group, [])
-            if item.get("symbol")
-        }
         # Compact, literal field:range spec instead of prose sentences - a
         # model reproduces a short explicit schema more reliably than a
         # description of one, which cuts both input tokens (helps the
-        # daily token budget) and output-format drift (fewer malformed/
-        # truncated responses across a full day of up to
-        # AGENT_DAILY_REQUEST_LIMIT calls). Every field below is still
-        # consumed downstream (research_supports_entry/_exit_bias in
-        # strategy.py) - only the wording shrank, not the schema.
+        # daily token budget) and output-format drift.
         #
-        # No search tool at all now (see request_kwargs' compound_custom
-        # below) - two rounds of "budget the search/reasoning better"
-        # (raising max_completion_tokens, then telling the model to keep
-        # JSON compact) still weren't reliable: Groq's own tool
-        # orchestration overhead before the JSON is written isn't
-        # something a prompt instruction can bound. Removing the tool
-        # entirely is the only way to actually guarantee it can't eat the
-        # output budget - TASK B was always computed purely from STATE's
-        # numeric data anyway (STATE.market_pulse already carries real,
-        # current top gainers/losers/most-active from Webull's own
-        # screeners - see AutoTrader.refresh_market_pulse), so nothing
-        # here ever needed search to begin with.
+        # No search tool (see request_kwargs' compound_custom below) -
+        # this assessment is computed entirely from STATE's own numeric
+        # performance data (holdings/pnl/trades), so nothing here ever
+        # needed search to begin with, and letting a tool run risks
+        # unpredictable overhead eating the output budget the same way
+        # it did for the predecessor of this capability.
+        lever_list = ", ".join(sorted(self._VALID_LEVERS))
         prompt = (
             "Output compact, single-line JSON only - no pretty-printing, "
             "no indentation, no newlines or spaces around punctuation. "
             "This account has a strict daily token budget shared across "
             "every request today; every unnecessary token (formatting "
             "whitespace especially) is budget a later cycle won't have.\n"
-            "You research setups for a fast US intraday scalping bot - "
-            "2-30min holds, not a long-term thesis. Assess every STATE "
-            "symbol from its price/chg(change ratio)/vol(volume)/spread, "
-            "using STATE.market_pulse (today's actual top gainers/losers/"
-            "most-active) as extra market context. Score for a scalp "
-            "happening in the next few minutes, not a multi-day move: "
-            "reward a real, currently-unfolding catalyst with repeatable "
-            "liquid movement; penalize wide spread, thin volume, stale "
-            "quotes, or a move that already happened and is fading. Never "
-            "invent data beyond what STATE provides; rank attention/setup "
-            "quality only, no buy/sell/hold calls. JSON only, numeric "
-            "fields only. This is a single request with no retry.\n"
-            "Return: market_direction:-1..1, market_volatility:0-1, "
-            "assessments[].\n"
-            "assessments[] (one per STATE symbol, no exceptions): {symbol, "
-            "priority:0-1, spread_opportunity:0-1, confidence:0-1, "
-            "quick_trade_score:0-1, symbol_volatility:0-1, "
-            "catalyst_strength:-1..1, expected_move_percent:signed, "
-            "horizon_minutes:1-390, downside_risk:0-1, liquidity_risk:0-1, "
-            "exit_bias:-1..1}.\n"
-            "priority/quick_trade_score: how good this symbol is for a "
-            "scalp entry right now - low if the move already happened, "
-            "the catalyst is stale, or there's nothing actionable in the "
-            "next few minutes.\n"
-            "exit_bias: negative=de-risk/exit now (fading catalyst, rising "
-            "halt/dilution/reversal risk), positive=fresh strong catalyst "
-            "supports holding for a larger move, 0=neutral. Every field is "
-            "required for every STATE symbol - use neutral values with low "
-            "confidence when evidence is thin, never omit a symbol or a "
-            "field.\nSTATE:"
+            "You review the live performance of an automated US "
+            "intraday scalping bot. Assess whether its CURRENT strategy "
+            "is actually working from the real holdings/today's pnl/"
+            "recent trades in STATE - not any single trade or stock "
+            "pick, the pattern across STATE as a whole. Never invent "
+            "data beyond what STATE provides. This is a single request "
+            "with no retry.\n"
+            "Return exactly: assessment (string, 1-2 sentences), "
+            "severity:\"none\"|\"minor\"|\"moderate\"|\"severe\", "
+            "confidence:0-1, suggested_changes[].\n"
+            "suggested_changes[] (0 or more - omit entirely when "
+            "severity is \"none\"): {lever, direction:\"increase\"|"
+            "\"decrease\"|\"disable\"|\"enable\", reasoning}. lever MUST "
+            "be exactly one of: " + lever_list + ". Never invent a lever "
+            "name outside this list, never reference code, config keys, "
+            "or other internals directly - these are read by a human "
+            "who will decide how to actually implement a change, not "
+            "applied automatically.\n"
+            "severity reflects how confident you are the CURRENT "
+            "strategy (not normal variance) needs a change - \"none\" if "
+            "today's results look like ordinary noise, \"severe\" only "
+            "for a clear, repeated pattern across multiple trades (e.g. "
+            "every stop-loss losing more than every profit-take gains, "
+            "or fractional trades consistently losing to flat fees)."
+            "\nSTATE:"
             + json.dumps(state, separators=(",", ":"), default=str)
         )
         self.log.info(
-            "AGENT  | requesting research | symbols=%s | bytes=%s | daily=%s/%s",
-            len(expected_symbols),
+            "AGENT  | requesting strategy review | trades=%s | bytes=%s | "
+            "daily=%s/%s",
+            len(state.get("recent_trades", [])),
             len(prompt.encode("utf-8")),
             self._requests_today,
             self.config.agent_daily_request_limit,
@@ -507,14 +447,13 @@ class MarketResearchAgent:
             # the request outright, before the model even runs, once
             # prompt_tokens + max_completion_tokens exceeds that). 4000
             # leaves comfortable room for STATE to grow while still being
-            # far more than a real response has needed in testing (under
-            # 900 completion tokens, reasoning included, for a 5-symbol
-            # payload).
+            # far more than a real response needs for this fixed, small
+            # schema.
             "max_completion_tokens": 4000,
-            # Low, not zero: keeps numeric fields consistent/reproducible run
-            # to run instead of drifting, while still leaving enough room for
-            # the model to weigh conflicting signals rather than collapsing
-            # to one canned answer.
+            # Low, not zero: keeps the severity/confidence assessment
+            # consistent/reproducible run to run instead of drifting,
+            # while still leaving enough room to weigh conflicting
+            # signals rather than collapsing to one canned answer.
             "temperature": 0.2,
         }
         if "compound" in self.config.groq_model.lower():
@@ -522,35 +461,26 @@ class MarketResearchAgent:
             # deliberately isn't on one anymore (see groq_model's default
             # in config.py) - a plain model doesn't understand this param,
             # so it's only sent when it would actually do something.
-            # Disables every built-in tool (web_search, visit_website,
-            # code_interpreter, wolfram_alpha) - TASK B never needed
-            # search to begin with (it's computed purely from STATE's
-            # numeric data), and Compound's own tool-orchestration
-            # overhead before the JSON is written was the actual source of
-            # the truncated/malformed/empty responses _parse_response's
-            # fallback kept having to catch, not the output schema itself.
             request_kwargs["compound_custom"] = {"tools": {"enabled_tools": []}}
         if "gpt-oss" in self.config.groq_model.lower():
             # gpt-oss is a reasoning model - it spends hidden "reasoning"
             # tokens (counted against max_completion_tokens) before writing
-            # the actual JSON answer. Left uncapped this reintroduces the
-            # same category of risk Compound caused (unpredictable
-            # non-answer overhead crowding out the real response); "low"
-            # keeps it small (~15-200 tokens observed) instead of unbounded.
-            # Only sent for gpt-oss - Groq rejects this param outright for
-            # Compound, and other model families use a different enum.
+            # the actual JSON answer. Left uncapped this risks unpredictable
+            # non-answer overhead crowding out the real response; "low"
+            # keeps it small. Only sent for gpt-oss - Groq rejects this
+            # param outright for Compound, and other model families use a
+            # different enum.
             request_kwargs["reasoning_effort"] = self.config.groq_reasoning_effort
-        # Exactly one Groq call per research cycle, deliberately no retry -
+        # Exactly one Groq call per review cycle, deliberately no retry -
         # a retry-with-different-params here would count a second time
         # against both AGENT_DAILY_REQUEST_LIMIT and the rolling token
-        # budget, silently spending the day's budget faster than the
-        # core/extended interval pacing intends (this was a real cause of
-        # hitting the daily token ceiling hours before end of day). Any
-        # failure here - oversized request, empty/malformed response - is
-        # handled by falling back to conservative defaults for this cycle
-        # only; the next scheduled cycle (2-10 minutes later) tries again
-        # fresh. The outer worker loop's exception handler already logs a
-        # specific, clear message for both failure modes below.
+        # budget, silently spending the day's budget faster than
+        # STRATEGY_REVIEW_INTERVAL_SECONDS' pacing intends. Any failure
+        # here - oversized request, empty/malformed response - is handled
+        # by skipping this cycle only; the next scheduled cycle (15
+        # minutes later) tries again fresh. The outer worker loop's
+        # exception handler already logs a specific, clear message for
+        # both failure modes below.
         response = self.client.chat.completions.create(**request_kwargs)
         usage = getattr(response, "usage", None)
         tokens_used = int(getattr(usage, "total_tokens", 0) or 0) if usage else 0
@@ -558,43 +488,20 @@ class MarketResearchAgent:
             self._token_usage_log.append((time.monotonic(), tokens_used))
         content = response.choices[0].message.content
         parsed = self._parse_response(content)
-        raw_assessments = parsed.get("assessments") if isinstance(parsed, dict) else None
-        if expected_symbols and not raw_assessments:
-            self.log.warning(
-                "AGENT  | model returned no real assessments for %s "
-                "requested symbols this cycle; falling back to "
-                "conservative defaults | raw=%s",
-                len(expected_symbols),
-                json.dumps(parsed, separators=(",", ":"))[:300],
-            )
-        payload = self._normalize(parsed, expected_symbols)
-        now = time.monotonic()
+        review = self._normalize_review(parsed)
+        review["updated_at"] = time.monotonic()
         with self._lock:
-            for item in payload["assessments"]:
-                symbol = item["symbol"].upper()
-                item["market_direction"] = payload["market_direction"]
-                item["market_volatility"] = payload["market_volatility"]
-                item["updated_at"] = now
-                self._assessments[symbol] = item
+            self._latest_strategy_review = review
         self.log.info(
-            "AGENT  | priority research | direction=%+.2f | volatility=%.2f | researched=%s",
-            payload["market_direction"],
-            payload["market_volatility"],
-            len(payload["assessments"]),
+            "AGENT  | strategy review | severity=%s | confidence=%.2f | %s",
+            review["severity"],
+            review["confidence"],
+            review["assessment"],
         )
-        for item in payload["assessments"]:
-            self.log.info(
-                "AI     | %-8s | priority=%.2f | quick=%.2f | volatility=%.2f | spread=%.2f | conf=%.2f | catalyst=%+.2f | move=%+.2f%%/%sm | downside=%.2f | liquidity=%.2f | exit=%+.2f",
-                item["symbol"],
-                item["priority"],
-                item["quick_trade_score"],
-                item["symbol_volatility"],
-                item["spread_opportunity"],
-                item["confidence"],
-                item["catalyst_strength"],
-                item["expected_move_percent"],
-                item["horizon_minutes"],
-                item["downside_risk"],
-                item["liquidity_risk"],
-                item["exit_bias"],
+        for change in review["suggested_changes"]:
+            self.log.warning(
+                "AGENT  | suggested change | lever=%s | direction=%s | %s",
+                change["lever"],
+                change["direction"],
+                change["reasoning"],
             )

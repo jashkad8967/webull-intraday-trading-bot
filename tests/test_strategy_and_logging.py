@@ -1665,41 +1665,48 @@ class BotOvertradingCapTests(unittest.TestCase):
         self.assertFalse(handle())
 
 
-class ResearchDiscoveryTests(unittest.TestCase):
+class StrategyReviewAgentTests(unittest.TestCase):
     def test_empty_or_truncated_completion_does_not_raise(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         self.assertEqual(agent._parse_response(""), {})
         self.assertEqual(agent._parse_response(None), {})
 
-    def test_salvage_assessments_extracts_complete_objects_before_a_cutoff(self):
-        # Two complete assessment objects, then a third cut off mid-string -
-        # exactly the "Unterminated string" shape a real truncation produces.
+    def test_salvage_json_objects_extracts_complete_entries_before_a_cutoff(self):
+        # Two complete suggested_changes entries, then a third cut off
+        # mid-string - exactly the "Unterminated string" shape a real
+        # truncation produces.
         truncated = (
-            '{"market_direction":0.2,"market_volatility":0.5,"assessments":['
-            '{"symbol":"NVDA","priority":0.8},'
-            '{"symbol":"TSLA","priority":0.6},'
-            '{"symbol":"AMD","priority":0.3,"catalyst_strength":"unterminat'
+            '{"assessment":"x","severity":"minor","suggested_changes":['
+            '{"lever":"position size","direction":"decrease"},'
+            '{"lever":"entry selectivity","direction":"increase"},'
+            '{"lever":"stop-loss tightness","reasoning":"unterminat'
         )
-        salvaged = MarketResearchAgent._salvage_assessments(truncated)
-        self.assertEqual([item["symbol"] for item in salvaged], ["NVDA", "TSLA"])
+        salvaged = MarketResearchAgent._salvage_json_objects(truncated, "lever")
+        self.assertEqual(
+            [item["lever"] for item in salvaged],
+            ["position size", "entry selectivity"],
+        )
 
-    def test_salvage_assessments_ignores_objects_without_a_symbol_key(self):
-        text = '{"market_direction":0.2,"nested":{"foo":"bar"}}'
-        self.assertEqual(MarketResearchAgent._salvage_assessments(text), [])
+    def test_salvage_json_objects_ignores_objects_without_the_required_key(self):
+        text = '{"assessment":"x","nested":{"foo":"bar"}}'
+        self.assertEqual(
+            MarketResearchAgent._salvage_json_objects(text, "lever"), []
+        )
 
-    def test_parse_response_recovers_partial_assessments_from_truncation(self):
+    def test_parse_response_recovers_partial_suggested_changes_from_truncation(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.log = logging.getLogger("test-agent")
         truncated = (
-            '{"market_direction":0.2,"market_volatility":0.5,"assessments":['
-            '{"symbol":"NVDA","priority":0.8},'
-            '{"symbol":"TSLA","priority":0.6},'
-            '{"symbol":"AMD","catalyst_strength":"unterminat'
+            '{"assessment":"x","severity":"minor","suggested_changes":['
+            '{"lever":"position size","direction":"decrease"},'
+            '{"lever":"entry selectivity","direction":"increase"},'
+            '{"lever":"stop-loss tightness","reasoning":"unterminat'
         )
         with self.assertLogs("test-agent", level="WARNING") as logs:
             parsed = agent._parse_response(truncated)
         self.assertEqual(
-            [item["symbol"] for item in parsed["assessments"]], ["NVDA", "TSLA"]
+            [item["lever"] for item in parsed["suggested_changes"]],
+            ["position size", "entry selectivity"],
         )
         self.assertIn("salvaged", logs.output[0])
 
@@ -1707,34 +1714,87 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.log = logging.getLogger("test-agent")
         with self.assertRaises(json.JSONDecodeError):
-            agent._parse_response('{"market_direction": "unterminat')
+            agent._parse_response('{"assessment": "unterminat')
 
     def test_parse_response_salvages_a_balanced_but_internally_broken_object(self):
         """Regression test: a top-level object whose braces are perfectly
         balanced but has a syntax error INSIDE it (e.g. a missing comma
-        between two assessment objects - "Expecting ',' delimiter" from a
-        real production response) used to propagate straight out of
-        _parse_response uncaught. _extract_json_object found a candidate
-        (braces balance fine), but json.loads(candidate) itself raised and
-        that call sat outside any try/except - the salvage path never even
-        ran for this failure shape, only for a genuinely truncated one.
+        between two suggested_changes entries - "Expecting ',' delimiter"
+        from a real production response) used to propagate straight out
+        of _parse_response uncaught. _extract_json_object found a
+        candidate (braces balance fine), but json.loads(candidate) itself
+        raised and that call sat outside any try/except - the salvage
+        path never even ran for this failure shape, only for a genuinely
+        truncated one.
         """
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.log = logging.getLogger("test-agent")
         # Balanced overall, but missing the comma between the two
-        # assessment objects in the array.
+        # suggested_changes entries in the array.
         broken = (
-            '{"market_direction":0.2,"market_volatility":0.5,"assessments":['
-            '{"symbol":"NVDA","priority":0.8}'
-            '{"symbol":"TSLA","priority":0.6}'
+            '{"assessment":"x","severity":"minor","suggested_changes":['
+            '{"lever":"position size","direction":"decrease"}'
+            '{"lever":"entry selectivity","direction":"increase"}'
             ']}'
         )
         with self.assertLogs("test-agent", level="WARNING") as logs:
             parsed = agent._parse_response(broken)
         self.assertEqual(
-            [item["symbol"] for item in parsed["assessments"]], ["NVDA", "TSLA"]
+            [item["lever"] for item in parsed["suggested_changes"]],
+            ["position size", "entry selectivity"],
         )
         self.assertIn("salvaged", logs.output[0])
+
+    def test_normalize_review_drops_an_unrecognized_lever(self):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        payload = agent._normalize_review(
+            {
+                "assessment": "x",
+                "severity": "moderate",
+                "confidence": 0.5,
+                "suggested_changes": [
+                    {
+                        "lever": "made up lever",
+                        "direction": "increase",
+                        "reasoning": "not real",
+                    },
+                    {
+                        "lever": "position size",
+                        "direction": "decrease",
+                        "reasoning": "ok",
+                    },
+                ],
+            }
+        )
+        self.assertEqual(len(payload["suggested_changes"]), 1)
+        self.assertEqual(payload["suggested_changes"][0]["lever"], "position size")
+
+    def test_normalize_review_drops_an_unrecognized_direction(self):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        payload = agent._normalize_review(
+            {
+                "suggested_changes": [
+                    {
+                        "lever": "position size",
+                        "direction": "explode",
+                        "reasoning": "not real",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(payload["suggested_changes"], [])
+
+    def test_normalize_review_defaults_safely_for_garbage_input(self):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        payload = agent._normalize_review("not a dict")
+        self.assertEqual(payload["severity"], "none")
+        self.assertEqual(payload["confidence"], 0)
+        self.assertEqual(payload["suggested_changes"], [])
+
+    def test_normalize_review_rejects_an_unrecognized_severity(self):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        payload = agent._normalize_review({"severity": "catastrophic"})
+        self.assertEqual(payload["severity"], "none")
 
     def test_session_date_resets_at_market_open_not_midnight(self):
         """AGENT_DAILY_REQUEST_LIMIT budgets the extended trading day
@@ -1763,7 +1823,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
             agent._session_date(mid_session), datetime(2026, 8, 6).date()
         )
 
-    def test_submit_resets_budget_at_the_new_sessions_market_open(self):
+    def test_submit_strategy_review_resets_budget_at_the_new_sessions_market_open(self):
         import queue as queue_module
 
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
@@ -1771,6 +1831,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
             agent_daily_request_limit=250,
             agent_daily_token_budget=90000,
             market_open_time="04:00",
+            strategy_review_interval_seconds=0,
         )
         agent.config.session_time = (
             lambda value: datetime_time(*(int(p) for p in value.split(":")))
@@ -1782,7 +1843,6 @@ class ResearchDiscoveryTests(unittest.TestCase):
         # calendar date has already ticked over past midnight.
         agent._request_date = datetime(2026, 8, 5).date()
         agent._last_submitted = 0.0
-        agent._interval_seconds = lambda: 0
         agent._rate_limit_blocked = False
         agent._token_usage_log = []
         agent._token_limit_logged_at = 0.0
@@ -1795,7 +1855,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
             mock_datetime.now.return_value = datetime(
                 2026, 8, 6, 2, 30, tzinfo=timezone.utc
             )
-            agent.submit({"a": 1})
+            agent.submit_strategy_review({"a": 1})
         # Before market open - still yesterday's session, budget untouched.
         self.assertEqual(agent._requests_today, 200)
 
@@ -1805,20 +1865,21 @@ class ResearchDiscoveryTests(unittest.TestCase):
             mock_datetime.now.return_value = datetime(
                 2026, 8, 6, 5, 0, tzinfo=timezone.utc
             )
-            agent.submit({"a": 1})
-        # Past market open - new session, budget resets to 0 (submit()
-        # only resets/enqueues; _research() is what later advances the
-        # count, on the worker thread this test doesn't run).
+            agent.submit_strategy_review({"a": 1})
+        # Past market open - new session, budget resets to 0
+        # (submit_strategy_review() only resets/enqueues; _review_strategy()
+        # is what later advances the count, on the worker thread this test
+        # doesn't run).
         self.assertEqual(agent._requests_today, 0)
         self.assertEqual(agent._request_date, datetime(2026, 8, 6).date())
 
-    def test_submit_force_bypasses_the_interval_throttle(self):
+    def test_submit_strategy_review_force_bypasses_the_interval_throttle(self):
         """force=True must actually skip the interval wait - it was
         previously accepted as a parameter but never read anywhere in
-        submit(), so a forced post-liquidation reevaluation
-        (submit_agent_research(..., force=True)) silently behaved
-        identically to a routine submit and could sit rate-limited for
-        minutes instead of firing immediately.
+        submit_strategy_review(), so a forced post-circuit-breaker
+        reevaluation (submit_strategy_review(..., force=True)) silently
+        behaved identically to a routine submit and could sit rate-
+        limited for minutes instead of firing immediately.
         """
         import queue as queue_module
         import time as time_module
@@ -1829,38 +1890,40 @@ class ResearchDiscoveryTests(unittest.TestCase):
             agent_daily_token_budget=90000,
             market_open_time="00:00",
             session_time=lambda value: datetime_time(0, 0),
+            strategy_review_interval_seconds=120,
         )
         agent._request_date = datetime.now(timezone.utc).date()
         agent._requests_today = 0
         agent._limit_logged_date = None
         agent._last_submitted = time_module.monotonic()  # "just submitted"
         agent._timezone = timezone.utc
-        agent._interval_seconds = lambda: 120
         agent._work = queue_module.Queue(maxsize=1)
         agent._rate_limit_blocked = False
         agent._token_usage_log = []
         agent._token_limit_logged_at = 0.0
         agent.log = logging.getLogger("test-agent")
 
-        agent.submit({"a": 1}, force=False)
+        agent.submit_strategy_review({"a": 1}, force=False)
         self.assertTrue(agent._work.empty())  # still within the interval
 
-        agent.submit({"a": 1}, force=True)
+        agent.submit_strategy_review({"a": 1}, force=True)
         self.assertFalse(agent._work.empty())  # force bypassed the wait
 
-    def test_submit_respects_rolling_token_budget_and_rate_limit_block(self):
+    def test_submit_strategy_review_respects_rolling_token_budget_and_rate_limit_block(self):
         """The interval throttle alone doesn't protect against Groq's real
         tokens-per-day cap - a request can be perfectly on-schedule and
         still 429 if the account's rolling 24h usage is near its limit.
-        submit() must refuse to queue work in either case: usage already
-        near budget, or a prior 429 having blocked the rest of the session.
+        submit_strategy_review() must refuse to queue work in either case:
+        usage already near budget, or a prior 429 having blocked the rest
+        of the session.
         """
         import queue as queue_module
 
-        # A fixed monotonic clock, not the real one - submit()'s interval
-        # check compares elapsed-since-_last_submitted against this, and
-        # the real clock's absolute value depends on how long the host has
-        # been up, which is not something a test should depend on.
+        # A fixed monotonic clock, not the real one -
+        # submit_strategy_review()'s interval check compares elapsed-
+        # since-_last_submitted against this, and the real clock's
+        # absolute value depends on how long the host has been up, which
+        # is not something a test should depend on.
         now = 100_000.0
 
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
@@ -1869,13 +1932,13 @@ class ResearchDiscoveryTests(unittest.TestCase):
             agent_daily_token_budget=1000,
             market_open_time="00:00",
             session_time=lambda value: datetime_time(0, 0),
+            strategy_review_interval_seconds=120,
         )
         agent._request_date = datetime.now(timezone.utc).date()
         agent._requests_today = 0
         agent._limit_logged_date = None
         agent._last_submitted = 0.0
         agent._timezone = timezone.utc
-        agent._interval_seconds = lambda: 120
         agent._rate_limit_blocked = False
         agent._token_limit_logged_at = 0.0
         agent.log = logging.getLogger("test-agent")
@@ -1884,13 +1947,13 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent._work = queue_module.Queue(maxsize=1)
         agent._token_usage_log = [(now, 1500)]
         with unittest.mock.patch("time.monotonic", return_value=now):
-            agent.submit({"a": 1})
+            agent.submit_strategy_review({"a": 1})
         self.assertTrue(agent._work.empty())
 
         # Under budget and past the interval - goes through normally.
         agent._token_usage_log = [(now, 100)]
         with unittest.mock.patch("time.monotonic", return_value=now):
-            agent.submit({"a": 1})
+            agent.submit_strategy_review({"a": 1})
         self.assertFalse(agent._work.empty())
 
         # A prior 429 blocks submission for the rest of the session, even
@@ -1901,7 +1964,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent._token_usage_log = []
         agent._rate_limit_blocked = True
         with unittest.mock.patch("time.monotonic", return_value=now):
-            agent.submit({"a": 1})
+            agent.submit_strategy_review({"a": 1})
         self.assertTrue(agent._work.empty())
 
     def test_rolling_tokens_used_prunes_entries_older_than_24h(self):
@@ -1931,7 +1994,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         seconds = MarketResearchAgent._parse_retry_after("rate_limit_exceeded")
         self.assertEqual(seconds, 1800.0)
 
-    def test_rate_limit_error_blocks_research_for_the_rest_of_the_session(self):
+    def test_rate_limit_error_blocks_review_for_the_rest_of_the_session(self):
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.log = logging.getLogger("test-agent")
         agent._rate_limit_blocked = False
@@ -1942,16 +2005,16 @@ class ResearchDiscoveryTests(unittest.TestCase):
             "'code': 'rate_limit_exceeded'}}"
         )
         with self.assertLogs("test-agent", level="WARNING") as logs:
-            agent._handle_research_error(error)
+            agent._handle_review_error(error)
 
         self.assertTrue(agent._rate_limit_blocked)
         self.assertIn("until the next session", logs.output[0])
 
     def test_rate_limit_block_clears_only_at_the_next_session(self):
-        """A prior day's 429 must not silently linger and block research
-        forever - it clears specifically when submit() rolls over to a new
-        _session_date (start of the next extended trading day), same as
-        the request-count budget.
+        """A prior day's 429 must not silently linger and block review
+        forever - it clears specifically when submit_strategy_review()
+        rolls over to a new _session_date (start of the next extended
+        trading day), same as the request-count budget.
         """
         import queue as queue_module
 
@@ -1960,6 +2023,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
             agent_daily_request_limit=250,
             agent_daily_token_budget=90000,
             market_open_time="04:00",
+            strategy_review_interval_seconds=0,
         )
         agent.config.session_time = (
             lambda value: datetime_time(*(int(p) for p in value.split(":")))
@@ -1970,7 +2034,6 @@ class ResearchDiscoveryTests(unittest.TestCase):
         agent._request_date = datetime(2026, 8, 5).date()
         agent._rate_limit_blocked = True
         agent._last_submitted = 0.0
-        agent._interval_seconds = lambda: 0
         agent._token_usage_log = []
         agent._token_limit_logged_at = 0.0
         agent._work = queue_module.Queue(maxsize=1)
@@ -1982,7 +2045,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
             mock_datetime.now.return_value = datetime(
                 2026, 8, 5, 22, 0, tzinfo=timezone.utc
             )
-            agent.submit({"a": 1})
+            agent.submit_strategy_review({"a": 1})
         # Still the same session - the block must still be in effect.
         self.assertTrue(agent._rate_limit_blocked)
         self.assertTrue(agent._work.empty())
@@ -1993,18 +2056,19 @@ class ResearchDiscoveryTests(unittest.TestCase):
             mock_datetime.now.return_value = datetime(
                 2026, 8, 6, 5, 0, tzinfo=timezone.utc
             )
-            agent.submit({"a": 1})
+            agent.submit_strategy_review({"a": 1})
         # Past market open on a new day - the block clears and this submit
         # goes through.
         self.assertFalse(agent._rate_limit_blocked)
         self.assertFalse(agent._work.empty())
 
-    def test_research_makes_exactly_one_call_per_cycle(self):
+    def test_review_strategy_makes_exactly_one_call_per_cycle(self):
         """Regression test: a retry-with-different-params here used to
         count a second time against AGENT_DAILY_REQUEST_LIMIT and the
-        rolling token budget, spending the day's budget faster than the
-        core/extended interval pacing intends - _research must now place
-        exactly one Groq call per invocation, no matter what comes back.
+        rolling token budget, spending the day's budget faster than
+        STRATEGY_REVIEW_INTERVAL_SECONDS' pacing intends -
+        _review_strategy must place exactly one Groq call per invocation,
+        no matter what comes back.
         """
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(
@@ -2013,7 +2077,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         )
         agent.log = logging.getLogger("test-agent")
         agent._requests_today = 0
-        agent._assessments = {}
+        agent._latest_strategy_review = None
         agent._lock = threading.Lock()
 
         calls = []
@@ -2040,26 +2104,28 @@ class ResearchDiscoveryTests(unittest.TestCase):
             )
         )
 
-        agent._research({"positions": [{"symbol": "NVDA"}], "candidates": []})
+        agent._review_strategy(
+            {"holdings": [], "pnl_today": {}, "recent_trades": []}
+        )
 
         # Exactly one call - an empty response falls back to conservative
         # defaults for this cycle rather than retrying with different
         # params, and the request budget only ever advances by one.
         self.assertEqual(len(calls), 1)
         self.assertEqual(agent._requests_today, 1)
-        self.assertIn("NVDA", agent._assessments)
-        self.assertEqual(agent._assessments["NVDA"]["priority"], 0)
-        self.assertEqual(agent._assessments["NVDA"]["confidence"], 0)
+        self.assertEqual(agent._latest_strategy_review["severity"], "none")
+        self.assertEqual(agent._latest_strategy_review["confidence"], 0)
+        self.assertEqual(agent._latest_strategy_review["suggested_changes"], [])
 
-    def test_research_disables_every_built_in_tool(self):
+    def test_review_strategy_disables_every_built_in_tool(self):
         """Regression test: raising max_completion_tokens and then telling
         the model to keep JSON compact both failed to reliably stop
         truncated/malformed responses in production - Groq's own tool-
         orchestration overhead before writing the JSON isn't something a
-        prompt instruction can bound. TASK B never needed search (it's
-        computed purely from STATE's numeric data), so every built-in tool
-        must be disabled outright via compound_custom, not just
-        discouraged in the prompt.
+        prompt instruction can bound. This assessment never needs search
+        (it's computed purely from STATE's numeric performance data), so
+        every built-in tool must be disabled outright via compound_custom,
+        not just discouraged in the prompt.
         """
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(
@@ -2068,7 +2134,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         )
         agent.log = logging.getLogger("test-agent")
         agent._requests_today = 0
-        agent._assessments = {}
+        agent._latest_strategy_review = None
         agent._lock = threading.Lock()
 
         captured = {}
@@ -2095,21 +2161,19 @@ class ResearchDiscoveryTests(unittest.TestCase):
             )
         )
 
-        agent._research({"positions": [], "candidates": []})
+        agent._review_strategy(
+            {"holdings": [], "pnl_today": {}, "recent_trades": []}
+        )
 
         self.assertEqual(
             captured["compound_custom"], {"tools": {"enabled_tools": []}}
         )
         self.assertNotIn("search_settings", captured)
 
-    def test_research_omits_compound_custom_for_a_plain_model(self):
+    def test_review_strategy_omits_compound_custom_for_a_plain_model(self):
         """A plain (non-Compound) model doesn't understand compound_custom -
         it must only be sent when groq_model is actually a Compound system,
-        not unconditionally. The default model (see config.py) switched
-        away from compound-mini entirely once search was disabled, since
-        Compound's tool-orchestration layer was the actual source of the
-        truncated/malformed/empty responses, not something worth paying
-        for once it has no tools left to use.
+        not unconditionally.
         """
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(
@@ -2118,7 +2182,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         )
         agent.log = logging.getLogger("test-agent")
         agent._requests_today = 0
-        agent._assessments = {}
+        agent._latest_strategy_review = None
         agent._lock = threading.Lock()
 
         captured = {}
@@ -2145,16 +2209,16 @@ class ResearchDiscoveryTests(unittest.TestCase):
             )
         )
 
-        agent._research({"positions": [], "candidates": []})
+        agent._review_strategy(
+            {"holdings": [], "pnl_today": {}, "recent_trades": []}
+        )
 
         self.assertNotIn("compound_custom", captured)
 
-    def test_research_includes_reasoning_effort_for_a_gpt_oss_model(self):
+    def test_review_strategy_includes_reasoning_effort_for_a_gpt_oss_model(self):
         """gpt-oss is a reasoning model - its hidden "thinking" tokens are
         counted against max_completion_tokens, so reasoning_effort must be
-        sent to keep that overhead small and bounded instead of unbounded
-        (the same category of risk Compound's orchestration overhead was,
-        just smaller - see groq_model's default in config.py).
+        sent to keep that overhead small and bounded instead of unbounded.
         """
         agent = MarketResearchAgent.__new__(MarketResearchAgent)
         agent.config = SimpleNamespace(
@@ -2164,7 +2228,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         )
         agent.log = logging.getLogger("test-agent")
         agent._requests_today = 0
-        agent._assessments = {}
+        agent._latest_strategy_review = None
         agent._lock = threading.Lock()
 
         captured = {}
@@ -2191,12 +2255,14 @@ class ResearchDiscoveryTests(unittest.TestCase):
             )
         )
 
-        agent._research({"positions": [], "candidates": []})
+        agent._review_strategy(
+            {"holdings": [], "pnl_today": {}, "recent_trades": []}
+        )
 
         self.assertEqual(captured["reasoning_effort"], "low")
         self.assertNotIn("compound_custom", captured)
 
-    def test_research_omits_reasoning_effort_for_a_non_gpt_oss_model(self):
+    def test_review_strategy_omits_reasoning_effort_for_a_non_gpt_oss_model(self):
         """reasoning_effort is a gpt-oss-specific parameter - Groq rejects
         it outright for Compound, and other model families use a different
         enum, so it must only be sent when groq_model is actually gpt-oss.
@@ -2208,7 +2274,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         )
         agent.log = logging.getLogger("test-agent")
         agent._requests_today = 0
-        agent._assessments = {}
+        agent._latest_strategy_review = None
         agent._lock = threading.Lock()
 
         captured = {}
@@ -2235,11 +2301,13 @@ class ResearchDiscoveryTests(unittest.TestCase):
             )
         )
 
-        agent._research({"positions": [], "candidates": []})
+        agent._review_strategy(
+            {"holdings": [], "pnl_today": {}, "recent_trades": []}
+        )
 
         self.assertNotIn("reasoning_effort", captured)
 
-    def test_research_requests_a_tpm_safe_completion_budget(self):
+    def test_review_strategy_requests_a_tpm_safe_completion_budget(self):
         """This account's on-demand tier caps prompt_tokens +
         max_completion_tokens at 8000 per request, enforced before the
         model runs - requesting the old 8000 ceiling here would always be
@@ -2253,7 +2321,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         )
         agent.log = logging.getLogger("test-agent")
         agent._requests_today = 0
-        agent._assessments = {}
+        agent._latest_strategy_review = None
         agent._lock = threading.Lock()
 
         captured = {}
@@ -2280,23 +2348,11 @@ class ResearchDiscoveryTests(unittest.TestCase):
             )
         )
 
-        agent._research({"positions": [], "candidates": []})
+        agent._review_strategy(
+            {"holdings": [], "pnl_today": {}, "recent_trades": []}
+        )
 
         self.assertLessEqual(captured["max_completion_tokens"], 4000)
-
-    def test_normalize_no_longer_produces_a_discoveries_key(self):
-        """Discovery of new symbols moved out of the model entirely (see
-        AutoTrader.refresh_market_pulse) - _normalize's output shape
-        shouldn't carry a vestigial discoveries field even if a stale
-        prompt/response still mentions one.
-        """
-        agent = MarketResearchAgent.__new__(MarketResearchAgent)
-        agent.config = SimpleNamespace()
-        payload = agent._normalize(
-            {"discoveries": [{"symbol": "NVDA"}]},
-            set(),
-        )
-        self.assertNotIn("discoveries", payload)
 
 
 class AllocationAndLoggingTests(unittest.TestCase):

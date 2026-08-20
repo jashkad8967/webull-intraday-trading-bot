@@ -186,7 +186,6 @@ class AutoTrader:
         # from buying_power (spendable cash only).
         self.cached_account_value: Decimal | None = None
         self.working_orders: dict[str, dict] = {}
-        self.agent_candidates: dict[str, dict] = {}
         self.entries_paused = False
         self.circuit_breaker_time = 0.0
         self.last_circuit_research = 0.0
@@ -1197,9 +1196,13 @@ class AutoTrader:
         return Decimal(str(min(1.0, (idle_seconds - grace) / ramp)))
 
     def agent_assessment(self, symbol: str) -> dict | None:
-        if not self.market_agent:
-            return None
-        return self.market_agent.assessment(symbol)
+        """The agent no longer scores individual symbols (see
+        MarketResearchAgent - it now reviews account-wide performance,
+        not per-symbol setups). Kept as an always-None stub so
+        prioritized_stock_batch/stock_decision's existing "no
+        assessment" handling doesn't need to change.
+        """
+        return None
 
     @staticmethod
     def _quote_size(quote: dict, *fields: str) -> Decimal | None:
@@ -1312,57 +1315,70 @@ class AutoTrader:
             symbol for symbol in pulse_symbols if symbol in available
         }
 
-    def submit_agent_research(
+    def submit_strategy_review(
         self,
         positions: list[dict],
         buying_power: Decimal,
         force: bool = False,
-        event: str = "ROUTINE_RESEARCH",
+        event: str = "ROUTINE_REVIEW",
     ) -> None:
-        if not self.market_agent:
+        """Sends the agent a compact snapshot of real account performance
+        (holdings, today's pnl, recent trades) - not per-symbol setups -
+        and lets it assess whether the CURRENT strategy is working. See
+        MarketResearchAgent.submit_strategy_review's docstring: this is
+        review-gated, the result is only ever a logged/dashboard
+        suggestion, never applied automatically.
+        """
+        if not self.market_agent or not self.config.strategy_review_enabled:
             return
-        self.refresh_market_pulse()
-        research_limit = min(self.config.agent_max_symbols, 10)
         held = [
             {
                 "symbol": str(item.get("symbol", "")).upper(),
                 "type": item.get("instrument_type"),
                 "qty": self._compact_number(item.get("quantity")),
-                "pnl": self._compact_number(
+                "cost": self._compact_number(item.get("cost_price"), 2),
+                "unrealized_pnl": self._compact_number(
                     self.strategy.position_unrealized_pnl(item), 2
+                ),
+                "day_pnl": self._compact_number(
+                    self.strategy.position_day_pnl(item), 2
                 ),
             }
             for item in positions
             if Decimal(str(item.get("quantity", "0"))) != 0
-        ][:research_limit]
-        candidate_limit = max(0, research_limit - len(held))
-        candidates = list(self.agent_candidates.values())[
-            :candidate_limit
         ]
-        self.agent_candidates.clear()
-        selected = {
-            str(item.get("symbol", "")).upper()
-            for item in held + candidates
-            if item.get("symbol")
-        }
-        if len(candidates) < candidate_limit:
-            candidates.extend(
-                self.strategy.research_candidates(
-                    candidate_limit - len(candidates),
-                    selected,
-                    self.agent_assessment,
-                    self.wash_sales.blocked_until,
-                )
-            )
-        self.market_agent.submit(
+        recent_trades = [
+            {
+                "symbol": trade.get("symbol"),
+                "action": trade.get("action"),
+                "entry": trade.get("entry_price"),
+                "exit": trade.get("limit_price"),
+                "qty": trade.get("quantity"),
+                "pnl": trade.get("pnl"),
+            }
+            for trade in list(self.status.trades)[
+                : self.config.strategy_review_trade_history_limit
+            ]
+        ]
+        self.market_agent.submit_strategy_review(
             {
                 "event": event,
                 "buying_power": self._compact_number(buying_power, 0),
-                "positions": held,
-                "candidates": [
-                    self._compact_candidate(item) for item in candidates
-                ],
-                "market_pulse": self.market_pulse_cache,
+                "holdings": held,
+                # Same reconciliation StatusWriter's own dashboard total
+                # uses - Webull's own account_day_pnl when available
+                # (ground truth), not just the bot's local estimate. The
+                # agent should review real performance, not the same
+                # drifting number this session's earlier fixes addressed.
+                "pnl_today": StatusWriter.pnl_today_payload(
+                    self.daily_realized_pnl,
+                    sum(
+                        (Decimal(str(item["day_pnl"])) for item in held),
+                        Decimal("0"),
+                    ),
+                    self.cached_account_day_pnl,
+                ),
+                "recent_trades": recent_trades,
             },
             force=force,
         )
@@ -1377,18 +1393,6 @@ class AutoTrader:
             return int(number) if number == int(number) else round(number, 4)
         rounded = round(number, digits)
         return int(rounded) if digits == 0 else rounded
-
-    def _compact_candidate(self, item: dict) -> dict:
-        record = {
-            "symbol": str(item.get("symbol", "")).upper(),
-            "price": self._compact_number(item.get("price"), 4),
-            "chg": self._compact_number(item.get("change_ratio"), 4),
-            "vol": self._compact_number(item.get("volume"), 0),
-            "spread": self._compact_number(item.get("spread_percent"), 3),
-        }
-        if item.get("technical_signal"):
-            record["signal"] = item["technical_signal"]
-        return record
 
     def stop_loss_guard_active(self) -> bool:
         """freqtrade-style StoplossGuard: pause NEW entries (stock and
@@ -1491,7 +1495,7 @@ class AutoTrader:
                 >= self.config.loss_reevaluation_seconds
             ):
                 self.last_circuit_research = now
-                self.submit_agent_research(
+                self.submit_strategy_review(
                     positions,
                     buying_power,
                     force=True,
@@ -1534,7 +1538,7 @@ class AutoTrader:
         self.circuit_breaker_time = now
         self.last_circuit_research = now
         self.last_account_refresh = 0.0
-        self.submit_agent_research(
+        self.submit_strategy_review(
             positions,
             buying_power,
             force=True,
@@ -2204,14 +2208,6 @@ class AutoTrader:
                             price,
                             self.config.stock_price_sanity_percent * 100,
                         )
-                if decision.action == "BUY":
-                    self.agent_candidates[symbol] = {
-                        "symbol": symbol,
-                        "type": self.stock_categories.get(symbol, "US_STOCK"),
-                        "price": str(price),
-                        **self.strategy.metrics.get(symbol, {}),
-                        "technical_signal": "BUY",
-                    }
                 if quantity == 0:
                     self.pending_stock_exits.discard(symbol)
                     self.stop_exit_submitted.pop(symbol, None)
@@ -2221,7 +2217,6 @@ class AutoTrader:
                 if decision.action == "BUY" and quantity == 0:
                     blocked_until = self.wash_sales.blocked_until(symbol)
                     if blocked_until:
-                        self.agent_candidates.pop(symbol, None)
                         if symbol not in self.wash_skip_logged:
                             self.wash_skip_logged.add(symbol)
                             log.info(
@@ -3428,6 +3423,7 @@ class AutoTrader:
                 "enabled": True,
                 "market_pulse": self.market_pulse_cache,
                 "popular_symbols": sorted(self.agent_popular_symbols),
+                "strategy_review": self.market_agent.strategy_review(),
             }
         day_pnl_total = sum(
             (Decimal(row["day_pnl"]) for row in position_rows),
@@ -4066,7 +4062,7 @@ class AutoTrader:
                     )
                     self.cached_buying_power = buying_power
                     self.cached_positions = [dict(item) for item in positions]
-                    self.submit_agent_research(positions, buying_power)
+                    self.submit_strategy_review(positions, buying_power)
                 self.write_status_snapshot(positions, buying_power, circuit_active)
                 if time.monotonic() - self.last_status_log >= 1:
                     self.last_status_log = time.monotonic()

@@ -135,7 +135,7 @@ class StatusWriter:
         self._save_state()
 
     @staticmethod
-    def _pnl_today_payload(
+    def pnl_today_payload(
         realized_pnl_today: Decimal,
         open_pnl_total: Decimal,
         account_day_pnl_total: Decimal | None,
@@ -208,7 +208,7 @@ class StatusWriter:
             "recent_trades": list(self.trades),
             "pending_orders": pending_orders or [],
             "balance_history": list(self.balance_history),
-            "pnl_today": self._pnl_today_payload(
+            "pnl_today": self.pnl_today_payload(
                 realized_pnl_today, open_pnl_total, account_day_pnl_total
             ),
         }
