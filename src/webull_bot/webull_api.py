@@ -782,6 +782,61 @@ class WebullAPI:
                 closes[symbol] = sma
         return closes
 
+    def recent_minute_closes(
+        self,
+        symbols: list[str],
+        category: str,
+        count: int = 30,
+    ) -> dict[str, list[float]]:
+        """Real M1 bar closes per symbol, oldest-first - used to seed a
+        symbol's volatility-scalp price window from actual intraday
+        history the moment it's first scanned, instead of that window
+        only building up one live snapshot poll at a time (several scan
+        cycles just to accumulate enough samples to become eligible).
+        Same batching/parsing structure as sma_trend/historical_volatility,
+        just M1 instead of daily bars.
+        """
+        from webull.data.common.timespan import Timespan
+
+        results: dict[str, list[float]] = {}
+        unique = list(dict.fromkeys(symbol.upper() for symbol in symbols))
+        for start in range(0, len(unique), 20):
+            batch = unique[start : start + 20]
+            page = self._history_bars_resilient(
+                batch,
+                category,
+                Timespan.M1.name,
+                str(count),
+            )
+            for entry in page or []:
+                if not isinstance(entry, dict):
+                    continue
+                symbol = str(entry.get("symbol", "")).upper()
+                if not symbol:
+                    continue
+                bars = entry.get("bars")
+                if not isinstance(bars, list):
+                    candles = entry.get("candles")
+                    bars = candles if isinstance(candles, list) else None
+                if not bars:
+                    continue
+                closes = []
+                for bar in bars[:count]:
+                    if not isinstance(bar, dict):
+                        continue
+                    try:
+                        close = float(bar.get("close"))
+                    except (TypeError, ValueError):
+                        continue
+                    if close > 0:
+                        closes.append(close)
+                if closes:
+                    # bars arrive newest-first (same convention as the
+                    # daily-bar parsing above) - reverse to oldest-first
+                    # so appending live polls afterward stays chronological.
+                    results[symbol] = list(reversed(closes))
+        return results
+
     @staticmethod
     def _average_close(bars: list, days: int) -> float | None:
         samples: list[float] = []

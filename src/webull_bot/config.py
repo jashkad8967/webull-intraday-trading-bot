@@ -304,6 +304,14 @@ class Settings(BaseSettings):
     volatility_scalp_reentry_cooldown_seconds: int = Field(
         default=5, ge=0, le=300
     )
+    # Warm-starts a symbol's volatility window from real M1 bars the
+    # moment it's first scanned, instead of needing several live scan
+    # cycles just to accumulate enough snapshot-poll samples to become
+    # eligible - see WebullAPI.recent_minute_closes and AutoTrader.
+    # trade_stocks' bar-seed call. Self-limiting: only ever fetched once
+    # per symbol (skipped the moment its window is non-empty), so this
+    # never grows unbounded as the watchlist rotates through.
+    volatility_scalp_bar_seed_enabled: bool = True
     # During core trading hours, size new stock entries as this fraction of
     # total account buying power (a genuinely fractional/decimal quantity),
     # instead of the fixed STOCK_QUANTITY whole-share sizing - see

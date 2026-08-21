@@ -137,6 +137,13 @@ class AutoTrader:
         # see trade_stocks' dip-entry block and the quick-target override
         # applied to these positions' exit decision below.
         self.volatility_scalp_positions: set[str] = set()
+        # Broker-side "closing orders only" restriction (see
+        # is_symbol_restricted_to_closing_only) - deliberately NOT
+        # broker_conflict_symbols, which skips a symbol's exit management
+        # entirely too. A close-only restriction means the opposite: new
+        # entries are blocked but exits must keep working normally for
+        # any position already held.
+        self.entry_restricted_symbols: set[str] = set()
         self.stock_cursor = 0
         self.option_cursor = 0
         self.option_discovery_cursor = 0
@@ -866,6 +873,38 @@ class AutoTrader:
             "Webull's $2,000 equity minimum for short selling. Disabling "
             "new short entries for the rest of this run; restart the bot "
             "once equity clears that minimum to re-enable them. | %s",
+            exc,
+        )
+
+    @staticmethod
+    def is_symbol_restricted_to_closing_only(exc: Exception) -> bool:
+        """True for Webull's OAUTH_OPENAPI_CAN_NOT_CREATE_A_OPEN_ORDER
+        rejection ("This symbol is restricted to closing orders only") -
+        a per-security, broker-side restriction (e.g. a halt, an
+        emergency SSR-style curb, being pulled from tradability) that
+        deterministically rejects every single opening order for this
+        symbol, exactly the same way, for as long as it's in effect.
+        Live incident: RFAI. Retrying changes nothing, same reasoning as
+        is_short_selling_unsupported/is_fractional_ticker_unsupported -
+        letting it accumulate toward the generic order-error-rate
+        blacklist (5 errors in a shared, cross-symbol window) wastes
+        several futile attempts and API calls first, and risks that
+        window tripping on account of an unrelated symbol instead.
+        """
+        return "CAN_NOT_CREATE_A_OPEN_ORDER" in str(exc).upper()
+
+    def handle_symbol_restricted_to_closing_only(
+        self, symbol: str, exc: Exception
+    ) -> None:
+        if symbol in self.entry_restricted_symbols:
+            return
+        self.entry_restricted_symbols.add(symbol)
+        log.warning(
+            "GUARD  | %-8s | restricted to closing orders only by the "
+            "broker - blocking new entries for %s for the rest of the "
+            "day (existing positions still exit normally) | %s",
+            symbol,
+            symbol,
             exc,
         )
 
@@ -2070,6 +2109,38 @@ class AutoTrader:
             added += 1
         return added
 
+    def seed_volatility_windows(self, symbols: list[str]) -> None:
+        """Warm-starts each not-yet-seen symbol's volatility-scalp window
+        from real M1 bar closes in one batched call per category, instead
+        of leaving it to build up one live snapshot poll at a time. Fully
+        self-limiting: TradingStrategy.seed_volatility_window is a no-op
+        for any symbol whose window already has data (from a prior seed
+        or from live polling), so the candidate list naturally shrinks to
+        nothing as the watchlist gets covered.
+        """
+        unseeded = [
+            symbol
+            for symbol in symbols
+            if not self.strategy.volatility_price_history.get(symbol)
+        ]
+        if not unseeded:
+            return
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for symbol in unseeded:
+            grouped[self.stock_categories.get(symbol, "US_STOCK")].append(symbol)
+        for category, category_symbols in grouped.items():
+            try:
+                closes_by_symbol = self.api.recent_minute_closes(
+                    category_symbols,
+                    category,
+                    self.config.volatility_scalp_lookback_samples,
+                )
+            except Exception as exc:
+                log.warning("SCALP  | bar seed fetch failed | %s | %s", category, exc)
+                continue
+            for symbol, closes in closes_by_symbol.items():
+                self.strategy.seed_volatility_window(symbol, closes)
+
     def trade_stocks(
         self,
         positions: list[dict],
@@ -2224,6 +2295,13 @@ class AutoTrader:
         quote_by_symbol = {
             str(quote.get("symbol", "")).upper(): quote for quote in quotes
         }
+        if (
+            self.config.volatility_scalp_enabled
+            and self.config.volatility_scalp_bar_seed_enabled
+        ):
+            self.seed_volatility_windows(
+                [symbol for symbol in batch if symbol in quote_by_symbol]
+            )
         for symbol in batch:
             if symbol in self.broker_conflict_symbols:
                 continue
@@ -2295,6 +2373,7 @@ class AutoTrader:
                 if (
                     quantity == 0
                     and symbol not in self.broker_conflict_symbols
+                    and symbol not in self.entry_restricted_symbols
                     and len(self.volatility_scalp_positions)
                     < self.config.volatility_scalp_max_concurrent_positions
                     and open_count < self.config.max_open_positions
@@ -2349,6 +2428,8 @@ class AutoTrader:
                                 price,
                             )
                 if decision.action == "BUY" and quantity == 0:
+                    if symbol in self.entry_restricted_symbols:
+                        continue
                     blocked_until = self.wash_sales.blocked_until(symbol)
                     if blocked_until:
                         if symbol not in self.wash_skip_logged:
@@ -2471,6 +2552,8 @@ class AutoTrader:
                         )
                         open_count += 1
                 if decision.action == "SHORT" and quantity == 0:
+                    if symbol in self.entry_restricted_symbols:
+                        continue
                     blocked_until = self.wash_sales.blocked_until(symbol)
                     if blocked_until:
                         if symbol not in self.wash_skip_logged:
@@ -2748,6 +2831,9 @@ class AutoTrader:
                     continue
                 if self.is_short_selling_unsupported(exc):
                     self.handle_short_selling_unsupported(exc)
+                    continue
+                if self.is_symbol_restricted_to_closing_only(exc):
+                    self.handle_symbol_restricted_to_closing_only(symbol, exc)
                     continue
                 log.error("STOCK  | %s | %s", symbol, exc)
         return buying_power
