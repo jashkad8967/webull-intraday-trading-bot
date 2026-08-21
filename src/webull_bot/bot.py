@@ -3192,26 +3192,42 @@ class AutoTrader:
                         )
                     elif symbol in self.volatility_scalp_symbols:
                         # By request: "the sell price has to be
-                        # reasonable" - live incident, GAUZ. A fixed
-                        # target can be missed entirely if the real,
-                        # tradeable ask has already dipped back below it
-                        # by the time the order is actually submitted
-                        # (the decision fired off a last-trade tick that
-                        # can differ from the live ask) - resting
-                        # stubbornly at the exact target then means
-                        # giving back a real, already-available profit
-                        # while waiting for a price that may not
-                        # reoccur. Take whatever the current ask offers
-                        # instead, as long as it's still above cost -
-                        # the active entry/exit repricers (reprice_
-                        # volatility_scalp_exits/_entries) keep chasing
-                        # a better price afterward anyway.
-                        ask = self.api.quote_ask(quote)
+                        # reasonable" - live incident, GAUZ. Resting at
+                        # the raw ask isn't actually "reasonable" on a
+                        # wide-spread penny stock (GAUZ: bid=0.40,
+                        # ask=0.43, a 7.5% spread) - that's the top of
+                        # the book, not a price anyone's actually buying
+                        # at, so the order just sits unfilled the same
+                        # way a fixed target did. Reuses _stall_exit_
+                        # price's already-correct logic instead: takes
+                        # the bid immediately if it alone clears cost (a
+                        # real, guaranteed-fill profit), only falls back
+                        # to resting at the ask if the bid doesn't clear
+                        # but the ask does AND the spread itself isn't
+                        # absurdly wide (same spread-sanity check the
+                        # stall-breaker already uses). Skips the cycle
+                        # entirely (continue) rather than resting at an
+                        # unreliable price if neither holds.
+                        if exit_is_fractional:
+                            fee_per_share = self.config.sell_fee_dollars
+                        else:
+                            fee_per_share = (
+                                self.config.sell_fee_dollars / exit_quantity
+                            )
+                        min_profit = cost * self.config.volatility_scalp_target_percent
                         limit_price = (
                             self.api.stock_limit_price(quote, "SELL")
                             if symbol in self.stop_loss_escalated
-                            else (max(ask, cost) if ask else target)
+                            else self._stall_exit_price(
+                                quote, cost, min_profit, fee_per_share
+                            )
                         )
+                        if limit_price is None:
+                            self.gate_rejections[
+                                "volatility scalp - no reasonably fillable "
+                                "profit price available yet"
+                            ] += 1
+                            continue
                     else:
                         ask = self.api.quote_ask(quote)
                         # ask can be below target - or even below cost - if
