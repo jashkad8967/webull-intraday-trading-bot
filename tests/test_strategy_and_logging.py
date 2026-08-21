@@ -5299,6 +5299,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
     @staticmethod
     def _fake_bot_for_placement(placed, price="10.00"):
         from webull_bot.bot import AutoTrader
+        from webull_bot.strategy import TradingStrategy
 
         class FakeApi:
             @staticmethod
@@ -5314,7 +5315,10 @@ class ExecutionGuardrailTests(unittest.TestCase):
                 return "order-1"
 
         fake_bot = SimpleNamespace(
-            api=FakeApi(), iceberg_orders={}, price_sanity_rejected_at={}
+            api=FakeApi(),
+            iceberg_orders={},
+            price_sanity_rejected_at={},
+            strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
@@ -5349,6 +5353,26 @@ class ExecutionGuardrailTests(unittest.TestCase):
         self.assertEqual(placed[0][2], Decimal(ICEBERG_SLICE_SHARES))
         entry = fake_bot.iceberg_orders["AAA:BUY"]
         self.assertEqual(entry["remaining"], total_qty - ICEBERG_SLICE_SHARES)
+
+    def test_place_stock_scaled_never_slices_below_the_lot_restricted_minimum(self):
+        """Live incident: HOWL, priced in the $0.10-$0.999 band, sized to
+        a 100+ share order (Webull's own minimum there) but iceberg-sliced
+        into 10-share clips - every clip individually below the 100-share
+        floor, so every single slice got rejected with 417
+        OAUTH_OPENAPI_CANT_TRADE_FOR_PRICE_BETWEEN_0099_AND_0999. A
+        lot-restricted order must go out whole, never sliced.
+        """
+        from webull_bot.bot import AutoTrader, ICEBERG_MIN_SHARES
+
+        placed = []
+        fake_bot = self._fake_bot_for_placement(placed)
+        place = AutoTrader.place_stock_scaled.__get__(fake_bot)
+        total_qty = ICEBERG_MIN_SHARES + 50
+        order_id = place("HOWL", "BUY", total_qty, "STOCK:HOWL", {"price": "0.30"})
+        self.assertEqual(order_id, "order-1")
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0][2], total_qty)
+        self.assertNotIn("HOWL:BUY", fake_bot.iceberg_orders)
 
     def test_place_stock_scaled_clamps_to_hard_notional_ceiling(self):
         from webull_bot.bot import AutoTrader
@@ -5397,6 +5421,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
             ICEBERG_SLICE_INTERVAL_SECONDS,
             ICEBERG_SLICE_SHARES,
         )
+        from webull_bot.strategy import TradingStrategy
 
         placed = []
 
@@ -5430,6 +5455,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
                 }
             },
             price_sanity_rejected_at={},
+            strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
@@ -5478,6 +5504,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
 
     def test_process_iceberg_orders_removes_entry_when_fully_filled(self):
         from webull_bot.bot import AutoTrader, ICEBERG_SLICE_INTERVAL_SECONDS, ICEBERG_SLICE_SHARES
+        from webull_bot.strategy import TradingStrategy
 
         class FakeApi:
             def stock_quote(self, symbol):
@@ -5509,12 +5536,65 @@ class ExecutionGuardrailTests(unittest.TestCase):
             },
             record_trade=lambda *a, **k: None,
             price_sanity_rejected_at={},
+            strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
         process = AutoTrader.process_iceberg_orders.__get__(fake_bot)
         process()
         self.assertNotIn("AAA:BUY", fake_bot.iceberg_orders)
+
+    def test_process_iceberg_orders_places_the_full_remainder_in_the_lot_restricted_band(self):
+        """Companion to the place_stock_scaled regression test - if price
+        drifts into the $0.10-$0.999 band after the first clip already
+        went out, a later slice must not keep trying 10-share clips
+        either.
+        """
+        from webull_bot.bot import AutoTrader, ICEBERG_SLICE_INTERVAL_SECONDS
+        from webull_bot.strategy import TradingStrategy
+
+        placed = []
+
+        class FakeApi:
+            def stock_quote(self, symbol):
+                return {"symbol": symbol, "bid": "0.29", "ask": "0.31", "price": "0.30"}
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def stock_limit_price(q, side):
+                return Decimal(str(q["price"]))
+
+            def place_stock(self, symbol, side, quantity, limit_price=None):
+                placed.append((symbol, side, quantity, limit_price))
+                return "order-4"
+
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            iceberg_orders={
+                "HOWL:BUY": {
+                    "symbol": "HOWL",
+                    "side": "BUY",
+                    "key": "STOCK:HOWL",
+                    "remaining": Decimal("120"),
+                    "last_slice_at": time.monotonic()
+                    - ICEBERG_SLICE_INTERVAL_SECONDS
+                    - 1,
+                }
+            },
+            price_sanity_rejected_at={},
+            strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
+        fake_bot.record_trade = lambda *a, **k: None
+        process = AutoTrader.process_iceberg_orders.__get__(fake_bot)
+        process()
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0][2], Decimal("120"))
+        self.assertNotIn("HOWL:BUY", fake_bot.iceberg_orders)
 
 
 class FractionalExitGuardTests(unittest.TestCase):

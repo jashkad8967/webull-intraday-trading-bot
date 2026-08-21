@@ -1778,8 +1778,22 @@ class AutoTrader:
         slice duration.
         """
         total = Decimal(str(quantity))
-        clip = total if total < ICEBERG_MIN_SHARES or fractional else Decimal(ICEBERG_SLICE_SHARES)
         last_price = self.api.quote_price(quote)
+        # Webull requires a 100-share minimum lot for any order (either
+        # side) while price sits in the $0.10-$0.999 band - slicing into
+        # ICEBERG_SLICE_SHARES=10-share clips there guarantees every
+        # single slice gets rejected (live incident: HOWL, 417
+        # OAUTH_OPENAPI_CANT_TRADE_FOR_PRICE_BETWEEN_0099_AND_0999, on
+        # every iceberg slice attempt). A lot-restricted order is cheap
+        # enough in absolute notional (100 shares of a sub-$1 stock) that
+        # it doesn't need price-impact slicing anyway - place it whole.
+        clip = (
+            total
+            if total < ICEBERG_MIN_SHARES
+            or fractional
+            or self.strategy.minimum_lot_size(last_price) > 1
+            else Decimal(ICEBERG_SLICE_SHARES)
+        )
         if not fractional and clip * last_price > HARD_ORDER_NOTIONAL_CEILING:
             clip = (HARD_ORDER_NOTIONAL_CEILING / last_price).to_integral_value(
                 rounding=ROUND_DOWN
@@ -1845,7 +1859,16 @@ class AutoTrader:
             side = entry["side"]
             try:
                 quote = self.api.stock_quote(symbol)
-                clip = min(entry["remaining"], Decimal(ICEBERG_SLICE_SHARES))
+                last_price = self.api.quote_price(quote)
+                # Same lot-restriction guard as place_stock_scaled - price
+                # can drift into the $0.10-$0.999 band between the first
+                # clip and a later slice even if it wasn't there at
+                # submission time.
+                clip = (
+                    entry["remaining"]
+                    if self.strategy.minimum_lot_size(last_price) > 1
+                    else min(entry["remaining"], Decimal(ICEBERG_SLICE_SHARES))
+                )
                 limit_price = self.api.stock_limit_price(quote, side)
                 if not self.price_sanity_ok(symbol, self.api.quote_price(quote), limit_price):
                     entry["last_slice_at"] = now
