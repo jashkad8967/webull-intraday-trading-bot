@@ -5182,15 +5182,67 @@ class ExecutionGuardrailTests(unittest.TestCase):
     def test_price_sanity_ok_within_tolerance(self):
         from webull_bot.bot import AutoTrader
 
-        check = AutoTrader.price_sanity_ok.__get__(SimpleNamespace())
-        self.assertTrue(check(Decimal("100.00"), Decimal("103.00")))
+        check = AutoTrader.price_sanity_ok.__get__(
+            SimpleNamespace(price_sanity_rejected_at={})
+        )
+        self.assertTrue(check("AAPL", Decimal("100.00"), Decimal("103.00")))
 
     def test_price_sanity_rejects_large_deviation(self):
         from webull_bot.bot import AutoTrader
 
-        check = AutoTrader.price_sanity_ok.__get__(SimpleNamespace())
-        with self.assertLogs("webull-bot", level="ERROR"):
-            self.assertFalse(check(Decimal("100.00"), Decimal("110.00")))
+        fake_bot = SimpleNamespace(price_sanity_rejected_at={})
+        check = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        with self.assertLogs("webull-bot", level="ERROR") as logs:
+            self.assertFalse(check("AAPL", Decimal("100.00"), Decimal("110.00")))
+        self.assertIn("AAPL", logs.output[0])
+        self.assertIn("AAPL", fake_bot.price_sanity_rejected_at)
+
+    def test_entry_price_sanity_cooldown_blocks_a_recent_rejection(self):
+        """Live incident: one illiquid symbol's quote sat just past
+        price_sanity_ok's tolerance and got retried (and re-rejected) on
+        essentially every scan cycle for hours - nothing backed it off.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(price_sanity_cooldown_seconds=30),
+            price_sanity_rejected_at={"AAPL": 100.0},
+        )
+        ready = AutoTrader.entry_price_sanity_cooldown_ready.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=110.0):
+            self.assertFalse(ready("AAPL"))
+
+    def test_entry_price_sanity_cooldown_clears_after_the_window(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(price_sanity_cooldown_seconds=30),
+            price_sanity_rejected_at={"AAPL": 100.0},
+        )
+        ready = AutoTrader.entry_price_sanity_cooldown_ready.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=131.0):
+            self.assertTrue(ready("AAPL"))
+
+    def test_entry_price_sanity_cooldown_ready_for_a_never_rejected_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(price_sanity_cooldown_seconds=30),
+            price_sanity_rejected_at={},
+        )
+        ready = AutoTrader.entry_price_sanity_cooldown_ready.__get__(fake_bot)
+        self.assertTrue(ready("AAPL"))
+
+    def test_entry_price_sanity_cooldown_is_per_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(price_sanity_cooldown_seconds=30),
+            price_sanity_rejected_at={"AAPL": 100.0},
+        )
+        ready = AutoTrader.entry_price_sanity_cooldown_ready.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=110.0):
+            self.assertTrue(ready("MSFT"))
 
     @staticmethod
     def _fake_bot_for_order_errors():
@@ -5261,7 +5313,9 @@ class ExecutionGuardrailTests(unittest.TestCase):
                 placed.append((symbol, side, quantity, limit_price, fractional))
                 return "order-1"
 
-        fake_bot = SimpleNamespace(api=FakeApi(), iceberg_orders={})
+        fake_bot = SimpleNamespace(
+            api=FakeApi(), iceberg_orders={}, price_sanity_rejected_at={}
+        )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
         return fake_bot
@@ -5326,7 +5380,9 @@ class ExecutionGuardrailTests(unittest.TestCase):
                 placed.append((a, k))
                 return "order-1"
 
-        fake_bot = SimpleNamespace(api=BadPriceApi(), iceberg_orders={})
+        fake_bot = SimpleNamespace(
+            api=BadPriceApi(), iceberg_orders={}, price_sanity_rejected_at={}
+        )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
         place = AutoTrader.place_stock_scaled.__get__(fake_bot)
@@ -5373,6 +5429,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
                     - 1,
                 }
             },
+            price_sanity_rejected_at={},
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
@@ -5451,6 +5508,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
                 }
             },
             record_trade=lambda *a, **k: None,
+            price_sanity_rejected_at={},
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)

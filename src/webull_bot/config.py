@@ -255,6 +255,15 @@ class Settings(BaseSettings):
         gt=0,
         le=1,
     )
+    # How long AutoTrader.entry_price_sanity_cooldown_ready backs off a
+    # symbol after a price_sanity_ok rejection, before letting a fresh
+    # entry attempt retry it. Live incident: one illiquid symbol's quote
+    # sat just past PRICE_SANITY_TOLERANCE and got retried (and
+    # re-rejected) on essentially every scan cycle for hours with no
+    # backoff at all - not entering is always safe, so this only ever
+    # delays a retry, it never forces one through the way the exit
+    # side's stalled-order backstops do.
+    price_sanity_cooldown_seconds: int = Field(default=30, ge=5, le=600)
     stock_entry_max_spread_percent: Decimal = Field(
         default=Decimal("0.50"),
         gt=0,
