@@ -678,7 +678,7 @@ class WebullAPI:
         if not symbols:
             return []
         try:
-            return self._call(
+            response = self._call(
                 lambda: self.data.market_data.get_batch_history_bar(
                     symbols,
                     category,
@@ -687,6 +687,19 @@ class WebullAPI:
                 ),
                 "market",
             )
+            # Live response shape is {"result": [{"symbol": ..., "result":
+            # [...bars]}]} - one level deeper than every caller here
+            # (_parse_amplitudes/_parse_closes/recent_minute_closes)
+            # assumed. Unwrapping only the outer layer here (the inner
+            # per-symbol "result" key is handled by _extract_bars) kept
+            # this call always silently returning zero usable rows -
+            # VOLFILT's daily volatility pre-filter and the SMA trend
+            # filter have both been getting 0/N coverage and falling
+            # back to "no filtering" this whole time, and the new M1
+            # bar-seeding got nothing to seed with either.
+            if isinstance(response, dict):
+                return response.get("result") or []
+            return response
         except Exception as exc:
             message = str(exc)
             invalid_symbol = (
@@ -716,6 +729,20 @@ class WebullAPI:
                 )
             )
 
+    @staticmethod
+    def _extract_bars(entry: dict) -> list | None:
+        """A per-symbol history-bar entry's actual bar list can arrive
+        under any of these keys depending on which shape the SDK/API
+        happens to hand back - "result" is the one the live batch-history
+        endpoint actually uses (see _history_bars_resilient), "bars"/
+        "candles" kept as defensive fallbacks for any other shape.
+        """
+        for key in ("bars", "candles", "result"):
+            value = entry.get(key)
+            if isinstance(value, list):
+                return value
+        return None
+
     @classmethod
     def _parse_amplitudes(cls, page, days: int) -> dict[str, float]:
         amplitudes: dict[str, float] = {}
@@ -725,10 +752,7 @@ class WebullAPI:
             symbol = str(entry.get("symbol", "")).upper()
             if not symbol:
                 continue
-            bars = entry.get("bars")
-            if not isinstance(bars, list):
-                candles = entry.get("candles")
-                bars = candles if isinstance(candles, list) else None
+            bars = cls._extract_bars(entry)
             if bars is None:
                 continue
             amplitude = cls._average_amplitude(bars, days)
@@ -771,10 +795,7 @@ class WebullAPI:
             symbol = str(entry.get("symbol", "")).upper()
             if not symbol:
                 continue
-            bars = entry.get("bars")
-            if not isinstance(bars, list):
-                candles = entry.get("candles")
-                bars = candles if isinstance(candles, list) else None
+            bars = cls._extract_bars(entry)
             if bars is None:
                 continue
             sma = cls._average_close(bars, days)
@@ -814,10 +835,7 @@ class WebullAPI:
                 symbol = str(entry.get("symbol", "")).upper()
                 if not symbol:
                     continue
-                bars = entry.get("bars")
-                if not isinstance(bars, list):
-                    candles = entry.get("candles")
-                    bars = candles if isinstance(candles, list) else None
+                bars = self._extract_bars(entry)
                 if not bars:
                     continue
                 closes = []

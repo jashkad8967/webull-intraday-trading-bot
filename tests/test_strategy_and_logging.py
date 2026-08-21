@@ -3196,6 +3196,123 @@ class PayloadSizingTests(unittest.TestCase):
         self.assertGreater(len(calls), 1)
 
 
+class HistoryBarResponseShapeTests(unittest.TestCase):
+    """Live incident: the real batch-history-bar response is
+    {"result": [{"symbol": ..., "result": [...bars]}]} - one layer
+    deeper than _parse_amplitudes/_parse_closes/recent_minute_closes
+    ever assumed (they expected a flat list with bars under "bars" or
+    "candles"). This silently gave VOLFILT's daily volatility pre-filter
+    and the SMA trend filter 0/N coverage every single day (both fell
+    back to their safe "no filtering" default, so nothing crashed - it
+    just never worked), and broke volatility-scalp's M1 bar-seeding
+    outright (recent_minute_closes always returned {}).
+    """
+
+    def test_history_bars_resilient_unwraps_the_outer_result_key(self):
+        api = WebullAPI.__new__(WebullAPI)
+
+        def fake_call(callback, group):
+            return {
+                "result": [
+                    {
+                        "symbol": "TBB",
+                        "result": [{"close": "19.53"}, {"close": "19.50"}],
+                        "instrument_id": "925401989",
+                    }
+                ]
+            }
+
+        api._call = fake_call
+        page = api._history_bars_resilient(["TBB"], "US_STOCK", "M1", "20")
+        self.assertEqual(page, [
+            {
+                "symbol": "TBB",
+                "result": [{"close": "19.53"}, {"close": "19.50"}],
+                "instrument_id": "925401989",
+            }
+        ])
+
+    def test_history_bars_resilient_passes_through_an_already_flat_list(self):
+        """Defensive: if the SDK ever hands back an already-unwrapped
+        list (e.g. a test double, or a future SDK version), don't break.
+        """
+        api = WebullAPI.__new__(WebullAPI)
+
+        def fake_call(callback, group):
+            return [{"symbol": "TBB", "bars": [{"close": "19.53"}]}]
+
+        api._call = fake_call
+        page = api._history_bars_resilient(["TBB"], "US_STOCK", "M1", "20")
+        self.assertEqual(page, [{"symbol": "TBB", "bars": [{"close": "19.53"}]}])
+
+    def test_extract_bars_prefers_bars_then_candles_then_result(self):
+        self.assertEqual(WebullAPI._extract_bars({"bars": [1]}), [1])
+        self.assertEqual(WebullAPI._extract_bars({"candles": [2]}), [2])
+        self.assertEqual(WebullAPI._extract_bars({"result": [3]}), [3])
+        self.assertIsNone(WebullAPI._extract_bars({}))
+        self.assertIsNone(WebullAPI._extract_bars({"result": "not-a-list"}))
+
+    def test_recent_minute_closes_parses_the_real_nested_response_shape(self):
+        api = WebullAPI.__new__(WebullAPI)
+        fake_timespan = SimpleNamespace(M1=SimpleNamespace(name="M1"))
+
+        def fake_call(callback, group):
+            return {
+                "result": [
+                    {
+                        "symbol": "TBB",
+                        "result": [
+                            {"time": "2026-08-21T17:43:00.000+0000", "close": "19.53"},
+                            {"time": "2026-08-21T17:34:00.000+0000", "close": "19.54"},
+                            {"time": "2026-08-21T17:30:00.000+0000", "close": "19.5285"},
+                        ],
+                        "instrument_id": "925401989",
+                    }
+                ]
+            }
+
+        api._call = fake_call
+        api.data = SimpleNamespace(
+            market_data=SimpleNamespace(get_batch_history_bar=lambda *a, **k: None)
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"webull.data.common.timespan": SimpleNamespace(Timespan=fake_timespan)},
+        ):
+            closes = api.recent_minute_closes(["TBB"], "US_STOCK", count=20)
+
+        self.assertEqual(closes, {"TBB": [19.5285, 19.54, 19.53]})
+
+    def test_sma_trend_parses_the_real_nested_response_shape(self):
+        api = WebullAPI.__new__(WebullAPI)
+        fake_category = SimpleNamespace(US_STOCK=SimpleNamespace(name="US_STOCK"))
+        fake_timespan = SimpleNamespace(D=SimpleNamespace(name="DAY"))
+
+        def fake_call(callback, group):
+            return {
+                "result": [
+                    {"symbol": "NVDA", "result": [{"close": "100"}, {"close": "80"}]}
+                ]
+            }
+
+        api._call = fake_call
+        api.data = SimpleNamespace(
+            market_data=SimpleNamespace(get_batch_history_bar=lambda *a, **k: None)
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "webull.data.common.category": SimpleNamespace(Category=fake_category),
+                "webull.data.common.timespan": SimpleNamespace(Timespan=fake_timespan),
+            },
+        ):
+            sma = api.sma_trend(["NVDA"], days=2)
+
+        self.assertEqual(sma, {"NVDA": 90.0})
+
+
 class HistoricalVolatilityTests(unittest.TestCase):
     def test_amplitudes_parse_across_shapes_and_skip_bad_bars(self):
         page = [
