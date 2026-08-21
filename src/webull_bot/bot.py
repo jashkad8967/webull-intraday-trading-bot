@@ -2399,6 +2399,35 @@ class AutoTrader:
             ]
             if missing:
                 batch = list(batch) + missing
+        # Safety net, unconditional: ANY symbol with a real nonzero
+        # EQUITY position must get an exit decision every single cycle,
+        # regardless of whether it's currently in stock_symbols at all.
+        # Live incident: MYND, a real held position, fell out of the
+        # daily volatility-filtered scan universe (VOLFILT keeps only
+        # ~200 of the full universe) and simply stopped being evaluated
+        # - no stop-loss, no profit-target, nothing - while it kept
+        # sliding to an 11%+ unrealized loss with zero protective
+        # action taken. A position already being risked with real money
+        # must never depend on still being in the day's scan list to
+        # get managed.
+        held_symbols = [
+            str(item.get("symbol", "")).upper()
+            for item in positions
+            if item.get("instrument_type") == "EQUITY"
+            and Decimal(str(item.get("quantity", "0"))) != 0
+        ]
+        unmanaged_held = [
+            symbol for symbol in held_symbols if symbol and symbol not in batch
+        ]
+        if unmanaged_held:
+            log.warning(
+                "GUARD  | %s held position(s) had fallen out of the scanned "
+                "universe - forcing them back into this cycle's batch so "
+                "exit management resumes | %s",
+                len(unmanaged_held),
+                ",".join(sorted(unmanaged_held)),
+            )
+            batch = list(batch) + unmanaged_held
         bucket_remaining = {
             bucket: buying_power * fraction
             for bucket, fraction in self.config.stock_capital_fractions().items()
