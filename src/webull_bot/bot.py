@@ -2382,6 +2382,23 @@ class AutoTrader:
             if injected:
                 batch = list(batch) + injected
             self.priority_scan_symbols.clear()
+        if self.volatility_scalp_symbols:
+            # The curated cohort is only ~4 symbols out of a 200+ symbol
+            # scanned universe - left to prioritized_stock_batch's normal
+            # ranking, any one of them might only get re-evaluated once
+            # every several cycles, which can't support "multiple times
+            # a minute" trading. Force every cohort symbol into every
+            # single cycle's batch (not one-time, unlike
+            # priority_scan_symbols above) so its entry/exit decisions
+            # always run through the same, single, correct code path
+            # below - no separate/duplicated logic needed.
+            missing = [
+                symbol
+                for symbol in self.volatility_scalp_symbols
+                if symbol in self.stock_symbols and symbol not in batch
+            ]
+            if missing:
+                batch = list(batch) + missing
         bucket_remaining = {
             bucket: buying_power * fraction
             for bucket, fraction in self.config.stock_capital_fractions().items()
