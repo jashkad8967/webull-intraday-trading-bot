@@ -2593,6 +2593,18 @@ class AutoTrader:
                 if (
                     quantity == 0
                     and symbol in self.volatility_scalp_symbols
+                    # Live incident: GAUZ compounded into a 200-share
+                    # position (double the intended fixed 100) after the
+                    # cohort started being force-scanned every cycle -
+                    # `quantity == 0` alone isn't enough, since positions
+                    # only comes from account_state()'s cache (refreshed
+                    # every ACCOUNT_REFRESH_SECONDS, ~2s), and a second
+                    # entry could fire against that same stale "flat"
+                    # snapshot before the first order's fill ever shows
+                    # up in it. volatility_scalp_positions is updated
+                    # synchronously, in-process, the instant an order is
+                    # placed below - a race-free second guard.
+                    and symbol not in self.volatility_scalp_positions
                     and symbol not in self.broker_conflict_symbols
                     and symbol not in self.entry_restricted_symbols
                     and len(self.volatility_scalp_positions)
