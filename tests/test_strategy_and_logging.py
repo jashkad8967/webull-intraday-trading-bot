@@ -527,14 +527,50 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         """
         strategy = TradingStrategy(self.config())
         # A strong uptrend where every new sample is a new all-time-
-        # window high, until one small pullback.
-        self._feed(strategy, "HOWL", [1, 2, 3, 4, 5, 5.5, 6, 6.5, 7])
+        # window high, then one small pullback (6.90), THEN a small
+        # bounce off that pullback (6.95) - see the bounce-confirmation
+        # tests below for why the entry now waits for the bounce tick.
+        self._feed(strategy, "HOWL", [1, 2, 3, 4, 5, 5.5, 6, 6.5, 7, 6.90])
         self.assertFalse(strategy.volatility_scalp_dip_signal("HOWL", Decimal("6.99")))
         self.assertTrue(strategy.volatility_scalp_dip_signal("HOWL", Decimal("6.95")))
 
     def test_dip_signal_false_for_an_unseen_symbol(self):
         strategy = TradingStrategy(self.config())
         self.assertFalse(strategy.volatility_scalp_dip_signal("NEVERSEEN", Decimal("10")))
+
+    def test_dip_signal_requires_a_bounce_not_just_being_below_the_local_high(self):
+        """Live incident: both HOWL and GAUZ were bought on a raw dip
+        (price below the local high by enough percent) while still
+        actively falling, and were stopped out within minutes - a
+        classic "catch the falling knife" entry. The signal must wait
+        for the first uptick after the dip, not fire on every tick on
+        the way down.
+        """
+        strategy = TradingStrategy(self.config())
+        # 10.5 -> 10.4 -> 10.3 -> 10.2: still declining every tick.
+        self._feed(strategy, "WILD", [10.5, 10.4, 10.3, 10.2])
+        # Still falling (10.15 < the last recorded sample, 10.2) - even
+        # though it clears the drop-from-local-high threshold, this must
+        # NOT fire.
+        self.assertFalse(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.15")))
+        # A genuine uptick from the last sample (10.2 -> 10.25) - the
+        # dip has stopped getting worse, now it's allowed to fire.
+        self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.25")))
+
+    def test_dip_signal_excludes_the_current_price_when_already_appended(self):
+        """In live usage (via update_stock_snapshot), the window's last
+        element IS already this same price by the time this runs - the
+        local high and bounce reference must both look at history
+        strictly before it, not compare price against itself.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.volatility_price_history["WILD"].extend(
+            [10.5, 10.4, 10.3, 10.2, 10.25]
+        )
+        # 10.25 is already the window's last element (as if just
+        # appended by update_stock_snapshot) - previous sample is 10.2,
+        # not 10.25 itself.
+        self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.25")))
 
     def test_target_price_is_cost_plus_the_configured_small_percent(self):
         strategy = TradingStrategy(self.config())
