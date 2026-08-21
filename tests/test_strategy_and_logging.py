@@ -7933,6 +7933,95 @@ class PhantomExitReversalTests(unittest.TestCase):
         self.assertEqual(fake_bot.consecutive_exit_failures["ASHR"], 1)
 
 
+class ManualOrderDiscoveryTests(unittest.TestCase):
+    """By request: an order the bot never submitted itself (almost
+    always a manual action taken directly in the Webull app) used to
+    just log an opaque order_id - "just says monitoring." Now fetches
+    the real symbol/side/quantity and runs it through the same
+    record_trade tracking a bot-driven trade gets.
+    """
+
+    @staticmethod
+    def _fake_bot(order_detail_response, open_order_ids, raise_on_detail=False):
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            def open_orders(self):
+                return []
+
+            @staticmethod
+            def open_order_ids(groups):
+                return open_order_ids
+
+            def order_detail(self, order_id):
+                if raise_on_detail:
+                    raise RuntimeError("boom")
+                return order_detail_response
+
+        recorded = []
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                order_monitor_seconds=Decimal("0"),
+                order_timeout_seconds=120,
+            ),
+            api=FakeApi(),
+            last_order_monitor=0.0,
+            working_orders={},
+        )
+        fake_bot.record_trade = (
+            lambda key, order_id, action, quantity=None: recorded.append(
+                (key, order_id, action, quantity)
+            )
+        )
+        fake_bot.monitor = AutoTrader.monitor_working_orders.__get__(fake_bot)
+        return fake_bot, recorded
+
+    def test_extracts_symbol_and_side_and_runs_it_through_record_trade(self):
+        fake_bot, recorded = self._fake_bot(
+            {
+                "orders": [
+                    {"symbol": "ashr", "side": "BUY", "total_quantity": "5"}
+                ]
+            },
+            ["order-1"],
+        )
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.monitor()
+        self.assertEqual(
+            recorded, [("STOCK:ASHR", "order-1", "MANUAL_BUY", Decimal("5"))]
+        )
+
+    def test_a_sell_side_manual_order_is_recorded_as_manual_sell(self):
+        fake_bot, recorded = self._fake_bot(
+            {"orders": [{"symbol": "ASHR", "side": "SELL", "total_quantity": "5"}]},
+            ["order-1"],
+        )
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.monitor()
+        self.assertEqual(recorded[0][2], "MANUAL_SELL")
+
+    def test_falls_back_to_the_opaque_broker_order_when_detail_fetch_fails(self):
+        fake_bot, recorded = self._fake_bot(
+            None, ["order-1"], raise_on_detail=True
+        )
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            with self.assertLogs("webull-bot", level="WARNING"):
+                fake_bot.monitor()
+        self.assertEqual(recorded, [])
+        self.assertIn("order-1", fake_bot.working_orders)
+        self.assertEqual(fake_bot.working_orders["order-1"]["action"], "UNKNOWN")
+
+    def test_falls_back_when_detail_has_no_symbol(self):
+        fake_bot, recorded = self._fake_bot(
+            {"orders": [{"status": "SUBMITTED"}]}, ["order-1"]
+        )
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.monitor()
+        self.assertEqual(recorded, [])
+        self.assertIn("order-1", fake_bot.working_orders)
+        self.assertEqual(fake_bot.working_orders["order-1"]["action"], "UNKNOWN")
+
+
 class OrderHistoryThrottleGroupTests(unittest.TestCase):
     """Live incident: order_history shared the "order" _call throttle
     group with real order placement/cancellation - once volatility-scalp

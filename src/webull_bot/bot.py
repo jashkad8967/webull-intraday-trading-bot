@@ -1117,16 +1117,64 @@ class AutoTrader:
 
         for order_id in open_ids:
             if order_id not in self.working_orders:
-                self.working_orders[order_id] = {
-                    "submitted_at": now,
-                    "key": "",
-                    "action": "UNKNOWN",
-                    "cancel_requested_at": None,
-                }
-                log.info(
-                    "ORDER  | monitoring broker order | id=%s",
-                    order_id,
-                )
+                # An order the bot never submitted itself and doesn't
+                # already know about - almost always a manual action
+                # taken directly in the Webull app (a dashboard-driven
+                # manual buy/sell already calls record_trade immediately,
+                # so it would already be in working_orders by the time
+                # this runs). By request: don't just log an opaque
+                # order_id - fetch the real symbol/side/quantity and run
+                # it through the same record_trade tracking a bot-driven
+                # trade gets, so it actually factors into last_trade/
+                # last_exit_at, symbol_pnl_history, the idle-cash ramp,
+                # and the dashboard's trade log, instead of sitting
+                # invisible to all of that.
+                symbol = ""
+                side = ""
+                quantity = None
+                try:
+                    detail = self.api.order_detail(order_id)
+                    orders = detail.get("orders") or []
+                    first = (
+                        orders[0]
+                        if orders and isinstance(orders[0], dict)
+                        else detail
+                    )
+                    symbol = str(first.get("symbol") or "").upper()
+                    side = str(first.get("side") or "").upper()
+                    raw_quantity = first.get("total_quantity")
+                    if raw_quantity not in (None, ""):
+                        quantity = Decimal(str(raw_quantity))
+                except Exception as exc:
+                    log.warning(
+                        "ORDER  | could not fetch detail for an "
+                        "unrecognized order | id=%s | %s",
+                        order_id,
+                        exc,
+                    )
+                if symbol:
+                    action = "MANUAL_SELL" if side in ("SELL", "COVER") else "MANUAL_BUY"
+                    self.record_trade(
+                        f"STOCK:{symbol}", order_id, action, quantity=quantity
+                    )
+                    log.info(
+                        "ORDER  | monitoring manual order | %-8s | side=%s "
+                        "| id=%s",
+                        symbol,
+                        side or "?",
+                        order_id,
+                    )
+                else:
+                    self.working_orders[order_id] = {
+                        "submitted_at": now,
+                        "key": "",
+                        "action": "UNKNOWN",
+                        "cancel_requested_at": None,
+                    }
+                    log.info(
+                        "ORDER  | monitoring broker order | id=%s",
+                        order_id,
+                    )
 
         for order_id, order in list(self.working_orders.items()):
             if order_id not in open_ids:
@@ -3141,6 +3189,28 @@ class AutoTrader:
                             self.api.stock_limit_price(quote, "COVER")
                             if symbol in self.stop_loss_escalated
                             else (min(bid, target) if bid else target)
+                        )
+                    elif symbol in self.volatility_scalp_symbols:
+                        # By request: "the sell price has to be
+                        # reasonable" - live incident, GAUZ. A fixed
+                        # target can be missed entirely if the real,
+                        # tradeable ask has already dipped back below it
+                        # by the time the order is actually submitted
+                        # (the decision fired off a last-trade tick that
+                        # can differ from the live ask) - resting
+                        # stubbornly at the exact target then means
+                        # giving back a real, already-available profit
+                        # while waiting for a price that may not
+                        # reoccur. Take whatever the current ask offers
+                        # instead, as long as it's still above cost -
+                        # the active entry/exit repricers (reprice_
+                        # volatility_scalp_exits/_entries) keep chasing
+                        # a better price afterward anyway.
+                        ask = self.api.quote_ask(quote)
+                        limit_price = (
+                            self.api.stock_limit_price(quote, "SELL")
+                            if symbol in self.stop_loss_escalated
+                            else (max(ask, cost) if ask else target)
                         )
                     else:
                         ask = self.api.quote_ask(quote)
