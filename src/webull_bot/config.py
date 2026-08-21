@@ -289,11 +289,15 @@ class Settings(BaseSettings):
     volatility_scalp_min_stdev_percent: Decimal = Field(
         default=Decimal("0.015"), gt=0, le=1
     )
+    # Both lowered by request from 0.5% - "constantly buy the dip and
+    # sell the rise, even a little rise" - a smaller dip threshold fires
+    # entries more readily, and a smaller target sells on a smaller
+    # bounce instead of waiting for a bigger move.
     volatility_scalp_dip_entry_percent: Decimal = Field(
-        default=Decimal("0.005"), gt=0, le=1
+        default=Decimal("0.002"), gt=0, le=1
     )
     volatility_scalp_target_percent: Decimal = Field(
-        default=Decimal("0.005"), gt=0, le=1
+        default=Decimal("0.002"), gt=0, le=1
     )
     volatility_scalp_max_concurrent_positions: int = Field(
         default=3, ge=1, le=20
@@ -316,8 +320,12 @@ class Settings(BaseSettings):
     volatility_scalp_reselect_seconds: int = Field(
         default=1800, ge=60, le=86400
     )
+    # Lowered from 5 by request - "multiple times a minute" - 2s still
+    # leaves room for the reprice/exit machinery to actually process a
+    # fill before the next entry attempt, just without an unnecessarily
+    # long gap between round-trips.
     volatility_scalp_reentry_cooldown_seconds: int = Field(
-        default=5, ge=0, le=300
+        default=2, ge=0, le=300
     )
     # Warm-starts a symbol's volatility window from real M1 bars the
     # moment it's first scanned, instead of needing several live scan

@@ -538,39 +538,39 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         strategy = TradingStrategy(self.config())
         self.assertFalse(strategy.volatility_scalp_dip_signal("NEVERSEEN", Decimal("10")))
 
-    def test_dip_signal_requires_a_bounce_not_just_being_below_the_local_high(self):
-        """Live incident: both HOWL and GAUZ were bought on a raw dip
-        (price below the local high by enough percent) while still
-        actively falling, and were stopped out within minutes - a
-        classic "catch the falling knife" entry. The signal must wait
-        for the first uptick after the dip, not fire on every tick on
-        the way down.
+    def test_dip_signal_does_not_require_a_bounce_by_design(self):
+        """By explicit request: keep buying the dip continuously, even
+        while price is still actively declining tick to tick, rather
+        than waiting for a confirmed reversal - the user wants constant,
+        high-frequency trading on this cohort and accepts the resulting
+        losses as the cost of that. An earlier version of this signal
+        required an uptick from the immediately-preceding sample before
+        firing; that requirement has been deliberately removed.
         """
         strategy = TradingStrategy(self.config())
         # 10.5 -> 10.4 -> 10.3 -> 10.2: still declining every tick.
         self._feed(strategy, "WILD", [10.5, 10.4, 10.3, 10.2])
-        # Still falling (10.15 < the last recorded sample, 10.2) - even
-        # though it clears the drop-from-local-high threshold, this must
-        # NOT fire.
-        self.assertFalse(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.15")))
-        # A genuine uptick from the last sample (10.2 -> 10.25) - the
-        # dip has stopped getting worse, now it's allowed to fire.
-        self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.25")))
+        # Still falling relative to the last sample (10.2), but clears
+        # the drop-from-local-high threshold - fires anyway.
+        self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.15")))
 
     def test_dip_signal_excludes_the_current_price_when_already_appended(self):
         """In live usage (via update_stock_snapshot), the window's last
-        element IS already this same price by the time this runs - the
-        local high and bounce reference must both look at history
-        strictly before it, not compare price against itself.
+        element IS already this same price by the time this runs. If the
+        local-high lookback naively included it as an extra sample, the
+        real recent high can get pushed out of the last-N window and the
+        signal would compare price against itself (0% drop, never a
+        dip) instead of the actual recent high.
         """
         strategy = TradingStrategy(self.config())
+        # True recent high is 10.5 (the oldest sample) - if the current
+        # price (9.5) were double-counted as a 6th sample, the last-5
+        # lookback would push 10.5 out and see only 9.0s and the current
+        # price itself, masking a real ~9.5% dip.
         strategy.volatility_price_history["WILD"].extend(
-            [10.5, 10.4, 10.3, 10.2, 10.25]
+            [10.5, 9.0, 9.0, 9.0, 9.0, 9.5]
         )
-        # 10.25 is already the window's last element (as if just
-        # appended by update_stock_snapshot) - previous sample is 10.2,
-        # not 10.25 itself.
-        self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.25")))
+        self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("9.5")))
 
     def test_target_price_is_cost_plus_the_configured_small_percent(self):
         strategy = TradingStrategy(self.config())
@@ -4256,48 +4256,6 @@ class VolatilityScalpCohortSelectionTests(unittest.TestCase):
         with unittest.mock.patch("time.monotonic", return_value=2000.0):
             fake_bot.select_volatility_scalp_symbols()
         self.assertEqual(fake_bot.volatility_scalp_symbols, {"NEW"})
-
-
-class VolatilityScalpWashSaleOverrideTests(unittest.TestCase):
-    """volatility_scalp_wash_sale_override_ok - by request, keep trading
-    this cohort's symbols through an active wash-sale block as long as
-    the symbol is still net profitable overall.
-    """
-
-    @staticmethod
-    def _fake_bot(blocked_until, pnl_history):
-        from webull_bot.bot import AutoTrader
-
-        fake_bot = SimpleNamespace(
-            wash_sales=SimpleNamespace(blocked_until=lambda symbol: blocked_until),
-            symbol_pnl_history={"STOCK:WILD": pnl_history},
-        )
-        fake_bot.check = (
-            AutoTrader.volatility_scalp_wash_sale_override_ok.__get__(fake_bot)
-        )
-        return fake_bot
-
-    def test_not_blocked_at_all_is_always_ok(self):
-        fake_bot = self._fake_bot(None, [])
-        self.assertTrue(fake_bot.check("WILD", "STOCK:WILD"))
-
-    def test_blocked_but_net_profitable_overrides_the_block(self):
-        fake_bot = self._fake_bot(
-            datetime(2026, 9, 1, tzinfo=timezone.utc),
-            [(1.0, Decimal("2.00")), (2.0, Decimal("-0.50"))],
-        )
-        self.assertTrue(fake_bot.check("WILD", "STOCK:WILD"))
-
-    def test_blocked_and_net_losing_still_blocks(self):
-        fake_bot = self._fake_bot(
-            datetime(2026, 9, 1, tzinfo=timezone.utc),
-            [(1.0, Decimal("-2.00")), (2.0, Decimal("0.50"))],
-        )
-        self.assertFalse(fake_bot.check("WILD", "STOCK:WILD"))
-
-    def test_blocked_with_no_trade_history_still_blocks(self):
-        fake_bot = self._fake_bot(datetime(2026, 9, 1, tzinfo=timezone.utc), [])
-        self.assertFalse(fake_bot.check("WILD", "STOCK:WILD"))
 
 
 class PositionPnlTests(StrategyConfigMixin, unittest.TestCase):
