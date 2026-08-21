@@ -5611,6 +5611,7 @@ class FractionalExitGuardTests(unittest.TestCase):
                 stall_breaker_seconds=1,
                 stall_breaker_min_profit=Decimal("0.01"),
                 sell_fee_dollars=Decimal("0.02"),
+                stock_entry_max_spread_percent=Decimal("0.50"),
             ),
             api=FakeApi(),
             stock_categories={},
@@ -5674,6 +5675,7 @@ class FractionalExitGuardTests(unittest.TestCase):
                 stall_breaker_seconds=1,
                 stall_breaker_min_profit=Decimal("0.01"),
                 sell_fee_dollars=Decimal("0.02"),
+                stock_entry_max_spread_percent=Decimal("0.50"),
             ),
             api=FakeApi(),
             strategy=SimpleNamespace(
@@ -5741,6 +5743,7 @@ class FractionalExitGuardTests(unittest.TestCase):
                 stall_breaker_seconds=120,
                 stall_breaker_min_profit=Decimal("0.01"),
                 sell_fee_dollars=Decimal("0.02"),
+                stock_entry_max_spread_percent=Decimal("0.50"),
             ),
             api=FakeApi(),
             strategy=SimpleNamespace(
@@ -5781,6 +5784,127 @@ class FractionalExitGuardTests(unittest.TestCase):
 
         self.assertEqual(calls, ["STALE"])
         self.assertIn("STALE", fake_bot.pending_stock_exits)
+
+
+class StallExitPriceSpreadSanityTests(unittest.TestCase):
+    """Live incident: TBB (1 share, cost=19.42) sat with bid=19.39/
+    ask=19.89 - a ~2.5% spread, well past stock_entry_max_spread_percent's
+    default 0.50%. The bid never cleared cost+min_profit+fee, so
+    _stall_exit_price fell back to resting a passive SELL at the ask -
+    but the ask was far above where TBB was actually trading (prints at
+    19.41), so the order sat until order_timeout_seconds, got cancelled,
+    and boost_stalled_positions resubmitted the identical unreachable
+    limit next stall cycle. Forever, without ever filling. The fix:
+    _stall_exit_price now refuses the ask fallback when the spread itself
+    is wider than the same bound entries are held to, and simply waits
+    (no order submitted this cycle) instead of spinning on a doomed one.
+    """
+
+    @staticmethod
+    def _price_fn():
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(stock_entry_max_spread_percent=Decimal("0.50")),
+            api=SimpleNamespace(
+                quote_bid=lambda q: Decimal(str(q["bid"])) if q.get("bid") else None,
+                quote_ask=lambda q: Decimal(str(q["ask"])) if q.get("ask") else None,
+            ),
+        )
+        return AutoTrader._stall_exit_price.__get__(fake_bot)
+
+    def test_refuses_to_rest_at_an_unreachable_ask_on_a_wide_spread(self):
+        price_fn = self._price_fn()
+        quote = {"bid": "19.39", "ask": "19.89"}
+        result = price_fn(
+            quote,
+            average_cost=Decimal("19.42"),
+            min_profit=Decimal("0.01"),
+            fee_per_share=Decimal("0.02"),
+        )
+        self.assertIsNone(result)
+
+    def test_still_uses_the_ask_when_the_spread_is_tight(self):
+        price_fn = self._price_fn()
+        quote = {"bid": "19.40", "ask": "19.48"}
+        result = price_fn(
+            quote,
+            average_cost=Decimal("19.42"),
+            min_profit=Decimal("0.01"),
+            fee_per_share=Decimal("0.02"),
+        )
+        self.assertEqual(result, Decimal("19.48"))
+
+    def test_bid_alone_clearing_the_floor_is_unaffected_by_the_spread_check(self):
+        price_fn = self._price_fn()
+        quote = {"bid": "19.89", "ask": "20.50"}
+        result = price_fn(
+            quote,
+            average_cost=Decimal("19.42"),
+            min_profit=Decimal("0.01"),
+            fee_per_share=Decimal("0.02"),
+        )
+        self.assertEqual(result, Decimal("19.89"))
+
+
+class StallBreakerWideSpreadResubmitTests(unittest.TestCase):
+    def test_boost_stalled_positions_does_not_resubmit_at_an_unfillable_ask(self):
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+
+        class FakeApi:
+            def stock_quotes_resilient(self, symbols, category):
+                calls.extend(symbols)
+                return [
+                    {"symbol": s, "bid": "19.39", "ask": "19.89"} for s in symbols
+                ], set()
+
+            @staticmethod
+            def quote_bid(q):
+                return Decimal(str(q["bid"]))
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            def place_stock(self, *a, **k):
+                raise AssertionError(
+                    "must not rest a limit at an ask far above the last "
+                    "trade price on a wide-spread, illiquid symbol"
+                )
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                stall_breaker_enabled=True,
+                stall_breaker_seconds=1,
+                stall_breaker_min_profit=Decimal("0.01"),
+                sell_fee_dollars=Decimal("0.02"),
+                stock_entry_max_spread_percent=Decimal("0.50"),
+            ),
+            api=FakeApi(),
+            stock_categories={},
+            last_trade={},
+            last_stall_boost=0.0,
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+        )
+        fake_bot.cooldown_ready = lambda key: True
+        fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
+        fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
+        fake_bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(fake_bot)
+        boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TBB",
+                "quantity": "1",
+                "cost_price": "19.42",
+            }
+        ]
+        boost(positions, options_active=False, core_session_active=True)
+        self.assertEqual(calls, ["TBB"])
+        self.assertNotIn("TBB", fake_bot.pending_stock_exits)
 
 
 class EntrySizingSplitTests(unittest.TestCase):
