@@ -240,16 +240,39 @@ class TradingStrategy:
         exactly the kind of fast, small back-and-forth wiggles this
         strategy exists to capture. A local high stays reactive to those
         wiggles regardless of the larger trend.
+
+        Also requires a bounce confirmation: price must have ticked back
+        UP from its own immediately-preceding sample, not merely be
+        below the local high. Live incident: without this, the entry
+        bought into an active decline ("catching a falling knife") -
+        both HOWL and GAUZ were stopped out within minutes of a dip-only
+        entry, well before the position ever had a chance to actually
+        reverse. Requiring the first uptick after a dip, instead of
+        buying anywhere on the way down, is a real (if small) signal
+        that the pullback has stopped, not a guess at where it ends.
         """
         window = self.volatility_price_history.get(symbol)
         if not window:
             return False
-        recent_samples = list(window)[-self.VOLATILITY_SCALP_LOCAL_HIGH_SAMPLES:]
+        samples = list(window)
+        # In live usage, update_stock_snapshot has already appended this
+        # same price as the window's last element by the time this runs
+        # - exclude it so both the local high and the bounce reference
+        # compare against history strictly BEFORE this observation, not
+        # against itself.
+        if samples and Decimal(str(samples[-1])) == price:
+            samples = samples[:-1]
+        if not samples:
+            return False
+        recent_samples = samples[-self.VOLATILITY_SCALP_LOCAL_HIGH_SAMPLES:]
         recent_high = Decimal(str(max(recent_samples)))
         if recent_high <= 0 or price <= 0:
             return False
         drop = (recent_high - price) / recent_high
-        return drop >= self.config.volatility_scalp_dip_entry_percent
+        if drop < self.config.volatility_scalp_dip_entry_percent:
+            return False
+        previous_sample = Decimal(str(samples[-1]))
+        return price >= previous_sample
 
     def volatility_scalp_exit_override(
         self,
