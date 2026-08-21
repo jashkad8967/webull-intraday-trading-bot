@@ -148,6 +148,13 @@ class AutoTrader:
         # entries and active management for this strategy are scoped to
         # just these symbols, not every eligible symbol seen in passing.
         self.volatility_scalp_symbols: set[str] = set()
+        # How many averaging-down buys a currently-held cohort position
+        # has already made (see AutoTrader's averaging-buy entry block
+        # and TradingStrategy.volatility_scalp_average_down_signal) -
+        # capped by volatility_scalp_max_averaging_buys, reset to 0 the
+        # moment the position fully closes.
+        self.volatility_scalp_average_down_count: dict[str, int] = defaultdict(int)
+        self.last_volatility_average_down: dict[str, float] = {}
         # -inf, not 0.0: time.monotonic() starts near zero at process
         # boot too, so a 0.0 default would silently throttle the very
         # first selection until VOLATILITY_SCALP_RESELECT_SECONDS
@@ -181,6 +188,7 @@ class AutoTrader:
         self.last_order_monitor = 0.0
         self.last_reprice = 0.0
         self.last_volatility_reprice = 0.0
+        self.last_volatility_entry_reprice = 0.0
         self.last_stall_boost = 0.0
         # See idle_cash_ramp_progress()/record_trade() - tracks how long
         # cash has sat above MIN_CASH_RESERVE_DOLLARS with nothing bought,
@@ -1004,6 +1012,10 @@ class AutoTrader:
             "cancel_requested_at": None,
             "limit_price": limit_price,
             "pnl": pnl,
+            # Needed to resubmit a like-for-like replacement order when
+            # actively repricing a resting entry - see
+            # reprice_volatility_scalp_entries.
+            "quantity": quantity,
         }
         instrument_type, symbol = key.split(":", 1)
         self.status.record_trade(
@@ -1318,6 +1330,73 @@ class AutoTrader:
                 )
             except Exception as exc:
                 log.error("SCALP  | %s | reprice failed | %s", symbol, exc)
+
+    def reprice_volatility_scalp_entries(self) -> None:
+        """Actively re-quotes a resting cohort BUY order toward the
+        current market instead of waiting passively for price to come
+        back up to the original limit - by request: "do not wait at
+        all until the order gets filled, because the price may not
+        reach that point, you may have to lower a little." Only ever
+        lowers the limit (tracks a further decline), never raises it -
+        chasing the price up would mean paying more for the same dip-
+        buy, defeating the point. Same fast dedicated cadence as
+        reprice_volatility_scalp_exits.
+        """
+        now = time.monotonic()
+        if now - self.last_volatility_entry_reprice < float(
+            self.config.volatility_scalp_reprice_seconds
+        ):
+            return
+        self.last_volatility_entry_reprice = now
+        for order_id, order in list(self.working_orders.items()):
+            action = order.get("action")
+            key = str(order.get("key") or "")
+            if action != "BUY" or not key.startswith("STOCK:"):
+                continue
+            if order.get("cancel_requested_at") is not None:
+                continue
+            symbol = key.split(":", 1)[1]
+            if symbol not in self.volatility_scalp_symbols:
+                continue
+            quantity = order.get("quantity")
+            if not quantity or quantity <= 0:
+                continue
+            try:
+                quote = self.api.stock_quote(symbol)
+                limit_price = self.api.stock_limit_price(quote, "BUY")
+                current_limit = order.get("limit_price")
+                if (
+                    limit_price is None
+                    or current_limit is None
+                    or limit_price >= current_limit
+                ):
+                    continue
+                self.api.cancel(order_id)
+                new_order_id = self.api.place_stock(
+                    symbol,
+                    "BUY",
+                    quantity,
+                    limit_price=limit_price,
+                )
+                self.working_orders.pop(order_id, None)
+                self.working_orders[new_order_id] = {
+                    "submitted_at": now,
+                    "key": key,
+                    "action": action,
+                    "cancel_requested_at": None,
+                    "limit_price": limit_price,
+                    "pnl": order.get("pnl"),
+                    "quantity": quantity,
+                }
+                self.status.rekey_trade(order_id, new_order_id)
+                log.info(
+                    "SCALP  | %-8s | reprice entry | limit=%s | id=%s",
+                    symbol,
+                    limit_price,
+                    new_order_id,
+                )
+            except Exception as exc:
+                log.error("SCALP  | %s | entry reprice failed | %s", symbol, exc)
 
     def account_state(self) -> tuple[Decimal, list[dict]]:
         now = time.monotonic()
@@ -2635,6 +2714,8 @@ class AutoTrader:
                     self.stop_condition_since.pop(symbol, None)
                     self.short_symbols.discard(symbol)
                     self.volatility_scalp_positions.discard(symbol)
+                    self.volatility_scalp_average_down_count.pop(symbol, None)
+                    self.last_volatility_average_down.pop(symbol, None)
                 if (
                     quantity == 0
                     and symbol in self.volatility_scalp_symbols
@@ -2717,6 +2798,69 @@ class AutoTrader:
                                 symbol,
                                 scalp_quantity,
                                 price,
+                            )
+                if (
+                    quantity > 0
+                    and symbol in self.volatility_scalp_symbols
+                    and symbol in self.volatility_scalp_positions
+                    and symbol not in self.broker_conflict_symbols
+                    and symbol not in self.entry_restricted_symbols
+                    and self.volatility_scalp_average_down_count[symbol]
+                    < self.config.volatility_scalp_max_averaging_buys
+                    # In-process, race-free throttle (same reasoning as
+                    # the fresh-entry guard above) - without it, several
+                    # cycles within one ACCOUNT_REFRESH_SECONDS window
+                    # could each independently see the same still-low
+                    # cost basis and fire a fresh averaging buy before
+                    # the last one's fill ever updates it.
+                    and (
+                        time.monotonic()
+                        - self.last_volatility_average_down.get(symbol, 0.0)
+                    )
+                    >= float(self.config.volatility_scalp_reentry_cooldown_seconds)
+                    and self.strategy.volatility_scalp_average_down_signal(
+                        price, cost
+                    )
+                ):
+                    average_down_quantity = self.strategy.volatility_scalp_share_count(
+                        price
+                    )
+                    if average_down_quantity > 0 and price * Decimal(
+                        average_down_quantity
+                    ) * Decimal("1.03") > buying_power:
+                        average_down_quantity = 0
+                    if average_down_quantity > 0:
+                        order_id = self.place_stock_scaled(
+                            symbol,
+                            "BUY",
+                            average_down_quantity,
+                            key,
+                            quote,
+                        )
+                        if order_id is not None:
+                            self.record_trade(
+                                key,
+                                order_id,
+                                "BUY",
+                                entry_price=self.api.stock_limit_price(quote, "BUY"),
+                                quantity=average_down_quantity,
+                            )
+                            self.volatility_scalp_average_down_count[symbol] += 1
+                            self.last_volatility_average_down[symbol] = (
+                                time.monotonic()
+                            )
+                            buying_power = max(
+                                Decimal("0"),
+                                buying_power
+                                - price * Decimal("1.03") * average_down_quantity,
+                            )
+                            log.info(
+                                "SCALP  | %-8s | average down | qty=%s | price=%s "
+                                "| count=%s",
+                                symbol,
+                                average_down_quantity,
+                                price,
+                                self.volatility_scalp_average_down_count[symbol],
                             )
                 if decision.action == "BUY" and quantity == 0:
                     if symbol in self.entry_restricted_symbols:
@@ -4563,6 +4707,7 @@ class AutoTrader:
                 self.reprice_volatility_scalp_exits(
                     self.cached_positions, core_session_active
                 )
+                self.reprice_volatility_scalp_entries()
                 self.escalate_stalled_stop_losses()
                 self.select_volatility_scalp_symbols()
                 self.reconcile_order_history()

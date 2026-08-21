@@ -279,18 +279,50 @@ class TradingStrategy:
         price: Decimal,
     ) -> Decision:
         """Called only for a position currently held via the volatility-
-        scalp dip-buy path - lets its own small, fast profit target fire
-        the exit earlier than stock_decision's normal adaptive target
-        would. Never overrides a LOSS (the normal stop-loss stays fully
-        in effect) or an already-firing PROFIT - only promotes a HOLD to
-        PROFIT once price clears the quick target.
+        scalp dip-buy path.
+
+        Two things, by explicit request: lets its own small, fast profit
+        target fire the exit earlier than stock_decision's normal
+        adaptive target would (promotes a HOLD to PROFIT once price
+        clears the quick target); and suppresses a LOSS entirely -
+        "focus less on the stop loss" - since a dip on this cohort is
+        now meant to be averaged into (see AutoTrader's averaging-buy
+        entry path and volatility_scalp_average_down_signal below), not
+        stopped out of. average_cost keeps reflecting the broker's own
+        blended cost across every averaging buy, so the quick-target
+        sell price naturally sits above the new average once one fires,
+        with no extra tracking needed here.
         """
-        if decision.action != "HOLD" or quantity <= 0 or average_cost <= 0:
+        if quantity <= 0 or average_cost <= 0:
+            return decision
+        if decision.action == "LOSS":
+            return Decision(
+                "HOLD",
+                "volatility scalp - averaging down instead of stopping out",
+                price,
+            )
+        if decision.action != "HOLD":
             return decision
         target = self.volatility_scalp_target_price(average_cost)
         if price >= target:
             return Decision("PROFIT", "volatility scalp quick target reached", target)
         return decision
+
+    def volatility_scalp_average_down_signal(
+        self, price: Decimal, average_cost: Decimal
+    ) -> bool:
+        """True when price has dropped at least volatility_scalp_
+        dip_entry_percent below the position's OWN average cost (not
+        the rolling window's local high, unlike the fresh-entry dip
+        signal) - "if they dip a lot after you buy, average it out with
+        another buy." Reuses the same threshold that defines a "real"
+        dip for a fresh entry, just measured against the position's own
+        cost basis instead.
+        """
+        if average_cost <= 0 or price <= 0:
+            return False
+        drop = (average_cost - price) / average_cost
+        return drop >= self.config.volatility_scalp_dip_entry_percent
 
     def volatility_scalp_share_count(self, price: Decimal) -> int:
         """Fixed share-count sizing for the curated daily volatility
