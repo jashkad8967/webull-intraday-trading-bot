@@ -6917,6 +6917,12 @@ class FractionalExitGuardTests(unittest.TestCase):
             def quote_ask(q):
                 return Decimal(str(q["ask"]))
 
+            @staticmethod
+            def price_tick_size(price):
+                from webull_bot.webull_api import WebullAPI
+
+                return WebullAPI.price_tick_size(price)
+
             def place_stock(self, *a, **k):
                 return "order-1"
 
@@ -6988,11 +6994,14 @@ class StallExitPriceSpreadSanityTests(unittest.TestCase):
     def _price_fn():
         from webull_bot.bot import AutoTrader
 
+        from webull_bot.webull_api import WebullAPI
+
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(stock_entry_max_spread_percent=Decimal("0.50")),
             api=SimpleNamespace(
                 quote_bid=lambda q: Decimal(str(q["bid"])) if q.get("bid") else None,
                 quote_ask=lambda q: Decimal(str(q["ask"])) if q.get("ask") else None,
+                price_tick_size=WebullAPI.price_tick_size,
             ),
         )
         return AutoTrader._stall_exit_price.__get__(fake_bot)
@@ -7618,10 +7627,63 @@ def _fake_webull_api(**config_overrides):
     config = SimpleNamespace(
         quote_price_sanity_percent=Decimal("0.08"), **config_overrides
     )
-    fake_api = SimpleNamespace(config=config, _quote_decimal=WebullAPI._quote_decimal)
+    fake_api = SimpleNamespace(
+        config=config,
+        _quote_decimal=WebullAPI._quote_decimal,
+        price_tick_size=WebullAPI.price_tick_size,
+    )
     fake_api._sane_bid_or_ask = WebullAPI._sane_bid_or_ask.__get__(fake_api)
     fake_api._bid_ask_last_midpoint = WebullAPI._bid_ask_last_midpoint.__get__(fake_api)
     return fake_api
+
+
+class PriceTickSizeTests(unittest.TestCase):
+    """By request: smaller/cheaper stocks quote with real sub-penny
+    precision (a live GAUZ quote showed bid=0.4592) - blanket-rounding
+    every computed price to whole cents threw away up to a cent of real
+    value per share on exactly the stocks where a cent is a meaningful
+    fraction of the price.
+    """
+
+    def test_under_a_dollar_uses_sub_penny_precision(self):
+        self.assertEqual(
+            WebullAPI.price_tick_size(Decimal("0.4592")), Decimal("0.0001")
+        )
+
+    def test_a_dollar_or_more_uses_whole_cents(self):
+        self.assertEqual(WebullAPI.price_tick_size(Decimal("1.00")), Decimal("0.01"))
+        self.assertEqual(WebullAPI.price_tick_size(Decimal("20.15")), Decimal("0.01"))
+
+    def test_stock_limit_price_keeps_sub_penny_precision_under_a_dollar(self):
+        fake_api = _fake_webull_api(stock_limit_offset=Decimal("0"))
+        price_fn = WebullAPI.stock_limit_price.__get__(fake_api)
+        # BUY uses the bid/ask/last midpoint = (0.4592 + 0.4839) / 2 =
+        # 0.47155, rounded DOWN to the nearest 0.0001 = 0.4715 - not
+        # flattened to a whole cent (0.47).
+        quote = {"bid": "0.4592", "ask": "0.4839"}
+        self.assertEqual(price_fn(quote, "BUY"), Decimal("0.4715"))
+
+    def test_stall_exit_price_keeps_sub_penny_precision_under_a_dollar(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(stock_entry_max_spread_percent=Decimal("5")),
+            api=SimpleNamespace(
+                quote_bid=lambda q: Decimal(str(q["bid"])),
+                quote_ask=lambda q: Decimal(str(q["ask"])),
+                price_tick_size=WebullAPI.price_tick_size,
+            ),
+        )
+        price_fn = AutoTrader._stall_exit_price.__get__(fake_bot)
+        # bid 0.4592 clears cost(0.41) + min_profit(0.01) + fee(0.001) -
+        # must return the real bid, not a cent-flattened 0.45.
+        result = price_fn(
+            {"bid": "0.4592", "ask": "0.4839"},
+            average_cost=Decimal("0.41"),
+            min_profit=Decimal("0.01"),
+            fee_per_share=Decimal("0.001"),
+        )
+        self.assertEqual(result, Decimal("0.4592"))
 
 
 class ShortPricingTests(unittest.TestCase):
@@ -7942,7 +8004,12 @@ class ManualOrderDiscoveryTests(unittest.TestCase):
     """
 
     @staticmethod
-    def _fake_bot(order_detail_response, open_order_ids, raise_on_detail=False):
+    def _fake_bot(
+        order_detail_response,
+        open_order_ids,
+        raise_on_detail=False,
+        submitted_order_ids_today=None,
+    ):
         from webull_bot.bot import AutoTrader
 
         class FakeApi:
@@ -7967,6 +8034,11 @@ class ManualOrderDiscoveryTests(unittest.TestCase):
             api=FakeApi(),
             last_order_monitor=0.0,
             working_orders={},
+            submitted_order_ids_today=(
+                submitted_order_ids_today
+                if submitted_order_ids_today is not None
+                else set()
+            ),
         )
         fake_bot.record_trade = (
             lambda key, order_id, action, quantity=None: recorded.append(
@@ -8020,6 +8092,31 @@ class ManualOrderDiscoveryTests(unittest.TestCase):
         self.assertEqual(recorded, [])
         self.assertIn("order-1", fake_bot.working_orders)
         self.assertEqual(fake_bot.working_orders["order-1"]["action"], "UNKNOWN")
+
+    def test_a_bot_owned_order_missing_from_working_orders_is_not_treated_as_manual(
+        self,
+    ):
+        """Live incident: the fast volatility-scalp entry/exit repricers
+        cancel-and-replace roughly every second, and there's a real
+        window right after cancel() where the OLD order_id can still
+        show up in open_orders() (broker-side latency) even though
+        working_orders already dropped it in favor of the replacement
+        order_id. That window was getting misread as a manual order -
+        the bot's own normal repricing showed up mislabeled as manual
+        activity. submitted_order_ids_today (already populated for
+        every order the bot has ever placed today, via record_trade)
+        must short-circuit this before the "unrecognized -> manual"
+        detection ever runs.
+        """
+        fake_bot, recorded = self._fake_bot(
+            {"orders": [{"symbol": "GAUZ", "side": "SELL", "total_quantity": "100"}]},
+            ["order-1"],
+            submitted_order_ids_today={"order-1"},
+        )
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.monitor()
+        self.assertEqual(recorded, [])
+        self.assertNotIn("order-1", fake_bot.working_orders)
 
 
 class OrderHistoryThrottleGroupTests(unittest.TestCase):
