@@ -1143,7 +1143,9 @@ class WebullAPI:
         }
         if limit_price is not None and not fractional and not market:
             order["limit_price"] = str(
-                limit_price.quantize(Decimal("0.01"), rounding=ROUND_UP)
+                limit_price.quantize(
+                    self.price_tick_size(limit_price), rounding=ROUND_UP
+                )
             )
         self._call(
             lambda: self.trade.order_v3.place_order(
@@ -1213,6 +1215,19 @@ class WebullAPI:
             return (bid + ask + last) / 3
         return (bid + ask) / 2
 
+    @staticmethod
+    def price_tick_size(price: Decimal) -> Decimal:
+        """The real increment a stock's price actually moves in - $0.0001
+        under $1 (the standard US equity sub-penny allowance for stocks
+        priced under a dollar), $0.01 at or above it. By request: these
+        smaller/cheaper stocks quote with real 4-decimal precision (a
+        live GAUZ quote showed bid=0.4592) - blanket-rounding every
+        computed price to whole cents was throwing away up to a cent of
+        real value per share on exactly the stocks where a cent is a
+        meaningful fraction of the price.
+        """
+        return Decimal("0.0001") if price < 1 else Decimal("0.01")
+
     def stock_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.stock_limit_offset
         if side in ("BUY", "SHORT"):
@@ -1228,10 +1243,8 @@ class WebullAPI:
                     "stock quote has no valid bid/ask spread for a buy"
                 )
             price = self._bid_ask_last_midpoint(quote, bid, ask)
-            return max(Decimal("0.01"), price).quantize(
-                Decimal("0.01"),
-                rounding=ROUND_DOWN,
-            )
+            price = max(Decimal("0.01"), price)
+            return price.quantize(self.price_tick_size(price), rounding=ROUND_DOWN)
         elif side == "COVER":
             # Buying back a short to close it out is economically a BUY,
             # not a SELL - the aggressive-crossing `else` branch below
@@ -1245,10 +1258,8 @@ class WebullAPI:
                 or self._sane_bid_or_ask(quote, "bid")
             )
             price = base * (Decimal("1") + offset)
-            return max(Decimal("0.01"), price).quantize(
-                Decimal("0.01"),
-                rounding=ROUND_UP,
-            )
+            price = max(Decimal("0.01"), price)
+            return price.quantize(self.price_tick_size(price), rounding=ROUND_UP)
         else:
             base = (
                 self._sane_bid_or_ask(quote, "bid")
@@ -1256,10 +1267,8 @@ class WebullAPI:
                 or self._sane_bid_or_ask(quote, "ask")
             )
             price = base * (Decimal("1") - offset)
-        return max(Decimal("0.01"), price).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_UP,
-        )
+        price = max(Decimal("0.01"), price)
+        return price.quantize(self.price_tick_size(price), rounding=ROUND_UP)
 
     def stock_stop_exit_price(self, quote: dict) -> Decimal:
         """Midpoint sell limit for a stop-loss exit.
@@ -1277,10 +1286,8 @@ class WebullAPI:
                 "stock quote has no valid bid/ask spread for a stop exit"
             )
         price = self._bid_ask_last_midpoint(quote, bid, ask)
-        return max(Decimal("0.01"), price).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_DOWN,
-        )
+        price = max(Decimal("0.01"), price)
+        return price.quantize(self.price_tick_size(price), rounding=ROUND_DOWN)
 
     def option_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.option_limit_offset

@@ -1116,6 +1116,22 @@ class AutoTrader:
         open_ids = set(self.api.open_order_ids(groups))
 
         for order_id in open_ids:
+            if order_id in self.submitted_order_ids_today:
+                # A bot-submitted order, just not currently in
+                # working_orders - live incident: the fast volatility-
+                # scalp entry/exit repricers cancel-and-replace roughly
+                # every second, and there's a real window right after
+                # cancel() where the OLD order_id can still show up in
+                # open_orders() (broker-side latency) even though
+                # working_orders already dropped it in favor of the new
+                # replacement order_id. Without this check, that window
+                # got misread as "the bot's own order is unrecognized -
+                # must be manual," mislabeling normal repricing as a
+                # manual action. submitted_order_ids_today (already
+                # maintained for reconcile_order_history) never shrinks
+                # intraday, so it reliably distinguishes "ours, just
+                # untracked right now" from "genuinely never ours."
+                continue
             if order_id not in self.working_orders:
                 # An order the bot never submitted itself and doesn't
                 # already know about - almost always a manual action
@@ -3979,7 +3995,14 @@ class AutoTrader:
         floor = average_cost + min_profit + fee_per_share
         bid = self.api.quote_bid(quote)
         if bid is not None:
-            sell_price = bid.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            # By request: these smaller/cheaper stocks have real
+            # sub-penny precision (a live quote showed bid=0.4592) -
+            # quantizing to a flat cent throws away real value on
+            # exactly the stocks where a cent is a meaningful fraction
+            # of the price. See WebullAPI.price_tick_size.
+            sell_price = bid.quantize(
+                self.api.price_tick_size(bid), rounding=ROUND_DOWN
+            )
             if sell_price >= floor:
                 return sell_price
         ask = self.api.quote_ask(quote)
@@ -3999,7 +4022,9 @@ class AutoTrader:
                 spread_percent = (ask - bid) / bid * 100
                 if spread_percent > self.config.stock_entry_max_spread_percent:
                     return None
-            sell_price = ask.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            sell_price = ask.quantize(
+                self.api.price_tick_size(ask), rounding=ROUND_DOWN
+            )
             if sell_price >= floor:
                 return sell_price
         return None
