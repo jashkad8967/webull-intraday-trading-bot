@@ -302,6 +302,13 @@ class Settings(BaseSettings):
     volatility_scalp_max_concurrent_positions: int = Field(
         default=3, ge=1, le=20
     )
+    # By request: "if they dip a lot after you buy, average it out with
+    # another buy" - caps how many additional buys a single held cohort
+    # position can make while averaging down, bounding worst-case
+    # exposure per symbol to (this + 1) * volatility_scalp_share_count's
+    # fixed lot size, instead of an unbounded chase. 0 disables
+    # averaging entirely.
+    volatility_scalp_max_averaging_buys: int = Field(default=3, ge=0, le=10)
     # Curated daily cohort, not the whole scanned universe: identify a
     # small handful of the cheapest, most volatile names and concentrate
     # on rapidly cycling just those until they cool off, instead of

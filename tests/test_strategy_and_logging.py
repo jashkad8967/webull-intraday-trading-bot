@@ -598,9 +598,13 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertIs(result, hold)
 
-    def test_exit_override_never_touches_a_loss_decision(self):
-        """The normal stop-loss must stay fully in effect for a
-        volatility-scalp position - only a HOLD ever gets promoted.
+    def test_exit_override_suppresses_a_loss_in_favor_of_averaging_down(self):
+        """By explicit request ("focus less on the stop loss" /
+        "average it out with another buy"): a LOSS decision on a
+        volatility-scalp position is downgraded to HOLD instead of
+        being allowed to stop the position out - the position is meant
+        to be averaged into on a dip (see AutoTrader's averaging-buy
+        entry path), not exited at a loss.
         """
         strategy = TradingStrategy(self.config())
         from webull_bot.strategy import Decision
@@ -609,7 +613,53 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         result = strategy.volatility_scalp_exit_override(
             loss, quantity=10, average_cost=Decimal("20.00"), price=Decimal("20.20")
         )
-        self.assertIs(result, loss)
+        self.assertEqual(result.action, "HOLD")
+
+    def test_exit_override_leaves_a_loss_alone_when_flat_or_no_cost_basis(self):
+        strategy = TradingStrategy(self.config())
+        from webull_bot.strategy import Decision
+
+        loss = Decision("LOSS", "percentage stop reached", Decimal("19.00"))
+        self.assertIs(
+            strategy.volatility_scalp_exit_override(
+                loss, quantity=0, average_cost=Decimal("20.00"), price=Decimal("20.20")
+            ),
+            loss,
+        )
+        self.assertIs(
+            strategy.volatility_scalp_exit_override(
+                loss, quantity=10, average_cost=Decimal("0"), price=Decimal("20.20")
+            ),
+            loss,
+        )
+
+    def test_average_down_signal_fires_once_price_clears_the_dip_threshold(self):
+        strategy = TradingStrategy(self.config())
+        # dip_entry_percent default 0.2% - 0.15% below cost doesn't
+        # clear it, 0.5% below does.
+        self.assertFalse(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("19.97"), average_cost=Decimal("20.00")
+            )
+        )
+        self.assertTrue(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("19.90"), average_cost=Decimal("20.00")
+            )
+        )
+
+    def test_average_down_signal_false_above_cost_or_with_no_cost_basis(self):
+        strategy = TradingStrategy(self.config())
+        self.assertFalse(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("20.10"), average_cost=Decimal("20.00")
+            )
+        )
+        self.assertFalse(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("19.00"), average_cost=Decimal("0")
+            )
+        )
 
     def test_clear_market_state_resets_the_volatility_window(self):
         strategy = TradingStrategy(self.config())
@@ -1977,6 +2027,168 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
         reprice = AutoTrader.reprice_volatility_scalp_exits.__get__(fake_bot)
         with unittest.mock.patch("time.monotonic", return_value=100.0):
             reprice([])
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+
+class VolatilityScalpEntryRepriceTests(unittest.TestCase):
+    """reprice_volatility_scalp_entries - by request, don't wait
+    passively for a resting dip-buy to fill; actively lower the limit
+    if price keeps falling, since it may never come back up to the
+    original price.
+    """
+
+    @staticmethod
+    def _fake_bot(cohort_symbols, working_orders, buy_limit_by_symbol):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+
+        class FakeApi:
+            @staticmethod
+            def stock_quote(symbol):
+                return {"symbol": symbol}
+
+            @staticmethod
+            def stock_limit_price(q, side):
+                return buy_limit_by_symbol.get(q["symbol"])
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_stock(symbol, side, quantity, limit_price=None):
+                placed.append((symbol, side, quantity, limit_price))
+                return "order-new"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(volatility_scalp_reprice_seconds=Decimal("1")),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_volatility_entry_reprice=0.0,
+            volatility_scalp_symbols=set(cohort_symbols),
+            working_orders=working_orders,
+        )
+        return fake_bot, cancelled, placed
+
+    def test_lowers_the_limit_when_price_has_fallen(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:GAUZ",
+                "action": "BUY",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("0.45"),
+                "quantity": 100,
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            {"GAUZ"}, working_orders, {"GAUZ": Decimal("0.40")}
+        )
+        reprice = AutoTrader.reprice_volatility_scalp_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice()
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertEqual(placed, [("GAUZ", "BUY", 100, Decimal("0.40"))])
+        self.assertNotIn("order-1", fake_bot.working_orders)
+        self.assertEqual(
+            fake_bot.working_orders["order-new"]["limit_price"], Decimal("0.40")
+        )
+        self.assertEqual(fake_bot.working_orders["order-new"]["quantity"], 100)
+
+    def test_never_chases_the_price_upward(self):
+        """Repricing up would mean paying more for the same dip-buy -
+        only ever lower the resting limit, never raise it.
+        """
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:GAUZ",
+                "action": "BUY",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("0.40"),
+                "quantity": 100,
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            {"GAUZ"}, working_orders, {"GAUZ": Decimal("0.45")}
+        )
+        reprice = AutoTrader.reprice_volatility_scalp_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice()
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+    def test_ignores_a_symbol_not_in_the_cohort(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:CALM",
+                "action": "BUY",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("10.00"),
+                "quantity": 5,
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            set(), working_orders, {"CALM": Decimal("9.00")}
+        )
+        reprice = AutoTrader.reprice_volatility_scalp_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice()
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+    def test_ignores_a_non_buy_order(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:GAUZ",
+                "action": "PROFIT",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("0.45"),
+                "quantity": 100,
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            {"GAUZ"}, working_orders, {"GAUZ": Decimal("0.40")}
+        )
+        reprice = AutoTrader.reprice_volatility_scalp_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice()
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+    def test_respects_its_own_throttle(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:GAUZ",
+                "action": "BUY",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("0.45"),
+                "quantity": 100,
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            {"GAUZ"}, working_orders, {"GAUZ": Decimal("0.40")}
+        )
+        fake_bot.last_volatility_entry_reprice = 99.5
+        reprice = AutoTrader.reprice_volatility_scalp_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice()
         self.assertEqual(cancelled, [])
         self.assertEqual(placed, [])
 
