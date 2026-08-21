@@ -4179,6 +4179,30 @@ class VolatilityScalpCohortSelectionTests(unittest.TestCase):
         # cohort should stay untouched (empty, since it started empty).
         self.assertEqual(fake_bot.volatility_scalp_symbols, set())
 
+    def test_an_empty_result_does_not_consume_the_throttle(self):
+        """Live incident: the very first call on every startup runs
+        before any symbol has been scanned (self.strategy.prices is
+        still empty), finds zero candidates, but used to stamp last_
+        volatility_symbol_selection anyway - "spending" the throttle on
+        a result with no real data behind it and leaving the cohort
+        empty for the full 30-minute reselect window before ever trying
+        again. An empty-candidates call must leave the throttle
+        untouched so the very next cycle (once real data exists) can
+        actually select something.
+        """
+        fake_bot = self._fake_bot({}, {})  # nothing scanned yet
+        with unittest.mock.patch("time.monotonic", return_value=0.001):
+            fake_bot.select_volatility_scalp_symbols()
+        self.assertEqual(fake_bot.last_volatility_symbol_selection, float("-inf"))
+
+        # Now real data exists - must not be throttled out just because
+        # almost no time has passed since the (empty) first call.
+        fake_bot.strategy.prices = {"WILD": Decimal("0.89")}
+        fake_bot.strategy.realized_volatility_percent = lambda symbol: Decimal("0.05")
+        with unittest.mock.patch("time.monotonic", return_value=0.002):
+            fake_bot.select_volatility_scalp_symbols()
+        self.assertEqual(fake_bot.volatility_scalp_symbols, {"WILD"})
+
     def test_reselecting_can_drop_a_cooled_off_symbol_and_add_a_new_one(self):
         prices = {"OLD": Decimal("0.50"), "NEW": Decimal("0.80")}
         fake_bot = self._fake_bot(
