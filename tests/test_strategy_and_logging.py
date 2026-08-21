@@ -4782,6 +4782,7 @@ class DashboardCommandTests(unittest.TestCase):
             user_watchlist=set(),
             stock_categories={},
             stock_symbols=["AAPL"],
+            priority_scan_symbols=set(),
             api=SimpleNamespace(stock_categories=lambda symbols: {"TSLA": "US_STOCK"}),
         )
         add = AutoTrader.add_to_watchlist.__get__(fake_bot)
@@ -4791,6 +4792,12 @@ class DashboardCommandTests(unittest.TestCase):
         self.assertIn("TSLA", fake_bot.user_watchlist)
         self.assertEqual(fake_bot.stock_categories.get("TSLA"), "US_STOCK")
         self.assertIn("TSLA", fake_bot.stock_symbols)
+        # Regression coverage: a freshly-added symbol has zero
+        # accumulated activity score and can otherwise lose out to every
+        # already-active watchlist symbol in prioritized_stock_batch's
+        # ranking forever - live incident, HOWL never once got scanned
+        # after being added. Must be queued for a guaranteed first scan.
+        self.assertIn("TSLA", fake_bot.priority_scan_symbols)
 
 
 class WashSaleTrackerTests(unittest.TestCase):
@@ -5165,10 +5172,12 @@ class AccountStateCashReserveTests(unittest.TestCase):
             cached_account_day_pnl=None,
             cached_positions=[],
             last_account_refresh=0.0,
+            short_selling_supported=True,
         )
         account_state = AutoTrader.account_state.__get__(fake_bot)
 
-        buying_power, positions = account_state()
+        with self.assertLogs("webull-bot", level="WARNING"):
+            buying_power, positions = account_state()
 
         self.assertEqual(buying_power, Decimal("110.00"))
         self.assertEqual(positions, [{"symbol": "AAPL"}])
@@ -5231,12 +5240,76 @@ class AccountStateCashReserveTests(unittest.TestCase):
             cached_account_day_pnl=None,
             cached_positions=[],
             last_account_refresh=0.0,
+            short_selling_supported=True,
         )
         account_state = AutoTrader.account_state.__get__(fake_bot)
 
         buying_power, _ = account_state()
 
         self.assertEqual(buying_power, Decimal("0"))
+
+
+class ShortSellingEquityGateTests(unittest.TestCase):
+    """account_state proactively disables short selling once cached
+    account equity is seen under Webull's own $2,000 minimum, instead of
+    spending a live order attempt (certain to be rejected) to discover
+    it - see SHORT_SELLING_MIN_EQUITY.
+    """
+
+    @staticmethod
+    def _fake_bot(account_value, short_selling_supported=True):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                account_refresh_seconds=Decimal("5"),
+                min_cash_reserve_dollars=Decimal("10"),
+            ),
+            api=SimpleNamespace(
+                balance=lambda: {},
+                buying_power_from_balance=lambda balance: Decimal("120.00"),
+                account_day_pnl_from_balance=lambda balance: Decimal("0"),
+                account_value_from_balance=lambda balance: account_value,
+                positions=lambda: [],
+            ),
+            cached_buying_power=Decimal("0"),
+            cached_raw_buying_power=Decimal("0"),
+            cached_account_day_pnl=None,
+            cached_positions=[],
+            last_account_refresh=0.0,
+            short_selling_supported=short_selling_supported,
+        )
+        fake_bot.account_state = AutoTrader.account_state.__get__(fake_bot)
+        return fake_bot
+
+    def test_disables_short_selling_when_equity_is_under_the_minimum(self):
+        fake_bot = self._fake_bot(Decimal("500.00"))
+        with self.assertLogs("webull-bot", level="WARNING") as logs:
+            fake_bot.account_state()
+        self.assertFalse(fake_bot.short_selling_supported)
+        self.assertIn("500.00", logs.output[0])
+
+    def test_leaves_short_selling_enabled_when_equity_clears_the_minimum(self):
+        fake_bot = self._fake_bot(Decimal("5000.00"))
+        from webull_bot import bot as bot_module
+
+        with unittest.mock.patch.object(bot_module.log, "warning") as warn:
+            fake_bot.account_state()
+        warn.assert_not_called()
+        self.assertTrue(fake_bot.short_selling_supported)
+
+    def test_does_not_relog_once_already_disabled(self):
+        fake_bot = self._fake_bot(Decimal("500.00"), short_selling_supported=False)
+        from webull_bot import bot as bot_module
+
+        with unittest.mock.patch.object(bot_module.log, "warning") as warn:
+            fake_bot.account_state()
+        warn.assert_not_called()
+
+    def test_no_crash_when_account_value_is_unavailable(self):
+        fake_bot = self._fake_bot(None)
+        fake_bot.account_state()  # must not raise
+        self.assertTrue(fake_bot.short_selling_supported)
 
 
 class StopLossGuardTests(unittest.TestCase):
