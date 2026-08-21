@@ -580,6 +580,41 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         strategy.seed_volatility_window("NEW", [10.0, 0, -1, 10.2, 9.9])
         self.assertEqual(list(strategy.volatility_price_history["NEW"]), [10.0, 10.2, 9.9])
 
+    def test_entry_budget_widens_to_afford_the_lot_restricted_minimum(self):
+        """Live incident: HOWL, priced ~$0.89 (the $0.10-$0.999 band,
+        100-share minimum), was eligible and showing a dip signal but the
+        flat $50 clip only affords ~56 shares - stock_order_quantity
+        would size that down to 0 rather than submit an order Webull
+        would reject. The budget must widen enough to actually afford
+        the 100-share minimum, capped by buying_power.
+        """
+        strategy = TradingStrategy(self.config())
+        budget = strategy.volatility_scalp_entry_budget(
+            price=Decimal("0.89"),
+            buying_power=Decimal("500"),
+            clip_dollars=Decimal("50"),
+        )
+        # 100 shares * 0.89 * 1.03 buffer = 91.67
+        self.assertEqual(budget, Decimal("0.89") * Decimal("100") * Decimal("1.03"))
+
+    def test_entry_budget_never_exceeds_buying_power_even_when_widened(self):
+        strategy = TradingStrategy(self.config())
+        budget = strategy.volatility_scalp_entry_budget(
+            price=Decimal("0.89"),
+            buying_power=Decimal("60"),
+            clip_dollars=Decimal("50"),
+        )
+        self.assertEqual(budget, Decimal("60"))
+
+    def test_entry_budget_stays_the_plain_clip_outside_the_lot_restricted_band(self):
+        strategy = TradingStrategy(self.config())
+        budget = strategy.volatility_scalp_entry_budget(
+            price=Decimal("20.00"),
+            buying_power=Decimal("500"),
+            clip_dollars=Decimal("50"),
+        )
+        self.assertEqual(budget, Decimal("50"))
+
 
 class VolatilityScalpReentryCooldownTests(unittest.TestCase):
     def test_ready_when_never_exited(self):

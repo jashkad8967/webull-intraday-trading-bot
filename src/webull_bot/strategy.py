@@ -258,6 +258,24 @@ class TradingStrategy:
             return Decision("PROFIT", "volatility scalp quick target reached", target)
         return decision
 
+    def volatility_scalp_entry_budget(
+        self, price: Decimal, buying_power: Decimal, clip_dollars: Decimal
+    ) -> Decimal:
+        """The small fixed VOLATILITY_SCALP_CLIP_DOLLARS clip, widened
+        just enough to afford minimum_lot_size's 100-share minimum for a
+        sub-$1 stock - without this, a lot-restricted symbol's dip-buy
+        would size to 0 shares (the clip alone rarely covers 100 shares)
+        and silently never enter one of exactly the choppiest, highest-
+        eligibility names (live example: HOWL, up ~100% intraday, priced
+        under $1). Never exceeds buying_power either way.
+        """
+        entry_budget = min(buying_power, clip_dollars)
+        min_lot = self.minimum_lot_size(price)
+        if min_lot > 1:
+            min_lot_cost = price * Decimal(min_lot) * Decimal("1.03")
+            entry_budget = min(buying_power, max(entry_budget, min_lot_cost))
+        return entry_budget
+
     def volatility_scalp_target_price(self, average_cost: Decimal) -> Decimal:
         """Sell the rip: a small, fixed quick-profit target above cost -
         deliberately not the normal adaptive-stop-scaled target

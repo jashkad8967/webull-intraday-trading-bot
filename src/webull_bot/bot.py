@@ -2330,7 +2330,14 @@ class AutoTrader:
                     idle_relaxation_amount,
                     seconds_since_entry,
                 )
-                if symbol in self.volatility_scalp_positions:
+                # Applies to ANY held position currently eligible - not
+                # just ones opened via the dip-buy path below. A position
+                # that got held through the normal trend entry can still
+                # turn into a highly volatile mover later in the day (live
+                # example: HOWL, up ~100% intraday) and deserves the same
+                # fast buy-dip/sell-rip cycling from that point on, not
+                # just a wait for the slower normal profit target.
+                if quantity > 0 and self.strategy.is_volatility_scalp_eligible(symbol):
                     decision = self.strategy.volatility_scalp_exit_override(
                         decision, quantity, cost, price
                     )
@@ -2388,8 +2395,11 @@ class AutoTrader:
                     and self.strategy.is_volatility_scalp_eligible(symbol)
                     and self.strategy.volatility_scalp_dip_signal(symbol, price)
                 ):
+                    entry_budget = self.strategy.volatility_scalp_entry_budget(
+                        price, buying_power, self.config.volatility_scalp_clip_dollars
+                    )
                     scalp_quantity, _ = self.strategy.stock_order_quantity(
-                        price, min(buying_power, self.config.volatility_scalp_clip_dollars)
+                        price, entry_budget
                     )
                     if scalp_quantity > 0:
                         order_id = self.place_stock_scaled(
