@@ -295,11 +295,26 @@ class Settings(BaseSettings):
     volatility_scalp_target_percent: Decimal = Field(
         default=Decimal("0.005"), gt=0, le=1
     )
-    volatility_scalp_clip_dollars: Decimal = Field(
-        default=Decimal("50"), gt=0, le=Decimal("2000")
-    )
     volatility_scalp_max_concurrent_positions: int = Field(
         default=3, ge=1, le=20
+    )
+    # Curated daily cohort, not the whole scanned universe: identify a
+    # small handful of the cheapest, most volatile names and concentrate
+    # on rapidly cycling just those until they cool off, instead of
+    # spreading thin across every eligible symbol seen in passing. See
+    # AutoTrader.select_volatility_scalp_symbols, re-run periodically
+    # (VOLATILITY_SCALP_RESELECT_SECONDS) so a symbol that's slowed down
+    # gets dropped and a newly-hot one takes its place.
+    volatility_scalp_symbol_count: int = Field(default=4, ge=1, le=10)
+    # Capped at $1.50 specifically so every selected symbol sizes to a
+    # clean fixed share count (see TradingStrategy.
+    # volatility_scalp_share_count: 100 shares under $1, 50 shares
+    # $1-$1.50) instead of a dollar-budget-derived quantity.
+    volatility_scalp_max_price: Decimal = Field(
+        default=Decimal("1.50"), gt=0, le=Decimal("50")
+    )
+    volatility_scalp_reselect_seconds: int = Field(
+        default=1800, ge=60, le=86400
     )
     volatility_scalp_reentry_cooldown_seconds: int = Field(
         default=5, ge=0, le=300

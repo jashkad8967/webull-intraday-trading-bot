@@ -144,6 +144,16 @@ class AutoTrader:
         # see trade_stocks' dip-entry block and the quick-target override
         # applied to these positions' exit decision below.
         self.volatility_scalp_positions: set[str] = set()
+        # The curated daily cohort (see select_volatility_scalp_symbols) -
+        # entries and active management for this strategy are scoped to
+        # just these symbols, not every eligible symbol seen in passing.
+        self.volatility_scalp_symbols: set[str] = set()
+        # -inf, not 0.0: time.monotonic() starts near zero at process
+        # boot too, so a 0.0 default would silently throttle the very
+        # first selection until VOLATILITY_SCALP_RESELECT_SECONDS
+        # (default 30 min) into every run, leaving the cohort empty that
+        # whole time for no reason.
+        self.last_volatility_symbol_selection = float("-inf")
         # Broker-side "closing orders only" restriction (see
         # is_symbol_restricted_to_closing_only) - deliberately NOT
         # broker_conflict_symbols, which skips a symbol's exit management
@@ -1158,7 +1168,10 @@ class AutoTrader:
             symbol = key.split(":", 1)[1]
             if symbol in self.stop_loss_escalated:
                 continue
-            if self.strategy.is_volatility_scalp_eligible(symbol):
+            if (
+                symbol in self.volatility_scalp_symbols
+                and self.strategy.is_volatility_scalp_eligible(symbol)
+            ):
                 continue
             try:
                 quote = self.api.stock_quote(symbol)
@@ -1247,7 +1260,10 @@ class AutoTrader:
             symbol = key.split(":", 1)[1]
             if symbol in self.stop_loss_escalated:
                 continue
-            if not self.strategy.is_volatility_scalp_eligible(symbol):
+            if (
+                symbol not in self.volatility_scalp_symbols
+                or not self.strategy.is_volatility_scalp_eligible(symbol)
+            ):
                 continue
             try:
                 quote = self.api.stock_quote(symbol)
@@ -1633,6 +1649,27 @@ class AutoTrader:
             self.config.symbol_quarantine_cooldown_seconds,
         )
         return True
+
+    def volatility_scalp_wash_sale_override_ok(self, symbol: str, key: str) -> bool:
+        """By request: for the volatility-scalp cohort specifically, keep
+        trading a symbol through an active wash-sale block as long as
+        it's still net profitable overall (summed across every realized
+        exit currently in symbol_pnl_history, the same recent-trade
+        record symbol_quarantined already reads) - the tax-loss-
+        disallowance concern a wash-sale block exists for doesn't apply
+        the same way to a symbol that, in aggregate, hasn't produced a
+        loss to disallow. Does not affect wash-sale enforcement for the
+        normal trend-entry path anywhere else - only this cohort's own
+        entry gate calls this instead of checking wash_sales.blocked_
+        until directly.
+        """
+        blocked_until = self.wash_sales.blocked_until(symbol)
+        if not blocked_until:
+            return True
+        net_pnl = sum(
+            (pnl for _, pnl in self.symbol_pnl_history.get(key, ())), Decimal("0")
+        )
+        return net_pnl > 0
 
     def handle_portfolio_circuit_breaker(
         self,
@@ -2248,6 +2285,48 @@ class AutoTrader:
             for symbol, closes in closes_by_symbol.items():
                 self.strategy.seed_volatility_window(symbol, closes)
 
+    def select_volatility_scalp_symbols(self) -> None:
+        """Re-ranks the curated volatility-scalp cohort from data already
+        being collected during normal scanning (self.strategy.prices/
+        volatility_price_history) - no extra API calls needed. Picks the
+        top VOLATILITY_SCALP_SYMBOL_COUNT symbols, by realized short-
+        window volatility, among those priced at or under
+        VOLATILITY_SCALP_MAX_PRICE with enough samples to have a real
+        reading. Re-run periodically (VOLATILITY_SCALP_RESELECT_SECONDS),
+        so a symbol that's cooled off drops out and a newly-hot one
+        (from anywhere in the scanned universe, not just today's
+        starting picks) can take its place - "keep looking for volatile
+        stocks to add to the group."
+        """
+        if not self.config.volatility_scalp_enabled:
+            return
+        now = time.monotonic()
+        if (
+            now - self.last_volatility_symbol_selection
+            < float(self.config.volatility_scalp_reselect_seconds)
+        ):
+            return
+        self.last_volatility_symbol_selection = now
+        candidates: list[tuple[Decimal, str]] = []
+        for symbol, price in self.strategy.prices.items():
+            if price <= 0 or price > self.config.volatility_scalp_max_price:
+                continue
+            stdev = self.strategy.realized_volatility_percent(symbol)
+            if stdev is None:
+                continue
+            candidates.append((stdev, symbol))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        selected = {
+            symbol
+            for _, symbol in candidates[: self.config.volatility_scalp_symbol_count]
+        }
+        if selected != self.volatility_scalp_symbols:
+            log.info(
+                "SCALP  | daily cohort | %s",
+                ", ".join(sorted(selected)) if selected else "(none eligible yet)",
+            )
+        self.volatility_scalp_symbols = selected
+
     def trade_stocks(
         self,
         positions: list[dict],
@@ -2454,14 +2533,18 @@ class AutoTrader:
                     idle_relaxation_amount,
                     seconds_since_entry,
                 )
-                # Applies to ANY held position currently eligible - not
-                # just ones opened via the dip-buy path below. A position
-                # that got held through the normal trend entry can still
-                # turn into a highly volatile mover later in the day (live
-                # example: HOWL, up ~100% intraday) and deserves the same
-                # fast buy-dip/sell-rip cycling from that point on, not
-                # just a wait for the slower normal profit target.
-                if quantity > 0 and self.strategy.is_volatility_scalp_eligible(symbol):
+                # Scoped to the curated daily cohort (select_volatility_
+                # scalp_symbols), not just symbols opened via the dip-buy
+                # path below - a position already held through the normal
+                # trend entry gets the same fast cycling once its symbol
+                # is picked into the cohort (live example: HOWL, up ~100%
+                # intraday), and stops getting it the moment the symbol
+                # cools off and drops back out.
+                if (
+                    quantity > 0
+                    and symbol in self.volatility_scalp_symbols
+                    and self.strategy.is_volatility_scalp_eligible(symbol)
+                ):
                     decision = self.strategy.volatility_scalp_exit_override(
                         decision, quantity, cost, price
                     )
@@ -2503,6 +2586,7 @@ class AutoTrader:
                     self.volatility_scalp_positions.discard(symbol)
                 if (
                     quantity == 0
+                    and symbol in self.volatility_scalp_symbols
                     and symbol not in self.broker_conflict_symbols
                     and symbol not in self.entry_restricted_symbols
                     and len(self.volatility_scalp_positions)
@@ -2511,7 +2595,7 @@ class AutoTrader:
                     and not guard_active
                     and not regime_gate_active
                     and not self.symbol_quarantined(key)
-                    and not self.wash_sales.blocked_until(symbol)
+                    and self.volatility_scalp_wash_sale_override_ok(symbol, key)
                     and self.cooldown_ready(key)
                     and not self.rate_capped(key)
                     and self.volatility_scalp_reentry_ready(key)
@@ -2519,12 +2603,11 @@ class AutoTrader:
                     and self.strategy.is_volatility_scalp_eligible(symbol)
                     and self.strategy.volatility_scalp_dip_signal(symbol, price)
                 ):
-                    entry_budget = self.strategy.volatility_scalp_entry_budget(
-                        price, buying_power, self.config.volatility_scalp_clip_dollars
-                    )
-                    scalp_quantity, _ = self.strategy.stock_order_quantity(
-                        price, entry_budget
-                    )
+                    scalp_quantity = self.strategy.volatility_scalp_share_count(price)
+                    if scalp_quantity > 0 and price * Decimal(scalp_quantity) * Decimal(
+                        "1.03"
+                    ) > buying_power:
+                        scalp_quantity = 0
                     if scalp_quantity > 0:
                         order_id = self.place_stock_scaled(
                             symbol,
@@ -4407,6 +4490,7 @@ class AutoTrader:
                     self.cached_positions, core_session_active
                 )
                 self.escalate_stalled_stop_losses()
+                self.select_volatility_scalp_symbols()
                 self.reconcile_order_history()
                 self.log_trade_events()
                 buying_power, positions = self.account_state()

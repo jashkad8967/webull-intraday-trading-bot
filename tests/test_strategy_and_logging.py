@@ -93,6 +93,7 @@ class StrategyConfigMixin:
             volatility_scalp_min_stdev_percent=Decimal("0.015"),
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
             volatility_scalp_target_percent=Decimal("0.005"),
+            volatility_scalp_max_price=Decimal("1.50"),
         )
 
 
@@ -597,40 +598,24 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         strategy.seed_volatility_window("NEW", [10.0, 0, -1, 10.2, 9.9])
         self.assertEqual(list(strategy.volatility_price_history["NEW"]), [10.0, 10.2, 9.9])
 
-    def test_entry_budget_widens_to_afford_the_lot_restricted_minimum(self):
-        """Live incident: HOWL, priced ~$0.89 (the $0.10-$0.999 band,
-        100-share minimum), was eligible and showing a dip signal but the
-        flat $50 clip only affords ~56 shares - stock_order_quantity
-        would size that down to 0 rather than submit an order Webull
-        would reject. The budget must widen enough to actually afford
-        the 100-share minimum, capped by buying_power.
-        """
+    def test_share_count_is_100_under_a_dollar(self):
         strategy = TradingStrategy(self.config())
-        budget = strategy.volatility_scalp_entry_budget(
-            price=Decimal("0.89"),
-            buying_power=Decimal("500"),
-            clip_dollars=Decimal("50"),
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(Decimal("0.89")), 100
         )
-        # 100 shares * 0.89 * 1.03 buffer = 91.67
-        self.assertEqual(budget, Decimal("0.89") * Decimal("100") * Decimal("1.03"))
 
-    def test_entry_budget_never_exceeds_buying_power_even_when_widened(self):
+    def test_share_count_is_50_from_a_dollar_up_to_the_cap(self):
         strategy = TradingStrategy(self.config())
-        budget = strategy.volatility_scalp_entry_budget(
-            price=Decimal("0.89"),
-            buying_power=Decimal("60"),
-            clip_dollars=Decimal("50"),
-        )
-        self.assertEqual(budget, Decimal("60"))
+        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("1.00")), 50)
+        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("1.50")), 50)
 
-    def test_entry_budget_stays_the_plain_clip_outside_the_lot_restricted_band(self):
+    def test_share_count_is_zero_above_the_max_price_cap(self):
         strategy = TradingStrategy(self.config())
-        budget = strategy.volatility_scalp_entry_budget(
-            price=Decimal("20.00"),
-            buying_power=Decimal("500"),
-            clip_dollars=Decimal("50"),
-        )
-        self.assertEqual(budget, Decimal("50"))
+        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("1.51")), 0)
+
+    def test_share_count_is_zero_for_a_non_positive_price(self):
+        strategy = TradingStrategy(self.config())
+        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("0")), 0)
 
 
 class VolatilityScalpReentryCooldownTests(unittest.TestCase):
@@ -1512,6 +1497,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             ),
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
+            volatility_scalp_symbols=set(),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 12345.0},
@@ -1595,6 +1581,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             api=FakeApi(),
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
+            volatility_scalp_symbols=set(),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 5.0},
@@ -1637,6 +1624,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             api=FakeApi(),
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
+            volatility_scalp_symbols=set(),
             stop_loss_escalated={"ASHR"},
             pending_stock_exits=set(),
             stop_exit_submitted={},
@@ -1684,6 +1672,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             api=FakeApi(),
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
+            volatility_scalp_symbols=set(),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 0.0},
@@ -1752,6 +1741,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             api=FakeApi(),
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
+            volatility_scalp_symbols=set(),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 12345.0},
@@ -1837,6 +1827,7 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
             strategy=SimpleNamespace(
                 is_volatility_scalp_eligible=lambda symbol: symbol in eligible_symbols
             ),
+            volatility_scalp_symbols=set(eligible_symbols),
             stop_loss_escalated=set(),
             is_fractional_quantity=AutoTrader.is_fractional_quantity,
             working_orders=working_orders,
@@ -3991,6 +3982,145 @@ class VolatilityScalpBarSeedTests(unittest.TestCase):
         with self.assertLogs("webull-bot", level="WARNING"):
             seed(["AAA", "BBB"])
         self.assertEqual(seeded, [("BBB", [1.0, 1.1])])
+
+
+class VolatilityScalpCohortSelectionTests(unittest.TestCase):
+    """select_volatility_scalp_symbols - the daily curated cohort (a
+    handful of the cheapest, most volatile names), re-ranked
+    periodically from data already collected during normal scanning.
+    """
+
+    @staticmethod
+    def _fake_bot(prices, stdev_by_symbol, **config_overrides):
+        from webull_bot.bot import AutoTrader
+
+        config = dict(
+            volatility_scalp_enabled=True,
+            volatility_scalp_symbol_count=3,
+            volatility_scalp_max_price=Decimal("1.50"),
+            volatility_scalp_reselect_seconds=1800,
+        )
+        config.update(config_overrides)
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(**config),
+            last_volatility_symbol_selection=float("-inf"),
+            volatility_scalp_symbols=set(),
+            strategy=SimpleNamespace(
+                prices=prices,
+                realized_volatility_percent=lambda symbol: stdev_by_symbol.get(symbol),
+            ),
+        )
+        fake_bot.select_volatility_scalp_symbols = (
+            AutoTrader.select_volatility_scalp_symbols.__get__(fake_bot)
+        )
+        return fake_bot
+
+    def test_picks_the_top_n_by_volatility_among_symbols_under_the_price_cap(self):
+        prices = {
+            "WILD": Decimal("0.89"),
+            "CALM": Decimal("0.50"),
+            "PRICEY": Decimal("50.00"),  # over the cap - excluded regardless of stdev
+            "MID": Decimal("1.20"),
+            "OTHER": Decimal("0.30"),
+        }
+        stdev = {
+            "WILD": Decimal("0.05"),
+            "CALM": Decimal("0.001"),
+            "PRICEY": Decimal("0.20"),
+            "MID": Decimal("0.03"),
+            "OTHER": Decimal("0.02"),
+        }
+        fake_bot = self._fake_bot(prices, stdev)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.select_volatility_scalp_symbols()
+        self.assertEqual(fake_bot.volatility_scalp_symbols, {"WILD", "MID", "OTHER"})
+
+    def test_excludes_symbols_with_no_volatility_reading_yet(self):
+        prices = {"NEW": Decimal("0.80"), "WILD": Decimal("0.89")}
+        stdev = {"WILD": Decimal("0.05")}  # NEW has no reading yet
+        fake_bot = self._fake_bot(prices, stdev)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.select_volatility_scalp_symbols()
+        self.assertEqual(fake_bot.volatility_scalp_symbols, {"WILD"})
+
+    def test_disabled_in_config_never_selects_anything(self):
+        prices = {"WILD": Decimal("0.89")}
+        stdev = {"WILD": Decimal("0.05")}
+        fake_bot = self._fake_bot(prices, stdev, volatility_scalp_enabled=False)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.select_volatility_scalp_symbols()
+        self.assertEqual(fake_bot.volatility_scalp_symbols, set())
+
+    def test_respects_its_own_reselect_throttle(self):
+        prices = {"WILD": Decimal("0.89")}
+        stdev = {"WILD": Decimal("0.05")}
+        fake_bot = self._fake_bot(prices, stdev)
+        fake_bot.last_volatility_symbol_selection = 99.0
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.select_volatility_scalp_symbols()
+        # Still 30 minutes (default) away from the next reselect - the
+        # cohort should stay untouched (empty, since it started empty).
+        self.assertEqual(fake_bot.volatility_scalp_symbols, set())
+
+    def test_reselecting_can_drop_a_cooled_off_symbol_and_add_a_new_one(self):
+        prices = {"OLD": Decimal("0.50"), "NEW": Decimal("0.80")}
+        fake_bot = self._fake_bot(
+            prices, {"OLD": Decimal("0.05")}, volatility_scalp_symbol_count=1
+        )
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            fake_bot.select_volatility_scalp_symbols()
+        self.assertEqual(fake_bot.volatility_scalp_symbols, {"OLD"})
+
+        # OLD cools off, NEW heats up, and enough time passes for reselection.
+        fake_bot.strategy.realized_volatility_percent = lambda symbol: {
+            "OLD": Decimal("0.001"),
+            "NEW": Decimal("0.08"),
+        }.get(symbol)
+        with unittest.mock.patch("time.monotonic", return_value=2000.0):
+            fake_bot.select_volatility_scalp_symbols()
+        self.assertEqual(fake_bot.volatility_scalp_symbols, {"NEW"})
+
+
+class VolatilityScalpWashSaleOverrideTests(unittest.TestCase):
+    """volatility_scalp_wash_sale_override_ok - by request, keep trading
+    this cohort's symbols through an active wash-sale block as long as
+    the symbol is still net profitable overall.
+    """
+
+    @staticmethod
+    def _fake_bot(blocked_until, pnl_history):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            wash_sales=SimpleNamespace(blocked_until=lambda symbol: blocked_until),
+            symbol_pnl_history={"STOCK:WILD": pnl_history},
+        )
+        fake_bot.check = (
+            AutoTrader.volatility_scalp_wash_sale_override_ok.__get__(fake_bot)
+        )
+        return fake_bot
+
+    def test_not_blocked_at_all_is_always_ok(self):
+        fake_bot = self._fake_bot(None, [])
+        self.assertTrue(fake_bot.check("WILD", "STOCK:WILD"))
+
+    def test_blocked_but_net_profitable_overrides_the_block(self):
+        fake_bot = self._fake_bot(
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            [(1.0, Decimal("2.00")), (2.0, Decimal("-0.50"))],
+        )
+        self.assertTrue(fake_bot.check("WILD", "STOCK:WILD"))
+
+    def test_blocked_and_net_losing_still_blocks(self):
+        fake_bot = self._fake_bot(
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            [(1.0, Decimal("-2.00")), (2.0, Decimal("0.50"))],
+        )
+        self.assertFalse(fake_bot.check("WILD", "STOCK:WILD"))
+
+    def test_blocked_with_no_trade_history_still_blocks(self):
+        fake_bot = self._fake_bot(datetime(2026, 9, 1, tzinfo=timezone.utc), [])
+        self.assertFalse(fake_bot.check("WILD", "STOCK:WILD"))
 
 
 class PositionPnlTests(StrategyConfigMixin, unittest.TestCase):
