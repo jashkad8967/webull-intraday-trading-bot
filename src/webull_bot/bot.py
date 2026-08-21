@@ -60,6 +60,13 @@ PRICE_SANITY_TOLERANCE = Decimal("0.05")
 HARD_ORDER_NOTIONAL_CEILING = Decimal("2000")
 CONSECUTIVE_ORDER_ERROR_LIMIT = 5
 ORDER_ERROR_WINDOW_SECONDS = 60
+# Webull's own hard minimum account equity for short selling
+# (OAUTH_OPENAPI_NEW_NO_POSITION_MARGIN_ACCOUNT_CAN_NOT_SELL_SHORT_FOR_LT_2K)
+# - see AutoTrader.account_state's proactive check, which disables short
+# entries the moment equity is seen below this, instead of spending a
+# live order attempt (and its own share of the "order" rate budget) on
+# a short that's certain to be rejected every single time.
+SHORT_SELLING_MIN_EQUITY = Decimal("2000")
 
 # Hold non-intraday stock positions overnight instead of always flattening
 # at EOD_CLOSE_TIME. Buckets in ALWAYS_FLATTEN_BUCKETS stay same-day-only
@@ -260,6 +267,11 @@ class AutoTrader:
         self.daily_loss_breaker_triggered = False
         self.commands = CommandQueue(self.config.command_file)
         self.user_watchlist: set[str] = set(self.config.default_watchlist())
+        # Symbols a dashboard "add to watchlist" command just added -
+        # forced into the very next scan batch once, regardless of
+        # priority ranking. See trade_stocks' injection right after
+        # prioritized_stock_batch.
+        self.priority_scan_symbols: set[str] = set()
         self.gate_rejections: dict[str, int] = defaultdict(int)
         self.broker_conflict_symbols: set[str] = set()
         # Throttles the SANITY warning below so a persistently bad broker
@@ -1308,6 +1320,27 @@ class AutoTrader:
             self.cached_account_value = self.api.account_value_from_balance(balance)
             self.cached_positions = self.api.positions()
             self.last_account_refresh = now
+            if (
+                self.short_selling_supported
+                and self.cached_account_value is not None
+                and self.cached_account_value < SHORT_SELLING_MIN_EQUITY
+            ):
+                # Same threshold Webull's own rejection enforces - catch
+                # it here, proactively, instead of spending a live order
+                # attempt (certain to fail) to discover it. Once equity
+                # clears the minimum on a later refresh, no code re-
+                # enables this automatically (matches handle_short_
+                # selling_unsupported's existing "restart to re-enable"
+                # behavior) - intentionally conservative rather than
+                # flapping short-selling on and off around the threshold.
+                self.short_selling_supported = False
+                log.warning(
+                    "SHORT  | account equity ($%s) is under Webull's $%s "
+                    "minimum for short selling - disabling new short "
+                    "entries for the rest of this run",
+                    self.cached_account_value,
+                    SHORT_SELLING_MIN_EQUITY,
+                )
         return self.cached_buying_power, [dict(item) for item in self.cached_positions]
 
     def idle_cash_ramp_progress(self, buying_power: Decimal) -> Decimal:
@@ -2264,6 +2297,23 @@ class AutoTrader:
             self.agent_assessment,
             self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist,
         )
+        if self.priority_scan_symbols:
+            # A symbol just added via the dashboard has zero accumulated
+            # activity score yet, so it ranks at the very bottom of
+            # prioritized_stock_batch's popular/penny scoring and can
+            # lose out to every already-active watchlist symbol every
+            # single cycle - live incident: HOWL, added manually, never
+            # once appeared in a scan batch. Force it into THIS batch
+            # once, regardless of ranking, so a manual add is guaranteed
+            # to actually get looked at.
+            injected = [
+                symbol
+                for symbol in self.priority_scan_symbols
+                if symbol in self.stock_symbols and symbol not in batch
+            ]
+            if injected:
+                batch = list(batch) + injected
+            self.priority_scan_symbols.clear()
         bucket_remaining = {
             bucket: buying_power * fraction
             for bucket, fraction in self.config.stock_capital_fractions().items()
@@ -4281,6 +4331,7 @@ class AutoTrader:
             self.stock_categories[symbol] = categories.get(symbol, "US_STOCK")
         if symbol not in self.stock_symbols:
             self.stock_symbols.append(symbol)
+        self.priority_scan_symbols.add(symbol)
         log.warning("CMD    | added %-8s to watchlist from dashboard", symbol)
 
     def run(self) -> None:
