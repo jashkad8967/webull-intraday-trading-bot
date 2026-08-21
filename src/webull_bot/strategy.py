@@ -196,6 +196,23 @@ class TradingStrategy:
         variance = sum((r - mean) ** 2 for r in returns) / len(returns)
         return Decimal(str(variance ** 0.5))
 
+    def seed_volatility_window(self, symbol: str, closes: list[float]) -> None:
+        """One-time warm start from real M1 bar closes (see
+        AutoTrader.seed_volatility_windows) - only fires while the
+        window's still empty, so it never overwrites live snapshot-poll
+        history already being tracked for a symbol. Without this, a
+        freshly-scanned symbol needs VOLATILITY_SCALP_MIN_SAMPLES live
+        polls (several scan cycles) before it can even be evaluated for
+        eligibility; with it, real intraday history is available
+        immediately.
+        """
+        if self.volatility_price_history.get(symbol):
+            return
+        window = self.volatility_price_history[symbol]
+        for close in closes:
+            if close > 0:
+                window.append(close)
+
     def is_volatility_scalp_eligible(self, symbol: str) -> bool:
         if not self.config.volatility_scalp_enabled:
             return False

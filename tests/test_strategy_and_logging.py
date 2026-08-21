@@ -563,6 +563,23 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         strategy.clear_market_state()
         self.assertIsNone(strategy.realized_volatility_percent("WILD"))
 
+    def test_seed_volatility_window_populates_an_empty_window(self):
+        strategy = TradingStrategy(self.config())
+        strategy.seed_volatility_window("NEW", [10.0, 10.2, 9.9, 10.1, 9.8, 10.3])
+        self.assertIsNotNone(strategy.realized_volatility_percent("NEW"))
+
+    def test_seed_volatility_window_never_overwrites_existing_live_history(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "WILD", [10, 10.5, 9.6, 10.4, 9.7])
+        before = list(strategy.volatility_price_history["WILD"])
+        strategy.seed_volatility_window("WILD", [1.0, 1.1, 1.2, 1.3, 1.4, 1.5])
+        self.assertEqual(list(strategy.volatility_price_history["WILD"]), before)
+
+    def test_seed_volatility_window_skips_non_positive_closes(self):
+        strategy = TradingStrategy(self.config())
+        strategy.seed_volatility_window("NEW", [10.0, 0, -1, 10.2, 9.9])
+        self.assertEqual(list(strategy.volatility_price_history["NEW"]), [10.0, 10.2, 9.9])
+
 
 class VolatilityScalpReentryCooldownTests(unittest.TestCase):
     def test_ready_when_never_exited(self):
@@ -3063,6 +3080,49 @@ class HistoricalVolatilityTests(unittest.TestCase):
 
         self.assertEqual(sma, {"NVDA": 90.0})
 
+    def test_recent_minute_closes_parses_bars_oldest_first(self):
+        api = WebullAPI.__new__(WebullAPI)
+        fake_timespan = SimpleNamespace(M1=SimpleNamespace(name="M1"))
+
+        def fake_call(callback, group):
+            return callback()
+
+        def fake_get_batch_history_bar(symbols, category, timespan, count):
+            self.assertEqual(timespan, "M1")
+            return [
+                {
+                    # Newest-first, same convention as the daily-bar
+                    # parsing this mirrors - must come back reversed.
+                    "symbol": "WILD",
+                    "bars": [
+                        {"close": "10.3"},
+                        {"close": "10.1"},
+                        {"close": "10.0"},
+                    ],
+                },
+                {"symbol": "FLAT", "candles": [{"close": "x"}, {"close": "0"}]},
+                {"symbol": ""},
+            ]
+
+        api._call = fake_call
+        api.data = SimpleNamespace(
+            market_data=SimpleNamespace(
+                get_batch_history_bar=fake_get_batch_history_bar
+            )
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "webull.data.common.timespan": SimpleNamespace(
+                    Timespan=fake_timespan
+                ),
+            },
+        ):
+            closes = api.recent_minute_closes(["WILD", "FLAT"], "US_STOCK", count=30)
+
+        self.assertEqual(closes, {"WILD": [10.0, 10.1, 10.3]})
+
     def test_refresh_sma_trend_merges_into_existing_cache(self):
         from webull_bot.bot import AutoTrader
 
@@ -3593,6 +3653,141 @@ class BrokerConflictTests(unittest.TestCase):
             handle(RuntimeError("CAN_NOT_SELL_SHORT_FOR_LT_2K"))
         err.assert_not_called()
         self.assertFalse(fake_bot.short_selling_supported)
+
+    def test_is_symbol_restricted_to_closing_only_matches_the_broker_rejection(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertTrue(
+            AutoTrader.is_symbol_restricted_to_closing_only(
+                RuntimeError(
+                    "HTTP Status: 417, Code: "
+                    "OAUTH_OPENAPI_CAN_NOT_CREATE_A_OPEN_ORDER, Msg: This "
+                    "symbol is restricted to closing orders only."
+                )
+            )
+        )
+        self.assertFalse(
+            AutoTrader.is_symbol_restricted_to_closing_only(RuntimeError("timeout"))
+        )
+        self.assertFalse(
+            AutoTrader.is_symbol_restricted_to_closing_only(
+                RuntimeError("CAN_NOT_SELL_SHORT_FOR_LT_2K")
+            )
+        )
+
+    def test_handle_symbol_restricted_to_closing_only_blocks_just_that_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(entry_restricted_symbols=set())
+        handle = AutoTrader.handle_symbol_restricted_to_closing_only.__get__(fake_bot)
+
+        handle("RFAI", RuntimeError("CAN_NOT_CREATE_A_OPEN_ORDER"))
+        self.assertIn("RFAI", fake_bot.entry_restricted_symbols)
+        self.assertEqual(len(fake_bot.entry_restricted_symbols), 1)
+
+        # A second rejection for the same symbol is a silent no-op.
+        from webull_bot import bot as bot_module
+
+        with unittest.mock.patch.object(bot_module.log, "warning") as warn:
+            handle("RFAI", RuntimeError("CAN_NOT_CREATE_A_OPEN_ORDER"))
+        warn.assert_not_called()
+
+    def test_restriction_blocks_entries_but_not_broker_conflict_symbols(self):
+        """entry_restricted_symbols must be a distinct set from
+        broker_conflict_symbols - the latter skips a symbol's exit
+        management entirely too (see trade_stocks' top-of-loop check),
+        which would be exactly backwards for a "closing orders only"
+        restriction: exits must keep working normally.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            entry_restricted_symbols=set(), broker_conflict_symbols=set()
+        )
+        handle = AutoTrader.handle_symbol_restricted_to_closing_only.__get__(fake_bot)
+        handle("RFAI", RuntimeError("CAN_NOT_CREATE_A_OPEN_ORDER"))
+        self.assertIn("RFAI", fake_bot.entry_restricted_symbols)
+        self.assertNotIn("RFAI", fake_bot.broker_conflict_symbols)
+
+
+class VolatilityScalpBarSeedTests(unittest.TestCase):
+    """Warm-starts a symbol's volatility window from real M1 bars instead
+    of waiting on several live snapshot polls - see
+    AutoTrader.seed_volatility_windows and WebullAPI.recent_minute_closes.
+    """
+
+    def test_seeds_only_symbols_with_an_empty_window(self):
+        from webull_bot.bot import AutoTrader
+
+        requested = []
+
+        class FakeApi:
+            def recent_minute_closes(self, symbols, category, count):
+                requested.append((tuple(sorted(symbols)), category, count))
+                return {s: [10.0, 10.1, 9.9] for s in symbols}
+
+        seeded = []
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            stock_categories={"AAA": "US_STOCK", "BBB": "US_ETF"},
+            config=SimpleNamespace(volatility_scalp_lookback_samples=20),
+            strategy=SimpleNamespace(
+                volatility_price_history={"BBB": [5.0]},
+                seed_volatility_window=lambda symbol, closes: seeded.append(
+                    (symbol, closes)
+                ),
+            ),
+        )
+        seed = AutoTrader.seed_volatility_windows.__get__(fake_bot)
+        seed(["AAA", "BBB"])
+        # BBB already has a window - only AAA should ever be fetched/seeded.
+        self.assertEqual(requested, [(("AAA",), "US_STOCK", 20)])
+        self.assertEqual(seeded, [("AAA", [10.0, 10.1, 9.9])])
+
+    def test_noop_when_everything_is_already_seeded(self):
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            def recent_minute_closes(self, *a, **k):
+                raise AssertionError("must not fetch bars for an already-seeded symbol")
+
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            stock_categories={},
+            config=SimpleNamespace(volatility_scalp_lookback_samples=20),
+            strategy=SimpleNamespace(
+                volatility_price_history={"AAA": [10.0]},
+                seed_volatility_window=lambda *a, **k: None,
+            ),
+        )
+        seed = AutoTrader.seed_volatility_windows.__get__(fake_bot)
+        seed(["AAA"])  # must not raise
+
+    def test_a_failed_category_fetch_does_not_block_other_categories(self):
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            def recent_minute_closes(self, symbols, category, count):
+                if category == "US_STOCK":
+                    raise RuntimeError("boom")
+                return {s: [1.0, 1.1] for s in symbols}
+
+        seeded = []
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            stock_categories={"AAA": "US_STOCK", "BBB": "US_ETF"},
+            config=SimpleNamespace(volatility_scalp_lookback_samples=20),
+            strategy=SimpleNamespace(
+                volatility_price_history={},
+                seed_volatility_window=lambda symbol, closes: seeded.append(
+                    (symbol, closes)
+                ),
+            ),
+        )
+        seed = AutoTrader.seed_volatility_windows.__get__(fake_bot)
+        with self.assertLogs("webull-bot", level="WARNING"):
+            seed(["AAA", "BBB"])
+        self.assertEqual(seeded, [("BBB", [1.0, 1.1])])
 
 
 class PositionPnlTests(StrategyConfigMixin, unittest.TestCase):
