@@ -7366,6 +7366,34 @@ class PhantomExitReversalTests(unittest.TestCase):
         self.assertEqual(fake_bot.consecutive_exit_failures["ASHR"], 1)
 
 
+class OrderHistoryThrottleGroupTests(unittest.TestCase):
+    """Live incident: order_history shared the "order" _call throttle
+    group with real order placement/cancellation - once volatility-scalp
+    started cancel-and-replacing every ~1s, this read-only, once-per-30-
+    minutes audit call started losing out to real trading traffic for
+    that budget and getting a sustained 429. It must use the separate
+    "account" group instead, so it never competes with live order flow.
+    """
+
+    def test_order_history_uses_the_account_throttle_group_not_order(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(account_id="acct-1")
+        groups_used = []
+
+        def fake_call(callback, group):
+            groups_used.append(group)
+            return []
+
+        api._call = fake_call
+        api.trade = SimpleNamespace(
+            order_v3=SimpleNamespace(get_order_history=lambda **k: [])
+        )
+
+        api.order_history("2026-08-01", "2026-08-21")
+
+        self.assertEqual(groups_used, ["account"])
+
+
 class OrderHistoryReconciliationTests(unittest.TestCase):
     """reconcile_order_history is a log-only audit - it must never touch
     pnl, positions, or gating state, only log once per unrecognized

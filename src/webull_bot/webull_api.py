@@ -1143,6 +1143,18 @@ class WebullAPI:
         AutoTrader.reconcile_order_history's log-only audit. Webull
         rejects a page_size under 10 outright, so this always requests
         the max useful page and paginates via last_client_order_id.
+
+        Deliberately throttled under the "account" group, not "order" -
+        this is a read-only, once-per-ORDER_HISTORY_RECONCILE_SECONDS
+        (default 30 min) audit call, not a live trading action. Sharing
+        the "order" group with actual order placement/cancellation meant
+        it competed for the same rate budget as real-time trading
+        activity - live incident: with volatility-scalp's fast cent-by-
+        cent repricing (cancel+replace every ~1s per eligible position)
+        now adding real load there, this non-critical audit call was
+        getting starved out with a sustained 429 across every retry
+        attempt. An audit falling a cycle behind is harmless; a live
+        order call losing its rate-limit slot to an audit query is not.
         """
         orders: list[dict] = []
         cursor = None
@@ -1155,7 +1167,7 @@ class WebullAPI:
                     end_date=end_date,
                     last_client_order_id=cursor,
                 ),
-                "order",
+                "account",
             )
             if not page:
                 break
