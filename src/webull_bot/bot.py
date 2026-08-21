@@ -3279,6 +3279,21 @@ class AutoTrader:
                 return sell_price
         ask = self.api.quote_ask(quote)
         if ask is not None:
+            # A resting limit at the ask only has a realistic chance of
+            # filling if the spread itself is reasonably tight - the same
+            # bound entries are already held to (entry_spread_ok). On a
+            # thin/illiquid name with an artificially wide quoted spread,
+            # the ask can sit far above where the stock is actually
+            # trading (live incident: TBB quoted bid=19.39/ask=19.89 while
+            # prints were at 19.41) - resting there submits an order that
+            # can never fill, times out, and gets resubmitted at the
+            # identical unreachable price every stall cycle, forever.
+            # Skip the fallback entirely in that case and wait for the
+            # spread to normalize instead of spinning on a doomed order.
+            if bid is not None and bid > 0:
+                spread_percent = (ask - bid) / bid * 100
+                if spread_percent > self.config.stock_entry_max_spread_percent:
+                    return None
             sell_price = ask.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
             if sell_price >= floor:
                 return sell_price
