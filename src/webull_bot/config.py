@@ -274,6 +274,36 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("0.20"),
     )
+    # Volatility-scalp: a parallel, much faster entry/exit path for
+    # symbols whose own realized short-window volatility clears
+    # volatility_scalp_min_stdev_percent - buy a small dip, sell a small
+    # rip, repeatedly, all day. Runs alongside the normal EMA/VWAP trend
+    # entries (unaffected for everything else); only the profit-take side
+    # of the exit is overridden for a volatility-scalp position (see
+    # TradingStrategy.volatility_scalp_target_price and its use in
+    # AutoTrader.trade_stocks) - the normal stop-loss stays fully in
+    # effect, since a "very volatile" stock is exactly where that
+    # protection matters most.
+    volatility_scalp_enabled: bool = True
+    volatility_scalp_lookback_samples: int = Field(default=20, ge=5, le=200)
+    volatility_scalp_min_stdev_percent: Decimal = Field(
+        default=Decimal("0.015"), gt=0, le=1
+    )
+    volatility_scalp_dip_entry_percent: Decimal = Field(
+        default=Decimal("0.005"), gt=0, le=1
+    )
+    volatility_scalp_target_percent: Decimal = Field(
+        default=Decimal("0.005"), gt=0, le=1
+    )
+    volatility_scalp_clip_dollars: Decimal = Field(
+        default=Decimal("50"), gt=0, le=Decimal("2000")
+    )
+    volatility_scalp_max_concurrent_positions: int = Field(
+        default=3, ge=1, le=20
+    )
+    volatility_scalp_reentry_cooldown_seconds: int = Field(
+        default=5, ge=0, le=300
+    )
     # During core trading hours, size new stock entries as this fraction of
     # total account buying power (a genuinely fractional/decimal quantity),
     # instead of the fixed STOCK_QUANTITY whole-share sizing - see
@@ -424,7 +454,12 @@ class Settings(BaseSettings):
         le=Decimal("1"),
     )
     order_requests_per_minute: int = Field(default=480, ge=1, le=600)
-    account_refresh_seconds: Decimal = Field(default=Decimal("5"), ge=1, le=60)
+    # Lowered from 5 -> 2: this gates how fresh the dashboard's buying
+    # power/positions/day-pnl figures are (see AutoTrader.account_state) -
+    # 2s is still a small fraction of order_requests_per_minute's budget
+    # (480/min = one call every 0.125s) even with every other order/quote
+    # call running alongside it.
+    account_refresh_seconds: Decimal = Field(default=Decimal("2"), ge=1, le=60)
     order_timeout_seconds: int = Field(default=120, ge=15, le=3600)
     order_monitor_seconds: Decimal = Field(default=Decimal("5"), ge=1, le=60)
     stall_breaker_enabled: bool = True

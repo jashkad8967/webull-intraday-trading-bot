@@ -110,6 +110,16 @@ def _strategy_config(**overrides) -> SimpleNamespace:
         time_aware_stop_enabled=False,
         time_aware_stop_widen_seconds=60,
         time_aware_stop_widen_multiplier=Decimal("1.5"),
+        # Off by default here so existing scenarios keep testing only the
+        # trend strategy they were written for - the volatility-scalp
+        # path itself is covered directly in
+        # tests/test_strategy_and_logging.py, not via a paper-sim
+        # scenario.
+        volatility_scalp_enabled=False,
+        volatility_scalp_lookback_samples=20,
+        volatility_scalp_min_stdev_percent=Decimal("0.015"),
+        volatility_scalp_dip_entry_percent=Decimal("0.005"),
+        volatility_scalp_target_percent=Decimal("0.005"),
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

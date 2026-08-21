@@ -133,6 +133,10 @@ class AutoTrader:
         self.option_contracts: list[dict] = []
         self.pending_stock_exits: set[str] = set()
         self.pending_option_exits: set[str] = set()
+        # Symbols currently held via the volatility-scalp dip-buy path -
+        # see trade_stocks' dip-entry block and the quick-target override
+        # applied to these positions' exit decision below.
+        self.volatility_scalp_positions: set[str] = set()
         self.stock_cursor = 0
         self.option_cursor = 0
         self.option_discovery_cursor = 0
@@ -706,6 +710,16 @@ class AutoTrader:
     def reentry_cooldown_ready(self, key: str) -> bool:
         elapsed = time.monotonic() - self.last_exit_at.get(key, float("-inf"))
         return elapsed >= float(self.config.stock_reentry_cooldown_seconds)
+
+    def volatility_scalp_reentry_ready(self, key: str) -> bool:
+        """A much shorter reentry cooldown than the normal trend-entry
+        path's (STOCK_REENTRY_COOLDOWN_SECONDS, 180s default) - the whole
+        point of volatility-scalp is cycling the same volatile symbol's
+        capital back in as soon as it dips again, not waiting out a
+        cooldown sized for a slower, trend-following re-entry.
+        """
+        elapsed = time.monotonic() - self.last_exit_at.get(key, float("-inf"))
+        return elapsed >= float(self.config.volatility_scalp_reentry_cooldown_seconds)
 
     def stop_ready_to_submit(self, key: str, symbol: str) -> bool:
         """An escalated stop must resubmit immediately after its cancel, not
@@ -2238,6 +2252,10 @@ class AutoTrader:
                     idle_relaxation_amount,
                     seconds_since_entry,
                 )
+                if symbol in self.volatility_scalp_positions:
+                    decision = self.strategy.volatility_scalp_exit_override(
+                        decision, quantity, cost, price
+                    )
                 if decision.action == "LOSS":
                     if symbol not in self.stop_condition_since:
                         self.stop_condition_since[symbol] = time.monotonic()
@@ -2273,6 +2291,63 @@ class AutoTrader:
                     self.stop_loss_escalated.discard(symbol)
                     self.stop_condition_since.pop(symbol, None)
                     self.short_symbols.discard(symbol)
+                    self.volatility_scalp_positions.discard(symbol)
+                if (
+                    quantity == 0
+                    and symbol not in self.broker_conflict_symbols
+                    and len(self.volatility_scalp_positions)
+                    < self.config.volatility_scalp_max_concurrent_positions
+                    and open_count < self.config.max_open_positions
+                    and not guard_active
+                    and not regime_gate_active
+                    and not self.symbol_quarantined(key)
+                    and not self.wash_sales.blocked_until(symbol)
+                    and self.cooldown_ready(key)
+                    and not self.rate_capped(key)
+                    and self.volatility_scalp_reentry_ready(key)
+                    and self.entry_price_sanity_cooldown_ready(symbol)
+                    and self.strategy.is_volatility_scalp_eligible(symbol)
+                    and self.strategy.volatility_scalp_dip_signal(symbol, price)
+                ):
+                    scalp_quantity, _ = self.strategy.stock_order_quantity(
+                        price, min(buying_power, self.config.volatility_scalp_clip_dollars)
+                    )
+                    if scalp_quantity > 0:
+                        order_id = self.place_stock_scaled(
+                            symbol,
+                            "BUY",
+                            scalp_quantity,
+                            key,
+                            quote,
+                        )
+                        if order_id is not None:
+                            self.record_trade(
+                                key,
+                                order_id,
+                                "BUY",
+                                entry_price=self.api.stock_limit_price(quote, "BUY"),
+                                quantity=scalp_quantity,
+                            )
+                            self.volatility_scalp_positions.add(symbol)
+                            buffered_price = price * Decimal("1.03")
+                            buying_power = max(
+                                Decimal("0"),
+                                buying_power - buffered_price * scalp_quantity,
+                            )
+                            positions.append(
+                                {
+                                    "instrument_type": "EQUITY",
+                                    "symbol": symbol,
+                                    "quantity": str(scalp_quantity),
+                                }
+                            )
+                            open_count += 1
+                            log.info(
+                                "SCALP  | %-8s | dip entry | qty=%s | price=%s",
+                                symbol,
+                                scalp_quantity,
+                                price,
+                            )
                 if decision.action == "BUY" and quantity == 0:
                     blocked_until = self.wash_sales.blocked_until(symbol)
                     if blocked_until:
