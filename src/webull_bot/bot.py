@@ -2306,7 +2306,6 @@ class AutoTrader:
             < float(self.config.volatility_scalp_reselect_seconds)
         ):
             return
-        self.last_volatility_symbol_selection = now
         candidates: list[tuple[Decimal, str]] = []
         for symbol, price in self.strategy.prices.items():
             if price <= 0 or price > self.config.volatility_scalp_max_price:
@@ -2315,6 +2314,17 @@ class AutoTrader:
             if stdev is None:
                 continue
             candidates.append((stdev, symbol))
+        if not candidates:
+            # Don't stamp the throttle yet - this call ran before any
+            # symbol had accumulated a real volatility reading (always
+            # true for the very first call or two right after startup,
+            # since self.strategy.prices is still empty then). Stamping
+            # here anyway would "spend" the throttle on a result with no
+            # real data behind it and leave the cohort empty for the
+            # full VOLATILITY_SCALP_RESELECT_SECONDS (default 30 min)
+            # before ever trying again.
+            return
+        self.last_volatility_symbol_selection = now
         candidates.sort(key=lambda item: item[0], reverse=True)
         selected = {
             symbol
