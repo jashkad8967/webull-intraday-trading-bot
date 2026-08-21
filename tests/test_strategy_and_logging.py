@@ -507,12 +507,29 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         self._feed(strategy, "WILD", [10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8])
         self.assertFalse(strategy.is_volatility_scalp_eligible("WILD"))
 
-    def test_dip_signal_fires_once_price_pulls_back_far_enough_from_the_window_high(self):
+    def test_dip_signal_fires_once_price_pulls_back_far_enough_from_the_local_high(self):
         strategy = TradingStrategy(self.config())
         self._feed(strategy, "WILD", [10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8])
-        # Window high is 10.5 - 0.5% below that is 10.4475.
-        self.assertFalse(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.46")))
-        self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.40")))
+        # Local high is over the last 5 samples only (9.6, 10.4, 9.7,
+        # 10.3, 9.8) = 10.4, NOT the whole window's 10.5 - a stock making
+        # new highs every sample (a strong trend) should still register a
+        # real short pullback as a dip. 0.5% below 10.4 is 10.348.
+        self.assertFalse(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.36")))
+        self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.30")))
+
+    def test_dip_signal_reacts_to_recent_pullback_even_in_a_strong_uptrend(self):
+        """Live incident: HOWL, up ~100% intraday, kept making new window
+        highs almost every sample - a dip measured against the WHOLE
+        window's high almost never fired. Measuring against only the
+        last few samples keeps the signal reactive to real local
+        pullbacks regardless of the larger trend.
+        """
+        strategy = TradingStrategy(self.config())
+        # A strong uptrend where every new sample is a new all-time-
+        # window high, until one small pullback.
+        self._feed(strategy, "HOWL", [1, 2, 3, 4, 5, 5.5, 6, 6.5, 7])
+        self.assertFalse(strategy.volatility_scalp_dip_signal("HOWL", Decimal("6.99")))
+        self.assertTrue(strategy.volatility_scalp_dip_signal("HOWL", Decimal("6.95")))
 
     def test_dip_signal_false_for_an_unseen_symbol(self):
         strategy = TradingStrategy(self.config())
@@ -1494,6 +1511,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
                 rekey_trade=lambda old, new: rekeyed.append((old, new))
             ),
             last_reprice=0.0,
+            strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 12345.0},
@@ -1576,6 +1594,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
             api=FakeApi(),
             last_reprice=0.0,
+            strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 5.0},
@@ -1617,6 +1636,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
             api=FakeApi(),
             last_reprice=0.0,
+            strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             stop_loss_escalated={"ASHR"},
             pending_stock_exits=set(),
             stop_exit_submitted={},
@@ -1663,6 +1683,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
             api=FakeApi(),
             last_reprice=0.0,
+            strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 0.0},
@@ -1730,6 +1751,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
             api=FakeApi(),
             last_reprice=0.0,
+            strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 12345.0},
@@ -1767,6 +1789,152 @@ class RepriceRestingExitsTests(unittest.TestCase):
         self.assertEqual(
             fake_bot.working_orders["order-1"]["limit_price"], Decimal("30.20")
         )
+
+
+class VolatilityScalpRepriceTests(unittest.TestCase):
+    """reprice_volatility_scalp_exits - the "cent by cent" active
+    repricer, on its own faster VOLATILITY_SCALP_REPRICE_SECONDS cadence,
+    scoped only to symbols currently volatility-scalp eligible.
+    """
+
+    @staticmethod
+    def _fake_bot(eligible_symbols, working_orders, positions_cost_by_symbol):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+
+        class FakeApi:
+            @staticmethod
+            def stock_quote(symbol):
+                return {"symbol": symbol, "bid": "10.00", "ask": "10.05"}
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def stock_position(symbol, positions):
+                cost = positions_cost_by_symbol.get(symbol)
+                if cost is None:
+                    return Decimal("0"), Decimal("0")
+                return Decimal("1"), cost
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_stock(symbol, side, quantity, limit_price=None):
+                placed.append((symbol, side, quantity, limit_price))
+                return "order-new"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(volatility_scalp_reprice_seconds=Decimal("1")),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_volatility_reprice=0.0,
+            strategy=SimpleNamespace(
+                is_volatility_scalp_eligible=lambda symbol: symbol in eligible_symbols
+            ),
+            stop_loss_escalated=set(),
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
+            working_orders=working_orders,
+        )
+        return fake_bot, cancelled, placed
+
+    def test_reprices_toward_the_current_ask_for_an_eligible_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:HOWL",
+                "action": "PROFIT",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("9.90"),
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            {"HOWL"}, working_orders, {"HOWL": Decimal("9.50")}
+        )
+        reprice = AutoTrader.reprice_volatility_scalp_exits.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice([])
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertEqual(placed, [("HOWL", "SELL", Decimal("1"), Decimal("10.05"))])
+        self.assertNotIn("order-1", fake_bot.working_orders)
+        self.assertEqual(
+            fake_bot.working_orders["order-new"]["limit_price"], Decimal("10.05")
+        )
+
+    def test_ignores_a_symbol_that_is_not_currently_eligible(self):
+        """Left to the separate reprice_resting_exits instead - see its
+        own skip of eligible symbols.
+        """
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:CALM",
+                "action": "PROFIT",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("9.90"),
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            set(), working_orders, {"CALM": Decimal("9.50")}
+        )
+        reprice = AutoTrader.reprice_volatility_scalp_exits.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice([])
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+    def test_never_reprices_below_entry_cost(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:HOWL",
+                "action": "PROFIT",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("11.00"),
+            }
+        }
+        # Ask (10.05) is below cost (10.50) - never chase it down there.
+        fake_bot, cancelled, placed = self._fake_bot(
+            {"HOWL"}, working_orders, {"HOWL": Decimal("10.50")}
+        )
+        reprice = AutoTrader.reprice_volatility_scalp_exits.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice([])
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+    def test_respects_its_own_faster_throttle(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:HOWL",
+                "action": "PROFIT",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("9.90"),
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            {"HOWL"}, working_orders, {"HOWL": Decimal("9.50")}
+        )
+        fake_bot.last_volatility_reprice = 99.5
+        reprice = AutoTrader.reprice_volatility_scalp_exits.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice([])
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
 
 
 class BotOvertradingCapTests(unittest.TestCase):

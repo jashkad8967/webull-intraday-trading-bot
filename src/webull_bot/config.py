@@ -312,6 +312,16 @@ class Settings(BaseSettings):
     # per symbol (skipped the moment its window is non-empty), so this
     # never grows unbounded as the watchlist rotates through.
     volatility_scalp_bar_seed_enabled: bool = True
+    # How often a resting volatility-scalp PROFIT order gets re-quoted to
+    # the current ask - deliberately much faster than the generic
+    # ORDER_MONITOR_SECONDS (order_monitor_seconds) reprice cadence every
+    # other resting PROFIT order uses, since this strategy exists
+    # specifically to capture a fast-moving, choppy stock's small moves
+    # "cent by cent" rather than rest passively - see
+    # AutoTrader.reprice_volatility_scalp_exits.
+    volatility_scalp_reprice_seconds: Decimal = Field(
+        default=Decimal("1"), ge=Decimal("0.25"), le=Decimal("30")
+    )
     # During core trading hours, size new stock entries as this fraction of
     # total account buying power (a genuinely fractional/decimal quantity),
     # instead of the fixed STOCK_QUANTITY whole-share sizing - see

@@ -173,6 +173,9 @@ class TradingStrategy:
     # not configurable (unlike the window length itself), same reasoning
     # as the other hardcoded quality-filter thresholds up top.
     VOLATILITY_SCALP_MIN_SAMPLES = 5
+    # How many of the most recent samples count as the "local high" a dip
+    # is measured against - see volatility_scalp_dip_signal.
+    VOLATILITY_SCALP_LOCAL_HIGH_SAMPLES = 5
 
     def realized_volatility_percent(self, symbol: str) -> Decimal | None:
         """Stdev of consecutive-sample percent returns over the rolling
@@ -227,11 +230,22 @@ class TradingStrategy:
         recent high - "buy the dip" for a symbol that's already been
         confirmed choppy enough to qualify (see is_volatility_scalp_
         eligible; callers are expected to check that first).
+
+        Measured against a short LOCAL high (the last few samples), not
+        the whole rolling window's high - a stock trending hard in one
+        direction all day (live example: HOWL, up ~100% intraday) keeps
+        making new window highs almost every sample, so "down X% from
+        the window's own all-time-today high" almost never fires once a
+        strong trend is underway, even though the stock is still making
+        exactly the kind of fast, small back-and-forth wiggles this
+        strategy exists to capture. A local high stays reactive to those
+        wiggles regardless of the larger trend.
         """
         window = self.volatility_price_history.get(symbol)
         if not window:
             return False
-        recent_high = Decimal(str(max(window)))
+        recent_samples = list(window)[-self.VOLATILITY_SCALP_LOCAL_HIGH_SAMPLES:]
+        recent_high = Decimal(str(max(recent_samples)))
         if recent_high <= 0 or price <= 0:
             return False
         drop = (recent_high - price) / recent_high

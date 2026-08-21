@@ -163,6 +163,7 @@ class AutoTrader:
         self.last_account_refresh = 0.0
         self.last_order_monitor = 0.0
         self.last_reprice = 0.0
+        self.last_volatility_reprice = 0.0
         self.last_stall_boost = 0.0
         # See idle_cash_ramp_progress()/record_trade() - tracks how long
         # cash has sat above MIN_CASH_RESERVE_DOLLARS with nothing bought,
@@ -1111,7 +1112,10 @@ class AutoTrader:
         the current ask - the top of the spread - for as long as it stays
         unfilled and unescalated ("keep modifying to stay in the spread
         until sold"). Once a symbol is escalated, this stops chasing the ask
-        for it and leaves resubmission to the normal escalation path.
+        for it and leaves resubmission to the normal escalation path. Also
+        skips any symbol currently volatility-scalp eligible - see
+        reprice_volatility_scalp_exits, which handles those on a much
+        faster, dedicated cadence instead.
 
         PROFIT only, deliberately - not STOP. A stop-loss needs to fill
         fast to cap a loss; chasing the ask means chasing a price *above*
@@ -1141,6 +1145,8 @@ class AutoTrader:
                 continue
             symbol = key.split(":", 1)[1]
             if symbol in self.stop_loss_escalated:
+                continue
+            if self.strategy.is_volatility_scalp_eligible(symbol):
                 continue
             try:
                 quote = self.api.stock_quote(symbol)
@@ -1200,6 +1206,74 @@ class AutoTrader:
                 )
             except Exception as exc:
                 log.error("REPRICE| %s | %s", symbol, exc)
+
+    def reprice_volatility_scalp_exits(
+        self, positions: list[dict], core_session_active: bool = False
+    ) -> None:
+        """The volatility-scalp equivalent of reprice_resting_exits, on
+        its own much faster VOLATILITY_SCALP_REPRICE_SECONDS cadence
+        (default 1s vs the generic ORDER_MONITOR_SECONDS, default 5s) -
+        "actively reprice within the spread to capture the profit, cent
+        by cent" only makes sense at a cadence this strategy is actually
+        meant to run at. Same cancel-and-replace-toward-the-current-ask
+        logic as reprice_resting_exits, just scoped to symbols currently
+        volatility-scalp eligible instead of everything else.
+        """
+        now = time.monotonic()
+        if now - self.last_volatility_reprice < float(
+            self.config.volatility_scalp_reprice_seconds
+        ):
+            return
+        self.last_volatility_reprice = now
+        for order_id, order in list(self.working_orders.items()):
+            action = order.get("action")
+            key = str(order.get("key") or "")
+            if action != "PROFIT" or not key.startswith("STOCK:"):
+                continue
+            if order.get("cancel_requested_at") is not None:
+                continue
+            symbol = key.split(":", 1)[1]
+            if symbol in self.stop_loss_escalated:
+                continue
+            if not self.strategy.is_volatility_scalp_eligible(symbol):
+                continue
+            try:
+                quote = self.api.stock_quote(symbol)
+                ask = self.api.quote_ask(quote)
+                if ask is None or ask == order.get("limit_price"):
+                    continue
+                quantity, cost = self.api.stock_position(symbol, positions)
+                if quantity <= 0:
+                    continue
+                if self.is_fractional_quantity(quantity) and not core_session_active:
+                    continue
+                if cost > 0 and ask < cost:
+                    continue
+                self.api.cancel(order_id)
+                new_order_id = self.api.place_stock(
+                    symbol,
+                    "SELL",
+                    quantity,
+                    limit_price=ask,
+                )
+                self.working_orders.pop(order_id, None)
+                self.working_orders[new_order_id] = {
+                    "submitted_at": now,
+                    "key": key,
+                    "action": action,
+                    "cancel_requested_at": None,
+                    "limit_price": ask,
+                    "pnl": order.get("pnl"),
+                }
+                self.status.rekey_trade(order_id, new_order_id)
+                log.info(
+                    "SCALP  | %-8s | reprice | ask=%s | id=%s",
+                    symbol,
+                    ask,
+                    new_order_id,
+                )
+            except Exception as exc:
+                log.error("SCALP  | %s | reprice failed | %s", symbol, exc)
 
     def account_state(self) -> tuple[Decimal, list[dict]]:
         now = time.monotonic()
@@ -4278,6 +4352,9 @@ class AutoTrader:
                 self.monitor_working_orders()
                 self.process_iceberg_orders()
                 self.reprice_resting_exits(self.cached_positions, core_session_active)
+                self.reprice_volatility_scalp_exits(
+                    self.cached_positions, core_session_active
+                )
                 self.escalate_stalled_stop_losses()
                 self.reconcile_order_history()
                 self.log_trade_events()
