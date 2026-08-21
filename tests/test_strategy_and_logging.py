@@ -88,6 +88,11 @@ class StrategyConfigMixin:
             time_aware_stop_enabled=False,
             time_aware_stop_widen_seconds=60,
             time_aware_stop_widen_multiplier=Decimal("1.5"),
+            volatility_scalp_enabled=True,
+            volatility_scalp_lookback_samples=20,
+            volatility_scalp_min_stdev_percent=Decimal("0.015"),
+            volatility_scalp_dip_entry_percent=Decimal("0.005"),
+            volatility_scalp_target_percent=Decimal("0.005"),
         )
 
 
@@ -455,6 +460,140 @@ class TradeEventLoggingTests(unittest.TestCase):
         with self.assertLogs("webull-bot", level="INFO") as logs:
             log_trade_events()
         self.assertIn("abc", logs.output[0])
+
+
+class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
+    """Buy small dips, sell small rips, repeatedly, on symbols whose own
+    realized short-window volatility clears volatility_scalp_min_stdev_
+    percent - see strategy.py's realized_volatility_percent/
+    is_volatility_scalp_eligible/volatility_scalp_dip_signal/
+    volatility_scalp_exit_override.
+    """
+
+    def _feed(self, strategy, symbol, prices):
+        for price in prices:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+
+    def test_not_eligible_with_too_few_samples(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "THIN", [10, 10.1, 9.9])
+        self.assertIsNone(strategy.realized_volatility_percent("THIN"))
+        self.assertFalse(strategy.is_volatility_scalp_eligible("THIN"))
+
+    def test_calm_symbol_is_not_eligible(self):
+        strategy = TradingStrategy(self.config())
+        # Tiny back-and-forth well under the 1.5% stdev threshold.
+        self._feed(strategy, "CALM", [10.00, 10.01, 9.99, 10.00, 10.01, 9.99, 10.00])
+        stdev = strategy.realized_volatility_percent("CALM")
+        self.assertIsNotNone(stdev)
+        self.assertLess(stdev, self.config().volatility_scalp_min_stdev_percent)
+        self.assertFalse(strategy.is_volatility_scalp_eligible("CALM"))
+
+    def test_choppy_symbol_is_eligible(self):
+        strategy = TradingStrategy(self.config())
+        # Swings of several percent each step - clears the 1.5% stdev bar.
+        self._feed(strategy, "WILD", [10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8])
+        stdev = strategy.realized_volatility_percent("WILD")
+        self.assertIsNotNone(stdev)
+        self.assertGreaterEqual(stdev, self.config().volatility_scalp_min_stdev_percent)
+        self.assertTrue(strategy.is_volatility_scalp_eligible("WILD"))
+
+    def test_disabled_in_config_is_never_eligible_even_when_choppy(self):
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_enabled = False
+        self._feed(strategy, "WILD", [10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8])
+        self.assertFalse(strategy.is_volatility_scalp_eligible("WILD"))
+
+    def test_dip_signal_fires_once_price_pulls_back_far_enough_from_the_window_high(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "WILD", [10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8])
+        # Window high is 10.5 - 0.5% below that is 10.4475.
+        self.assertFalse(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.46")))
+        self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("10.40")))
+
+    def test_dip_signal_false_for_an_unseen_symbol(self):
+        strategy = TradingStrategy(self.config())
+        self.assertFalse(strategy.volatility_scalp_dip_signal("NEVERSEEN", Decimal("10")))
+
+    def test_target_price_is_cost_plus_the_configured_small_percent(self):
+        strategy = TradingStrategy(self.config())
+        target = strategy.volatility_scalp_target_price(Decimal("20.00"))
+        self.assertEqual(target, Decimal("20.00") * Decimal("1.005"))
+
+    def test_exit_override_promotes_hold_to_profit_once_the_quick_target_is_cleared(self):
+        strategy = TradingStrategy(self.config())
+        from webull_bot.strategy import Decision
+
+        hold = Decision("HOLD", "position between target and stop", Decimal("20.50"))
+        result = strategy.volatility_scalp_exit_override(
+            hold, quantity=10, average_cost=Decimal("20.00"), price=Decimal("20.15")
+        )
+        self.assertEqual(result.action, "PROFIT")
+        self.assertEqual(result.target_price, Decimal("20.00") * Decimal("1.005"))
+
+    def test_exit_override_leaves_hold_alone_below_the_quick_target(self):
+        strategy = TradingStrategy(self.config())
+        from webull_bot.strategy import Decision
+
+        hold = Decision("HOLD", "position between target and stop", Decimal("20.50"))
+        result = strategy.volatility_scalp_exit_override(
+            hold, quantity=10, average_cost=Decimal("20.00"), price=Decimal("20.05")
+        )
+        self.assertIs(result, hold)
+
+    def test_exit_override_never_touches_a_loss_decision(self):
+        """The normal stop-loss must stay fully in effect for a
+        volatility-scalp position - only a HOLD ever gets promoted.
+        """
+        strategy = TradingStrategy(self.config())
+        from webull_bot.strategy import Decision
+
+        loss = Decision("LOSS", "percentage stop reached", Decimal("19.00"))
+        result = strategy.volatility_scalp_exit_override(
+            loss, quantity=10, average_cost=Decimal("20.00"), price=Decimal("20.20")
+        )
+        self.assertIs(result, loss)
+
+    def test_clear_market_state_resets_the_volatility_window(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "WILD", [10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8])
+        strategy.clear_market_state()
+        self.assertIsNone(strategy.realized_volatility_percent("WILD"))
+
+
+class VolatilityScalpReentryCooldownTests(unittest.TestCase):
+    def test_ready_when_never_exited(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_exit_at={},
+            config=SimpleNamespace(volatility_scalp_reentry_cooldown_seconds=5),
+        )
+        ready = AutoTrader.volatility_scalp_reentry_ready.__get__(fake_bot)
+        self.assertTrue(ready("STOCK:WILD"))
+
+    def test_blocked_immediately_after_an_exit(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_exit_at={"STOCK:WILD": time.monotonic()},
+            config=SimpleNamespace(volatility_scalp_reentry_cooldown_seconds=5),
+        )
+        ready = AutoTrader.volatility_scalp_reentry_ready.__get__(fake_bot)
+        self.assertFalse(ready("STOCK:WILD"))
+
+    def test_ready_again_once_the_short_cooldown_elapses(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_exit_at={"STOCK:WILD": time.monotonic() - 10},
+            config=SimpleNamespace(volatility_scalp_reentry_cooldown_seconds=5),
+        )
+        ready = AutoTrader.volatility_scalp_reentry_ready.__get__(fake_bot)
+        self.assertTrue(ready("STOCK:WILD"))
 
 
 class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):

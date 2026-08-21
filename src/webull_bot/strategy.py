@@ -84,6 +84,13 @@ class TradingStrategy:
         # gradual cadence and shouldn't be thrown away just because the
         # trading day rolled over.
         self.analyst_priority: dict[str, float] = {}
+        # Volatility-scalp: a rolling window of raw prices per symbol
+        # (independent of self.prices, which only ever holds the latest
+        # one) - see update_stock_snapshot, realized_volatility_percent,
+        # volatility_scalp_dip_signal.
+        self.volatility_price_history: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=config.volatility_scalp_lookback_samples)
+        )
 
     def clear_market_state(self) -> None:
         self.activity.clear()
@@ -93,6 +100,7 @@ class TradingStrategy:
         self.vwap_state.clear()
         self.crossover_counts.clear()
         self.tick_history.clear()
+        self.volatility_price_history.clear()
 
     @staticmethod
     def rotating_batch(items: list, cursor: int, batch_size: int) -> tuple[list, int]:
@@ -158,6 +166,91 @@ class TradingStrategy:
             "activity_score": activity,
         }
         self._update_vwap(symbol, price, volume)
+        if price > 0:
+            self.volatility_price_history[symbol].append(float(price))
+
+    # Below this many samples, a stdev estimate is too noisy to trust -
+    # not configurable (unlike the window length itself), same reasoning
+    # as the other hardcoded quality-filter thresholds up top.
+    VOLATILITY_SCALP_MIN_SAMPLES = 5
+
+    def realized_volatility_percent(self, symbol: str) -> Decimal | None:
+        """Stdev of consecutive-sample percent returns over the rolling
+        window, as a fraction (0.02 = 2%) - the "how choppy has this
+        symbol actually been just now" signal volatility-scalp eligibility
+        is gated on. None (not "very volatile") until there's enough
+        history to say so.
+        """
+        window = self.volatility_price_history.get(symbol)
+        if not window or len(window) < self.VOLATILITY_SCALP_MIN_SAMPLES:
+            return None
+        returns = []
+        prev = None
+        for sample in window:
+            if prev is not None and prev > 0:
+                returns.append((sample - prev) / prev)
+            prev = sample
+        if len(returns) < 2:
+            return None
+        mean = sum(returns) / len(returns)
+        variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+        return Decimal(str(variance ** 0.5))
+
+    def is_volatility_scalp_eligible(self, symbol: str) -> bool:
+        if not self.config.volatility_scalp_enabled:
+            return False
+        stdev = self.realized_volatility_percent(symbol)
+        if stdev is None:
+            return False
+        return stdev >= self.config.volatility_scalp_min_stdev_percent
+
+    def volatility_scalp_dip_signal(self, symbol: str, price: Decimal) -> bool:
+        """True when price has pulled back at least
+        volatility_scalp_dip_entry_percent from the rolling window's own
+        recent high - "buy the dip" for a symbol that's already been
+        confirmed choppy enough to qualify (see is_volatility_scalp_
+        eligible; callers are expected to check that first).
+        """
+        window = self.volatility_price_history.get(symbol)
+        if not window:
+            return False
+        recent_high = Decimal(str(max(window)))
+        if recent_high <= 0 or price <= 0:
+            return False
+        drop = (recent_high - price) / recent_high
+        return drop >= self.config.volatility_scalp_dip_entry_percent
+
+    def volatility_scalp_exit_override(
+        self,
+        decision: Decision,
+        quantity,
+        average_cost: Decimal,
+        price: Decimal,
+    ) -> Decision:
+        """Called only for a position currently held via the volatility-
+        scalp dip-buy path - lets its own small, fast profit target fire
+        the exit earlier than stock_decision's normal adaptive target
+        would. Never overrides a LOSS (the normal stop-loss stays fully
+        in effect) or an already-firing PROFIT - only promotes a HOLD to
+        PROFIT once price clears the quick target.
+        """
+        if decision.action != "HOLD" or quantity <= 0 or average_cost <= 0:
+            return decision
+        target = self.volatility_scalp_target_price(average_cost)
+        if price >= target:
+            return Decision("PROFIT", "volatility scalp quick target reached", target)
+        return decision
+
+    def volatility_scalp_target_price(self, average_cost: Decimal) -> Decimal:
+        """Sell the rip: a small, fixed quick-profit target above cost -
+        deliberately not the normal adaptive-stop-scaled target
+        (stock_decision's base_target), since the whole point of this
+        path is cycling capital fast on a volatile symbol's own natural
+        back-and-forth rather than waiting for one bigger move.
+        """
+        return average_cost * (
+            Decimal("1") + self.config.volatility_scalp_target_percent
+        )
 
     def _update_vwap(self, symbol: str, price: Decimal, volume: float) -> None:
         state = self.vwap_state.get(symbol)
