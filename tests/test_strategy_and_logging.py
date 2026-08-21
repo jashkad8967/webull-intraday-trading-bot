@@ -1440,11 +1440,28 @@ class StopLossConfirmationTests(unittest.TestCase):
             ),
             stop_condition_since={},
             stop_loss_escalated=set(),
+            volatility_scalp_symbols=set(),
         )
         defaults.update(overrides)
         fake_bot = SimpleNamespace(**defaults)
         fake_bot.stop_loss_confirmed = AutoTrader.stop_loss_confirmed.__get__(fake_bot)
         return fake_bot
+
+    def test_volatility_scalp_cohort_skips_the_confirmation_wait(self):
+        """Live incident: MYND (a volatility-scalp cohort symbol) sat
+        11%+ past its stop for many minutes because price kept ticking
+        back above the stop line often enough that the 2s confirmation
+        window never completed - the same choppiness that made it
+        eligible for this cohort in the first place also defeated the
+        wick-filtering confirmation. This cohort's positions must stop
+        out on the first breach, no wait.
+        """
+        fake_bot = self._fake_bot(volatility_scalp_symbols={"MYND"})
+        # No stop_condition_since entry at all - would normally be
+        # unconfirmed (see test_symbol_never_seen_in_breach_is_not_
+        # confirmed), but the cohort bypass short-circuits before that
+        # check ever runs.
+        self.assertTrue(fake_bot.stop_loss_confirmed("MYND"))
 
     def test_unconfirmed_breach_is_not_yet_actionable(self):
         fake_bot = self._fake_bot(stop_condition_since={"ASHR": 10.0})
