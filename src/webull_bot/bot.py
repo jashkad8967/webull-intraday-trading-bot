@@ -1650,27 +1650,6 @@ class AutoTrader:
         )
         return True
 
-    def volatility_scalp_wash_sale_override_ok(self, symbol: str, key: str) -> bool:
-        """By request: for the volatility-scalp cohort specifically, keep
-        trading a symbol through an active wash-sale block as long as
-        it's still net profitable overall (summed across every realized
-        exit currently in symbol_pnl_history, the same recent-trade
-        record symbol_quarantined already reads) - the tax-loss-
-        disallowance concern a wash-sale block exists for doesn't apply
-        the same way to a symbol that, in aggregate, hasn't produced a
-        loss to disallow. Does not affect wash-sale enforcement for the
-        normal trend-entry path anywhere else - only this cohort's own
-        entry gate calls this instead of checking wash_sales.blocked_
-        until directly.
-        """
-        blocked_until = self.wash_sales.blocked_until(symbol)
-        if not blocked_until:
-            return True
-        net_pnl = sum(
-            (pnl for _, pnl in self.symbol_pnl_history.get(key, ())), Decimal("0")
-        )
-        return net_pnl > 0
-
     def handle_portfolio_circuit_breaker(
         self,
         positions: list[dict],
@@ -2602,12 +2581,23 @@ class AutoTrader:
                     and len(self.volatility_scalp_positions)
                     < self.config.volatility_scalp_max_concurrent_positions
                     and open_count < self.config.max_open_positions
-                    and not guard_active
+                    # By explicit request: keep buying this cohort's
+                    # dips continuously, multiple times a minute, EVEN
+                    # THROUGH a losing stretch - unlike every other
+                    # entry path, this deliberately does NOT check
+                    # guard_active (account-wide stop-loss guard),
+                    # symbol_quarantined (recent-loss pause), a wash-
+                    # sale block, or rate_capped (hourly trade cap),
+                    # since all of those exist specifically to slow
+                    # down or pause trading after losses - exactly what
+                    # this strategy is meant to keep doing anyway. Only
+                    # cooldown_ready (a cross-order-submission race
+                    # guard, not a loss-driven pause -
+                    # trade_cooldown_seconds defaults to 0) and
+                    # volatility_scalp_reentry_ready (its own short 5s
+                    # cooldown) still gate timing.
                     and not regime_gate_active
-                    and not self.symbol_quarantined(key)
-                    and self.volatility_scalp_wash_sale_override_ok(symbol, key)
                     and self.cooldown_ready(key)
-                    and not self.rate_capped(key)
                     and self.volatility_scalp_reentry_ready(key)
                     and self.entry_price_sanity_cooldown_ready(symbol)
                     and self.strategy.is_volatility_scalp_eligible(symbol)

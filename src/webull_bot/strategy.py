@@ -241,15 +241,16 @@ class TradingStrategy:
         strategy exists to capture. A local high stays reactive to those
         wiggles regardless of the larger trend.
 
-        Also requires a bounce confirmation: price must have ticked back
-        UP from its own immediately-preceding sample, not merely be
-        below the local high. Live incident: without this, the entry
-        bought into an active decline ("catching a falling knife") -
-        both HOWL and GAUZ were stopped out within minutes of a dip-only
-        entry, well before the position ever had a chance to actually
-        reverse. Requiring the first uptick after a dip, instead of
-        buying anywhere on the way down, is a real (if small) signal
-        that the pullback has stopped, not a guess at where it ends.
+        By explicit request, this does NOT require a bounce confirmation
+        (an earlier version did, added after HOWL/GAUZ were stopped out
+        within minutes of a dip-only entry - but the user explicitly
+        wants continuous, high-frequency dip-buying on this cohort even
+        through losses, not a cautious wait for a confirmed reversal).
+        Losses on this path are an accepted, intended cost of trading
+        this fast - see volatility_scalp_bypasses_loss_gates in bot.py
+        for the entry-side gates (quarantine, wash-sale, stop-loss
+        guard, hourly rate cap) deliberately bypassed for this cohort so
+        a losing stretch doesn't pause it.
         """
         window = self.volatility_price_history.get(symbol)
         if not window:
@@ -257,9 +258,8 @@ class TradingStrategy:
         samples = list(window)
         # In live usage, update_stock_snapshot has already appended this
         # same price as the window's last element by the time this runs
-        # - exclude it so both the local high and the bounce reference
-        # compare against history strictly BEFORE this observation, not
-        # against itself.
+        # - exclude it so the local high compares against history
+        # strictly BEFORE this observation, not against itself.
         if samples and Decimal(str(samples[-1])) == price:
             samples = samples[:-1]
         if not samples:
@@ -269,10 +269,7 @@ class TradingStrategy:
         if recent_high <= 0 or price <= 0:
             return False
         drop = (recent_high - price) / recent_high
-        if drop < self.config.volatility_scalp_dip_entry_percent:
-            return False
-        previous_sample = Decimal(str(samples[-1]))
-        return price >= previous_sample
+        return drop >= self.config.volatility_scalp_dip_entry_percent
 
     def volatility_scalp_exit_override(
         self,
