@@ -769,8 +769,24 @@ class AutoTrader:
         aggressive price after sitting unfilled) skips this: the breach
         was already confirmed once, and escalation is itself a response to
         elapsed time, not a fresh signal that could be a single bad tick.
+
+        Also skips it for the volatility-scalp cohort. Live incident:
+        MYND sat well past its stop level (11%+ underwater against a
+        ~1.5% max stop) for many minutes without ever stopping out -
+        "GATES | stop breach not yet confirmed" kept firing intermittently,
+        meaning price ticked back above the stop line often enough that
+        the 2s confirmation window never completed. That grace exists to
+        filter a single-tick wick; for a symbol whose entire selection
+        criterion IS being unusually choppy, the same real, sustained
+        loss can cross the stop/un-cross it fast enough to never confirm
+        at all, indefinitely deferring real protection on exactly the
+        positions most likely to need it fast.
         """
-        if not self.config.stop_loss_confirmation_enabled or symbol in self.stop_loss_escalated:
+        if (
+            not self.config.stop_loss_confirmation_enabled
+            or symbol in self.stop_loss_escalated
+            or symbol in self.volatility_scalp_symbols
+        ):
             return True
         since = self.stop_condition_since.get(symbol)
         if since is None:
