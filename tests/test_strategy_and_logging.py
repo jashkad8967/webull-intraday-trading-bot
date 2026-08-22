@@ -736,6 +736,52 @@ class VolatilityScalpReentryCooldownTests(unittest.TestCase):
         self.assertTrue(ready("STOCK:WILD"))
 
 
+class VolatilityScalpPositionValueCapTests(unittest.TestCase):
+    """Live incident: GAUZ alone grew to ~66% of a small account's total
+    value. volatility_scalp_position_value_ok caps any single cohort
+    symbol's total position value (existing + a prospective new buy) to
+    VOLATILITY_SCALP_MAX_POSITION_FRACTION of total account value.
+    """
+
+    @staticmethod
+    def _fake_bot(account_value, max_fraction=Decimal("0.35")):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            cached_account_value=account_value,
+            config=SimpleNamespace(volatility_scalp_max_position_fraction=max_fraction),
+        )
+        return AutoTrader.volatility_scalp_position_value_ok.__get__(fake_bot)
+
+    def test_blocks_a_buy_that_would_exceed_the_fraction_of_account_value(self):
+        check = self._fake_bot(account_value=Decimal("200"))
+        # 300 shares * 0.44 = 132, well over 35% of 200 (=70).
+        self.assertFalse(check(200, 100, Decimal("0.44")))
+
+    def test_allows_a_buy_that_stays_within_the_fraction(self):
+        check = self._fake_bot(account_value=Decimal("200"))
+        # 100 shares * 0.44 = 44, under 35% of 200 (=70).
+        self.assertTrue(check(0, 100, Decimal("0.44")))
+
+    def test_fails_open_when_account_value_is_unknown(self):
+        check = self._fake_bot(account_value=None)
+        self.assertTrue(check(1000, 1000, Decimal("100")))
+
+    def test_fails_open_when_account_value_is_non_positive(self):
+        check = self._fake_bot(account_value=Decimal("0"))
+        self.assertTrue(check(1000, 1000, Decimal("100")))
+
+    def test_considers_the_existing_position_value_too(self):
+        """An averaging-down buy must account for what's already held,
+        not just the new clip - the cap is on the TOTAL resulting
+        position, not each individual buy in isolation.
+        """
+        check = self._fake_bot(account_value=Decimal("200"))
+        # Already holding 100 shares (44 worth) - adding another 100
+        # (another 44) totals 88, over 35% of 200 (=70).
+        self.assertFalse(check(100, 100, Decimal("0.44")))
+
+
 class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_vwap_gate_blocks_entry_below_session_vwap(self):
         strategy = TradingStrategy(self.config())
@@ -7036,6 +7082,28 @@ class StallExitPriceSpreadSanityTests(unittest.TestCase):
             average_cost=Decimal("19.42"),
             min_profit=Decimal("0.01"),
             fee_per_share=Decimal("0.02"),
+        )
+        self.assertEqual(result, Decimal("19.89"))
+
+    def test_a_wider_explicit_max_spread_percent_allows_the_ask_fallback(self):
+        """Live incident: GAUZ routinely quoted 2-7% spreads (its normal
+        character, not a glitch) - the volatility-scalp cohort's own
+        exit pricing passes a much wider max_spread_percent explicitly
+        instead of falling back to the tight default, so the ask
+        fallback stays usable on exactly the wide-spread names this
+        cohort exists to trade.
+        """
+        price_fn = self._price_fn()
+        # (19.89 - 19.39) / 19.39 * 100 = 2.58% - would be refused under
+        # the default 0.50% bound (see test_refuses_to_rest_at_an_
+        # unreachable_ask_on_a_wide_spread above), but is allowed here.
+        quote = {"bid": "19.39", "ask": "19.89"}
+        result = price_fn(
+            quote,
+            average_cost=Decimal("19.42"),
+            min_profit=Decimal("0.01"),
+            fee_per_share=Decimal("0.02"),
+            max_spread_percent=Decimal("8"),
         )
         self.assertEqual(result, Decimal("19.89"))
 

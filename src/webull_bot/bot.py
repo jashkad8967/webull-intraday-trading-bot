@@ -759,6 +759,32 @@ class AutoTrader:
         elapsed = time.monotonic() - self.last_exit_at.get(key, float("-inf"))
         return elapsed >= float(self.config.volatility_scalp_reentry_cooldown_seconds)
 
+    def volatility_scalp_position_value_ok(
+        self,
+        current_quantity,
+        additional_quantity,
+        price: Decimal,
+    ) -> bool:
+        """True as long as a cohort symbol's total position value
+        (existing + a prospective new buy, fresh entry or averaging-
+        down) would stay within VOLATILITY_SCALP_MAX_POSITION_FRACTION
+        of total account value. Live incident: GAUZ alone grew to ~66%
+        of a small account's total value - averaging is still allowed
+        up to the separate VOLATILITY_SCALP_MAX_AVERAGING_BUYS cap, but
+        never to the point of concentrating most of the account in one
+        name. Fails open (True) if account value isn't known yet - a
+        missing/stale account-value read should never itself block
+        trading.
+        """
+        account_value = self.cached_account_value
+        if account_value is None or account_value <= 0:
+            return True
+        projected_value = (
+            Decimal(str(current_quantity)) + Decimal(str(additional_quantity))
+        ) * price
+        cap = account_value * self.config.volatility_scalp_max_position_fraction
+        return projected_value <= cap
+
     def stop_ready_to_submit(self, key: str, symbol: str) -> bool:
         """An escalated stop must resubmit immediately after its cancel, not
         wait out the normal trade cooldown - that cooldown was timed from
@@ -2827,6 +2853,10 @@ class AutoTrader:
                         "1.03"
                     ) > buying_power:
                         scalp_quantity = 0
+                    if scalp_quantity > 0 and not self.volatility_scalp_position_value_ok(
+                        0, scalp_quantity, price
+                    ):
+                        scalp_quantity = 0
                     if scalp_quantity > 0:
                         order_id = self.place_stock_scaled(
                             symbol,
@@ -2892,6 +2922,13 @@ class AutoTrader:
                     if average_down_quantity > 0 and price * Decimal(
                         average_down_quantity
                     ) * Decimal("1.03") > buying_power:
+                        average_down_quantity = 0
+                    if (
+                        average_down_quantity > 0
+                        and not self.volatility_scalp_position_value_ok(
+                            quantity, average_down_quantity, price
+                        )
+                    ):
                         average_down_quantity = 0
                     if average_down_quantity > 0:
                         order_id = self.place_stock_scaled(
@@ -3235,7 +3272,13 @@ class AutoTrader:
                             self.api.stock_limit_price(quote, "SELL")
                             if symbol in self.stop_loss_escalated
                             else self._stall_exit_price(
-                                quote, cost, min_profit, fee_per_share
+                                quote,
+                                cost,
+                                min_profit,
+                                fee_per_share,
+                                max_spread_percent=(
+                                    self.config.volatility_scalp_max_exit_spread_percent
+                                ),
                             )
                         )
                         if limit_price is None:
@@ -3981,6 +4024,7 @@ class AutoTrader:
         average_cost: Decimal,
         min_profit: Decimal,
         fee_per_share: Decimal,
+        max_spread_percent: Decimal | None = None,
     ) -> Decimal | None:
         """Pick the best available green exit price for a stalled position.
 
@@ -3991,7 +4035,21 @@ class AutoTrader:
         just because the aggressive/immediate price isn't green yet. Never
         prices below cost + min_profit + fee on either side, so this can
         only ever produce a genuinely profitable exit or no exit at all.
+
+        max_spread_percent defaults to stock_entry_max_spread_percent (the
+        stall-breaker's own long-standing bound, tuned for a quote-glitch
+        on an otherwise normal, liquid stock - see the TBB incident
+        below). Callers whose positions are deliberately choppy/wide-
+        spread by their own selection criterion (the volatility-scalp
+        cohort) should pass a wider bound explicitly - live incident:
+        GAUZ routinely quoted 2-7% spreads (its normal character, not a
+        glitch), so the 0.50% default meant the ask-fallback almost
+        never fired, exits depended entirely on the bid alone clearing
+        cost, and the strategy kept averaging into new dip-buys (a much
+        looser bar) far faster than it could ever exit.
         """
+        if max_spread_percent is None:
+            max_spread_percent = self.config.stock_entry_max_spread_percent
         floor = average_cost + min_profit + fee_per_share
         bid = self.api.quote_bid(quote)
         if bid is not None:
@@ -4020,7 +4078,7 @@ class AutoTrader:
             # spread to normalize instead of spinning on a doomed order.
             if bid is not None and bid > 0:
                 spread_percent = (ask - bid) / bid * 100
-                if spread_percent > self.config.stock_entry_max_spread_percent:
+                if spread_percent > max_spread_percent:
                     return None
             sell_price = ask.quantize(
                 self.api.price_tick_size(ask), rounding=ROUND_DOWN

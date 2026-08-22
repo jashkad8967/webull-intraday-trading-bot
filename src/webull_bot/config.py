@@ -309,6 +309,27 @@ class Settings(BaseSettings):
     # fixed lot size, instead of an unbounded chase. 0 disables
     # averaging entirely.
     volatility_scalp_max_averaging_buys: int = Field(default=3, ge=0, le=10)
+    # Live incident: GAUZ's routine 2-7% spread meant the general
+    # STOCK_ENTRY_MAX_SPREAD_PERCENT (0.50%, tuned for a quote-glitch on
+    # an otherwise normal, liquid stock) almost never let the exit
+    # pricing fall back to the ask - exits depended entirely on the bid
+    # alone clearing cost, a much harder bar than the entry side's dip
+    # signal, so the position kept averaging down far faster than it
+    # could ever exit. This cohort is deliberately wide-spread/choppy by
+    # its own selection criterion, so its own exit pricing gets a wider,
+    # separately-tunable bound instead of the general one.
+    volatility_scalp_max_exit_spread_percent: Decimal = Field(
+        default=Decimal("8"), gt=0, le=Decimal("50")
+    )
+    # Live incident: GAUZ alone grew to ~66% of total account value.
+    # Caps any single cohort symbol's total position value (existing +
+    # a prospective new buy, whether a fresh entry or an averaging-down
+    # buy) to this fraction of account value - averaging is still
+    # allowed up to VOLATILITY_SCALP_MAX_AVERAGING_BUYS, but never to
+    # the point of concentrating most of the account in one name.
+    volatility_scalp_max_position_fraction: Decimal = Field(
+        default=Decimal("0.35"), gt=0, le=1
+    )
     # Curated daily cohort, not the whole scanned universe: identify a
     # small handful of the cheapest, most volatile names and concentrate
     # on rapidly cycling just those until they cool off, instead of
