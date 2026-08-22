@@ -633,6 +633,28 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
             loss,
         )
 
+    def test_exit_override_leaves_a_loss_alone_when_averaging_is_not_available(self):
+        """Sanity-check fix: a position that gets the fast profit-take
+        purely because its symbol is in the cohort, but was never opened
+        via the dip-buy path (e.g. a normal trend-strategy position),
+        has no averaging-down recovery plan behind it. Suppressing its
+        stop-loss with nothing else backing it up would leave it
+        bleeding indefinitely with no path back to even - its normal
+        stop-loss must stay fully in effect.
+        """
+        strategy = TradingStrategy(self.config())
+        from webull_bot.strategy import Decision
+
+        loss = Decision("LOSS", "percentage stop reached", Decimal("19.00"))
+        result = strategy.volatility_scalp_exit_override(
+            loss,
+            quantity=10,
+            average_cost=Decimal("20.00"),
+            price=Decimal("20.20"),
+            averaging_available=False,
+        )
+        self.assertIs(result, loss)
+
     def test_average_down_signal_fires_once_price_clears_the_dip_threshold(self):
         strategy = TradingStrategy(self.config())
         # dip_entry_percent default 0.2% - 0.15% below cost doesn't
