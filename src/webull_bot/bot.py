@@ -2766,7 +2766,11 @@ class AutoTrader:
                     and self.strategy.is_volatility_scalp_eligible(symbol)
                 ):
                     decision = self.strategy.volatility_scalp_exit_override(
-                        decision, quantity, cost, price
+                        decision,
+                        quantity,
+                        cost,
+                        price,
+                        averaging_available=symbol in self.volatility_scalp_positions,
                     )
                 if decision.action == "LOSS":
                     if symbol not in self.stop_condition_since:
@@ -2901,6 +2905,16 @@ class AutoTrader:
                     and symbol not in self.entry_restricted_symbols
                     and self.volatility_scalp_average_down_count[symbol]
                     < self.config.volatility_scalp_max_averaging_buys
+                    # Sanity-check fix: the fresh-entry gate above
+                    # deliberately still checks regime_gate_active (a
+                    # market-wide VIXY-spike gate is kept even though
+                    # this cohort's own loss-driven gates are bypassed),
+                    # but this averaging-down block had no such check -
+                    # meaning a market-wide vol spike would block NEW
+                    # dip-buys while still letting the bot add to an
+                    # EXISTING losing position, backwards from what a
+                    # risk-off signal should do.
+                    and not regime_gate_active
                     # In-process, race-free throttle (same reasoning as
                     # the fresh-entry guard above) - without it, several
                     # cycles within one ACCOUNT_REFRESH_SECONDS window

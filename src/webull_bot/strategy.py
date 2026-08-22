@@ -277,25 +277,38 @@ class TradingStrategy:
         quantity,
         average_cost: Decimal,
         price: Decimal,
+        averaging_available: bool = True,
     ) -> Decision:
-        """Called only for a position currently held via the volatility-
-        scalp dip-buy path.
+        """Called for any held position currently in the volatility-scalp
+        cohort - not just ones opened via the dip-buy path (a position
+        already held through the normal trend entry gets the same fast
+        profit-take once its symbol is picked into the cohort).
 
         Two things, by explicit request: lets its own small, fast profit
         target fire the exit earlier than stock_decision's normal
         adaptive target would (promotes a HOLD to PROFIT once price
-        clears the quick target); and suppresses a LOSS entirely -
-        "focus less on the stop loss" - since a dip on this cohort is
-        now meant to be averaged into (see AutoTrader's averaging-buy
-        entry path and volatility_scalp_average_down_signal below), not
-        stopped out of. average_cost keeps reflecting the broker's own
-        blended cost across every averaging buy, so the quick-target
-        sell price naturally sits above the new average once one fires,
-        with no extra tracking needed here.
+        clears the quick target) - this always applies; and suppresses a
+        LOSS entirely - "focus less on the stop loss" - since a dip on
+        this cohort is meant to be averaged into instead of stopped out
+        of. average_cost keeps reflecting the broker's own blended cost
+        across every averaging buy, so the quick-target sell price
+        naturally sits above the new average once one fires, with no
+        extra tracking needed here.
+
+        The LOSS suppression only applies when averaging_available is
+        True (the position is actually eligible for AutoTrader's
+        averaging-buy entry path, i.e. it was opened via the dip-buy
+        path in the first place) - sanity-check fix: a position that
+        got the fast profit-take purely because its symbol is in the
+        cohort, but was never opened by this strategy, has no averaging-
+        down recovery plan behind it. Suppressing its stop-loss with
+        nothing else backing it up would just leave it bleeding
+        indefinitely with no path back to even. Its normal stop-loss
+        stays fully in effect instead.
         """
         if quantity <= 0 or average_cost <= 0:
             return decision
-        if decision.action == "LOSS":
+        if decision.action == "LOSS" and averaging_available:
             return Decision(
                 "HOLD",
                 "volatility scalp - averaging down instead of stopping out",
