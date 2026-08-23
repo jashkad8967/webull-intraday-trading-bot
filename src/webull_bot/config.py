@@ -330,6 +330,18 @@ class Settings(BaseSettings):
     volatility_scalp_max_position_fraction: Decimal = Field(
         default=Decimal("0.35"), gt=0, le=1
     )
+    # Per-symbol caps alone don't bound worst case: with up to
+    # VOLATILITY_SCALP_MAX_CONCURRENT_POSITIONS symbols each individually
+    # allowed to reach VOLATILITY_SCALP_MAX_POSITION_FRACTION, a
+    # correlated selloff across the whole cohort (likely, since these are
+    # explicitly the most volatile names selected together) had no
+    # aggregate brake - three symbols could each legitimately reach 35%
+    # of the account. This caps total cohort exposure across every
+    # symbol combined, so an account-wide correlated move is still
+    # bounded even when each individual symbol's own cap is satisfied.
+    volatility_scalp_max_total_exposure_fraction: Decimal = Field(
+        default=Decimal("0.60"), gt=0, le=1
+    )
     # Curated daily cohort, not the whole scanned universe: identify a
     # small handful of the cheapest, most volatile names and concentrate
     # on rapidly cycling just those until they cool off, instead of
