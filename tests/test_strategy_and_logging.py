@@ -3057,8 +3057,8 @@ class AllocationAndLoggingTests(unittest.TestCase):
         )
         self.assertEqual(config.stock_universe_page_size, 200)
         self.assertEqual(config.stocks(), ["ALL"])
-        self.assertEqual(config.max_symbols, 500)
-        self.assertEqual(config.stock_universe_limit(), 500)
+        self.assertEqual(config.max_symbols, 800)
+        self.assertEqual(config.stock_universe_limit(), 800)
         self.assertEqual(Settings(max_symbols=0).stock_universe_limit(), 500)
         self.assertTrue(
             {"NVDA", "TSLA", "AAPL", "GME", "AMC"}
