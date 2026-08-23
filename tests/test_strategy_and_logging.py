@@ -804,6 +804,67 @@ class VolatilityScalpPositionValueCapTests(unittest.TestCase):
         self.assertFalse(check(100, 100, Decimal("0.44")))
 
 
+class VolatilityScalpTotalExposureCapTests(unittest.TestCase):
+    """Per-symbol caps alone don't bound worst case: several cohort
+    symbols could each individually satisfy
+    volatility_scalp_max_position_fraction while the account as a whole
+    is almost entirely concentrated in the cohort during a correlated
+    selloff. volatility_scalp_total_exposure_ok caps the WHOLE cohort's
+    combined value instead.
+    """
+
+    @staticmethod
+    def _fake_bot(account_value, symbols, max_fraction=Decimal("0.60")):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            cached_account_value=account_value,
+            volatility_scalp_symbols=set(symbols),
+            config=SimpleNamespace(
+                volatility_scalp_max_total_exposure_fraction=max_fraction
+            ),
+        )
+        return AutoTrader.volatility_scalp_total_exposure_ok.__get__(fake_bot)
+
+    def test_blocks_when_existing_cohort_positions_plus_the_new_buy_exceed_the_cap(
+        self,
+    ):
+        check = self._fake_bot(
+            account_value=Decimal("200"), symbols={"AAA", "BBB", "CCC"}
+        )
+        positions = [
+            {"symbol": "AAA", "quantity": "100", "cost_price": "0.50"},
+            {"symbol": "BBB", "quantity": "100", "cost_price": "0.50"},
+        ]
+        # 50 + 50 already held; a 20 more pushes total to 120, over 60% of 200 (=120 is exactly the boundary)
+        self.assertFalse(check(positions, Decimal("20.01")))
+
+    def test_allows_when_combined_cohort_value_stays_within_the_cap(self):
+        check = self._fake_bot(
+            account_value=Decimal("200"), symbols={"AAA", "BBB", "CCC"}
+        )
+        positions = [
+            {"symbol": "AAA", "quantity": "100", "cost_price": "0.50"},
+        ]
+        # 50 already held; adding 20 totals 70, under 60% of 200 (=120).
+        self.assertTrue(check(positions, Decimal("20")))
+
+    def test_ignores_positions_outside_the_cohort(self):
+        check = self._fake_bot(account_value=Decimal("200"), symbols={"AAA"})
+        positions = [
+            {"symbol": "NOTSCALP", "quantity": "1000", "cost_price": "50"},
+        ]
+        self.assertTrue(check(positions, Decimal("20")))
+
+    def test_fails_open_when_account_value_is_unknown(self):
+        check = self._fake_bot(account_value=None, symbols={"AAA"})
+        self.assertTrue(check([], Decimal("1000")))
+
+    def test_fails_open_when_account_value_is_non_positive(self):
+        check = self._fake_bot(account_value=Decimal("0"), symbols={"AAA"})
+        self.assertTrue(check([], Decimal("1000")))
+
+
 class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_vwap_gate_blocks_entry_below_session_vwap(self):
         strategy = TradingStrategy(self.config())
