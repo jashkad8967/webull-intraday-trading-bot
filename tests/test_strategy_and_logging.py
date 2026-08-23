@@ -4380,6 +4380,7 @@ class VolatilityScalpBarSeedTests(unittest.TestCase):
                 seed_volatility_window=lambda symbol, closes: seeded.append(
                     (symbol, closes)
                 ),
+                prices={},
             ),
         )
         seed = AutoTrader.seed_volatility_windows.__get__(fake_bot)
@@ -4387,6 +4388,32 @@ class VolatilityScalpBarSeedTests(unittest.TestCase):
         # BBB already has a window - only AAA should ever be fetched/seeded.
         self.assertEqual(requested, [(("AAA",), "US_STOCK", 20)])
         self.assertEqual(seeded, [("AAA", [10.0, 10.1, 9.9])])
+        # Also seeds self.strategy.prices, so a bar-seeded (but not yet
+        # live-scanned) symbol is already visible to cohort selection.
+        self.assertEqual(fake_bot.strategy.prices, {"AAA": Decimal("9.9")})
+
+    def test_never_overwrites_an_already_live_price(self):
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            def recent_minute_closes(self, symbols, category, count):
+                return {s: [10.0, 10.1, 9.9] for s in symbols}
+
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            stock_categories={"AAA": "US_STOCK"},
+            config=SimpleNamespace(volatility_scalp_lookback_samples=20),
+            strategy=SimpleNamespace(
+                volatility_price_history={},
+                seed_volatility_window=lambda *a, **k: None,
+                # Already has a live-scanned price for AAA - the stale
+                # bar close (9.9) must not clobber it.
+                prices={"AAA": Decimal("11.25")},
+            ),
+        )
+        seed = AutoTrader.seed_volatility_windows.__get__(fake_bot)
+        seed(["AAA"])
+        self.assertEqual(fake_bot.strategy.prices, {"AAA": Decimal("11.25")})
 
     def test_noop_when_everything_is_already_seeded(self):
         from webull_bot.bot import AutoTrader
@@ -4426,6 +4453,7 @@ class VolatilityScalpBarSeedTests(unittest.TestCase):
                 seed_volatility_window=lambda symbol, closes: seeded.append(
                     (symbol, closes)
                 ),
+                prices={},
             ),
         )
         seed = AutoTrader.seed_volatility_windows.__get__(fake_bot)
