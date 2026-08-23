@@ -655,6 +655,28 @@ class AutoTrader:
         self.option_contracts = self.api.resolve_options()
         self.discover_all_options = "ALL" in self.config.option_roots()
         self.strategy.clear_market_state()
+        if (
+            self.config.volatility_scalp_enabled
+            and self.config.volatility_scalp_bar_seed_enabled
+        ):
+            # By request: pick the volatility-scalp cohort very early in
+            # the day, not whenever organic scanning happens to reach
+            # enough symbols - left to the normal per-batch seeding
+            # alone, the first cohort selection would only ever see
+            # whichever ~100 of 300+ symbols happened to be scanned
+            # first (a rotating batch, not the whole universe), biasing
+            # it toward scan order instead of genuine volatility. Bar-
+            # seeding the WHOLE day's candidate pool once, right here,
+            # means the very first select_volatility_scalp_symbols()
+            # call (right after this function returns) already has full
+            # visibility across every symbol, not a scan-order-biased
+            # slice of it.
+            log.info(
+                "SCALP  | seeding volatility windows for %s symbols ahead "
+                "of the day's first cohort selection",
+                len(self.stock_symbols),
+            )
+            self.seed_volatility_windows(self.stock_symbols)
         self.stock_cursor = 0
         self.option_cursor = 0
         self.option_discovery_cursor = 0
@@ -2448,6 +2470,16 @@ class AutoTrader:
                 continue
             for symbol, closes in closes_by_symbol.items():
                 self.strategy.seed_volatility_window(symbol, closes)
+                # select_volatility_scalp_symbols candidates come from
+                # self.strategy.prices, which otherwise only gets
+                # populated by a live quote scan (update_stock_snapshot)
+                # - without this, bar-seeding the volatility window alone
+                # still wouldn't make a symbol visible to cohort
+                # selection until it was actually scanned. Never
+                # overwrites an already-live price with a stale bar
+                # close.
+                if closes and symbol not in self.strategy.prices:
+                    self.strategy.prices[symbol] = Decimal(str(closes[-1]))
 
     def select_volatility_scalp_symbols(self) -> None:
         """Re-ranks the curated volatility-scalp cohort from data already
