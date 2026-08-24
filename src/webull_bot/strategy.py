@@ -271,6 +271,181 @@ class TradingStrategy:
         drop = (recent_high - price) / recent_high
         return drop >= self.config.volatility_scalp_dip_entry_percent
 
+    def _synthetic_bars(self, symbol: str) -> list[dict]:
+        """Buckets the rolling tick-price window (volatility_price_history)
+        into fixed-size synthetic OHLC bars, HEIKIN_ASHI_BAR_SAMPLES ticks
+        per bar - no separate bar/candle feed exists here, so this is the
+        only OHLC series available to build Heikin-Ashi or Parabolic SAR
+        from.
+
+        Degrades gracefully instead of requiring the FULL
+        heikin_ashi_bar_count * heikin_ashi_bar_samples history: uses
+        however many complete buckets the window (bounded by
+        volatility_scalp_lookback_samples, which can be smaller than
+        that product) actually holds, capped at heikin_ashi_bar_count,
+        and always bucketed from the most recent samples so a partial
+        trailing bar is never included. Requiring the exact full count
+        would mean these signals could never fire at all whenever the
+        window is shorter than bar_samples * bar_count - not a rare
+        edge case with the two configs' actual defaults. Empty list
+        when there isn't even 2 full buckets' worth of history yet.
+        """
+        window = self.volatility_price_history.get(symbol)
+        if not window:
+            return []
+        bar_samples = self.config.heikin_ashi_bar_samples
+        bar_count = self.config.heikin_ashi_bar_count
+        samples = list(window)
+        usable = len(samples) - (len(samples) % bar_samples)
+        if usable < bar_samples * 2:
+            return []
+        max_samples = min(usable, bar_samples * bar_count)
+        recent = samples[-max_samples:]
+        bars = []
+        for start in range(0, len(recent), bar_samples):
+            chunk = recent[start : start + bar_samples]
+            bars.append(
+                {
+                    "open": chunk[0],
+                    "high": max(chunk),
+                    "low": min(chunk),
+                    "close": chunk[-1],
+                }
+            )
+        return bars
+
+    def heikin_ashi_bullish_reversal_signal(self, symbol: str) -> bool:
+        """True on a confirmed Heikin-Ashi bullish reversal: the most
+        recent completed synthetic bar is bearish (red) immediately
+        followed by a bullish (green) one with little/no lower wick on
+        the green bar - HA's own "strength confirmed" reversal read,
+        not just a single green print that could reverse again next
+        tick. An ADDITIONAL alternative entry trigger alongside the dip
+        and breakout signals (OR'd, not required) - by request, every
+        extra qualifying signal should mean MORE trading opportunities.
+        """
+        bars = self._synthetic_bars(symbol)
+        if len(bars) < 2:
+            return False
+        ha_bars = []
+        prev_ha_open = None
+        prev_ha_close = None
+        for bar in bars:
+            ha_close = (bar["open"] + bar["high"] + bar["low"] + bar["close"]) / 4
+            if prev_ha_open is None:
+                ha_open = (bar["open"] + bar["close"]) / 2
+            else:
+                ha_open = (prev_ha_open + prev_ha_close) / 2
+            ha_low = min(bar["low"], ha_open, ha_close)
+            ha_bars.append({"open": ha_open, "low": ha_low, "close": ha_close})
+            prev_ha_open, prev_ha_close = ha_open, ha_close
+        previous, current = ha_bars[-2], ha_bars[-1]
+        if previous["close"] >= previous["open"]:
+            return False
+        if current["close"] <= current["open"]:
+            return False
+        body = current["close"] - current["open"]
+        lower_wick = current["open"] - current["low"]
+        return lower_wick <= body * 0.25
+
+    def dual_thrust_breakout_signal(self, symbol: str, price: Decimal) -> bool:
+        """Opening-range-breakout entry signal, adapted from the classic
+        Dual Thrust strategy: fires when price pushes above the rolling
+        window's own recent local range (the same lookback the dip
+        signal already uses) by VOLATILITY_SCALP_BREAKOUT_K times that
+        range's own size - a fresh breakout to a new high with real
+        range behind it, not a single-tick blip. Uses the SAME rolling
+        window as the dip signal (not the separate synthetic-bar
+        bucketing the Heikin-Ashi/SAR signals use) since a breakout
+        needs to react to the very latest tick, not wait for a bucket to
+        complete. An ADDITIONAL alternative entry trigger, OR'd with the
+        dip signal - the mirror case of it (buy a fresh push to a new
+        high, instead of buying a pullback).
+        """
+        window = self.volatility_price_history.get(symbol)
+        if not window:
+            return False
+        samples = list(window)
+        if samples and Decimal(str(samples[-1])) == price:
+            samples = samples[:-1]
+        if not samples:
+            return False
+        recent = samples[-self.VOLATILITY_SCALP_LOCAL_HIGH_SAMPLES:]
+        range_high = Decimal(str(max(recent)))
+        range_low = Decimal(str(min(recent)))
+        session_range = range_high - range_low
+        if session_range <= 0 or price <= 0:
+            return False
+        upper_band = range_high + session_range * self.config.volatility_scalp_breakout_k
+        return price >= upper_band
+
+    @staticmethod
+    def _parabolic_sar(bars: list[dict], af_step: float, af_max: float):
+        """Standard Wilder Parabolic SAR over a synthetic bar series.
+        Returns (sar_level, trend_is_up) computed through the last bar,
+        or None if there isn't enough history. trend_is_up flips to
+        False the moment a bar's low breaks the trailing SAR level -
+        that flip IS the trailing-stop signal callers act on.
+        """
+        if len(bars) < 2:
+            return None
+        trend_up = bars[1]["close"] >= bars[0]["close"]
+        sar = bars[0]["low"] if trend_up else bars[0]["high"]
+        ep = bars[0]["high"] if trend_up else bars[0]["low"]
+        af = af_step
+        prev_bar = bars[0]
+        for bar in bars[1:]:
+            sar = sar + af * (ep - sar)
+            if trend_up:
+                # Clamped by the PRIOR bar only, never the current one -
+                # folding bar["low"] into this clamp would pin sar to
+                # exactly the current bar's own low, making "bar['low']
+                # < sar" structurally impossible to ever trigger.
+                sar = min(sar, prev_bar["low"])
+                if bar["low"] < sar:
+                    trend_up = False
+                    sar = ep
+                    ep = bar["low"]
+                    af = af_step
+                elif bar["high"] > ep:
+                    ep = bar["high"]
+                    af = min(af + af_step, af_max)
+            else:
+                sar = max(sar, prev_bar["high"])
+                if bar["high"] > sar:
+                    trend_up = True
+                    sar = ep
+                    ep = bar["high"]
+                    af = af_step
+                elif bar["low"] < ep:
+                    ep = bar["low"]
+                    af = min(af + af_step, af_max)
+            prev_bar = bar
+        return sar, trend_up
+
+    def parabolic_sar_exit_signal(self, symbol: str, price: Decimal) -> bool:
+        """True when Parabolic SAR has flipped bearish (or the live tick
+        has already pushed below the trailing SAR level even though the
+        last completed synthetic bar hasn't confirmed it yet) - an
+        ADDITIONAL exit trigger for a held volatility-scalp position,
+        alongside (not instead of) the existing quick profit target.
+        Either one can independently close the position, so a trend
+        reversal locks in gains even before price clears the fixed
+        percentage target.
+        """
+        bars = self._synthetic_bars(symbol)
+        if len(bars) < 2:
+            return False
+        result = self._parabolic_sar(
+            bars,
+            float(self.config.parabolic_sar_af_step),
+            float(self.config.parabolic_sar_af_max),
+        )
+        if result is None:
+            return False
+        sar, trend_up = result
+        return (not trend_up) or float(price) < sar
+
     def volatility_scalp_exit_override(
         self,
         decision: Decision,
@@ -278,6 +453,7 @@ class TradingStrategy:
         average_cost: Decimal,
         price: Decimal,
         averaging_available: bool = True,
+        symbol: str = "",
     ) -> Decision:
         """Called for any held position currently in the volatility-scalp
         cohort - not just ones opened via the dip-buy path (a position
@@ -305,6 +481,13 @@ class TradingStrategy:
         nothing else backing it up would just leave it bleeding
         indefinitely with no path back to even. Its normal stop-loss
         stays fully in effect instead.
+
+        A THIRD, independent way to reach PROFIT: a Parabolic SAR trend
+        reversal (see parabolic_sar_exit_signal), but ONLY once price
+        has at least cleared cost - this locks in a reversal early
+        rather than waiting for the full quick target, without ever
+        turning into a second, backdoor stop-loss (which the LOSS
+        suppression above deliberately disables for this cohort).
         """
         if quantity <= 0 or average_cost <= 0:
             return decision
@@ -319,6 +502,14 @@ class TradingStrategy:
         target = self.volatility_scalp_target_price(average_cost)
         if price >= target:
             return Decision("PROFIT", "volatility scalp quick target reached", target)
+        if (
+            symbol
+            and price >= average_cost
+            and self.parabolic_sar_exit_signal(symbol, price)
+        ):
+            return Decision(
+                "PROFIT", "parabolic SAR trend reversal exit", price
+            )
         return decision
 
     def volatility_scalp_average_down_signal(
