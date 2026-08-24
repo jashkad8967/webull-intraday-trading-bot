@@ -780,6 +780,26 @@ class AutoTrader:
         elapsed = time.monotonic() - self.last_trade.get(key, float("-inf"))
         return elapsed >= float(self.config.trade_cooldown_seconds)
 
+    def has_pending_buy_order(self, key: str) -> bool:
+        """True while an uncancelled BUY order for this key is still
+        resting in self.working_orders - independent of the account's
+        own (up to ACCOUNT_REFRESH_SECONDS-stale) position snapshot,
+        which still reads "flat" (quantity 0) the entire time a BUY
+        order hasn't filled yet. Live incident: without this, the
+        volatility-scalp fresh-entry gate's only guard against
+        double-buying (self.volatility_scalp_positions) was being wiped
+        every single cycle by the quantity == 0 cleanup while a resting
+        order was still live, stacking repeated duplicate BUY orders
+        for the same symbol (MTNB: 5 orders in ~70s, same price, no
+        fill or cancel in between) with no cooldown left to stop it.
+        """
+        return any(
+            order.get("key") == key
+            and order.get("action") == "BUY"
+            and order.get("cancel_requested_at") is None
+            for order in self.working_orders.values()
+        )
+
     def reentry_cooldown_ready(self, key: str) -> bool:
         elapsed = time.monotonic() - self.last_exit_at.get(key, float("-inf"))
         return elapsed >= float(self.config.stock_reentry_cooldown_seconds)
@@ -2922,7 +2942,30 @@ class AutoTrader:
                     # up in it. volatility_scalp_positions is updated
                     # synchronously, in-process, the instant an order is
                     # placed below - a race-free second guard.
+                    #
+                    # Live incident (this bug, caught from production
+                    # logs): with volatility_scalp_reentry_cooldown_
+                    # seconds zeroed and trade_cooldown_seconds already
+                    # 0, this in-process set was the ONLY thing standing
+                    # between one cycle and the next - and the quantity
+                    # == 0 cleanup block right above discards a symbol
+                    # from it EVERY cycle the account's cached position
+                    # snapshot still shows flat, which is true the
+                    # entire time a resting BUY order hasn't filled yet
+                    # (quantity genuinely IS 0 - no shares owned, just a
+                    # pending order). That reopened the exact race this
+                    # set exists to close: MTNB got 5 separate 100-share
+                    # BUY orders stacked within ~70s, all at the same
+                    # price, because the guard was wiped and re-armed
+                    # every single cycle while the first order just sat
+                    # resting. self.has_pending_buy_order(key) checks
+                    # self.working_orders directly instead - true for as
+                    # long as an uncancelled BUY order for this symbol
+                    # actually exists, regardless of what the (up to
+                    # ACCOUNT_REFRESH_SECONDS-stale) position snapshot
+                    # says - a real fix, not another cooldown.
                     and symbol not in self.volatility_scalp_positions
+                    and not self.has_pending_buy_order(key)
                     and symbol not in self.broker_conflict_symbols
                     and symbol not in self.entry_restricted_symbols
                     and len(self.volatility_scalp_positions)
@@ -2962,7 +3005,9 @@ class AutoTrader:
                         or self.strategy.heikin_ashi_bullish_reversal_signal(symbol)
                     )
                 ):
-                    scalp_quantity = self.strategy.volatility_scalp_share_count(price)
+                    scalp_quantity = self.strategy.volatility_scalp_share_count(
+                        price, buying_power=buying_power
+                    )
                     if scalp_quantity > 0 and price * Decimal(scalp_quantity) * Decimal(
                         "1.03"
                     ) > buying_power:
@@ -3020,6 +3065,14 @@ class AutoTrader:
                     # self.volatility_scalp_symbols cohort list, same as
                     # every other gate in this block.
                     and symbol in self.volatility_scalp_positions
+                    # Same fix as the fresh-entry gate above -
+                    # volatility_scalp_reentry_cooldown_seconds is
+                    # zeroed by request, so the elapsed-time check just
+                    # below is a no-op (0 >= 0 is always true one cycle
+                    # later); has_pending_buy_order is the real guard
+                    # against stacking a second averaging buy while the
+                    # first is still resting unfilled.
+                    and not self.has_pending_buy_order(key)
                     and symbol not in self.broker_conflict_symbols
                     and symbol not in self.entry_restricted_symbols
                     and self.volatility_scalp_average_down_count[symbol]
@@ -3050,7 +3103,7 @@ class AutoTrader:
                     )
                 ):
                     average_down_quantity = self.strategy.volatility_scalp_share_count(
-                        price
+                        price, buying_power=buying_power
                     )
                     if average_down_quantity > 0 and price * Decimal(
                         average_down_quantity

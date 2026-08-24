@@ -93,7 +93,9 @@ class StrategyConfigMixin:
             volatility_scalp_min_stdev_percent=Decimal("0.015"),
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
             volatility_scalp_target_percent=Decimal("0.005"),
-            volatility_scalp_max_price=Decimal("1.50"),
+            volatility_scalp_max_price=Decimal("5"),
+            volatility_scalp_target_notional=Decimal("400"),
+            volatility_scalp_target_notional_buying_power_fraction=Decimal("0.15"),
             volatility_scalp_breakout_k=Decimal("0.5"),
             heikin_ashi_bar_samples=3,
             heikin_ashi_bar_count=6,
@@ -711,24 +713,96 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         strategy.seed_volatility_window("NEW", [10.0, 0, -1, 10.2, 9.9])
         self.assertEqual(list(strategy.volatility_price_history["NEW"]), [10.0, 10.2, 9.9])
 
-    def test_share_count_is_100_under_a_dollar(self):
+    def test_share_count_targets_the_configured_notional_under_a_dollar(self):
+        """Rounds to the nearest 100 shares (Webull's own lot-restricted-
+        band minimum under $1) - by request, not flatly capped at 100
+        anymore, this genuinely scales with the target notional.
+        """
         strategy = TradingStrategy(self.config())
+        # 400 / 0.89 = 449.4... -> floor to 449 -> round down to the
+        # nearest 100 -> 400 shares, well over the old flat 100.
         self.assertEqual(
-            strategy.volatility_scalp_share_count(Decimal("0.89")), 100
+            strategy.volatility_scalp_share_count(Decimal("0.89")), 400
         )
 
-    def test_share_count_is_50_from_a_dollar_up_to_the_cap(self):
+    def test_share_count_targets_the_configured_notional_at_a_dollar_and_up(self):
+        """Rounds to the nearest 10 shares at $1+ - "in the tens, if not
+        the hundreds," scaling with both price and the target notional.
+        """
         strategy = TradingStrategy(self.config())
-        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("1.00")), 50)
-        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("1.50")), 50)
+        # 400 / 1.99 = 201.0... -> floor to 201 -> round down to 200.
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(Decimal("1.99")), 200
+        )
+        # 400 / 5.00 = 80.
+        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("5.00")), 80)
+
+    def test_share_count_under_a_dollar_always_reaches_the_exchange_minimum(self):
+        """Sub-$1 has no smaller valid order than 100 shares (Webull's
+        own lot-restricted-band rule) - even a tiny target still rounds
+        UP to it, since there's no smaller legal alternative. The
+        caller's own affordability/exposure checks are the real
+        backstop on this, not this function.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_target_notional = Decimal("5")
+        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("0.50")), 100)
+
+    def test_share_count_at_a_dollar_and_up_degrades_gracefully_below_one_lot(self):
+        """$1+ has no exchange-mandated minimum - a target too small for
+        a full 10-share lot still buys whatever whole-share quantity it
+        can actually afford, rather than forcing a 10-share lot or
+        skipping the trade entirely.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_target_notional = Decimal("5")
+        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("4.00")), 1)
 
     def test_share_count_is_zero_above_the_max_price_cap(self):
         strategy = TradingStrategy(self.config())
-        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("1.51")), 0)
+        self.assertEqual(strategy.volatility_scalp_share_count(Decimal("5.01")), 0)
 
     def test_share_count_is_zero_for_a_non_positive_price(self):
         strategy = TradingStrategy(self.config())
         self.assertEqual(strategy.volatility_scalp_share_count(Decimal("0")), 0)
+
+    def test_buying_power_fraction_shrinks_the_target_on_a_small_account(self):
+        """Live sanity check caught this: on a small account, a flat
+        dollar target alone gets silently zeroed by the caller's
+        affordability check on nearly every attempt. Passing buying_
+        power scales the actual target down automatically instead.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_target_notional = Decimal("400")
+        strategy.config.volatility_scalp_target_notional_buying_power_fraction = (
+            Decimal("0.15")
+        )
+        # buying_power=$107.80 -> target = min(400, 107.80*0.15=16.17).
+        # 16.17 / 3.00 = 5.39 -> floor 5, under 10 -> degrades to 5.
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(
+                Decimal("3.00"), buying_power=Decimal("107.80")
+            ),
+            5,
+        )
+
+    def test_buying_power_none_falls_back_to_the_flat_target(self):
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_target_notional = Decimal("400")
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(Decimal("5.00"), buying_power=None),
+            80,
+        )
+
+    def test_non_positive_buying_power_falls_back_to_the_flat_target(self):
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_target_notional = Decimal("400")
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(
+                Decimal("5.00"), buying_power=Decimal("0")
+            ),
+            80,
+        )
 
 
 class DualThrustBreakoutSignalTests(StrategyConfigMixin, unittest.TestCase):
@@ -978,6 +1052,77 @@ class VolatilityScalpReentryCooldownTests(unittest.TestCase):
         )
         ready = AutoTrader.volatility_scalp_reentry_ready.__get__(fake_bot)
         self.assertTrue(ready("STOCK:WILD"))
+
+
+class HasPendingBuyOrderTests(unittest.TestCase):
+    """Live incident: with volatility_scalp_reentry_cooldown_seconds
+    zeroed by request, self.volatility_scalp_positions was the ONLY
+    thing preventing a duplicate BUY - and it gets wiped every cycle
+    the account's position snapshot still reads flat, which is true the
+    entire time a resting BUY order hasn't filled yet. MTNB got 5
+    duplicate 100-share BUY orders stacked within ~70s in production
+    because of this. has_pending_buy_order checks self.working_orders
+    directly instead, independent of that stale snapshot.
+    """
+
+    @staticmethod
+    def _fake_bot(working_orders):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(working_orders=working_orders)
+        return AutoTrader.has_pending_buy_order.__get__(fake_bot)
+
+    def test_true_while_an_uncancelled_buy_order_is_resting(self):
+        has_pending = self._fake_bot(
+            {
+                "order-1": {
+                    "key": "STOCK:MTNB",
+                    "action": "BUY",
+                    "cancel_requested_at": None,
+                }
+            }
+        )
+        self.assertTrue(has_pending("STOCK:MTNB"))
+
+    def test_false_once_a_cancel_has_been_requested(self):
+        has_pending = self._fake_bot(
+            {
+                "order-1": {
+                    "key": "STOCK:MTNB",
+                    "action": "BUY",
+                    "cancel_requested_at": time.monotonic(),
+                }
+            }
+        )
+        self.assertFalse(has_pending("STOCK:MTNB"))
+
+    def test_false_for_a_different_symbol(self):
+        has_pending = self._fake_bot(
+            {
+                "order-1": {
+                    "key": "STOCK:OTHER",
+                    "action": "BUY",
+                    "cancel_requested_at": None,
+                }
+            }
+        )
+        self.assertFalse(has_pending("STOCK:MTNB"))
+
+    def test_false_for_a_non_buy_order_on_the_same_symbol(self):
+        has_pending = self._fake_bot(
+            {
+                "order-1": {
+                    "key": "STOCK:MTNB",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                }
+            }
+        )
+        self.assertFalse(has_pending("STOCK:MTNB"))
+
+    def test_false_with_no_working_orders_at_all(self):
+        has_pending = self._fake_bot({})
+        self.assertFalse(has_pending("STOCK:MTNB"))
 
 
 class VolatilityScalpPositionValueCapTests(unittest.TestCase):

@@ -395,12 +395,41 @@ class Settings(BaseSettings):
     # (VOLATILITY_SCALP_RESELECT_SECONDS) so a symbol that's slowed down
     # gets dropped and a newly-hot one takes its place.
     volatility_scalp_symbol_count: int = Field(default=4, ge=1, le=10)
-    # Capped at $1.50 specifically so every selected symbol sizes to a
-    # clean fixed share count (see TradingStrategy.
-    # volatility_scalp_share_count: 100 shares under $1, 50 shares
-    # $1-$1.50) instead of a dollar-budget-derived quantity.
+    # Raised from $1.50 -> $5 by request - "the stocks in the strategy
+    # can be below 5 [dollars]."
     volatility_scalp_max_price: Decimal = Field(
-        default=Decimal("1.50"), gt=0, le=Decimal("50")
+        default=Decimal("5"), gt=0, le=Decimal("50")
+    )
+    # Target dollar notional per volatility-scalp entry (see
+    # TradingStrategy.volatility_scalp_share_count) - by request, don't
+    # cap every penny stock at a flat 100 shares or every $1+ stock at a
+    # flat 20-50 shares; size UP toward this dollar budget instead,
+    # rounded to a clean lot (nearest 100 shares under $1, matching
+    # Webull's own lot-restricted-band minimum there; nearest 10 shares
+    # at $1+). This is a CEILING, not the actual per-trade target most
+    # of the time - see volatility_scalp_target_notional_buying_power_
+    # fraction just below, which usually binds first on a small
+    # account. volatility_scalp_max_position_fraction/
+    # volatility_scalp_max_total_exposure_fraction and the buying-power
+    # affordability check already applied at every call site still
+    # backstop this - raising the per-trade target doesn't remove
+    # either cap, it just means sizing can actually reach them instead
+    # of always landing far below.
+    volatility_scalp_target_notional: Decimal = Field(
+        default=Decimal("400"), gt=0, le=Decimal("100000")
+    )
+    # Live sanity check caught this: a flat dollar target alone doesn't
+    # scale with account size - on a small account (live example:
+    # $107.80 buying power), a $400 flat target gets silently zeroed by
+    # the affordability check on nearly every attempt (scalp_quantity
+    # forced to 0, not gracefully shrunk - see trade_stocks), meaning
+    # close to ZERO trades instead of "high frequency." The actual
+    # per-trade target is min(volatility_scalp_target_notional, buying_
+    # power * this fraction) - scales down automatically on a small
+    # account and up as the account grows, so this doesn't need
+    # re-tuning by hand as the account's size changes.
+    volatility_scalp_target_notional_buying_power_fraction: Decimal = Field(
+        default=Decimal("0.15"), gt=0, le=Decimal("1")
     )
     volatility_scalp_reselect_seconds: int = Field(
         default=1800, ge=60, le=86400

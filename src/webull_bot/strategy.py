@@ -528,20 +528,58 @@ class TradingStrategy:
         drop = (average_cost - price) / average_cost
         return drop >= self.config.volatility_scalp_dip_entry_percent
 
-    def volatility_scalp_share_count(self, price: Decimal) -> int:
-        """Fixed share-count sizing for the curated daily volatility
-        cohort (see AutoTrader.select_volatility_scalp_symbols), by
-        request: 100 shares for a symbol priced under $1 (exactly
-        Webull's own lot-restricted-band minimum there, so this is
-        always a valid order), 50 shares from $1 up to
-        VOLATILITY_SCALP_MAX_PRICE. 0 (skip) for anything priced at or
-        below zero or above the cap - the caller is expected to only
-        offer symbols already selected within that cap, this is just a
-        defensive floor/ceiling, not the actual selection filter.
+    def volatility_scalp_share_count(
+        self, price: Decimal, buying_power: Decimal | None = None
+    ) -> int:
+        """Dollar-notional-target sizing for the volatility-scalp
+        strategy, by request: don't cap every penny stock at a flat 100
+        shares or every $1+ stock at a flat small count - size UP toward
+        a target notional instead, rounded to a clean lot.
+
+        The target itself is min(VOLATILITY_SCALP_TARGET_NOTIONAL, a
+        fraction of the caller's own buying_power) when buying_power is
+        passed - a flat dollar target alone doesn't scale with account
+        size (live sanity check caught this: on a small account, a
+        large flat target gets silently zeroed by the caller's
+        affordability check on nearly every attempt, meaning close to
+        ZERO trades instead of "high frequency" - see trade_stocks).
+        buying_power=None (the caller doesn't have it handy) just uses
+        the flat target as-is.
+
+        Under $1, always rounds UP to at least 100 shares regardless of
+        how small the target computes to - Webull's own lot-restricted-
+        band minimum there (see minimum_lot_size) leaves no smaller
+        valid order to fall back to, so the caller's own affordability/
+        exposure checks are the real backstop on this floor, not this
+        function. At $1 and up (no exchange-mandated minimum), rounds
+        to the nearest 10 shares when the target affords at least one
+        full 10-share lot - "in the tens, if not the hundreds" - but
+        degrades to whatever whole-share quantity the target actually
+        affords (down to 1) rather than forcing a 10-share lot a small
+        target can't comfortably support, or skipping an otherwise fine
+        smaller trade purely over lot-rounding.
+
+        0 (skip) for anything priced at or below zero, above
+        VOLATILITY_SCALP_MAX_PRICE, or too small to afford even one
+        share of a $1+ stock.
         """
         if price <= 0 or price > self.config.volatility_scalp_max_price:
             return 0
-        return 100 if price < Decimal("1") else 50
+        target_notional = self.config.volatility_scalp_target_notional
+        if buying_power is not None and buying_power > 0:
+            target_notional = min(
+                target_notional,
+                buying_power
+                * self.config.volatility_scalp_target_notional_buying_power_fraction,
+            )
+        raw_quantity = int(
+            (target_notional / price).to_integral_value(rounding=ROUND_DOWN)
+        )
+        if price < Decimal("1"):
+            return max(100, (raw_quantity // 100) * 100)
+        if raw_quantity >= 10:
+            return (raw_quantity // 10) * 10
+        return max(0, raw_quantity)
 
     def volatility_scalp_target_price(self, average_cost: Decimal) -> Decimal:
         """Sell the rip: a small, fixed quick-profit target above cost -
