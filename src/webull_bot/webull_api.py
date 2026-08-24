@@ -18,6 +18,12 @@ class QuoteUnavailableError(RuntimeError):
 
 
 class WebullAPI:
+    # Webull's own hard cap on a single stock-snapshot request - callers
+    # batching symbols across multiple cycles (see AutoTrader.
+    # trade_stocks' final batch-size cap) need this exposed, not just
+    # enforced as a private magic number inside stock_quotes below.
+    STOCK_SNAPSHOT_MAX_SYMBOLS = 100
+
     def __init__(self, config: Settings):
         config.validate_connection(require_account=False)
         try:
@@ -170,8 +176,11 @@ class WebullAPI:
 
         if not symbols:
             return []
-        if len(symbols) > 100:
-            raise ValueError("Webull stock snapshots accept at most 100 symbols")
+        if len(symbols) > self.STOCK_SNAPSHOT_MAX_SYMBOLS:
+            raise ValueError(
+                f"Webull stock snapshots accept at most "
+                f"{self.STOCK_SNAPSHOT_MAX_SYMBOLS} symbols"
+            )
         if category not in (Category.US_STOCK.name, Category.US_ETF.name):
             raise ValueError(f"Unsupported stock snapshot category: {category}")
         try:

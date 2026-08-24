@@ -780,6 +780,29 @@ class AutoTrader:
         elapsed = time.monotonic() - self.last_trade.get(key, float("-inf"))
         return elapsed >= float(self.config.trade_cooldown_seconds)
 
+    @staticmethod
+    def cap_batch_to_snapshot_limit(
+        batch: list[str], unmanaged_held: list[str]
+    ) -> list[str]:
+        """Caps a scan batch at WebullAPI's own hard 100-symbol snapshot
+        limit, always keeping every currently-held position first (a
+        real position losing quote coverage - see the "fell out of the
+        scanned universe" GUARD warning just above this call site - is
+        the more severe failure mode) and only trimming the lower-
+        priority remainder. Without this, force-injecting the curated
+        cohort/eligible-symbol set on top of an already-full batch could
+        push the combined size past the limit, making the ENTIRE quote
+        fetch for that cycle raise and fail - losing price data for
+        every symbol in the batch, not just the extra ones.
+        """
+        if len(batch) <= WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS:
+            return batch
+        held_set = set(unmanaged_held)
+        prioritized = [symbol for symbol in batch if symbol in held_set]
+        rest = [symbol for symbol in batch if symbol not in held_set]
+        room = max(0, WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS - len(prioritized))
+        return prioritized + rest[:room]
+
     def has_pending_buy_order(self, key: str) -> bool:
         """True while an uncancelled BUY order for this key is still
         resting in self.working_orders - independent of the account's
@@ -2721,6 +2744,15 @@ class AutoTrader:
                 ",".join(sorted(unmanaged_held)),
             )
             batch = list(batch) + unmanaged_held
+        # Live incident: force-injecting the curated cohort AND every
+        # volatility-scalp-eligible symbol (self.volatility_scalp_
+        # symbols | self.volatility_scalp_recently_eligible, above) on
+        # top of an already-full stock_batch_size batch pushed the
+        # combined batch size past Webull's own hard 100-symbol snapshot
+        # limit (WebullAPI.stock_quotes) - the ENTIRE quote fetch for
+        # that cycle then raised and failed, losing price data for every
+        # symbol in the batch, not just the extra ones.
+        batch = self.cap_batch_to_snapshot_limit(batch, unmanaged_held)
         bucket_remaining = {
             bucket: buying_power * fraction
             for bucket, fraction in self.config.stock_capital_fractions().items()
