@@ -271,6 +271,69 @@ class TradingStrategy:
         drop = (recent_high - price) / recent_high
         return drop >= self.config.volatility_scalp_dip_entry_percent
 
+    def volatility_scalp_momentum_stalled_or_rising(
+        self, symbol: str, price: Decimal
+    ) -> bool:
+        """True once a dip has stopped making fresh lows - stalled
+        (flat), at the bottom, or already ticking back up - false while
+        price is still actively falling tick-to-tick (a "falling
+        knife"). By request: "we don't want to buy when there is
+        downward momentum... we want to buy when the dip is stalled or
+        at the bottom, or even when the momentum starts to go up." An
+        AND gate alongside every entry trigger (dip/breakout/HA-
+        reversal), not a replacement for any of them - a symbol can
+        clear the dip-percent threshold and still be actively falling
+        the very instant it does, which is exactly the case this exists
+        to block.
+
+        Compares only against the single immediately-preceding sample
+        (not a multi-sample average or the local high used above) -
+        this needs to react to the very latest tick's direction, not a
+        slower-moving trend read. Fails OPEN (True, doesn't block) with
+        no history yet, same "no data -> don't block" convention as
+        every other entry gate in this file.
+        """
+        window = self.volatility_price_history.get(symbol)
+        if not window:
+            return True
+        samples = list(window)
+        if samples and Decimal(str(samples[-1])) == price:
+            samples = samples[:-1]
+        if not samples:
+            return True
+        previous = Decimal(str(samples[-1]))
+        if previous <= 0:
+            return True
+        return price >= previous
+
+    def volatility_scalp_momentum_stalling(self, symbol: str, price: Decimal) -> bool:
+        """Mirror of volatility_scalp_momentum_stalled_or_rising for the
+        exit side: true once upward momentum has stopped making fresh
+        highs - flat or already ticking back down. By request: "if
+        there is a profit and it doesn't seem to be going much higher,
+        then sell it off... before the next dip." Combined with an
+        in-profit check by the caller (volatility_scalp_exit_override) -
+        this alone doesn't imply profitability, just that the price
+        isn't still climbing.
+
+        Fails CLOSED (False, doesn't force an exit) with no history -
+        the opposite convention from the entry-side stall check, since
+        an unknown momentum read should never itself trigger closing a
+        position, only a confirmed stall should.
+        """
+        window = self.volatility_price_history.get(symbol)
+        if not window:
+            return False
+        samples = list(window)
+        if samples and Decimal(str(samples[-1])) == price:
+            samples = samples[:-1]
+        if not samples:
+            return False
+        previous = Decimal(str(samples[-1]))
+        if previous <= 0:
+            return False
+        return price <= previous
+
     def _synthetic_bars(self, symbol: str) -> list[dict]:
         """Buckets the rolling tick-price window (volatility_price_history)
         into fixed-size synthetic OHLC bars, HEIKIN_ASHI_BAR_SAMPLES ticks
@@ -488,6 +551,18 @@ class TradingStrategy:
         rather than waiting for the full quick target, without ever
         turning into a second, backdoor stop-loss (which the LOSS
         suppression above deliberately disables for this cohort).
+
+        A FOURTH, even more eager way to reach PROFIT: by request, "if
+        there is a profit and it doesn't seem to be going much higher,
+        then sell it off... before the next dip." Any real profit
+        (price above cost at all, not the full quick target) combined
+        with volatility_scalp_momentum_stalling - upward momentum has
+        stopped making fresh highs - takes the exit immediately rather
+        than waiting for either the fixed quick target or a full SAR
+        trend reversal, both of which can be slower to trigger than a
+        single stalled tick. Checked last (after the bigger, slower
+        targets) so a position that's still climbing keeps riding
+        toward the larger target instead of being cashed out early.
         """
         if quantity <= 0 or average_cost <= 0:
             return decision
@@ -502,14 +577,20 @@ class TradingStrategy:
         target = self.volatility_scalp_target_price(average_cost)
         if price >= target:
             return Decision("PROFIT", "volatility scalp quick target reached", target)
-        if (
-            symbol
-            and price >= average_cost
-            and self.parabolic_sar_exit_signal(symbol, price)
-        ):
-            return Decision(
-                "PROFIT", "parabolic SAR trend reversal exit", price
-            )
+        if symbol and price >= average_cost:
+            if self.parabolic_sar_exit_signal(symbol, price):
+                return Decision(
+                    "PROFIT", "parabolic SAR trend reversal exit", price
+                )
+            if price > average_cost and self.volatility_scalp_momentum_stalling(
+                symbol, price
+            ):
+                return Decision(
+                    "PROFIT",
+                    "momentum stalling on a profitable position - selling "
+                    "ahead of the next dip",
+                    price,
+                )
         return decision
 
     def volatility_scalp_average_down_signal(
@@ -529,7 +610,10 @@ class TradingStrategy:
         return drop >= self.config.volatility_scalp_dip_entry_percent
 
     def volatility_scalp_share_count(
-        self, price: Decimal, buying_power: Decimal | None = None
+        self,
+        price: Decimal,
+        buying_power: Decimal | None = None,
+        intensity: Decimal = Decimal("1"),
     ) -> int:
         """Dollar-notional-target sizing for the volatility-scalp
         strategy, by request: don't cap every penny stock at a flat 100
@@ -546,18 +630,30 @@ class TradingStrategy:
         buying_power=None (the caller doesn't have it handy) just uses
         the flat target as-is.
 
+        intensity (0-1, default 1 = full size) further scales the
+        target down - by request, "lessen the intensity" of trading
+        outside core hours without stopping it: entry signals and
+        frequency are completely unaffected by this, only how much
+        notional is targeted per $1+ trade (see the sub-$1 note below
+        for why this can't shrink every trade). The caller passes a
+        smaller value outside core hours (see AutoTrader.trade_stocks'
+        volatility_scalp_extended_hours_intensity use) and 1 during
+        core hours.
+
         Under $1, always rounds UP to at least 100 shares regardless of
-        how small the target computes to - Webull's own lot-restricted-
-        band minimum there (see minimum_lot_size) leaves no smaller
-        valid order to fall back to, so the caller's own affordability/
-        exposure checks are the real backstop on this floor, not this
-        function. At $1 and up (no exchange-mandated minimum), rounds
-        to the nearest 10 shares when the target affords at least one
-        full 10-share lot - "in the tens, if not the hundreds" - but
-        degrades to whatever whole-share quantity the target actually
-        affords (down to 1) rather than forcing a 10-share lot a small
-        target can't comfortably support, or skipping an otherwise fine
-        smaller trade purely over lot-rounding.
+        how small the target (or intensity) computes to - Webull's own
+        lot-restricted-band minimum there (see minimum_lot_size) leaves
+        no smaller valid order to fall back to, so intensity dampening
+        has no effect on sub-$1 trade size specifically - the caller's
+        own affordability/exposure checks are the real backstop on this
+        floor, not this function. At $1 and up (no exchange-mandated
+        minimum), rounds to the nearest 10 shares when the target
+        affords at least one full 10-share lot - "in the tens, if not
+        the hundreds" - but degrades to whatever whole-share quantity
+        the target actually affords (down to 1) rather than forcing a
+        10-share lot a small target can't comfortably support, or
+        skipping an otherwise fine smaller trade purely over lot-
+        rounding.
 
         0 (skip) for anything priced at or below zero, above
         VOLATILITY_SCALP_MAX_PRICE, or too small to afford even one
@@ -572,6 +668,7 @@ class TradingStrategy:
                 buying_power
                 * self.config.volatility_scalp_target_notional_buying_power_fraction,
             )
+        target_notional *= max(Decimal("0"), min(Decimal("1"), intensity))
         raw_quantity = int(
             (target_notional / price).to_integral_value(rounding=ROUND_DOWN)
         )
