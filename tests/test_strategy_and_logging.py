@@ -1054,6 +1054,55 @@ class VolatilityScalpReentryCooldownTests(unittest.TestCase):
         self.assertTrue(ready("STOCK:WILD"))
 
 
+class CapBatchToSnapshotLimitTests(unittest.TestCase):
+    """Live incident: force-injecting the curated cohort AND every
+    volatility-scalp-eligible symbol on top of an already-full
+    stock_batch_size batch pushed the combined size past Webull's own
+    hard 100-symbol snapshot limit - the ENTIRE quote fetch for that
+    cycle raised and failed (logged live: "STOCKS | quote batch failed
+    | Webull stock snapshots accept at most 100 symbols"), losing price
+    data for every symbol in the batch, not just the extra ones.
+    cap_batch_to_snapshot_limit caps the final batch, always keeping
+    held positions first.
+    """
+
+    def test_under_the_limit_is_unchanged(self):
+        from webull_bot.bot import AutoTrader
+
+        batch = [f"S{i}" for i in range(50)]
+        result = AutoTrader.cap_batch_to_snapshot_limit(batch, [])
+        self.assertEqual(result, batch)
+
+    def test_over_the_limit_is_trimmed_to_exactly_the_cap(self):
+        from webull_bot.bot import AutoTrader
+
+        batch = [f"S{i}" for i in range(150)]
+        result = AutoTrader.cap_batch_to_snapshot_limit(batch, [])
+        self.assertEqual(len(result), 100)
+
+    def test_held_positions_are_never_trimmed_even_over_the_limit(self):
+        from webull_bot.bot import AutoTrader
+
+        held = [f"HELD{i}" for i in range(10)]
+        batch = held + [f"S{i}" for i in range(150)]
+        result = AutoTrader.cap_batch_to_snapshot_limit(batch, held)
+        self.assertEqual(len(result), 100)
+        for symbol in held:
+            self.assertIn(symbol, result)
+
+    def test_a_large_held_count_still_keeps_every_held_position(self):
+        """Even if held positions alone exceed the cap (not expected in
+        practice given max_open_positions, but not this function's job
+        to enforce), protecting real positions wins over trimming to
+        exactly the cap.
+        """
+        from webull_bot.bot import AutoTrader
+
+        held = [f"HELD{i}" for i in range(120)]
+        result = AutoTrader.cap_batch_to_snapshot_limit(held, held)
+        self.assertEqual(len(result), 120)
+
+
 class HasPendingBuyOrderTests(unittest.TestCase):
     """Live incident: with volatility_scalp_reentry_cooldown_seconds
     zeroed by request, self.volatility_scalp_positions was the ONLY
