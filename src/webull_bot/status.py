@@ -190,6 +190,22 @@ class StatusWriter:
         user_watchlist: list[str] | None = None,
         pending_orders: list[dict] | None = None,
     ) -> None:
+        pending_orders = pending_orders or []
+        # By request: "no pending order should go into the recent
+        # trades." record_trade writes to self.trades optimistically at
+        # ORDER SUBMISSION time (before it's actually filled) - see
+        # discard_trade's docstring, which already reverses this for a
+        # CONFIRMED-never-filled order, but a still-resting order (not
+        # yet filled, not yet cancelled either) previously showed up in
+        # both the pending-orders and recent-trades lists at once. This
+        # doesn't change how/when self.trades itself gets written
+        # (still optimistic, for the exact reasons discard_trade already
+        # documents), just filters the DISPLAYED recent-trades list
+        # against whatever's currently still pending.
+        pending_ids = {order.get("order_id") for order in pending_orders}
+        recent_trades = [
+            trade for trade in self.trades if trade.get("order_id") not in pending_ids
+        ]
         payload = {
             "updated_at": time.time(),
             "mode": mode,
@@ -205,8 +221,8 @@ class StatusWriter:
             "user_watchlist": user_watchlist or [],
             "agent": agent_summary,
             "universe": {"stocks": stock_count, "options": option_count},
-            "recent_trades": list(self.trades),
-            "pending_orders": pending_orders or [],
+            "recent_trades": recent_trades,
+            "pending_orders": pending_orders,
             "balance_history": list(self.balance_history),
             "pnl_today": self.pnl_today_payload(
                 realized_pnl_today, open_pnl_total, account_day_pnl_total

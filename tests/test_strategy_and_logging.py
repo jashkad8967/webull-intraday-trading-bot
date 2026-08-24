@@ -861,6 +861,31 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         )
 
 
+class VolatilityScalpEntrySpreadGateTests(StrategyConfigMixin, unittest.TestCase):
+    """volatility_scalp_entry_spread_ok - by request, "make sure the
+    algo plays around in the spread while ensuring a profit, or a
+    profitable entry." Entries had no spread-quality check at all until
+    now; reuses the exit side's own VOLATILITY_SCALP_MAX_EXIT_SPREAD_
+    PERCENT bound for symmetry.
+    """
+
+    def test_blocks_an_absurdly_wide_spread(self):
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_max_exit_spread_percent = Decimal("8")
+        strategy.metrics["WIDE"] = {"spread_percent": "15"}
+        self.assertFalse(strategy.volatility_scalp_entry_spread_ok("WIDE"))
+
+    def test_allows_a_spread_within_the_bound(self):
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_max_exit_spread_percent = Decimal("8")
+        strategy.metrics["OK"] = {"spread_percent": "5"}
+        self.assertTrue(strategy.volatility_scalp_entry_spread_ok("OK"))
+
+    def test_no_spread_data_yet_does_not_block(self):
+        strategy = TradingStrategy(self.config())
+        self.assertTrue(strategy.volatility_scalp_entry_spread_ok("NEVERSEEN"))
+
+
 class DualThrustBreakoutSignalTests(StrategyConfigMixin, unittest.TestCase):
     """dual_thrust_breakout_signal - an opening-range-breakout style
     entry trigger adapted from the classic Dual Thrust strategy, OR'd
@@ -2652,20 +2677,38 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
     """
 
     @staticmethod
-    def _fake_bot(eligible_symbols, working_orders, positions_cost_by_symbol):
+    def _fake_bot(
+        eligible_symbols,
+        working_orders,
+        positions_cost_by_symbol,
+        quote_by_symbol=None,
+    ):
+        """quote_by_symbol maps symbol -> (bid, ask) as strings; defaults
+        to a tight bid=10.00/ask=10.05 spread on cost=9.50 (comfortably
+        clears any floor) unless a test overrides it.
+        """
         from webull_bot.bot import AutoTrader
+        from webull_bot.webull_api import WebullAPI
 
         cancelled = []
         placed = []
+        quote_by_symbol = quote_by_symbol or {}
 
         class FakeApi:
             @staticmethod
             def stock_quote(symbol):
-                return {"symbol": symbol, "bid": "10.00", "ask": "10.05"}
+                bid, ask = quote_by_symbol.get(symbol, ("10.00", "10.05"))
+                return {"symbol": symbol, "bid": bid, "ask": ask}
+
+            @staticmethod
+            def quote_bid(q):
+                return Decimal(str(q["bid"])) if q.get("bid") is not None else None
 
             @staticmethod
             def quote_ask(q):
-                return Decimal(str(q["ask"]))
+                return Decimal(str(q["ask"])) if q.get("ask") is not None else None
+
+            price_tick_size = staticmethod(WebullAPI.price_tick_size)
 
             @staticmethod
             def stock_position(symbol, positions):
@@ -2684,7 +2727,12 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
                 return "order-new"
 
         fake_bot = SimpleNamespace(
-            config=SimpleNamespace(volatility_scalp_reprice_seconds=Decimal("1")),
+            config=SimpleNamespace(
+                volatility_scalp_reprice_seconds=Decimal("1"),
+                sell_fee_dollars=Decimal("0"),
+                volatility_scalp_target_percent=Decimal("0.005"),
+                volatility_scalp_max_exit_spread_percent=Decimal("8"),
+            ),
             api=FakeApi(),
             status=SimpleNamespace(rekey_trade=lambda old, new: None),
             last_volatility_reprice=0.0,
@@ -2696,9 +2744,10 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
             is_fractional_quantity=AutoTrader.is_fractional_quantity,
             working_orders=working_orders,
         )
+        fake_bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(fake_bot)
         return fake_bot, cancelled, placed
 
-    def test_reprices_toward_the_current_ask_for_an_eligible_symbol(self):
+    def test_reprices_toward_a_new_fillable_price_for_an_eligible_symbol(self):
         from webull_bot.bot import AutoTrader
 
         working_orders = {
@@ -2710,6 +2759,8 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
                 "limit_price": Decimal("9.90"),
             }
         }
+        # cost=9.50, bid=10.00 clears cost + 0.5% target (9.5475) - fills
+        # immediately at the (rounded-down-to-tick) bid.
         fake_bot, cancelled, placed = self._fake_bot(
             {"HOWL"}, working_orders, {"HOWL": Decimal("9.50")}
         )
@@ -2717,10 +2768,10 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
         with unittest.mock.patch("time.monotonic", return_value=100.0):
             reprice([])
         self.assertEqual(cancelled, ["order-1"])
-        self.assertEqual(placed, [("HOWL", "SELL", Decimal("1"), Decimal("10.05"))])
+        self.assertEqual(placed, [("HOWL", "SELL", Decimal("1"), Decimal("10.00"))])
         self.assertNotIn("order-1", fake_bot.working_orders)
         self.assertEqual(
-            fake_bot.working_orders["order-new"]["limit_price"], Decimal("10.05")
+            fake_bot.working_orders["order-new"]["limit_price"], Decimal("10.00")
         )
 
     def test_ignores_a_symbol_that_is_not_currently_eligible(self):
@@ -2747,7 +2798,14 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
         self.assertEqual(cancelled, [])
         self.assertEqual(placed, [])
 
-    def test_never_reprices_below_entry_cost(self):
+    def test_never_reprices_below_the_profit_floor(self):
+        """Live incident: the old check here was a blunt "ask < cost ->
+        skip entirely," which left a resting order frozen at a stale
+        price whenever the ask dipped below cost, even if the bid still
+        cleared a profitable fill. Now uses _stall_exit_price - still
+        NEVER returns a price below cost + min_profit + fee, but tries
+        the bid too, not just a raw ask comparison.
+        """
         from webull_bot.bot import AutoTrader
 
         working_orders = {
@@ -2759,15 +2817,52 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
                 "limit_price": Decimal("11.00"),
             }
         }
-        # Ask (10.05) is below cost (10.50) - never chase it down there.
+        # cost=10.50, bid=9.95/ask=10.05 - NEITHER clears cost + 0.5%
+        # target (10.5525), so no fillable profitable price exists at
+        # all right now. Must not reprice (or fill) at a loss.
         fake_bot, cancelled, placed = self._fake_bot(
-            {"HOWL"}, working_orders, {"HOWL": Decimal("10.50")}
+            {"HOWL"},
+            working_orders,
+            {"HOWL": Decimal("10.50")},
+            quote_by_symbol={"HOWL": ("9.95", "10.05")},
         )
         reprice = AutoTrader.reprice_volatility_scalp_exits.__get__(fake_bot)
         with unittest.mock.patch("time.monotonic", return_value=100.0):
             reprice([])
         self.assertEqual(cancelled, [])
         self.assertEqual(placed, [])
+
+    def test_reprices_down_toward_a_still_profitable_bid_below_the_stale_ask(self):
+        """The specific bug this fix targets: the ask alone sitting
+        below cost used to freeze repricing entirely. Now, if the BID
+        still clears the floor, it reprices down to (and fills at) that
+        lower-but-still-profitable price instead of staying stuck.
+        """
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:HOWL",
+                "action": "PROFIT",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("11.00"),
+            }
+        }
+        # cost=10.00, bid=10.10 clears cost + 0.5% target (10.05) even
+        # though this is a lower price than the stale 11.00 resting
+        # limit - reprices down to it rather than freezing.
+        fake_bot, cancelled, placed = self._fake_bot(
+            {"HOWL"},
+            working_orders,
+            {"HOWL": Decimal("10.00")},
+            quote_by_symbol={"HOWL": ("10.10", "10.12")},
+        )
+        reprice = AutoTrader.reprice_volatility_scalp_exits.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice([])
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertEqual(placed, [("HOWL", "SELL", Decimal("1"), Decimal("10.10"))])
 
     def test_respects_its_own_faster_throttle(self):
         from webull_bot.bot import AutoTrader
@@ -5618,6 +5713,49 @@ class StatusWriterTests(unittest.TestCase):
         finally:
             shutil.rmtree(status_path.parent, ignore_errors=True)
 
+    def test_write_excludes_still_pending_orders_from_recent_trades(self):
+        """By request: "no pending order should go into the recent
+        trades." record_trade writes to self.trades optimistically at
+        order-submission time (before it's actually filled) - write()
+        now filters the DISPLAYED recent-trades list against whatever's
+        passed as still-pending, so a resting (not yet filled, not yet
+        cancelled) order shows in pending_orders but not recent_trades
+        at the same time.
+        """
+        status_path = Path("tests/.generated_status/status_pending_filter.json")
+        shutil.rmtree(status_path.parent, ignore_errors=True)
+        try:
+            writer = StatusWriter(str(status_path))
+            writer.record_trade("STOCK", "TSLA", "BUY", Decimal("100.00"), "order-1")
+            writer.record_trade("STOCK", "AAPL", "PROFIT", Decimal("50.00"), "order-2")
+            writer.write(
+                mode="LIVE",
+                buying_power=Decimal("1000"),
+                positions=[],
+                watchlist=[],
+                agent_summary=None,
+                paused=False,
+                stock_count=10,
+                option_count=0,
+                pending_orders=[
+                    {
+                        "order_id": "order-1",
+                        "instrument_type": "STOCK",
+                        "symbol": "TSLA",
+                        "action": "BUY",
+                        "limit_price": "100.00",
+                        "age_seconds": 3,
+                        "cancel_requested": False,
+                    }
+                ],
+            )
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            symbols = [trade["symbol"] for trade in payload["recent_trades"]]
+            self.assertNotIn("TSLA", symbols)
+            self.assertIn("AAPL", symbols)
+        finally:
+            shutil.rmtree(status_path.parent, ignore_errors=True)
+
     def test_discard_trade_removes_only_the_matching_order(self):
         """Regression test for a live incident: a cancelled order's
         optimistically-recorded trade-log entry stayed on the dashboard's
@@ -7792,6 +7930,7 @@ class StallExitPriceSpreadSanityTests(unittest.TestCase):
             api=SimpleNamespace(
                 quote_bid=lambda q: Decimal(str(q["bid"])) if q.get("bid") else None,
                 quote_ask=lambda q: Decimal(str(q["ask"])) if q.get("ask") else None,
+                quote_price=WebullAPI.quote_price,
                 price_tick_size=WebullAPI.price_tick_size,
             ),
         )
@@ -7851,6 +7990,60 @@ class StallExitPriceSpreadSanityTests(unittest.TestCase):
             max_spread_percent=Decimal("8"),
         )
         self.assertEqual(result, Decimal("19.89"))
+
+    def test_caps_the_ask_fallback_near_the_last_trade_not_the_top_of_spread(self):
+        """By request: "you cannot always go to the top of the spread
+        when it is big, you must ask a reasonable price, not too far
+        from the last [trade]." The spread here (2.58%) passes the
+        wider explicit bound, and the raw ask alone would clear the
+        floor - but real prints are at 19.41, far below the 19.89 ask,
+        so resting there wouldn't reflect where the stock is actually
+        trading. Caps at last_price * (1 + max_spread_percent/200).
+        """
+        price_fn = self._price_fn()
+        # average_cost=19.42 keeps this consistent with the sibling
+        # tests above: bid (19.39) alone does NOT clear the floor
+        # (19.45), so this actually reaches the ask-fallback/cap logic
+        # rather than returning the bid immediately.
+        quote = {"bid": "19.39", "ask": "19.89", "price": "19.41"}
+        result = price_fn(
+            quote,
+            average_cost=Decimal("19.42"),
+            min_profit=Decimal("0.01"),
+            fee_per_share=Decimal("0.02"),
+            max_spread_percent=Decimal("8"),
+        )
+        # cap = 19.41 * 1.04 = 20.1864 -> quantized down to 20.18, still
+        # above the raw ask (19.89) here, so this specific cap doesn't
+        # bind - confirms the cap tracks the last price, not a fixed
+        # ceiling, and doesn't wrongly reject a reachable ask.
+        self.assertEqual(result, Decimal("19.89"))
+
+    def test_cap_can_push_the_price_below_the_floor_and_skip_the_cycle(self):
+        """When the ask sits far above the last print (a truly stale/
+        unrealistic quote) even within the allowed spread, the capped
+        price can end up below the profit floor - correctly skips
+        rather than resting at an unrealistic price.
+        """
+        price_fn = self._price_fn()
+        # ask=19.89 alone would clear a floor of ~19.33, but the last
+        # print is only 19.00 - cap = 19.00 * 1.04 = 19.76, still above
+        # floor here, so use a tighter floor scenario instead: push
+        # average_cost up so only the raw ask (not the capped price)
+        # would clear it.
+        quote = {"bid": "19.39", "ask": "19.89", "price": "19.00"}
+        result = price_fn(
+            quote,
+            average_cost=Decimal("19.80"),
+            min_profit=Decimal("0.01"),
+            fee_per_share=Decimal("0.02"),
+            max_spread_percent=Decimal("8"),
+        )
+        # floor = 19.80 + 0.01 + 0.02 = 19.83. Raw ask (19.89) alone
+        # would clear it, but the cap (19.00 * 1.04 = 19.76) does not -
+        # must skip, not rest at an unrealistic price just because the
+        # raw ask alone would have looked profitable.
+        self.assertIsNone(result)
 
 
 class StallBreakerWideSpreadResubmitTests(unittest.TestCase):
