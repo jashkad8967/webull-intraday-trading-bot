@@ -3569,12 +3569,30 @@ class AutoTrader:
                     target = decision.target_price
                     if target is None:
                         continue
-                    force_market = self.should_force_market_exit(
-                        symbol, exit_is_fractional, core_session_active
-                    )
-                    if force_market:
-                        limit_price = None
-                    elif is_short_position:
+                    # Live incident (this bug, caught from a real trade
+                    # log): "PROFIT LEDS entry=2.00 exit=None pnl=-0.01"
+                    # - a PROFIT-type decision that closed at a real
+                    # loss with NO limit price at all, because
+                    # should_force_market_exit had tripped after too
+                    # many consecutive unfilled attempts and forced an
+                    # actual, completely unprotected MARKET order. This
+                    # is the same class of bug already fixed for the
+                    # escalation (stop_loss_escalated) pathway just
+                    # below - correct for a genuine stop-loss (guarantee
+                    # execution even at a worse price bounds the loss),
+                    # backwards for a profit-take (forces a fill "at any
+                    # price," converting an intended profit into a
+                    # guaranteed loss). PROFIT exits never force-market -
+                    # a symbol that genuinely can't get a profitable
+                    # fill just keeps waiting (the elif/else branches
+                    # below already skip via `continue` when nothing
+                    # fillable-and-profitable exists), same as this
+                    # cohort's own "average down instead of forcing a
+                    # bad exit" philosophy. should_force_market_exit
+                    # stays fully in effect for the separate STOP-loss
+                    # exit path elsewhere, where it's correct.
+                    force_market = False
+                    if is_short_position:
                         bid = self.api.quote_bid(quote)
                         # Mirror of the long case below: never cover above
                         # the target that triggered this, but also don't
