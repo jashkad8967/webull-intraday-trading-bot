@@ -2636,6 +2636,28 @@ class AutoTrader:
         core_session_active: bool = False,
     ) -> Decimal:
         open_count = self.strategy.open_position_count(positions)
+        # By request: "lessen the intensity" of volatility-scalp trading
+        # outside core hours without stopping it - a single 0-1 dial
+        # scaling both per-trade sizing (volatility_scalp_share_count)
+        # and how many concurrent positions/averaging adds are allowed
+        # at once, applied only to fresh entries and averaging-down
+        # buys. 1 (full intensity) during core hours, unaffected.
+        volatility_scalp_intensity = (
+            Decimal("1")
+            if core_session_active
+            else self.config.volatility_scalp_extended_hours_intensity
+        )
+        volatility_scalp_effective_max_concurrent = max(
+            1,
+            int(
+                self.config.volatility_scalp_max_concurrent_positions
+                * volatility_scalp_intensity
+            ),
+        )
+        volatility_scalp_effective_max_averaging = int(
+            self.config.volatility_scalp_max_averaging_buys
+            * volatility_scalp_intensity
+        )
         # freqtrade-style StoplossGuard: too many recent stop-losses pauses
         # NEW entries only (unlike handle_portfolio_circuit_breaker, this
         # never liquidates existing positions) - see stop_loss_guard_active.
@@ -3001,7 +3023,7 @@ class AutoTrader:
                     and symbol not in self.broker_conflict_symbols
                     and symbol not in self.entry_restricted_symbols
                     and len(self.volatility_scalp_positions)
-                    < self.config.volatility_scalp_max_concurrent_positions
+                    < volatility_scalp_effective_max_concurrent
                     and open_count < self.config.max_open_positions
                     # By explicit request: keep buying this cohort's
                     # dips continuously, multiple times a minute, EVEN
@@ -3036,9 +3058,22 @@ class AutoTrader:
                         or self.strategy.dual_thrust_breakout_signal(symbol, price)
                         or self.strategy.heikin_ashi_bullish_reversal_signal(symbol)
                     )
+                    # By request: "we don't want to buy when there is
+                    # downward momentum... buy when the dip is stalled
+                    # or at the bottom, or even when the momentum
+                    # starts to go up." An AND gate on top of all three
+                    # triggers above, not a fourth alternative - clearing
+                    # the dip-percent/breakout/HA-reversal bar doesn't
+                    # matter if price is still actively falling the
+                    # instant it does.
+                    and self.strategy.volatility_scalp_momentum_stalled_or_rising(
+                        symbol, price
+                    )
                 ):
                     scalp_quantity = self.strategy.volatility_scalp_share_count(
-                        price, buying_power=buying_power
+                        price,
+                        buying_power=buying_power,
+                        intensity=volatility_scalp_intensity,
                     )
                     if scalp_quantity > 0 and price * Decimal(scalp_quantity) * Decimal(
                         "1.03"
@@ -3108,7 +3143,7 @@ class AutoTrader:
                     and symbol not in self.broker_conflict_symbols
                     and symbol not in self.entry_restricted_symbols
                     and self.volatility_scalp_average_down_count[symbol]
-                    < self.config.volatility_scalp_max_averaging_buys
+                    < volatility_scalp_effective_max_averaging
                     # Sanity-check fix: the fresh-entry gate above
                     # deliberately still checks regime_gate_active (a
                     # market-wide VIXY-spike gate is kept even though
@@ -3133,9 +3168,18 @@ class AutoTrader:
                     and self.strategy.volatility_scalp_average_down_signal(
                         price, cost
                     )
+                    # Same "don't buy while still actively falling" gate
+                    # as the fresh-entry block above - averaging down is
+                    # still a fresh buy, just against an existing
+                    # position.
+                    and self.strategy.volatility_scalp_momentum_stalled_or_rising(
+                        symbol, price
+                    )
                 ):
                     average_down_quantity = self.strategy.volatility_scalp_share_count(
-                        price, buying_power=buying_power
+                        price,
+                        buying_power=buying_power,
+                        intensity=volatility_scalp_intensity,
                     )
                     if average_down_quantity > 0 and price * Decimal(
                         average_down_quantity
@@ -3496,18 +3540,38 @@ class AutoTrader:
                                 self.config.sell_fee_dollars / exit_quantity
                             )
                         min_profit = cost * self.config.volatility_scalp_target_percent
-                        limit_price = (
-                            self.api.stock_limit_price(quote, "SELL")
-                            if symbol in self.stop_loss_escalated
-                            else self._stall_exit_price(
-                                quote,
-                                cost,
-                                min_profit,
-                                fee_per_share,
-                                max_spread_percent=(
-                                    self.config.volatility_scalp_max_exit_spread_percent
-                                ),
-                            )
+                        # Live incident (this bug, caught from a real
+                        # trade log): "PROFIT"-labeled orders were
+                        # closing at a REAL LOSS (LSTA: bought $1.59,
+                        # sold $1.50; GOAI: bought $2.52, sold $2.42
+                        # twice) - the escalation path used to switch to
+                        # self.api.stock_limit_price(quote, "SELL"), a
+                        # raw aggressive-cross price with NO floor at
+                        # cost at all, once a symbol sat in self.
+                        # stop_loss_escalated (15s unfilled). That
+                        # tradeoff is correct for a genuine stop-loss
+                        # (guarantee execution even at a worse price
+                        # bounds the loss), but backwards for a
+                        # PROFIT-take order - forcing a fill "at any
+                        # price" converts an intended profit into a
+                        # guaranteed loss, defeating the entire purpose
+                        # of the order. ALWAYS use _stall_exit_price now,
+                        # escalated or not - it already tries harder to
+                        # find a fillable price (bid first, wider-
+                        # tolerance ask fallback) without ever dropping
+                        # below cost + min_profit + fee; if truly nothing
+                        # fillable-and-profitable exists, the position
+                        # just keeps waiting (continue below), which is
+                        # exactly this cohort's own "average down
+                        # instead of forcing a bad exit" philosophy.
+                        limit_price = self._stall_exit_price(
+                            quote,
+                            cost,
+                            min_profit,
+                            fee_per_share,
+                            max_spread_percent=(
+                                self.config.volatility_scalp_max_exit_spread_percent
+                            ),
                         )
                         if limit_price is None:
                             self.gate_rejections[
@@ -3525,11 +3589,25 @@ class AutoTrader:
                         # actually price below the target that triggered
                         # it, or it can silently execute at a real loss
                         # while still being logged as PROFIT.
-                        limit_price = (
-                            self.api.stock_limit_price(quote, "SELL")
-                            if symbol in self.stop_loss_escalated
-                            else (max(ask, target) if ask else target)
-                        )
+                        #
+                        # Same live incident/fix as the volatility-scalp
+                        # branch above (LSTA/GOAI closed at a real loss
+                        # while logged PROFIT): this comment already
+                        # described the intended behavior correctly, but
+                        # the code contradicted it - once escalated
+                        # (self.stop_loss_escalated, 15s unfilled), it
+                        # switched to a raw aggressive-cross price with
+                        # NO floor at target/cost at all. Escalation
+                        # should mean "try harder to fill," not "give up
+                        # on price entirely" for an order whose whole
+                        # purpose is realizing a profit. max(ask, target)
+                        # unconditionally now - if the market genuinely
+                        # can't offer a fillable price at or above
+                        # target, the resting order (or the normal
+                        # reprice_resting_exits cadence, which has its
+                        # own "never chase below cost" guard) keeps
+                        # waiting instead of forcing a loss.
+                        limit_price = max(ask, target) if ask else target
                     if force_market:
                         log.warning(
                             "ORDER  | %s | never filled %s times in a row - "

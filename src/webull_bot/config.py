@@ -285,6 +285,19 @@ class Settings(BaseSettings):
     # effect, since a "very volatile" stock is exactly where that
     # protection matters most.
     volatility_scalp_enabled: bool = True
+    # By request: "these stocks will not be as volatile in extended
+    # hours [pre-market/after-hours], we can chill on them in that time
+    # period for a bit" - clarified to mean lessen the intensity, not
+    # stop trading. Scales DOWN the per-trade notional target (see
+    # TradingStrategy.volatility_scalp_share_count) outside core hours
+    # by this fraction - entry signals, frequency, and eligibility are
+    # completely unaffected, only how much is risked per trade. 1.0
+    # would mean no dampening at all; exits/repricing/position
+    # management for anything already held are never touched by this,
+    # only fresh entry and averaging-down sizing.
+    volatility_scalp_extended_hours_intensity: Decimal = Field(
+        default=Decimal("0.4"), gt=0, le=1
+    )
     volatility_scalp_lookback_samples: int = Field(default=20, ge=5, le=200)
     # Lowered from 1.5% -> 0.8% by request - "if the bar for entry is
     # too restrictive, lower the bar." This is the hard AND gate every

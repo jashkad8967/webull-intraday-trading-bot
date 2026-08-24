@@ -804,6 +804,62 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
             80,
         )
 
+    def test_intensity_scales_down_a_dollar_and_up_trade_size(self):
+        """By request: "lessen the intensity" outside core hours without
+        stopping trading - intensity dampens the target notional for
+        $1+ trades, where it's the only lever that actually changes
+        anything (see the sub-$1 test just below for why).
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_target_notional = Decimal("400")
+        # Full intensity: 400 / 5.00 = 80.
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(
+                Decimal("5.00"), intensity=Decimal("1")
+            ),
+            80,
+        )
+        # 40% intensity: 160 / 5.00 = 32.
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(
+                Decimal("5.00"), intensity=Decimal("0.4")
+            ),
+            30,
+        )
+
+    def test_intensity_has_no_effect_on_the_sub_dollar_exchange_floor(self):
+        """Sub-$1 orders always round UP to at least 100 shares - Webull's
+        own lot-restricted-band minimum leaves no smaller valid order,
+        so dampening the soft target can't shrink this specific trade
+        size regardless of intensity.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_target_notional = Decimal("400")
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(
+                Decimal("0.50"), intensity=Decimal("0.1")
+            ),
+            100,
+        )
+
+    def test_intensity_clamped_to_the_zero_to_one_range(self):
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_target_notional = Decimal("400")
+        # Negative or >1 intensity should behave like the nearest valid
+        # bound (0 or 1), not silently invert or amplify sizing.
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(
+                Decimal("5.00"), intensity=Decimal("-1")
+            ),
+            0,
+        )
+        self.assertEqual(
+            strategy.volatility_scalp_share_count(
+                Decimal("5.00"), intensity=Decimal("2")
+            ),
+            80,
+        )
+
 
 class DualThrustBreakoutSignalTests(StrategyConfigMixin, unittest.TestCase):
     """dual_thrust_breakout_signal - an opening-range-breakout style
@@ -940,6 +996,160 @@ class ParabolicSarExitSignalTests(StrategyConfigMixin, unittest.TestCase):
         self.assertFalse(
             strategy.parabolic_sar_exit_signal("TREND", Decimal(str(base + 0.10)))
         )
+
+
+class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
+    """volatility_scalp_momentum_stalled_or_rising (entry side) and
+    volatility_scalp_momentum_stalling (exit side) - by request: "we
+    don't want to buy when there is downward momentum... buy when the
+    dip is stalled or at the bottom, or even when the momentum starts
+    to go up" and "if there is a profit and it doesn't seem to be going
+    much higher, then sell it off... before the next dip." Both compare
+    only against the single immediately-preceding tick, not a slower
+    multi-sample trend.
+    """
+
+    def _feed(self, strategy, symbol, prices):
+        for price in prices:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+
+    def test_entry_gate_blocks_while_still_falling(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "FALL", [10, 9.9, 9.8, 9.7])
+        self.assertFalse(
+            strategy.volatility_scalp_momentum_stalled_or_rising(
+                "FALL", Decimal("9.6")
+            )
+        )
+
+    def test_entry_gate_allows_once_stalled_flat(self):
+        strategy = TradingStrategy(self.config())
+        # Two consecutive equal ticks (9.7, 9.7) - the dip has stopped
+        # making fresh lows.
+        self._feed(strategy, "STALL", [10, 9.9, 9.8, 9.7, 9.7])
+        self.assertTrue(
+            strategy.volatility_scalp_momentum_stalled_or_rising(
+                "STALL", Decimal("9.7")
+            )
+        )
+
+    def test_entry_gate_allows_once_momentum_turns_up(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "TURN", [10, 9.9, 9.8, 9.7])
+        self.assertTrue(
+            strategy.volatility_scalp_momentum_stalled_or_rising(
+                "TURN", Decimal("9.75")
+            )
+        )
+
+    def test_entry_gate_fails_open_with_no_history(self):
+        strategy = TradingStrategy(self.config())
+        self.assertTrue(
+            strategy.volatility_scalp_momentum_stalled_or_rising(
+                "NEVERSEEN", Decimal("10")
+            )
+        )
+
+    def test_exit_gate_fires_once_upward_momentum_stalls(self):
+        strategy = TradingStrategy(self.config())
+        # Two consecutive equal ticks (10.3, 10.3) - upward momentum has
+        # stopped making fresh highs.
+        self._feed(strategy, "RISE", [10, 10.1, 10.2, 10.3, 10.3])
+        self.assertTrue(
+            strategy.volatility_scalp_momentum_stalling("RISE", Decimal("10.3"))
+        )
+
+    def test_exit_gate_does_not_fire_while_still_climbing(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "RISE", [10, 10.1, 10.2, 10.3])
+        self.assertFalse(
+            strategy.volatility_scalp_momentum_stalling("RISE", Decimal("10.4"))
+        )
+
+    def test_exit_gate_fails_closed_with_no_history(self):
+        strategy = TradingStrategy(self.config())
+        self.assertFalse(
+            strategy.volatility_scalp_momentum_stalling(
+                "NEVERSEEN", Decimal("10")
+            )
+        )
+
+
+class VolatilityScalpExitOverrideMomentumStallTests(
+    StrategyConfigMixin, unittest.TestCase
+):
+    """volatility_scalp_exit_override's fourth exit path: any real
+    profit combined with stalling upward momentum sells immediately,
+    ahead of the fixed quick target or a full SAR reversal - "sell it
+    off before the next dip."
+    """
+
+    def _feed(self, strategy, symbol, prices):
+        for price in prices:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+
+    def test_fires_on_a_small_profit_once_momentum_stalls(self):
+        strategy = TradingStrategy(self.config())
+        # cost=10.29 keeps this well under the 0.5% quick target
+        # (10.29 * 1.005 = 10.34...) so the quick-target path doesn't
+        # preempt this one - a real but small profit at price=10.30,
+        # with a repeated final tick (10.30, 10.30) showing momentum
+        # has stalled.
+        self._feed(strategy, "RISE", [10.1, 10.2, 10.29, 10.30, 10.30])
+        from webull_bot.strategy import Decision
+
+        result = strategy.volatility_scalp_exit_override(
+            Decision("HOLD", "between target and stop", Decimal("10.30")),
+            quantity=100,
+            average_cost=Decimal("10.29"),
+            price=Decimal("10.30"),
+            averaging_available=True,
+            symbol="RISE",
+        )
+        self.assertEqual(result.action, "PROFIT")
+        self.assertIn("momentum stalling", result.reason)
+
+    def test_never_fires_at_exactly_cost_no_real_profit(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "RISE", [10.1, 10.2, 10.3, 10.3])
+        from webull_bot.strategy import Decision
+
+        held = Decision("HOLD", "between target and stop", Decimal("10.3"))
+        result = strategy.volatility_scalp_exit_override(
+            held,
+            quantity=100,
+            average_cost=Decimal("10.30"),
+            price=Decimal("10.3"),
+            averaging_available=True,
+            symbol="RISE",
+        )
+        self.assertIs(result, held)
+
+    def test_does_not_fire_while_still_climbing(self):
+        strategy = TradingStrategy(self.config())
+        # cost=10.38 keeps this under the 0.5% quick target
+        # (10.38 * 1.005 = 10.4319) and price=10.40 is still a fresh
+        # high above the prior tick (10.35) - genuinely still climbing,
+        # not stalled.
+        self._feed(strategy, "RISE", [10.1, 10.2, 10.3, 10.35])
+        from webull_bot.strategy import Decision
+
+        held = Decision("HOLD", "between target and stop", Decimal("10.40"))
+        result = strategy.volatility_scalp_exit_override(
+            held,
+            quantity=100,
+            average_cost=Decimal("10.38"),
+            price=Decimal("10.40"),
+            averaging_available=True,
+            symbol="RISE",
+        )
+        self.assertIs(result, held)
 
 
 class VolatilityScalpExitOverrideSarTests(StrategyConfigMixin, unittest.TestCase):
