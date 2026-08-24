@@ -274,24 +274,31 @@ class TradingStrategy:
     def volatility_scalp_momentum_stalled_or_rising(
         self, symbol: str, price: Decimal
     ) -> bool:
-        """True once a dip has stopped making fresh lows - stalled
-        (flat), at the bottom, or already ticking back up - false while
-        price is still actively falling tick-to-tick (a "falling
-        knife"). By request: "we don't want to buy when there is
-        downward momentum... we want to buy when the dip is stalled or
-        at the bottom, or even when the momentum starts to go up." An
-        AND gate alongside every entry trigger (dip/breakout/HA-
-        reversal), not a replacement for any of them - a symbol can
-        clear the dip-percent threshold and still be actively falling
-        the very instant it does, which is exactly the case this exists
-        to block.
+        """True once a dip has stopped making fresh lows for TWO
+        consecutive ticks, not just one - stalled (flat), at the
+        bottom, or already ticking back up - false while price is
+        still actively falling tick-to-tick (a "falling knife"). By
+        request: "we don't want to buy when there is downward
+        momentum... we want to buy when the dip is stalled or at the
+        bottom, or even when the momentum starts to go up." An AND gate
+        alongside every entry trigger (dip/breakout/HA-reversal), not a
+        replacement for any of them - a symbol can clear the dip-
+        percent threshold and still be actively falling the very
+        instant it does, which is exactly the case this exists to
+        block.
 
-        Compares only against the single immediately-preceding sample
-        (not a multi-sample average or the local high used above) -
-        this needs to react to the very latest tick's direction, not a
-        slower-moving trend read. Fails OPEN (True, doesn't block) with
-        no history yet, same "no data -> don't block" convention as
-        every other entry gate in this file.
+        Recalibrated by a later request - "why is it selecting stocks
+        at such wrong times" - a single non-falling tick is weak,
+        noise-level confirmation (this cohort's whole selection
+        criterion is being choppy - one flat/up tick can just be a
+        bid/ask bounce, not a real stall). Requiring the current tick
+        AND the one before it to both hold above the low two ticks back
+        mirrors the same, symmetric strengthening already applied to
+        the exit-side stall check (volatility_scalp_momentum_stalling).
+
+        Fails OPEN (True, doesn't block) with no history yet, same "no
+        data -> don't block" convention as every other entry gate in
+        this file.
         """
         window = self.volatility_price_history.get(symbol)
         if not window:
@@ -299,12 +306,13 @@ class TradingStrategy:
         samples = list(window)
         if samples and Decimal(str(samples[-1])) == price:
             samples = samples[:-1]
-        if not samples:
+        if len(samples) < 2:
             return True
         previous = Decimal(str(samples[-1]))
-        if previous <= 0:
+        before_that = Decimal(str(samples[-2]))
+        if previous <= 0 or before_that <= 0:
             return True
-        return price >= previous
+        return price >= previous >= before_that
 
     def volatility_scalp_momentum_stalling(self, symbol: str, price: Decimal) -> bool:
         """Mirror of volatility_scalp_momentum_stalled_or_rising for the

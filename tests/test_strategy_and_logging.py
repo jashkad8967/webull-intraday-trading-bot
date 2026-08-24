@@ -1093,9 +1093,10 @@ class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
 
     def test_entry_gate_allows_once_stalled_flat(self):
         strategy = TradingStrategy(self.config())
-        # Two consecutive equal ticks (9.7, 9.7) - the dip has stopped
-        # making fresh lows.
-        self._feed(strategy, "STALL", [10, 9.9, 9.8, 9.7, 9.7])
+        # THREE consecutive equal ticks (9.7, 9.7, 9.7) - the dip has
+        # stopped making fresh lows for two ticks running now (the
+        # stronger, recalibrated confirmation).
+        self._feed(strategy, "STALL", [10, 9.9, 9.8, 9.7, 9.7, 9.7])
         self.assertTrue(
             strategy.volatility_scalp_momentum_stalled_or_rising(
                 "STALL", Decimal("9.7")
@@ -1104,10 +1105,26 @@ class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
 
     def test_entry_gate_allows_once_momentum_turns_up(self):
         strategy = TradingStrategy(self.config())
-        self._feed(strategy, "TURN", [10, 9.9, 9.8, 9.7])
+        # A genuine two-tick upturn already recorded (9.7 -> 9.72),
+        # querying a further rise (9.75) - two non-declining steps in a
+        # row, not just one.
+        self._feed(strategy, "TURN", [10, 9.9, 9.8, 9.7, 9.72])
         self.assertTrue(
             strategy.volatility_scalp_momentum_stalled_or_rising(
                 "TURN", Decimal("9.75")
+            )
+        )
+
+    def test_entry_gate_blocks_on_a_single_non_falling_tick(self):
+        """Recalibrated by request - "why is it selecting stocks at
+        such wrong times" - a single non-falling tick is weak, noise-
+        level confirmation and no longer enough on its own.
+        """
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "SINGLE", [10, 9.9, 9.8, 9.7])
+        self.assertFalse(
+            strategy.volatility_scalp_momentum_stalled_or_rising(
+                "SINGLE", Decimal("9.75")
             )
         )
 

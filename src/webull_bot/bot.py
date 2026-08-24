@@ -3151,6 +3151,22 @@ class AutoTrader:
                     # starts (the exit still has to clear the same wide
                     # spread to reach a real profit).
                     and self.strategy.volatility_scalp_entry_spread_ok(symbol)
+                    # By request, after "why is it selecting stocks at
+                    # such wrong times, having to sell majority for
+                    # losses": the scalp entry path never checked the
+                    # higher-timeframe daily trend at all, unlike the
+                    # general strategy (which already has this exact
+                    # filter). It would happily dip-buy a stock in a
+                    # real, sustained daily downtrend, where each "dip"
+                    # is just continuation, not a bounce setup - live
+                    # incident: AIRE averaged down once and stopped out
+                    # a minute later. Reuses the same sma_trend_
+                    # supports_entry infrastructure the general strategy
+                    # already relies on (refreshed once daily from real
+                    # daily-bar closes, see AutoTrader.refresh_sma_trend)
+                    # - only lets a dip-buy fire in the direction of (or
+                    # with no data on) the larger trend, not against it.
+                    and self.strategy.sma_trend_supports_entry(symbol, price, "BUY")
                     # THREE independent, OR'd entry triggers - by request,
                     # every extra qualifying signal means MORE trading
                     # opportunities, not a stricter combined bar: the
