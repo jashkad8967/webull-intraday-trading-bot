@@ -1440,13 +1440,19 @@ class AutoTrader:
             symbol = key.split(":", 1)[1]
             if symbol in self.stop_loss_escalated:
                 continue
-            if self.strategy.is_volatility_scalp_eligible(symbol):
+            if (
+                self.strategy.is_volatility_scalp_eligible(symbol)
+                or symbol in self.volatility_scalp_positions
+            ):
                 # Handled by the faster reprice_volatility_scalp_exits
                 # cadence instead - condensed onto eligibility alone
                 # (not the narrower curated self.volatility_scalp_symbols
                 # cohort list), so this skip applies to ANY symbol
                 # currently volatile enough to qualify, matching the
-                # entry side below.
+                # entry side below. Also keeps deferring for an already-
+                # adopted cohort position even once it's no longer
+                # live-eligible this cycle, so the two repricers never
+                # both try to manage the same resting order at once.
                 continue
             try:
                 quote = self.api.stock_quote(symbol)
@@ -1535,7 +1541,17 @@ class AutoTrader:
             symbol = key.split(":", 1)[1]
             if symbol in self.stop_loss_escalated:
                 continue
-            if not self.strategy.is_volatility_scalp_eligible(symbol):
+            # Also keeps repricing an already-adopted cohort position
+            # even if it's no longer live-eligible this exact cycle -
+            # same reasoning as the exit-override/pricing gates in
+            # trade_stocks (a position with real capital committed
+            # across several averaging buys shouldn't lose active
+            # management just because a transient stdev recalculation
+            # dipped under the eligibility bar for one cycle).
+            if (
+                not self.strategy.is_volatility_scalp_eligible(symbol)
+                and symbol not in self.volatility_scalp_positions
+            ):
                 continue
             try:
                 quote = self.api.stock_quote(symbol)
@@ -1626,7 +1642,14 @@ class AutoTrader:
             if order.get("cancel_requested_at") is not None:
                 continue
             symbol = key.split(":", 1)[1]
-            if not self.strategy.is_volatility_scalp_eligible(symbol):
+            # Also keeps repricing an already-adopted cohort position's
+            # resting BUY (e.g. an averaging-down order) even if it's no
+            # longer live-eligible this exact cycle - same reasoning as
+            # the other volatility-scalp gates.
+            if (
+                not self.strategy.is_volatility_scalp_eligible(symbol)
+                and symbol not in self.volatility_scalp_positions
+            ):
                 continue
             quantity = order.get("quantity")
             if not quantity or quantity <= 0:
@@ -3001,9 +3024,34 @@ class AutoTrader:
                 # scalp_symbols cohort list - not just symbols opened via
                 # the dip-buy path below, a position already held through
                 # the normal trend entry gets the same fast cycling once
-                # it qualifies, and stops getting it the moment it cools
-                # off and no longer does.
-                if quantity > 0 and self.strategy.is_volatility_scalp_eligible(symbol):
+                # it qualifies.
+                #
+                # Live incident (this bug, caught from a real trade
+                # log): BTCT averaged down 5 times (its blended cost
+                # landed around $1.8494), then stopped out at $1.81 - a
+                # 2.1% drop, well inside the 5% hard-stop floor that
+                # should have protected it. is_volatility_scalp_
+                # eligible is a LIVE, continuously-recalculated stdev
+                # check - once several fills naturally calmed the
+                # rolling window down below the eligibility threshold,
+                # the position instantly lost ALL cohort protection
+                # (averaging eligibility AND the hard-stop floor) and
+                # fell back to the plain, much tighter adaptive stop.
+                # Real capital was already committed across 5 averaging
+                # buys - that exposure doesn't shrink just because a
+                # transient stdev recalculation dipped under the bar for
+                # one cycle. Once a symbol has actually been adopted
+                # into cohort management (self.volatility_scalp_
+                # positions), it now keeps that treatment for as long as
+                # it's held, regardless of whether it's still live-
+                # eligible this exact cycle - eligibility still fully
+                # gates whether a NEW position gets adopted in the first
+                # place, just not whether an existing one keeps its
+                # protection.
+                if quantity > 0 and (
+                    self.strategy.is_volatility_scalp_eligible(symbol)
+                    or symbol in self.volatility_scalp_positions
+                ):
                     # Live incident (this bug, caught from a real trade
                     # log): a position opened via the NORMAL trend-entry
                     # path that later became scalp-eligible got this
@@ -3677,10 +3725,22 @@ class AutoTrader:
                             if symbol in self.stop_loss_escalated
                             else (min(bid, target) if bid else target)
                         )
-                    elif self.strategy.is_volatility_scalp_eligible(symbol):
+                    elif (
+                        self.strategy.is_volatility_scalp_eligible(symbol)
+                        or symbol in self.volatility_scalp_positions
+                    ):
                         # Condensed onto eligibility alone, not the
                         # narrower curated self.volatility_scalp_symbols
                         # cohort list - see the fresh-entry block above.
+                        # Also keeps this pricing for an already-adopted
+                        # cohort position even if it's no longer live-
+                        # eligible this exact cycle (same reasoning as
+                        # the exit-override gate above) - a position
+                        # with real capital committed across several
+                        # averaging buys shouldn't silently downgrade to
+                        # the tight-spread-only general pricing right
+                        # when it most needs the wider-spread-tolerant
+                        # exit logic to find a fillable price.
                         # By request: "the sell price has to be
                         # reasonable" - live incident, GAUZ. Resting at
                         # the raw ask isn't actually "reasonable" on a
