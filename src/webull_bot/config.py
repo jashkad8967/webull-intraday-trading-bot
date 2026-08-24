@@ -309,12 +309,33 @@ class Settings(BaseSettings):
     volatility_scalp_min_stdev_percent: Decimal = Field(
         default=Decimal("0.008"), gt=0, le=1
     )
-    # Both lowered by request from 0.5% - "constantly buy the dip and
-    # sell the rise, even a little rise" - a smaller dip threshold fires
-    # entries more readily, and a smaller target sells on a smaller
-    # bounce instead of waiting for a bigger move.
+    # Originally lowered from 0.5% -> 0.2% by request ("constantly buy
+    # the dip... even a little rise"), then raised back up here as a
+    # structural fix, not a same-day band-aid: 0.2% is noise-level on a
+    # cheap, choppy penny stock - live incident, BTCT averaged down at
+    # 1.79 then 1.78, essentially the same price, gaining no real risk
+    # reduction per add. Compared against freqtrade's documented DCA
+    # pattern, whose own docs warn a trigger this tight "runs out of
+    # money" refilling into noise rather than a real dip. 1.0% is a
+    # genuinely meaningful pullback - still well within reach multiple
+    # times a day for a name that clears VOLATILITY_SCALP_MIN_STDEV_
+    # PERCENT in the first place, but no longer fires on a single bid/
+    # ask bounce. See volatility_scalp_averaging_step_multiplier for how
+    # this widens further at each successive averaging level.
     volatility_scalp_dip_entry_percent: Decimal = Field(
-        default=Decimal("0.002"), gt=0, le=1
+        default=Decimal("0.01"), gt=0, le=1
+    )
+    # Each successive averaging-down buy requires a proportionally
+    # bigger drop than the last, via required = dip_entry_percent * (1
+    # + this * level) - level 0 (the first averaging buy) uses the base
+    # threshold, level 1 needs 1.5x that, level 2 needs 2x, etc. A
+    # position already several buys deep needs a genuinely bigger move
+    # to justify yet another add, not just another noise-level tick -
+    # spans the whole averaging ladder across a real range instead of
+    # exhausting all VOLATILITY_SCALP_MAX_AVERAGING_BUYS attempts within
+    # a percent or two of movement.
+    volatility_scalp_averaging_step_multiplier: Decimal = Field(
+        default=Decimal("0.5"), ge=0, le=5
     )
     # Raised 0.2% -> 0.5% by request - "too trigger happy to sell...
     # not capturing the profits when it can." A slightly bigger quick

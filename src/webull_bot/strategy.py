@@ -640,20 +640,36 @@ class TradingStrategy:
         return decision
 
     def volatility_scalp_average_down_signal(
-        self, price: Decimal, average_cost: Decimal
+        self, price: Decimal, average_cost: Decimal, level: int = 0
     ) -> bool:
-        """True when price has dropped at least volatility_scalp_
-        dip_entry_percent below the position's OWN average cost (not
-        the rolling window's local high, unlike the fresh-entry dip
-        signal) - "if they dip a lot after you buy, average it out with
-        another buy." Reuses the same threshold that defines a "real"
-        dip for a fresh entry, just measured against the position's own
-        cost basis instead.
+        """True when price has dropped enough below the position's OWN
+        average cost (not the rolling window's local high, unlike the
+        fresh-entry dip signal) - "if they dip a lot after you buy,
+        average it out with another buy."
+
+        Structural fix (not a same-day band-aid): compared against
+        freqtrade's documented DCA pattern after watching a real
+        position (BTCT) burn through its averaging buys at 1.79 -> 1.78
+        -> essentially the same price, no real risk-reduction gained
+        per add. freqtrade's own docs warn a tight, non-widening re-buy
+        trigger "runs out of money" refilling into noise rather than a
+        real dip. The required drop now WIDENS with each successive
+        averaging level (0-indexed: the first averaging buy still uses
+        the base VOLATILITY_SCALP_DIP_ENTRY_PERCENT, the second requires
+        1.5x that, the third 2x, etc., via
+        VOLATILITY_SCALP_AVERAGING_STEP_MULTIPLIER) - a position that's
+        already averaged down several times needs a genuinely bigger
+        move to justify yet another add, not just another noise-level
+        tick, and the whole averaging ladder now spans a real range
+        instead of exhausting itself within ~1% of movement.
         """
         if average_cost <= 0 or price <= 0:
             return False
         drop = (average_cost - price) / average_cost
-        return drop >= self.config.volatility_scalp_dip_entry_percent
+        required = self.config.volatility_scalp_dip_entry_percent * (
+            Decimal("1") + self.config.volatility_scalp_averaging_step_multiplier * level
+        )
+        return drop >= required
 
     def volatility_scalp_share_count(
         self,
