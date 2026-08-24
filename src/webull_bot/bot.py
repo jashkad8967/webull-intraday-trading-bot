@@ -3339,7 +3339,9 @@ class AutoTrader:
                     )
                     >= float(self.config.volatility_scalp_reentry_cooldown_seconds)
                     and self.strategy.volatility_scalp_average_down_signal(
-                        price, cost
+                        price,
+                        cost,
+                        level=self.volatility_scalp_average_down_count[symbol],
                     )
                     # By request: "when you average down, you buy at a
                     # lower price, not the same price." The signal above

@@ -92,6 +92,7 @@ class StrategyConfigMixin:
             volatility_scalp_lookback_samples=20,
             volatility_scalp_min_stdev_percent=Decimal("0.015"),
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
+            volatility_scalp_averaging_step_multiplier=Decimal("0.5"),
             volatility_scalp_target_percent=Decimal("0.005"),
             volatility_scalp_momentum_stall_min_profit_fraction=Decimal("0.6"),
             volatility_scalp_hard_stop_percent=Decimal("0.05"),
@@ -728,6 +729,53 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         self.assertFalse(
             strategy.volatility_scalp_average_down_signal(
                 price=Decimal("19.00"), average_cost=Decimal("0")
+            )
+        )
+
+    def test_average_down_signal_widens_the_required_drop_per_level(self):
+        """Structural fix (not a same-day band-aid): live incident, BTCT
+        averaged down at 1.79 then 1.78 - essentially the same price,
+        gaining no real risk reduction per add. Each successive
+        averaging level now requires a proportionally bigger drop -
+        level 0 uses the base 0.5% (this test's config), level 1 needs
+        1.5x that (0.75%), level 2 needs 2x (1.0%), etc., via
+        VOLATILITY_SCALP_AVERAGING_STEP_MULTIPLIER (0.5 here).
+        """
+        strategy = TradingStrategy(self.config())
+        cost = Decimal("20.00")
+        # Level 0: base 0.5% - 19.91 (0.45%) doesn't clear, 19.90 (0.5%)
+        # does, matching the un-widened test above.
+        self.assertFalse(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("19.91"), average_cost=cost, level=0
+            )
+        )
+        self.assertTrue(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("19.90"), average_cost=cost, level=0
+            )
+        )
+        # Level 1: requires 1.5x the base (0.75%) - the same 0.5% drop
+        # that cleared level 0 is no longer enough.
+        self.assertFalse(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("19.90"), average_cost=cost, level=1
+            )
+        )
+        self.assertTrue(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("19.85"), average_cost=cost, level=1
+            )
+        )
+        # Level 2: requires 2x the base (1.0%).
+        self.assertFalse(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("19.85"), average_cost=cost, level=2
+            )
+        )
+        self.assertTrue(
+            strategy.volatility_scalp_average_down_signal(
+                price=Decimal("19.80"), average_cost=cost, level=2
             )
         )
 
