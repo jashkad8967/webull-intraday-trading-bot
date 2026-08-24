@@ -167,6 +167,18 @@ class AutoTrader:
         # moment the position fully closes.
         self.volatility_scalp_average_down_count: dict[str, int] = defaultdict(int)
         self.last_volatility_average_down: dict[str, float] = {}
+        # The price actually used for a symbol's most recent volatility-
+        # scalp buy (fresh entry OR averaging-down) - by request, "when
+        # you average down, you buy at a lower price, not the same
+        # price." volatility_scalp_average_down_signal alone only checks
+        # the price against the position's BLENDED average cost, which a
+        # repeated buy at the same price barely moves - so the same
+        # price could keep re-qualifying as "X% below average cost"
+        # indefinitely without ever making a genuinely new, lower low.
+        # This tracks the actual last fill price and requires a strictly
+        # lower one before averaging down again. Reset the moment the
+        # position fully closes.
+        self.volatility_scalp_last_buy_price: dict[str, Decimal] = {}
         # -inf, not 0.0: time.monotonic() starts near zero at process
         # boot too, so a 0.0 default would silently throttle the very
         # first selection until VOLATILITY_SCALP_RESELECT_SECONDS
@@ -1502,22 +1514,48 @@ class AutoTrader:
                 continue
             try:
                 quote = self.api.stock_quote(symbol)
-                ask = self.api.quote_ask(quote)
-                if ask is None or ask == order.get("limit_price"):
-                    continue
                 quantity, cost = self.api.stock_position(symbol, positions)
                 if quantity <= 0:
                     continue
-                if self.is_fractional_quantity(quantity) and not core_session_active:
+                exit_is_fractional = self.is_fractional_quantity(quantity)
+                if exit_is_fractional and not core_session_active:
                     continue
-                if cost > 0 and ask < cost:
+                # Live incident (this bug, caught from a live report):
+                # "some sell orders are not repricing down in the
+                # spread." The old check here was a blunt "ask < cost ->
+                # skip entirely," which correctly avoided ever repricing
+                # below cost, but as a side effect froze the resting
+                # order completely stuck at a stale price the instant
+                # the ask dipped below cost - even when the BID still
+                # cleared a genuinely profitable fill. Reuses the same
+                # _stall_exit_price logic the initial PROFIT placement
+                # and the escalation fix both already use (bid first if
+                # it clears cost + min_profit + fee, else a spread-
+                # sanity-checked ask fallback) - this can still reprice
+                # DOWN toward a lower, still-profitable price, or fill
+                # immediately at the bid, instead of freezing.
+                if exit_is_fractional:
+                    fee_per_share = self.config.sell_fee_dollars
+                else:
+                    fee_per_share = self.config.sell_fee_dollars / quantity
+                min_profit = cost * self.config.volatility_scalp_target_percent
+                limit_price = self._stall_exit_price(
+                    quote,
+                    cost,
+                    min_profit,
+                    fee_per_share,
+                    max_spread_percent=(
+                        self.config.volatility_scalp_max_exit_spread_percent
+                    ),
+                )
+                if limit_price is None or limit_price == order.get("limit_price"):
                     continue
                 self.api.cancel(order_id)
                 new_order_id = self.api.place_stock(
                     symbol,
                     "SELL",
                     quantity,
-                    limit_price=ask,
+                    limit_price=limit_price,
                 )
                 self.working_orders.pop(order_id, None)
                 self.working_orders[new_order_id] = {
@@ -1525,14 +1563,14 @@ class AutoTrader:
                     "key": key,
                     "action": action,
                     "cancel_requested_at": None,
-                    "limit_price": ask,
+                    "limit_price": limit_price,
                     "pnl": order.get("pnl"),
                 }
                 self.status.rekey_trade(order_id, new_order_id)
                 log.info(
-                    "SCALP  | %-8s | reprice | ask=%s | id=%s",
+                    "SCALP  | %-8s | reprice | limit=%s | id=%s",
                     symbol,
-                    ask,
+                    limit_price,
                     new_order_id,
                 )
             except Exception as exc:
@@ -1602,6 +1640,14 @@ class AutoTrader:
                     limit_price,
                     new_order_id,
                 )
+            except QuoteUnavailableError as exc:
+                # A momentarily missing/crossed bid-ask (thin/low-volume
+                # penny stock, a quote glitch) is expected and already
+                # fully handled - the loop just moves on to the next
+                # order next cycle. WARNING, not ERROR - this isn't a
+                # fault, it's the same "no data -> don't act" convention
+                # every other entry gate in this strategy already uses.
+                log.warning("SCALP  | %s | entry reprice skipped | %s", symbol, exc)
             except Exception as exc:
                 log.error("SCALP  | %s | entry reprice failed | %s", symbol, exc)
 
@@ -2974,6 +3020,7 @@ class AutoTrader:
                     self.volatility_scalp_positions.discard(symbol)
                     self.volatility_scalp_average_down_count.pop(symbol, None)
                     self.last_volatility_average_down.pop(symbol, None)
+                    self.volatility_scalp_last_buy_price.pop(symbol, None)
                 if (
                     quantity == 0
                     # Condensed onto eligibility alone (any symbol
@@ -3046,6 +3093,13 @@ class AutoTrader:
                     and self.volatility_scalp_reentry_ready(key)
                     and self.entry_price_sanity_cooldown_ready(symbol)
                     and self.strategy.is_volatility_scalp_eligible(symbol)
+                    # By request: "make sure the algo plays around in
+                    # the spread while ensuring a profit, or a
+                    # profitable entry" - buying into an absurdly wide
+                    # spread sets up a losing trade before it even
+                    # starts (the exit still has to clear the same wide
+                    # spread to reach a real profit).
+                    and self.strategy.volatility_scalp_entry_spread_ok(symbol)
                     # THREE independent, OR'd entry triggers - by request,
                     # every extra qualifying signal means MORE trading
                     # opportunities, not a stricter combined bar: the
@@ -3104,6 +3158,7 @@ class AutoTrader:
                                 quantity=scalp_quantity,
                             )
                             self.volatility_scalp_positions.add(symbol)
+                            self.volatility_scalp_last_buy_price[symbol] = price
                             buffered_price = price * Decimal("1.03")
                             buying_power = max(
                                 Decimal("0"),
@@ -3168,6 +3223,20 @@ class AutoTrader:
                     and self.strategy.volatility_scalp_average_down_signal(
                         price, cost
                     )
+                    # By request: "when you average down, you buy at a
+                    # lower price, not the same price." The signal above
+                    # only checks price against the BLENDED average cost,
+                    # which a repeated buy at the same price barely
+                    # moves - so the same price could keep re-qualifying
+                    # as "X% below average cost" indefinitely without
+                    # ever making a genuinely new, lower low. Requires
+                    # strictly lower than the actual price of the last
+                    # buy (fresh entry or a prior averaging-down) on this
+                    # symbol.
+                    and (
+                        symbol not in self.volatility_scalp_last_buy_price
+                        or price < self.volatility_scalp_last_buy_price[symbol]
+                    )
                     # Same "don't buy while still actively falling" gate
                     # as the fresh-entry block above - averaging down is
                     # still a fresh buy, just against an existing
@@ -3175,6 +3244,9 @@ class AutoTrader:
                     and self.strategy.volatility_scalp_momentum_stalled_or_rising(
                         symbol, price
                     )
+                    # Same spread-quality gate as the fresh-entry block
+                    # above.
+                    and self.strategy.volatility_scalp_entry_spread_ok(symbol)
                 ):
                     average_down_quantity = self.strategy.volatility_scalp_share_count(
                         price,
@@ -3219,6 +3291,7 @@ class AutoTrader:
                             self.last_volatility_average_down[symbol] = (
                                 time.monotonic()
                             )
+                            self.volatility_scalp_last_buy_price[symbol] = price
                             buying_power = max(
                                 Decimal("0"),
                                 buying_power
@@ -4389,6 +4462,32 @@ class AutoTrader:
             sell_price = ask.quantize(
                 self.api.price_tick_size(ask), rounding=ROUND_DOWN
             )
+            # By request: "you cannot always go to the top of the spread
+            # when it is big, you must ask a reasonable price, not too
+            # far from the last [trade]." Even within max_spread_percent,
+            # the raw ask can still sit meaningfully far from where the
+            # stock is actually trading on a genuinely wide (not just
+            # glitchy) spread - the exact TBB pattern above, just not
+            # extreme enough to trip the spread-sanity skip entirely.
+            # Caps the fallback at half the allowed spread's distance
+            # above the last print instead of the literal ask, so a big
+            # spread means "rest closer to reality," not "chase the far
+            # edge of the book."
+            try:
+                last_price = self.api.quote_price(quote)
+            except Exception:
+                last_price = None
+            if last_price and last_price > 0:
+                reasonable_cap = last_price * (
+                    Decimal("1") + max_spread_percent / Decimal("200")
+                )
+                sell_price = min(
+                    sell_price,
+                    reasonable_cap.quantize(
+                        self.api.price_tick_size(reasonable_cap),
+                        rounding=ROUND_DOWN,
+                    ),
+                )
             if sell_price >= floor:
                 return sell_price
         return None
@@ -4539,15 +4638,33 @@ class AutoTrader:
             if quantity == 0:
                 continue
             symbol = str(position.get("symbol", "")).upper()
+            # Live incident (this bug, caught from a real UI report): the
+            # displayed last_price used to come from self.strategy.prices
+            # (the bot's own scan-cycle quote cache), while the P&L
+            # figures shown right next to it (position_unrealized_pnl/
+            # position_day_pnl) prefer the BROKER's own reported
+            # last_price/market_price field on the position itself when
+            # present - two independently-refreshed sources on different
+            # cadences, so the displayed price and the P&L shown beside
+            # it could silently disagree (a live example: KNRX showed
+            # last_price=0.392, but that price doesn't reconcile with
+            # the unrealized_pnl shown alongside it). Prefer the SAME
+            # broker-native fields the P&L math already uses, falling
+            # back to strategy.prices only when the broker hasn't
+            # reported one - makes price and P&L internally consistent.
+            last_price = (
+                position.get("last_price")
+                or position.get("market_price")
+                or self.strategy.prices.get(symbol)
+                or position.get("cost_price", "0")
+            )
             position_rows.append(
                 {
                     "symbol": symbol,
                     "instrument_type": position.get("instrument_type"),
                     "quantity": str(quantity),
                     "cost_price": str(position.get("cost_price", "0")),
-                    "last_price": str(
-                        self.strategy.prices.get(symbol, position.get("cost_price", "0"))
-                    ),
+                    "last_price": str(last_price),
                     "unrealized_pnl": str(self.strategy.position_unrealized_pnl(position)),
                     "day_pnl": str(self.strategy.position_day_pnl(position)),
                     "bucket": self.position_buckets.get(symbol, "DISCOVERY"),
@@ -4600,6 +4717,9 @@ class AutoTrader:
                 "instrument_type": order.get("key", "?:?").split(":", 1)[0],
                 "symbol": order.get("key", "?:?").split(":", 1)[-1],
                 "action": order.get("action"),
+                "quantity": (
+                    str(order["quantity"]) if order.get("quantity") is not None else None
+                ),
                 "limit_price": (
                     str(order["limit_price"])
                     if order.get("limit_price") is not None

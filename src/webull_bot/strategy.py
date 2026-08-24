@@ -1524,6 +1524,31 @@ class TradingStrategy:
         except Exception:
             return True
 
+    def volatility_scalp_entry_spread_ok(self, symbol: str) -> bool:
+        """By request: "make sure the algo plays around in the spread
+        while ensuring a profit, or a profitable entry." Entries had NO
+        spread-quality check at all - only exits did (_stall_exit_price's
+        VOLATILITY_SCALP_MAX_EXIT_SPREAD_PERCENT bound). Buying into an
+        absurdly wide spread sets up a losing trade before it even
+        starts: the fill happens near the ask/mid, but the very next
+        exit still has to clear the SAME wide spread to reach a real
+        bid-side profit. Reuses the exit side's own bound for symmetry -
+        this cohort's naturally wide (but legitimate, not glitchy)
+        spreads should be tradable on both sides equally. True (don't
+        block) when spread data isn't available yet, same "no data ->
+        don't block" convention as every other entry gate.
+        """
+        spread = self.metrics.get(symbol, {}).get("spread_percent")
+        if spread in (None, ""):
+            return True
+        try:
+            return (
+                Decimal(str(spread))
+                <= self.config.volatility_scalp_max_exit_spread_percent
+            )
+        except Exception:
+            return True
+
     def entry_extension_ok(
         self,
         symbol: str,

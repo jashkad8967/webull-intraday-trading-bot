@@ -341,6 +341,26 @@ function fmtMoney(value) {
   if (Number.isNaN(n)) return value;
   return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
 }
+// Per-share price formatter, distinct from fmtMoney (dollar totals/P&L,
+// always exactly 2 decimals) - by request, show up to 4 decimal places
+// where needed. Sub-$1 stocks trade in real $0.0001 increments (see
+// WebullAPI.price_tick_size on the backend, which already prices/sizes
+// orders at that precision) - a flat 2-decimal currency format was
+// silently rounding away that real precision in the UI, e.g. a stock
+// actually priced $0.3771 displaying as just $0.38. $1+ still shows the
+// normal 2 decimals, matching how those are actually quoted/traded.
+function fmtPrice(value) {
+  if (value == null) return "—";
+  const n = Number(value);
+  if (Number.isNaN(n)) return value;
+  const digits = Math.abs(n) < 1 ? 4 : 2;
+  return n.toLocaleString(undefined, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
 function fmtNum(value) {
   if (value == null) return "—";
   const n = Number(value);
@@ -425,8 +445,8 @@ async function refresh() {
       { label: "Symbol", render: r => r.symbol ?? "—" },
       { label: "Type", render: r => r.instrument_type ?? "—" },
       { label: "Qty", render: r => fmtNum(r.quantity), num: true },
-      { label: "Cost", render: r => fmtMoney(r.cost_price), num: true },
-      { label: "Last", render: r => fmtMoney(r.last_price), num: true },
+      { label: "Cost", render: r => fmtPrice(r.cost_price), num: true },
+      { label: "Last", render: r => fmtPrice(r.last_price), num: true },
       { label: "P&L", render: r => fmtMoney(r.unrealized_pnl), cls: r => pnlClass(r.unrealized_pnl), num: true },
       { label: "Bucket", render: r => r.bucket ? `<span class="pill">${r.bucket}</span>` : "—" },
       { label: "", render: r => `<button class="btn danger" onclick="sellPosition('${r.symbol}','${r.instrument_type}')">Sell</button>` },
@@ -436,7 +456,8 @@ async function refresh() {
       { label: "Time", render: r => r.age_seconds != null ? fmtTime(Date.now() / 1000 - r.age_seconds) : "—" },
       { label: "Stock", render: r => r.symbol ?? "—" },
       { label: "Buy/Sell", render: r => orderSide(r.action) },
-      { label: "Price", render: r => r.limit_price != null ? fmtMoney(r.limit_price) : "market", num: true },
+      { label: "Qty", render: r => r.quantity != null ? fmtNum(r.quantity) : "—", num: true },
+      { label: "Price", render: r => r.limit_price != null ? fmtPrice(r.limit_price) : "market", num: true },
       {
         label: "",
         render: r => r.cancel_requested
@@ -451,14 +472,14 @@ async function refresh() {
       { label: "Action", render: r => r.action ?? "—" },
       { label: "Symbol", render: r => r.symbol ?? "—" },
       { label: "Qty", render: r => r.quantity != null ? fmtNum(r.quantity) : "—", num: true },
-      { label: "Entry", render: r => r.entry_price != null ? fmtMoney(r.entry_price) : "—", num: true },
-      { label: "Exit", render: r => r.limit_price != null ? fmtMoney(r.limit_price) : "—", num: true },
+      { label: "Entry", render: r => r.entry_price != null ? fmtPrice(r.entry_price) : "—", num: true },
+      { label: "Exit", render: r => r.limit_price != null ? fmtPrice(r.limit_price) : "—", num: true },
       { label: "P&L", render: r => r.pnl != null ? fmtMoney(r.pnl) : "—", cls: r => pnlClass(r.pnl), num: true },
     ], data.recent_trades);
 
     document.getElementById("watchlist").innerHTML = table([
       { label: "Symbol", render: r => r.symbol ?? "—" },
-      { label: "Price", render: r => fmtMoney(r.price), num: true },
+      { label: "Price", render: r => fmtPrice(r.price), num: true },
       { label: "Bucket", render: r => r.bucket ? `<span class="pill">${r.bucket}</span>` : "—" },
       { label: "Vol", render: r => r.volume != null ? r.volume.toLocaleString() : "—", num: true },
       { label: "Spread%", render: r => r.spread_percent != null ? r.spread_percent : "—", num: true },
