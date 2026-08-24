@@ -94,6 +94,11 @@ class StrategyConfigMixin:
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
             volatility_scalp_target_percent=Decimal("0.005"),
             volatility_scalp_max_price=Decimal("1.50"),
+            volatility_scalp_breakout_k=Decimal("0.5"),
+            heikin_ashi_bar_samples=3,
+            heikin_ashi_bar_count=6,
+            parabolic_sar_af_step=Decimal("0.02"),
+            parabolic_sar_af_max=Decimal("0.2"),
         )
 
 
@@ -726,6 +731,223 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         self.assertEqual(strategy.volatility_scalp_share_count(Decimal("0")), 0)
 
 
+class DualThrustBreakoutSignalTests(StrategyConfigMixin, unittest.TestCase):
+    """dual_thrust_breakout_signal - an opening-range-breakout style
+    entry trigger adapted from the classic Dual Thrust strategy, OR'd
+    alongside the existing dip signal as an additional way to trigger a
+    fresh entry (the mirror case - buy a fresh push to a new high,
+    instead of buying a pullback).
+    """
+
+    def _feed(self, strategy, symbol, prices):
+        for price in prices:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+
+    def test_fires_once_price_breaks_above_the_recent_range_by_k_times_its_size(self):
+        strategy = TradingStrategy(self.config())
+        # Last 5 samples: 9.6, 10.4, 9.7, 10.3, 9.8 -> range_high=10.4,
+        # range_low=9.6, range=0.8. K=0.5 -> upper_band = 10.4 + 0.4 = 10.8.
+        self._feed(strategy, "WILD", [10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8])
+        self.assertFalse(
+            strategy.dual_thrust_breakout_signal("WILD", Decimal("10.7"))
+        )
+        self.assertTrue(
+            strategy.dual_thrust_breakout_signal("WILD", Decimal("10.9"))
+        )
+
+    def test_no_history_never_fires(self):
+        strategy = TradingStrategy(self.config())
+        self.assertFalse(
+            strategy.dual_thrust_breakout_signal("NEVERSEEN", Decimal("10"))
+        )
+
+    def test_a_flat_range_never_fires(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "FLAT", [10, 10, 10, 10, 10, 10])
+        self.assertFalse(
+            strategy.dual_thrust_breakout_signal("FLAT", Decimal("10.5"))
+        )
+
+
+class HeikinAshiReversalSignalTests(StrategyConfigMixin, unittest.TestCase):
+    """heikin_ashi_bullish_reversal_signal - a confirmed HA bullish
+    reversal (red bar immediately followed by a green one with little/no
+    lower wick) built from synthetic OHLC bars bucketed off the same
+    rolling tick-price window, OR'd alongside the dip and breakout
+    signals as a third independent entry trigger.
+    """
+
+    def _feed(self, strategy, symbol, prices):
+        for price in prices:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+
+    def test_not_enough_history_never_fires(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "THIN", [10, 10.1, 9.9])
+        self.assertFalse(strategy.heikin_ashi_bullish_reversal_signal("THIN"))
+
+    def test_fires_on_a_confirmed_bullish_reversal(self):
+        strategy = TradingStrategy(self.config())
+        # 6 bars of 5 samples each: a steady decline (bars 1-5, each bar
+        # closing lower than it opened) followed by one sharp, clean
+        # rally (bar 6, closing well above its open with almost no
+        # pullback) - a textbook red-then-green HA reversal.
+        prices = []
+        base = 10.0
+        for _ in range(5):
+            prices.extend([base, base - 0.02, base - 0.05, base - 0.08, base - 0.10])
+            base -= 0.10
+        prices.extend([base, base + 0.05, base + 0.15, base + 0.30, base + 0.50])
+        self._feed(strategy, "REV", prices)
+        self.assertTrue(strategy.heikin_ashi_bullish_reversal_signal("REV"))
+
+    def test_a_continuing_decline_does_not_fire(self):
+        strategy = TradingStrategy(self.config())
+        prices = []
+        base = 10.0
+        for _ in range(6):
+            prices.extend([base, base - 0.02, base - 0.05, base - 0.08, base - 0.10])
+            base -= 0.10
+        self._feed(strategy, "DOWN", prices)
+        self.assertFalse(strategy.heikin_ashi_bullish_reversal_signal("DOWN"))
+
+
+class ParabolicSarExitSignalTests(StrategyConfigMixin, unittest.TestCase):
+    """parabolic_sar_exit_signal - an additional exit trigger for a held
+    volatility-scalp position (alongside, not instead of, the existing
+    quick profit target): fires once the trailing SAR level flips
+    bearish over the synthetic bar series.
+    """
+
+    def _feed(self, strategy, symbol, prices):
+        for price in prices:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+
+    def test_not_enough_history_never_fires(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "THIN", [10, 10.1, 9.9])
+        self.assertFalse(
+            strategy.parabolic_sar_exit_signal("THIN", Decimal("10"))
+        )
+
+    def test_fires_once_an_uptrend_reverses(self):
+        strategy = TradingStrategy(self.config())
+        # A steady 6-bar rally followed by a sharp reversal bar - SAR
+        # should flip bearish once the reversal bar's low breaks the
+        # trailing stop built up during the rally.
+        prices = []
+        base = 10.0
+        for _ in range(6):
+            prices.extend([base, base + 0.05, base + 0.02, base + 0.08, base + 0.10])
+            base += 0.10
+        prices.extend([base, base - 0.20, base - 0.40, base - 0.60, base - 0.80])
+        self._feed(strategy, "TREND", prices)
+        self.assertTrue(
+            strategy.parabolic_sar_exit_signal("TREND", Decimal(str(base - 0.80)))
+        )
+
+    def test_a_continuing_uptrend_does_not_fire(self):
+        strategy = TradingStrategy(self.config())
+        prices = []
+        base = 10.0
+        for _ in range(6):
+            prices.extend([base, base + 0.05, base + 0.02, base + 0.08, base + 0.10])
+            base += 0.10
+        self._feed(strategy, "TREND", prices)
+        self.assertFalse(
+            strategy.parabolic_sar_exit_signal("TREND", Decimal(str(base + 0.10)))
+        )
+
+
+class VolatilityScalpExitOverrideSarTests(StrategyConfigMixin, unittest.TestCase):
+    """volatility_scalp_exit_override's third exit path: a Parabolic SAR
+    trend reversal, but only once price has at least cleared cost - it
+    locks in a reversal early, without ever becoming a second, backdoor
+    stop-loss (the LOSS suppression above deliberately disables the real
+    one for this cohort).
+    """
+
+    def _feed(self, strategy, symbol, prices):
+        for price in prices:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+
+    def _reversed_series(self, strategy, symbol):
+        prices = []
+        base = 10.0
+        for _ in range(6):
+            prices.extend([base, base + 0.05, base + 0.02, base + 0.08, base + 0.10])
+            base += 0.10
+        prices.extend([base, base - 0.20, base - 0.40, base - 0.60, base - 0.80])
+        self._feed(strategy, symbol, prices)
+        return Decimal(str(base - 0.80))
+
+    def test_sar_reversal_triggers_profit_once_price_clears_cost(self):
+        strategy = TradingStrategy(self.config())
+        price = self._reversed_series(strategy, "TREND")
+        from webull_bot.strategy import Decision
+
+        result = strategy.volatility_scalp_exit_override(
+            Decision("HOLD", "between target and stop", price),
+            quantity=100,
+            average_cost=price - Decimal("0.01"),
+            price=price,
+            averaging_available=True,
+            symbol="TREND",
+        )
+        self.assertEqual(result.action, "PROFIT")
+        self.assertIn("parabolic SAR", result.reason)
+
+    def test_sar_reversal_never_fires_below_cost(self):
+        """A SAR flip must never act as a backdoor stop-loss - this
+        cohort's real stop-loss is deliberately suppressed while
+        averaging is available, and SAR isn't meant to reintroduce it
+        by another name.
+        """
+        strategy = TradingStrategy(self.config())
+        price = self._reversed_series(strategy, "TREND")
+        from webull_bot.strategy import Decision
+
+        held = Decision("HOLD", "between target and stop", price)
+        result = strategy.volatility_scalp_exit_override(
+            held,
+            quantity=100,
+            average_cost=price + Decimal("1"),
+            price=price,
+            averaging_available=True,
+            symbol="TREND",
+        )
+        self.assertIs(result, held)
+
+    def test_no_symbol_passed_skips_the_sar_check_entirely(self):
+        strategy = TradingStrategy(self.config())
+        from webull_bot.strategy import Decision
+
+        # cost just barely below price - well under the quick target
+        # (0.5% default), so PROFIT can only come from a SAR check that
+        # (with no symbol/history available) must never fire.
+        held = Decision("HOLD", "between target and stop", Decimal("10"))
+        result = strategy.volatility_scalp_exit_override(
+            held,
+            quantity=100,
+            average_cost=Decimal("9.999"),
+            price=Decimal("10"),
+            averaging_available=True,
+        )
+        self.assertIs(result, held)
+
+
 class VolatilityScalpReentryCooldownTests(unittest.TestCase):
     def test_ready_when_never_exited(self):
         from webull_bot.bot import AutoTrader
@@ -819,7 +1041,7 @@ class VolatilityScalpTotalExposureCapTests(unittest.TestCase):
 
         fake_bot = SimpleNamespace(
             cached_account_value=account_value,
-            volatility_scalp_symbols=set(symbols),
+            volatility_scalp_positions=set(symbols),
             config=SimpleNamespace(
                 volatility_scalp_max_total_exposure_fraction=max_fraction
             ),
@@ -1620,6 +1842,7 @@ class StopLossConfirmationTests(unittest.TestCase):
             stop_condition_since={},
             stop_loss_escalated=set(),
             volatility_scalp_symbols=set(),
+            strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
         )
         defaults.update(overrides)
         fake_bot = SimpleNamespace(**defaults)
@@ -1627,15 +1850,20 @@ class StopLossConfirmationTests(unittest.TestCase):
         return fake_bot
 
     def test_volatility_scalp_cohort_skips_the_confirmation_wait(self):
-        """Live incident: MYND (a volatility-scalp cohort symbol) sat
+        """Live incident: MYND (a volatility-scalp-eligible symbol) sat
         11%+ past its stop for many minutes because price kept ticking
         back above the stop line often enough that the 2s confirmation
         window never completed - the same choppiness that made it
-        eligible for this cohort in the first place also defeated the
-        wick-filtering confirmation. This cohort's positions must stop
-        out on the first breach, no wait.
+        eligible in the first place also defeated the wick-filtering
+        confirmation. Any eligible symbol's positions must stop out on
+        the first breach, no wait - condensed onto eligibility alone,
+        not the narrower curated cohort list.
         """
-        fake_bot = self._fake_bot(volatility_scalp_symbols={"MYND"})
+        fake_bot = self._fake_bot(
+            strategy=SimpleNamespace(
+                is_volatility_scalp_eligible=lambda symbol: symbol == "MYND"
+            )
+        )
         # No stop_condition_since entry at all - would normally be
         # unconfirmed (see test_symbol_never_seen_in_breach_is_not_
         # confirmed), but the cohort bypass short-circuits before that
@@ -2168,7 +2396,7 @@ class VolatilityScalpEntryRepriceTests(unittest.TestCase):
     """
 
     @staticmethod
-    def _fake_bot(cohort_symbols, working_orders, buy_limit_by_symbol):
+    def _fake_bot(eligible_symbols, working_orders, buy_limit_by_symbol):
         from webull_bot.bot import AutoTrader
 
         cancelled = []
@@ -2197,7 +2425,9 @@ class VolatilityScalpEntryRepriceTests(unittest.TestCase):
             api=FakeApi(),
             status=SimpleNamespace(rekey_trade=lambda old, new: None),
             last_volatility_entry_reprice=0.0,
-            volatility_scalp_symbols=set(cohort_symbols),
+            strategy=SimpleNamespace(
+                is_volatility_scalp_eligible=lambda symbol: symbol in eligible_symbols
+            ),
             working_orders=working_orders,
         )
         return fake_bot, cancelled, placed

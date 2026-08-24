@@ -145,9 +145,21 @@ class AutoTrader:
         # applied to these positions' exit decision below.
         self.volatility_scalp_positions: set[str] = set()
         # The curated daily cohort (see select_volatility_scalp_symbols) -
-        # entries and active management for this strategy are scoped to
-        # just these symbols, not every eligible symbol seen in passing.
+        # a small priority subset still used for prioritized batch
+        # scanning/dashboard display, but no longer what entries/exits
+        # are actually gated on (see is_volatility_scalp_eligible calls
+        # in trade_stocks - condensed onto eligibility alone).
         self.volatility_scalp_symbols: set[str] = set()
+        # Every symbol that was volatility-scalp eligible the last time
+        # it was scanned, persisted across cycles (cleared once daily by
+        # clear_market_state, same as the cohort). Same "force into every
+        # cycle's batch" treatment as self.volatility_scalp_symbols
+        # below, extended to the FULL broadened set - by request, "make
+        # sure the data is received as frequently as possible": a
+        # symbol that qualified once shouldn't fall back to slow
+        # rotating-batch cadence just because it isn't in the curated
+        # top handful.
+        self.volatility_scalp_recently_eligible: set[str] = set()
         # How many averaging-down buys a currently-held cohort position
         # has already made (see AutoTrader's averaging-buy entry block
         # and TradingStrategy.volatility_scalp_average_down_signal) -
@@ -655,6 +667,7 @@ class AutoTrader:
         self.option_contracts = self.api.resolve_options()
         self.discover_all_options = "ALL" in self.config.option_roots()
         self.strategy.clear_market_state()
+        self.volatility_scalp_recently_eligible.clear()
         if (
             self.config.volatility_scalp_enabled
             and self.config.volatility_scalp_bar_seed_enabled
@@ -832,7 +845,13 @@ class AutoTrader:
         total = additional_value
         for position in positions:
             symbol = str(position.get("symbol", "")).upper()
-            if symbol not in self.volatility_scalp_symbols:
+            # self.volatility_scalp_positions (every symbol this
+            # strategy has an in-process-tracked open position in), not
+            # the narrower curated self.volatility_scalp_symbols cohort
+            # list - entries now open for any eligible symbol, not just
+            # the curated top handful, so exposure has to be summed
+            # against the same broadened set.
+            if symbol not in self.volatility_scalp_positions:
                 continue
             quantity = Decimal(str(position.get("quantity", "0") or "0"))
             cost_price = Decimal(str(position.get("cost_price") or "0"))
@@ -874,7 +893,7 @@ class AutoTrader:
         if (
             not self.config.stop_loss_confirmation_enabled
             or symbol in self.stop_loss_escalated
-            or symbol in self.volatility_scalp_symbols
+            or self.strategy.is_volatility_scalp_eligible(symbol)
         ):
             return True
         since = self.stop_condition_since.get(symbol)
@@ -1341,10 +1360,13 @@ class AutoTrader:
             symbol = key.split(":", 1)[1]
             if symbol in self.stop_loss_escalated:
                 continue
-            if (
-                symbol in self.volatility_scalp_symbols
-                and self.strategy.is_volatility_scalp_eligible(symbol)
-            ):
+            if self.strategy.is_volatility_scalp_eligible(symbol):
+                # Handled by the faster reprice_volatility_scalp_exits
+                # cadence instead - condensed onto eligibility alone
+                # (not the narrower curated self.volatility_scalp_symbols
+                # cohort list), so this skip applies to ANY symbol
+                # currently volatile enough to qualify, matching the
+                # entry side below.
                 continue
             try:
                 quote = self.api.stock_quote(symbol)
@@ -1433,10 +1455,7 @@ class AutoTrader:
             symbol = key.split(":", 1)[1]
             if symbol in self.stop_loss_escalated:
                 continue
-            if (
-                symbol not in self.volatility_scalp_symbols
-                or not self.strategy.is_volatility_scalp_eligible(symbol)
-            ):
+            if not self.strategy.is_volatility_scalp_eligible(symbol):
                 continue
             try:
                 quote = self.api.stock_quote(symbol)
@@ -1501,7 +1520,7 @@ class AutoTrader:
             if order.get("cancel_requested_at") is not None:
                 continue
             symbol = key.split(":", 1)[1]
-            if symbol not in self.volatility_scalp_symbols:
+            if not self.strategy.is_volatility_scalp_eligible(symbol):
                 continue
             quantity = order.get("quantity")
             if not quantity or quantity <= 0:
@@ -2632,19 +2651,23 @@ class AutoTrader:
             if injected:
                 batch = list(batch) + injected
             self.priority_scan_symbols.clear()
-        if self.volatility_scalp_symbols:
-            # The curated cohort is only ~4 symbols out of a 200+ symbol
-            # scanned universe - left to prioritized_stock_batch's normal
-            # ranking, any one of them might only get re-evaluated once
-            # every several cycles, which can't support "multiple times
-            # a minute" trading. Force every cohort symbol into every
-            # single cycle's batch (not one-time, unlike
-            # priority_scan_symbols above) so its entry/exit decisions
-            # always run through the same, single, correct code path
-            # below - no separate/duplicated logic needed.
+        force_scan = self.volatility_scalp_symbols | self.volatility_scalp_recently_eligible
+        if force_scan:
+            # Left to prioritized_stock_batch's normal ranking, any one
+            # of these might only get re-evaluated once every several
+            # cycles, which can't support "multiple times a minute"
+            # trading. Force every one of them into every single cycle's
+            # batch (not one-time, unlike priority_scan_symbols above) so
+            # entry/exit decisions always run through the same, single,
+            # correct code path below - no separate/duplicated logic
+            # needed. Covers both the curated cohort (a small priority
+            # subset) AND every symbol that was volatility-scalp
+            # eligible the last time it was scanned - by request, "make
+            # sure the data is received as frequently as possible" for
+            # the whole broadened set, not just the curated handful.
             missing = [
                 symbol
-                for symbol in self.volatility_scalp_symbols
+                for symbol in force_scan
                 if symbol in self.stock_symbols and symbol not in batch
             ]
             if missing:
@@ -2799,6 +2822,10 @@ class AutoTrader:
                     continue
                 price = self.api.quote_price(quote)
                 self.strategy.update_stock_snapshot(quote, price)
+                if self.strategy.is_volatility_scalp_eligible(symbol):
+                    self.volatility_scalp_recently_eligible.add(symbol)
+                else:
+                    self.volatility_scalp_recently_eligible.discard(symbol)
                 if self.analyst_service is not None:
                     self.analyst_service.request(symbol, price)
                 quantity, cost = self.api.stock_position(symbol, positions)
@@ -2818,24 +2845,22 @@ class AutoTrader:
                     idle_relaxation_amount,
                     seconds_since_entry,
                 )
-                # Scoped to the curated daily cohort (select_volatility_
-                # scalp_symbols), not just symbols opened via the dip-buy
-                # path below - a position already held through the normal
-                # trend entry gets the same fast cycling once its symbol
-                # is picked into the cohort (live example: HOWL, up ~100%
-                # intraday), and stops getting it the moment the symbol
-                # cools off and drops back out.
-                if (
-                    quantity > 0
-                    and symbol in self.volatility_scalp_symbols
-                    and self.strategy.is_volatility_scalp_eligible(symbol)
-                ):
+                # Condensed onto eligibility alone (any symbol currently
+                # volatile enough to qualify - see is_volatility_scalp_
+                # eligible), not the narrower curated self.volatility_
+                # scalp_symbols cohort list - not just symbols opened via
+                # the dip-buy path below, a position already held through
+                # the normal trend entry gets the same fast cycling once
+                # it qualifies, and stops getting it the moment it cools
+                # off and no longer does.
+                if quantity > 0 and self.strategy.is_volatility_scalp_eligible(symbol):
                     decision = self.strategy.volatility_scalp_exit_override(
                         decision,
                         quantity,
                         cost,
                         price,
                         averaging_available=symbol in self.volatility_scalp_positions,
+                        symbol=symbol,
                     )
                 if decision.action == "LOSS":
                     if symbol not in self.stop_condition_since:
@@ -2877,7 +2902,15 @@ class AutoTrader:
                     self.last_volatility_average_down.pop(symbol, None)
                 if (
                     quantity == 0
-                    and symbol in self.volatility_scalp_symbols
+                    # Condensed onto eligibility alone (any symbol
+                    # currently volatile enough to qualify), not the
+                    # narrower curated self.volatility_scalp_symbols
+                    # cohort list - by request: "trade volatile stocks
+                    # with high frequency," not just the top handful.
+                    # is_volatility_scalp_eligible is the real "is this
+                    # volatile enough" test; self.volatility_scalp_symbols
+                    # remains a separate, smaller priority list used only
+                    # for prioritized batch scanning/dashboard display.
                     # Live incident: GAUZ compounded into a 200-share
                     # position (double the intended fixed 100) after the
                     # cohort started being force-scanned every cycle -
@@ -2908,14 +2941,26 @@ class AutoTrader:
                     # cooldown_ready (a cross-order-submission race
                     # guard, not a loss-driven pause -
                     # trade_cooldown_seconds defaults to 0) and
-                    # volatility_scalp_reentry_ready (its own short 5s
-                    # cooldown) still gate timing.
+                    # volatility_scalp_reentry_ready (zeroed by request -
+                    # "orders can be made as frequently as possible
+                    # without a cooldown") still gate timing.
                     and not regime_gate_active
                     and self.cooldown_ready(key)
                     and self.volatility_scalp_reentry_ready(key)
                     and self.entry_price_sanity_cooldown_ready(symbol)
                     and self.strategy.is_volatility_scalp_eligible(symbol)
-                    and self.strategy.volatility_scalp_dip_signal(symbol, price)
+                    # THREE independent, OR'd entry triggers - by request,
+                    # every extra qualifying signal means MORE trading
+                    # opportunities, not a stricter combined bar: the
+                    # original dip-buy signal, a Dual-Thrust-style
+                    # opening-range breakout (the mirror case - a fresh
+                    # push to a new high instead of a pullback), and a
+                    # Heikin-Ashi confirmed bullish reversal candle.
+                    and (
+                        self.strategy.volatility_scalp_dip_signal(symbol, price)
+                        or self.strategy.dual_thrust_breakout_signal(symbol, price)
+                        or self.strategy.heikin_ashi_bullish_reversal_signal(symbol)
+                    )
                 ):
                     scalp_quantity = self.strategy.volatility_scalp_share_count(price)
                     if scalp_quantity > 0 and price * Decimal(scalp_quantity) * Decimal(
@@ -2968,7 +3013,12 @@ class AutoTrader:
                             )
                 if (
                     quantity > 0
-                    and symbol in self.volatility_scalp_symbols
+                    # symbol in self.volatility_scalp_positions is the
+                    # real gate here (an open position this strategy
+                    # itself opened, and is therefore eligible to average
+                    # down on) - condensed off the narrower curated
+                    # self.volatility_scalp_symbols cohort list, same as
+                    # every other gate in this block.
                     and symbol in self.volatility_scalp_positions
                     and symbol not in self.broker_conflict_symbols
                     and symbol not in self.entry_restricted_symbols
@@ -3333,7 +3383,10 @@ class AutoTrader:
                             if symbol in self.stop_loss_escalated
                             else (min(bid, target) if bid else target)
                         )
-                    elif symbol in self.volatility_scalp_symbols:
+                    elif self.strategy.is_volatility_scalp_eligible(symbol):
+                        # Condensed onto eligibility alone, not the
+                        # narrower curated self.volatility_scalp_symbols
+                        # cohort list - see the fresh-entry block above.
                         # By request: "the sell price has to be
                         # reasonable" - live incident, GAUZ. Resting at
                         # the raw ask isn't actually "reasonable" on a

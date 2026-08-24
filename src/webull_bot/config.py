@@ -286,8 +286,15 @@ class Settings(BaseSettings):
     # protection matters most.
     volatility_scalp_enabled: bool = True
     volatility_scalp_lookback_samples: int = Field(default=20, ge=5, le=200)
+    # Lowered from 1.5% -> 0.8% by request - "if the bar for entry is
+    # too restrictive, lower the bar." This is the hard AND gate every
+    # entry signal sits behind (is_volatility_scalp_eligible), so it's
+    # the single biggest lever on how MANY symbols the whole strategy
+    # even considers - a stock only needs to be moderately choppy now,
+    # not extremely so, to qualify for the fast dip/breakout/HA-reversal
+    # entry path.
     volatility_scalp_min_stdev_percent: Decimal = Field(
-        default=Decimal("0.015"), gt=0, le=1
+        default=Decimal("0.008"), gt=0, le=1
     )
     # Both lowered by request from 0.5% - "constantly buy the dip and
     # sell the rise, even a little rise" - a smaller dip threshold fires
@@ -342,6 +349,44 @@ class Settings(BaseSettings):
     volatility_scalp_max_total_exposure_fraction: Decimal = Field(
         default=Decimal("0.60"), gt=0, le=1
     )
+    # Opening-range-breakout entry signal, adapted from the classic Dual
+    # Thrust strategy: fires when price pushes above the rolling window's
+    # own recent local range (the same lookback the dip signal already
+    # uses) by K times that range's own size - a fresh breakout to a new
+    # high with real range behind it, not just a one-tick blip. This is
+    # an ADDITIONAL alternative entry trigger (OR'd with the existing dip
+    # signal, not a replacement) - by request, every extra qualifying
+    # signal should mean MORE trading opportunities, not a stricter bar.
+    # Lowered from 0.5 -> 0.2 - "if the bar for entry is too
+    # restrictive, lower the bar" - a smaller K means a smaller push
+    # past the recent range is enough to count as a real breakout.
+    volatility_scalp_breakout_k: Decimal = Field(
+        default=Decimal("0.2"), gt=0, le=Decimal("5")
+    )
+    # Heikin-Ashi reversal confirmation: synthetic OHLC bars are bucketed
+    # from the same rolling tick-price window (HEIKIN_ASHI_BAR_SAMPLES
+    # consecutive ticks per bar), then transformed to Heikin-Ashi
+    # candles. A third, independent alternative entry trigger alongside
+    # the dip and breakout signals - fires on a confirmed bullish
+    # reversal (a green HA bar with little/no lower wick immediately
+    # following a red one).
+    # bar_samples * bar_count should stay <= volatility_scalp_lookback_
+    # samples (default 20) so a full bar_count of bars can actually form
+    # - _synthetic_bars degrades gracefully with fewer if not, but signal
+    # quality is best with the full count. 3 * 6 = 18, comfortably under
+    # the 20-sample window.
+    heikin_ashi_bar_samples: int = Field(default=3, ge=2, le=50)
+    heikin_ashi_bar_count: int = Field(default=6, ge=3, le=50)
+    # Parabolic SAR trailing-stop exit: computed over the same synthetic
+    # bars as the Heikin-Ashi signal. Used as an ADDITIONAL exit trigger
+    # for a held volatility-scalp position, alongside (not instead of)
+    # the existing quick profit target - either one can independently
+    # close the position, locking in a trend reversal even if price
+    # hasn't yet cleared the fixed percentage target.
+    parabolic_sar_af_step: Decimal = Field(
+        default=Decimal("0.02"), gt=0, le=1
+    )
+    parabolic_sar_af_max: Decimal = Field(default=Decimal("0.2"), gt=0, le=1)
     # Curated daily cohort, not the whole scanned universe: identify a
     # small handful of the cheapest, most volatile names and concentrate
     # on rapidly cycling just those until they cool off, instead of
@@ -360,12 +405,14 @@ class Settings(BaseSettings):
     volatility_scalp_reselect_seconds: int = Field(
         default=1800, ge=60, le=86400
     )
-    # Lowered from 5 by request - "multiple times a minute" - 2s still
-    # leaves room for the reprice/exit machinery to actually process a
-    # fill before the next entry attempt, just without an unnecessarily
-    # long gap between round-trips.
+    # Zeroed by explicit request - "orders can be made as frequently as
+    # possible without a cooldown." The only remaining gap between a
+    # position closing and re-entering the same symbol is however long
+    # the fill/account-refresh round-trip itself actually takes (see
+    # volatility_scalp_positions' synchronous, race-free tracking in
+    # bot.py) - there's no artificial wait layered on top of that.
     volatility_scalp_reentry_cooldown_seconds: int = Field(
-        default=2, ge=0, le=300
+        default=0, ge=0, le=300
     )
     # Warm-starts a symbol's volatility window from real M1 bars the
     # moment it's first scanned, instead of needing several live scan
@@ -535,12 +582,16 @@ class Settings(BaseSettings):
         le=Decimal("1"),
     )
     order_requests_per_minute: int = Field(default=480, ge=1, le=600)
-    # Lowered from 5 -> 2: this gates how fresh the dashboard's buying
-    # power/positions/day-pnl figures are (see AutoTrader.account_state) -
-    # 2s is still a small fraction of order_requests_per_minute's budget
-    # (480/min = one call every 0.125s) even with every other order/quote
-    # call running alongside it.
-    account_refresh_seconds: Decimal = Field(default=Decimal("2"), ge=1, le=60)
+    # Lowered from 5 -> 2 -> 1 (the field's own floor) by request - "make
+    # sure the data is received as frequently as possible." This just
+    # gates how often the bot code ATTEMPTS a refresh (see
+    # AutoTrader.account_state); the actual API call is still separately
+    # paced by account_requests_per_second's token-bucket limiter
+    # (0.8/sec = a hard 1.25s floor between real calls - see
+    # WebullAPI._RATE_LIMITS["account"]), so this can't itself cause
+    # over-limit calls, it just means a refresh fires the instant the
+    # limiter allows one instead of waiting out an extra artificial gap.
+    account_refresh_seconds: Decimal = Field(default=Decimal("1"), ge=1, le=60)
     order_timeout_seconds: int = Field(default=120, ge=15, le=3600)
     order_monitor_seconds: Decimal = Field(default=Decimal("5"), ge=1, le=60)
     stall_breaker_enabled: bool = True
