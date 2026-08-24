@@ -2407,6 +2407,7 @@ class StopLossConfirmationTests(unittest.TestCase):
             stop_condition_since={},
             stop_loss_escalated=set(),
             volatility_scalp_symbols=set(),
+            volatility_scalp_positions=set(),
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
         )
         defaults.update(overrides)
@@ -2523,6 +2524,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             volatility_scalp_symbols=set(),
+            volatility_scalp_positions=set(),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 12345.0},
@@ -2607,6 +2609,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             volatility_scalp_symbols=set(),
+            volatility_scalp_positions=set(),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 5.0},
@@ -2650,6 +2653,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             volatility_scalp_symbols=set(),
+            volatility_scalp_positions=set(),
             stop_loss_escalated={"ASHR"},
             pending_stock_exits=set(),
             stop_exit_submitted={},
@@ -2698,6 +2702,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             volatility_scalp_symbols=set(),
+            volatility_scalp_positions=set(),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 0.0},
@@ -2767,6 +2772,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             last_reprice=0.0,
             strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda symbol: False),
             volatility_scalp_symbols=set(),
+            volatility_scalp_positions=set(),
             stop_loss_escalated=set(),
             pending_stock_exits={"ASHR"},
             stop_exit_submitted={"ASHR": 12345.0},
@@ -2876,6 +2882,7 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
                 is_volatility_scalp_eligible=lambda symbol: symbol in eligible_symbols
             ),
             volatility_scalp_symbols=set(eligible_symbols),
+            volatility_scalp_positions=set(),
             stop_loss_escalated=set(),
             is_fractional_quantity=AutoTrader.is_fractional_quantity,
             working_orders=working_orders,
@@ -2933,6 +2940,49 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
             reprice([])
         self.assertEqual(cancelled, [])
         self.assertEqual(placed, [])
+
+    def test_keeps_managing_an_adopted_position_even_once_no_longer_live_eligible(
+        self,
+    ):
+        """Live incident (this bug, caught from a real trade log): BTCT
+        averaged down 5 times (blended cost ~$1.8494), then stopped out
+        at $1.81 - a 2.1% drop, well inside the 5% hard-stop floor that
+        should have protected it. is_volatility_scalp_eligible is a
+        LIVE, continuously-recalculated stdev check - once several
+        fills naturally calmed the rolling window down below the
+        eligibility bar, the position instantly lost ALL cohort
+        management (including this repricer) and fell back to the
+        plain, much tighter general path. Once a symbol has actually
+        been adopted (self.volatility_scalp_positions), it now keeps
+        this treatment for as long as it's held, regardless of whether
+        it's still live-eligible this exact cycle.
+        """
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:BTCT",
+                "action": "PROFIT",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("1.90"),
+            }
+        }
+        # BTCT is NOT in eligible_symbols (simulating it dropping out of
+        # live eligibility), but IS in volatility_scalp_positions
+        # (already adopted) - must still be actively managed.
+        fake_bot, cancelled, placed = self._fake_bot(
+            set(),
+            working_orders,
+            {"BTCT": Decimal("1.8494")},
+            quote_by_symbol={"BTCT": ("1.86", "1.87")},
+        )
+        fake_bot.volatility_scalp_positions = {"BTCT"}
+        reprice = AutoTrader.reprice_volatility_scalp_exits.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice([])
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertTrue(placed)
 
     def test_never_reprices_below_the_profit_floor(self):
         """Live incident: the old check here was a blunt "ask < cost ->
@@ -3063,6 +3113,7 @@ class VolatilityScalpEntryRepriceTests(unittest.TestCase):
             strategy=SimpleNamespace(
                 is_volatility_scalp_eligible=lambda symbol: symbol in eligible_symbols
             ),
+            volatility_scalp_positions=set(),
             working_orders=working_orders,
         )
         return fake_bot, cancelled, placed
@@ -5409,6 +5460,7 @@ class VolatilityScalpCohortSelectionTests(unittest.TestCase):
             config=SimpleNamespace(**config),
             last_volatility_symbol_selection=float("-inf"),
             volatility_scalp_symbols=set(),
+            volatility_scalp_positions=set(),
             strategy=SimpleNamespace(
                 prices=prices,
                 realized_volatility_percent=lambda symbol: stdev_by_symbol.get(symbol),
