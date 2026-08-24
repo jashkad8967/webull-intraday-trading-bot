@@ -94,6 +94,7 @@ class StrategyConfigMixin:
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
             volatility_scalp_target_percent=Decimal("0.005"),
             volatility_scalp_momentum_stall_min_profit_fraction=Decimal("0.6"),
+            volatility_scalp_hard_stop_percent=Decimal("0.05"),
             volatility_scalp_max_price=Decimal("5"),
             volatility_scalp_target_notional=Decimal("400"),
             volatility_scalp_target_notional_buying_power_fraction=Decimal("0.15"),
@@ -620,6 +621,45 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         loss = Decision("LOSS", "percentage stop reached", Decimal("19.00"))
         result = strategy.volatility_scalp_exit_override(
             loss, quantity=10, average_cost=Decimal("20.00"), price=Decimal("20.20")
+        )
+        self.assertEqual(result.action, "HOLD")
+
+    def test_exit_override_lets_the_stop_through_past_the_hard_stop_floor(self):
+        """Research finding (compared against freqtrade's documented DCA
+        pattern after "basically only taking losses" was reported live):
+        a mature DCA implementation never fully suppresses the stop-loss
+        during averaging - it keeps a wide-but-always-active hard stop
+        as a catastrophic-loss backstop. VOLATILITY_SCALP_HARD_STOP_
+        PERCENT (5% in the test config) restores that: a drop beyond it
+        means a real breakdown, not a normal dip within the DCA ladder's
+        own range, so the real stop-loss is let through.
+        """
+        strategy = TradingStrategy(self.config())
+        from webull_bot.strategy import Decision
+
+        loss = Decision("LOSS", "percentage stop reached", Decimal("18.90"))
+        # (20.00 - 18.90) / 20.00 = 5.5% - past the 5% hard stop floor.
+        result = strategy.volatility_scalp_exit_override(
+            loss,
+            quantity=10,
+            average_cost=Decimal("20.00"),
+            price=Decimal("18.90"),
+            averaging_available=True,
+        )
+        self.assertIs(result, loss)
+
+    def test_exit_override_still_suppresses_a_loss_within_the_hard_stop_floor(self):
+        strategy = TradingStrategy(self.config())
+        from webull_bot.strategy import Decision
+
+        loss = Decision("LOSS", "percentage stop reached", Decimal("19.50"))
+        # (20.00 - 19.50) / 20.00 = 2.5% - well within the 5% floor.
+        result = strategy.volatility_scalp_exit_override(
+            loss,
+            quantity=10,
+            average_cost=Decimal("20.00"),
+            price=Decimal("19.50"),
+            averaging_available=True,
         )
         self.assertEqual(result.action, "HOLD")
 
