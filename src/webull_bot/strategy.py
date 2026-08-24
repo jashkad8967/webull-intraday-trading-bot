@@ -581,11 +581,32 @@ class TradingStrategy:
         if quantity <= 0 or average_cost <= 0:
             return decision
         if decision.action == "LOSS" and averaging_available:
-            return Decision(
-                "HOLD",
-                "volatility scalp - averaging down instead of stopping out",
-                price,
-            )
+            # Research finding (freqtrade's documented DCA pattern,
+            # compared against ours after "basically only taking
+            # losses" was reported live): a mature DCA implementation
+            # NEVER fully suppresses the stop-loss during averaging - it
+            # keeps a wide-but-always-active hard stop live from entry,
+            # sized to not fight the DCA ladder, specifically as a
+            # catastrophic-loss backstop distinct from the per-level
+            # re-buy logic. Ours removed the stop-loss entirely instead,
+            # leaving an averaging-eligible position with NO risk
+            # ceiling until all averaging attempts were exhausted - the
+            # likely root cause of realized losses running several
+            # times the size of this cohort's own tiny profit-takes.
+            # VOLATILITY_SCALP_HARD_STOP_PERCENT (default 5%) restores
+            # that backstop: still lets a normal-sized dip average down
+            # freely (the 5-level, 0.2%-per-level DCA ladder covers
+            # about 1% of adverse movement), but a drop beyond it means
+            # a real breakdown, not a normal dip - the actual stop-loss
+            # is allowed through instead of being suppressed forever.
+            drop = (average_cost - price) / average_cost
+            if drop < self.config.volatility_scalp_hard_stop_percent:
+                return Decision(
+                    "HOLD",
+                    "volatility scalp - averaging down instead of stopping out",
+                    price,
+                )
+            return decision
         if decision.action != "HOLD":
             return decision
         target = self.volatility_scalp_target_price(average_cost)

@@ -345,6 +345,20 @@ class Settings(BaseSettings):
     # averaging entirely. Raised 3 -> 5 by request - "not averaging
     # down enough."
     volatility_scalp_max_averaging_buys: int = Field(default=5, ge=0, le=10)
+    # Research finding (compared against freqtrade's documented DCA
+    # pattern after "basically only taking losses" was reported live):
+    # a mature DCA implementation never fully suppresses the stop-loss
+    # during averaging - it keeps a wide-but-always-active hard stop
+    # live from entry as a catastrophic-loss backstop distinct from the
+    # per-level re-buy logic. Sized to comfortably not interfere with
+    # the DCA ladder (5 levels * 0.2%/level covers roughly 1% of
+    # adverse movement) while still capping true worst-case loss - a
+    # drop beyond this means a real breakdown, not a normal dip, and
+    # the actual stop-loss is let through instead of staying suppressed
+    # until every averaging attempt is exhausted.
+    volatility_scalp_hard_stop_percent: Decimal = Field(
+        default=Decimal("0.05"), gt=0, le=1
+    )
     # Live incident: GAUZ's routine 2-7% spread meant the general
     # STOCK_ENTRY_MAX_SPREAD_PERCENT (0.50%, tuned for a quote-glitch on
     # an otherwise normal, liquid stock) almost never let the exit
