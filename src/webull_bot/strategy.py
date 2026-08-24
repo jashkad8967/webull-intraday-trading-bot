@@ -309,12 +309,20 @@ class TradingStrategy:
     def volatility_scalp_momentum_stalling(self, symbol: str, price: Decimal) -> bool:
         """Mirror of volatility_scalp_momentum_stalled_or_rising for the
         exit side: true once upward momentum has stopped making fresh
-        highs - flat or already ticking back down. By request: "if
+        highs for TWO consecutive ticks, not just one. By request: "if
         there is a profit and it doesn't seem to be going much higher,
         then sell it off... before the next dip." Combined with an
         in-profit check by the caller (volatility_scalp_exit_override) -
         this alone doesn't imply profitability, just that the price
         isn't still climbing.
+
+        Recalibrated by request - "too trigger happy to sell... not
+        capturing the profits when it can": a single flat/down tick is
+        normal noise even in a genuine uptrend and was cutting winners
+        off before they had room to run. Requiring the current tick AND
+        the one before it to both fail to make a fresh high is a much
+        stronger, less noise-sensitive stall confirmation - a real
+        plateau, not a single wobble.
 
         Fails CLOSED (False, doesn't force an exit) with no history -
         the opposite convention from the entry-side stall check, since
@@ -327,12 +335,13 @@ class TradingStrategy:
         samples = list(window)
         if samples and Decimal(str(samples[-1])) == price:
             samples = samples[:-1]
-        if not samples:
+        if len(samples) < 2:
             return False
         previous = Decimal(str(samples[-1]))
-        if previous <= 0:
+        before_that = Decimal(str(samples[-2]))
+        if previous <= 0 or before_that <= 0:
             return False
-        return price <= previous
+        return price <= previous <= before_that
 
     def _synthetic_bars(self, symbol: str) -> list[dict]:
         """Buckets the rolling tick-price window (volatility_price_history)
@@ -554,15 +563,20 @@ class TradingStrategy:
 
         A FOURTH, even more eager way to reach PROFIT: by request, "if
         there is a profit and it doesn't seem to be going much higher,
-        then sell it off... before the next dip." Any real profit
-        (price above cost at all, not the full quick target) combined
-        with volatility_scalp_momentum_stalling - upward momentum has
-        stopped making fresh highs - takes the exit immediately rather
-        than waiting for either the fixed quick target or a full SAR
-        trend reversal, both of which can be slower to trigger than a
-        single stalled tick. Checked last (after the bigger, slower
-        targets) so a position that's still climbing keeps riding
-        toward the larger target instead of being cashed out early.
+        then sell it off... before the next dip." Recalibrated by a
+        later request - "too trigger happy to sell... not capturing the
+        profits when it can" - this used to fire on ANY real profit at
+        all (even a fraction of a cent) combined with a single stalled
+        tick, which was cashing out winners before they had room to
+        run. Now requires price to have already covered at least
+        VOLATILITY_SCALP_MOMENTUM_STALL_MIN_PROFIT_FRACTION of the full
+        distance from cost to the quick target (default 60%) AND a
+        stronger two-tick stall confirmation (see
+        volatility_scalp_momentum_stalling) before taking the early
+        exit. Checked last (after the bigger, slower targets) so a
+        position that's still climbing - or hasn't earned enough of the
+        move yet - keeps riding toward the larger target instead of
+        being cashed out early.
         """
         if quantity <= 0 or average_cost <= 0:
             return decision
@@ -582,7 +596,10 @@ class TradingStrategy:
                 return Decision(
                     "PROFIT", "parabolic SAR trend reversal exit", price
                 )
-            if price > average_cost and self.volatility_scalp_momentum_stalling(
+            min_stall_price = average_cost + (target - average_cost) * (
+                self.config.volatility_scalp_momentum_stall_min_profit_fraction
+            )
+            if price >= min_stall_price and self.volatility_scalp_momentum_stalling(
                 symbol, price
             ):
                 return Decision(

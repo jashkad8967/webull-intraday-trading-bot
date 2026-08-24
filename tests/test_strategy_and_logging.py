@@ -93,6 +93,7 @@ class StrategyConfigMixin:
             volatility_scalp_min_stdev_percent=Decimal("0.015"),
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
             volatility_scalp_target_percent=Decimal("0.005"),
+            volatility_scalp_momentum_stall_min_profit_fraction=Decimal("0.6"),
             volatility_scalp_max_price=Decimal("5"),
             volatility_scalp_target_notional=Decimal("400"),
             volatility_scalp_target_notional_buying_power_fraction=Decimal("0.15"),
@@ -1080,10 +1081,23 @@ class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
 
     def test_exit_gate_fires_once_upward_momentum_stalls(self):
         strategy = TradingStrategy(self.config())
-        # Two consecutive equal ticks (10.3, 10.3) - upward momentum has
-        # stopped making fresh highs.
-        self._feed(strategy, "RISE", [10, 10.1, 10.2, 10.3, 10.3])
+        # THREE consecutive equal ticks (10.3, 10.3, 10.3) - upward
+        # momentum has stopped making fresh highs for two ticks running
+        # now (the stronger, recalibrated confirmation - a single flat
+        # tick alone is no longer enough).
+        self._feed(strategy, "RISE", [10, 10.1, 10.2, 10.3, 10.3, 10.3])
         self.assertTrue(
+            strategy.volatility_scalp_momentum_stalling("RISE", Decimal("10.3"))
+        )
+
+    def test_exit_gate_does_not_fire_on_a_single_flat_tick(self):
+        """Recalibrated by request - "too trigger happy to sell... not
+        capturing the profits when it can" - a single flat tick is
+        normal noise, not a real stall anymore.
+        """
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "RISE", [10, 10.1, 10.2, 10.3, 10.3])
+        self.assertFalse(
             strategy.volatility_scalp_momentum_stalling("RISE", Decimal("10.3"))
         )
 
@@ -1119,26 +1133,51 @@ class VolatilityScalpExitOverrideMomentumStallTests(
                 Decimal(str(price)),
             )
 
-    def test_fires_on_a_small_profit_once_momentum_stalls(self):
+    def test_fires_once_most_of_the_target_is_covered_and_momentum_stalls(self):
         strategy = TradingStrategy(self.config())
-        # cost=10.29 keeps this well under the 0.5% quick target
-        # (10.29 * 1.005 = 10.34...) so the quick-target path doesn't
-        # preempt this one - a real but small profit at price=10.30,
-        # with a repeated final tick (10.30, 10.30) showing momentum
-        # has stalled.
-        self._feed(strategy, "RISE", [10.1, 10.2, 10.29, 10.30, 10.30])
+        # cost=10.29, target = 10.29 * 1.005 = 10.34145 (under the mixin's
+        # 0.5% target_percent). min_stall_price (60% of the way from
+        # cost to target) = 10.29 + (10.34145-10.29)*0.6 = 10.3209 -
+        # price=10.33 clears that but stays under the full target, and
+        # ends with TWO consecutive equal ticks (the recalibrated,
+        # stronger stall confirmation).
+        self._feed(strategy, "RISE", [10.1, 10.2, 10.29, 10.32, 10.33, 10.33, 10.33])
         from webull_bot.strategy import Decision
 
         result = strategy.volatility_scalp_exit_override(
-            Decision("HOLD", "between target and stop", Decimal("10.30")),
+            Decision("HOLD", "between target and stop", Decimal("10.33")),
+            quantity=100,
+            average_cost=Decimal("10.29"),
+            price=Decimal("10.33"),
+            averaging_available=True,
+            symbol="RISE",
+        )
+        self.assertEqual(result.action, "PROFIT")
+        self.assertIn("momentum stalling", result.reason)
+
+    def test_does_not_fire_on_a_tiny_profit_even_if_momentum_stalls(self):
+        """Recalibrated by request - "too trigger happy to sell... not
+        capturing the profits when it can" - a tiny profit (well under
+        VOLATILITY_SCALP_MOMENTUM_STALL_MIN_PROFIT_FRACTION of the way
+        to the real target) no longer triggers an early exit just
+        because momentum stalled for a couple ticks.
+        """
+        strategy = TradingStrategy(self.config())
+        # cost=10.29, target=10.34145, min_stall_price=10.3209 - price
+        #=10.30 is a real profit but well under that fraction.
+        self._feed(strategy, "RISE", [10.1, 10.2, 10.29, 10.30, 10.30, 10.30])
+        from webull_bot.strategy import Decision
+
+        held = Decision("HOLD", "between target and stop", Decimal("10.30"))
+        result = strategy.volatility_scalp_exit_override(
+            held,
             quantity=100,
             average_cost=Decimal("10.29"),
             price=Decimal("10.30"),
             averaging_available=True,
             symbol="RISE",
         )
-        self.assertEqual(result.action, "PROFIT")
-        self.assertIn("momentum stalling", result.reason)
+        self.assertIs(result, held)
 
     def test_never_fires_at_exactly_cost_no_real_profit(self):
         strategy = TradingStrategy(self.config())
@@ -1287,6 +1326,46 @@ class VolatilityScalpReentryCooldownTests(unittest.TestCase):
         )
         ready = AutoTrader.volatility_scalp_reentry_ready.__get__(fake_bot)
         self.assertTrue(ready("STOCK:WILD"))
+
+
+class VolatilityScalpEntryPriceTests(unittest.TestCase):
+    """volatility_scalp_entry_price - by request, "a lot of the orders
+    are being cancelled... ensure the initial order itself is likely to
+    be filled." Crosses at the (tick-quantized) ask instead of the
+    passive bid/ask midpoint every other entry uses, guaranteeing a
+    real chance to fill immediately instead of sitting for the full
+    ORDER_TIMEOUT_SECONDS waiting for the market to fall back to a
+    passive mid-price.
+    """
+
+    @staticmethod
+    def _fake_bot():
+        from webull_bot.bot import AutoTrader
+        from webull_bot.webull_api import WebullAPI
+
+        fake_bot = SimpleNamespace(
+            api=SimpleNamespace(
+                quote_ask=lambda q: (
+                    Decimal(str(q["ask"])) if q.get("ask") else None
+                ),
+                price_tick_size=WebullAPI.price_tick_size,
+            )
+        )
+        return AutoTrader.volatility_scalp_entry_price.__get__(fake_bot)
+
+    def test_crosses_at_the_ask_for_a_dollar_plus_stock(self):
+        entry_price = self._fake_bot()
+        result = entry_price({"bid": "9.90", "ask": "10.05"})
+        self.assertEqual(result, Decimal("10.05"))
+
+    def test_crosses_at_the_ask_with_sub_penny_precision_under_a_dollar(self):
+        entry_price = self._fake_bot()
+        result = entry_price({"bid": "0.4590", "ask": "0.4600"})
+        self.assertEqual(result, Decimal("0.4600"))
+
+    def test_returns_none_with_no_valid_ask(self):
+        entry_price = self._fake_bot()
+        self.assertIsNone(entry_price({"bid": "9.90", "ask": None}))
 
 
 class CapBatchToSnapshotLimitTests(unittest.TestCase):

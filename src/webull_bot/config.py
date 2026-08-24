@@ -316,8 +316,23 @@ class Settings(BaseSettings):
     volatility_scalp_dip_entry_percent: Decimal = Field(
         default=Decimal("0.002"), gt=0, le=1
     )
+    # Raised 0.2% -> 0.5% by request - "too trigger happy to sell...
+    # not capturing the profits when it can." A slightly bigger quick
+    # target keeps more of a real move instead of cashing out at the
+    # first sign of a small bounce.
     volatility_scalp_target_percent: Decimal = Field(
-        default=Decimal("0.002"), gt=0, le=1
+        default=Decimal("0.005"), gt=0, le=1
+    )
+    # Gates TradingStrategy.volatility_scalp_exit_override's fourth,
+    # most-eager exit path (stalling momentum on a profitable position) -
+    # by request: "too trigger happy to sell... not capturing the
+    # profits when it can." Price must have already covered at least
+    # this fraction of the full distance from cost to the quick target
+    # before an early stall-triggered exit is allowed to fire - a small,
+    # immediate profit alone isn't enough anymore, it has to actually be
+    # most of the way to the real target first.
+    volatility_scalp_momentum_stall_min_profit_fraction: Decimal = Field(
+        default=Decimal("0.6"), gt=0, le=1
     )
     volatility_scalp_max_concurrent_positions: int = Field(
         default=3, ge=1, le=20
@@ -327,8 +342,9 @@ class Settings(BaseSettings):
     # position can make while averaging down, bounding worst-case
     # exposure per symbol to (this + 1) * volatility_scalp_share_count's
     # fixed lot size, instead of an unbounded chase. 0 disables
-    # averaging entirely.
-    volatility_scalp_max_averaging_buys: int = Field(default=3, ge=0, le=10)
+    # averaging entirely. Raised 3 -> 5 by request - "not averaging
+    # down enough."
+    volatility_scalp_max_averaging_buys: int = Field(default=5, ge=0, le=10)
     # Live incident: GAUZ's routine 2-7% spread meant the general
     # STOCK_ENTRY_MAX_SPREAD_PERCENT (0.50%, tuned for a quote-glitch on
     # an otherwise normal, liquid stock) almost never let the exit

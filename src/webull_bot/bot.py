@@ -2,7 +2,7 @@ import logging
 import time
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from zoneinfo import ZoneInfo
 
 from rich.logging import RichHandler
@@ -834,6 +834,31 @@ class AutoTrader:
             and order.get("cancel_requested_at") is None
             for order in self.working_orders.values()
         )
+
+    def volatility_scalp_entry_price(self, quote: dict) -> Decimal | None:
+        """Aggressive, cross-the-spread BUY price for the volatility-
+        scalp cohort - by request: "a lot of the orders are being
+        cancelled... ensure the initial order itself is likely to be
+        filled." The general stock_limit_price(quote, "BUY") used
+        everywhere else prices passively at the bid/ask midpoint - fine
+        for the normal strategy's slower entries, but for a strategy
+        whose whole point is fast, repeated round trips, a passive mid
+        that the market has to fall back down to before it ever fills
+        just sits for the full ORDER_TIMEOUT_SECONDS (120s) and gets
+        cancelled without ever entering the position (live incident:
+        several BUY orders cancelled "unfilled after 120s" in a row).
+        Crosses at the ask instead - a real cost (paying the spread
+        instead of resting inside it), but guarantees the order can
+        actually fill immediately in virtually all cases, which is the
+        whole point of a high-frequency strategy that depends on
+        actually being in the position to catch the next move.
+        reprice_volatility_scalp_entries still lowers this toward a
+        falling market afterward, same as before.
+        """
+        ask = self.api.quote_ask(quote)
+        if ask is None:
+            return None
+        return ask.quantize(self.api.price_tick_size(ask), rounding=ROUND_UP)
 
     def reentry_cooldown_ready(self, key: str) -> bool:
         elapsed = time.monotonic() - self.last_exit_at.get(key, float("-inf"))
@@ -2289,6 +2314,7 @@ class AutoTrader:
         key: str,
         quote: dict,
         fractional: bool = False,
+        limit_price_override: Decimal | None = None,
     ) -> str | None:
         """Slices a large order into smaller clips instead of dumping the
         whole size in one order - large firms never do that because it
@@ -2339,7 +2365,11 @@ class AutoTrader:
                 HARD_ORDER_NOTIONAL_CEILING,
             )
             return None
-        limit_price = self.api.stock_limit_price(quote, side)
+        limit_price = (
+            limit_price_override
+            if limit_price_override is not None
+            else self.api.stock_limit_price(quote, side)
+        )
         if not self.price_sanity_ok(symbol, last_price, limit_price):
             return None
         try:
@@ -2974,12 +3004,33 @@ class AutoTrader:
                 # it qualifies, and stops getting it the moment it cools
                 # off and no longer does.
                 if quantity > 0 and self.strategy.is_volatility_scalp_eligible(symbol):
+                    # Live incident (this bug, caught from a real trade
+                    # log): a position opened via the NORMAL trend-entry
+                    # path that later became scalp-eligible got this
+                    # fast quick-profit-take on the way UP (the block
+                    # above applies unconditionally to any eligible
+                    # held position), but NOT averaging-down protection
+                    # on the way down, since self.volatility_scalp_
+                    # positions only ever got populated by the scalp's
+                    # OWN dip-buy entry path - so its full, larger
+                    # adaptive stop-loss stayed active and fired for a
+                    # real loss several times the size of this cohort's
+                    # own tiny profit-takes (OSRH -1.14, VBIO -0.86 vs.
+                    # profits of 0.01-0.06) - heads win small, tails
+                    # lose big. Auto-adopts ANY held, currently-eligible
+                    # position into full cohort management the moment
+                    # it's seen here, regardless of how it was opened,
+                    # so it gets the SAME averaging-down recovery plan
+                    # and suppressed stop-loss as a symbol dip-bought by
+                    # this strategy directly - closing the asymmetry
+                    # that quick-profit-take alone was blind to.
+                    self.volatility_scalp_positions.add(symbol)
                     decision = self.strategy.volatility_scalp_exit_override(
                         decision,
                         quantity,
                         cost,
                         price,
-                        averaging_available=symbol in self.volatility_scalp_positions,
+                        averaging_available=True,
                         symbol=symbol,
                     )
                 if decision.action == "LOSS":
@@ -3148,13 +3199,16 @@ class AutoTrader:
                             scalp_quantity,
                             key,
                             quote,
+                            limit_price_override=self.volatility_scalp_entry_price(
+                                quote
+                            ),
                         )
                         if order_id is not None:
                             self.record_trade(
                                 key,
                                 order_id,
                                 "BUY",
-                                entry_price=self.api.stock_limit_price(quote, "BUY"),
+                                entry_price=self.volatility_scalp_entry_price(quote),
                                 quantity=scalp_quantity,
                             )
                             self.volatility_scalp_positions.add(symbol)
@@ -3237,16 +3291,17 @@ class AutoTrader:
                         symbol not in self.volatility_scalp_last_buy_price
                         or price < self.volatility_scalp_last_buy_price[symbol]
                     )
-                    # Same "don't buy while still actively falling" gate
-                    # as the fresh-entry block above - averaging down is
-                    # still a fresh buy, just against an existing
-                    # position.
-                    and self.strategy.volatility_scalp_momentum_stalled_or_rising(
-                        symbol, price
-                    )
-                    # Same spread-quality gate as the fresh-entry block
-                    # above.
-                    and self.strategy.volatility_scalp_entry_spread_ok(symbol)
+                    # By request: "not averaging down enough" - the
+                    # momentum-stall and spread-quality gates that apply
+                    # to FRESH entries (below) deliberately do NOT apply
+                    # here. A fresh entry is a brand-new commitment
+                    # where waiting for a stall/reasonable spread is
+                    # sound risk management; averaging down is adding to
+                    # a position already committed to, where the whole
+                    # point is catching the dip while it's still
+                    # happening, not waiting for it to finish falling
+                    # first. The strictly-lower-than-last-buy check just
+                    # above is the real quality gate here.
                 ):
                     average_down_quantity = self.strategy.volatility_scalp_share_count(
                         price,
@@ -3278,13 +3333,16 @@ class AutoTrader:
                             average_down_quantity,
                             key,
                             quote,
+                            limit_price_override=self.volatility_scalp_entry_price(
+                                quote
+                            ),
                         )
                         if order_id is not None:
                             self.record_trade(
                                 key,
                                 order_id,
                                 "BUY",
-                                entry_price=self.api.stock_limit_price(quote, "BUY"),
+                                entry_price=self.volatility_scalp_entry_price(quote),
                                 quantity=average_down_quantity,
                             )
                             self.volatility_scalp_average_down_count[symbol] += 1
