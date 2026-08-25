@@ -337,6 +337,25 @@ class Settings(BaseSettings):
     volatility_scalp_averaging_step_multiplier: Decimal = Field(
         default=Decimal("0.5"), ge=0, le=5
     )
+    # By request, after an end-of-day retrospective: "we just kept
+    # buying at the wrong time." The SMA trend filter added earlier
+    # only catches a MULTI-DAY downtrend (refreshed once daily from
+    # daily-bar closes) - it does nothing for a stock simply having a
+    # bad DAY today specifically, which is what repeated same-day
+    # losses on one symbol (BTCT, three times in one session) actually
+    # looks like: an intraday decline that hasn't shown up in the daily
+    # SMA yet, since today's close hasn't happened. The scalp entry
+    # path never checked the intraday VWAP at all (see vwap_supports_
+    # entry, already used by the general strategy) - a stock trading
+    # meaningfully below its own session VWAP is showing real intraday
+    # weakness, not just a normal dip. Needs its own, much wider band
+    # than VWAP_ENTRY_BAND_PERCENT (0.1%, tuned for the general
+    # strategy's more liquid names) - a genuinely wide-spread, choppy
+    # penny stock's normal dip-buy can easily sit several percent below
+    # its own VWAP without that being a real warning sign.
+    volatility_scalp_vwap_band_percent: Decimal = Field(
+        default=Decimal("0.05"), ge=0, le=Decimal("0.5")
+    )
     # Raised 0.2% -> 0.5% by request - "too trigger happy to sell...
     # not capturing the profits when it can." A slightly bigger quick
     # target keeps more of a real move instead of cashing out at the

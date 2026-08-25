@@ -93,6 +93,7 @@ class StrategyConfigMixin:
             volatility_scalp_min_stdev_percent=Decimal("0.015"),
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
             volatility_scalp_averaging_step_multiplier=Decimal("0.5"),
+            volatility_scalp_vwap_band_percent=Decimal("0.05"),
             volatility_scalp_target_percent=Decimal("0.005"),
             volatility_scalp_momentum_stall_min_profit_fraction=Decimal("0.6"),
             volatility_scalp_hard_stop_percent=Decimal("0.05"),
@@ -947,6 +948,57 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
                 Decimal("5.00"), intensity=Decimal("2")
             ),
             80,
+        )
+
+
+class VolatilityScalpVwapGateTests(StrategyConfigMixin, unittest.TestCase):
+    """volatility_scalp_vwap_supports_entry - by request, after an end-
+    of-day retrospective ("we just kept buying at the wrong time"): the
+    SMA trend filter only catches a multi-day downtrend, nothing for a
+    stock simply having a bad DAY today specifically. Uses its own much
+    wider band than the general vwap_supports_entry.
+    """
+
+    def test_blocks_when_price_sits_well_below_session_vwap(self):
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_vwap_band_percent = Decimal("0.05")
+        # Feed volume so VWAP actually accumulates (cum_pv/cum_vol).
+        strategy.update_stock_snapshot(
+            {"symbol": "WEAK", "volume": "1000", "price": "10.00"},
+            Decimal("10.00"),
+        )
+        strategy.update_stock_snapshot(
+            {"symbol": "WEAK", "volume": "2000", "price": "10.00"},
+            Decimal("10.00"),
+        )
+        # VWAP ~10.00, band 5% -> floor 9.50. Price 9.00 is well below.
+        self.assertFalse(
+            strategy.volatility_scalp_vwap_supports_entry("WEAK", Decimal("9.00"))
+        )
+
+    def test_allows_a_normal_dip_within_the_wider_band(self):
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_vwap_band_percent = Decimal("0.05")
+        strategy.update_stock_snapshot(
+            {"symbol": "OK", "volume": "1000", "price": "10.00"},
+            Decimal("10.00"),
+        )
+        strategy.update_stock_snapshot(
+            {"symbol": "OK", "volume": "2000", "price": "10.00"},
+            Decimal("10.00"),
+        )
+        # 9.70 is only 3% below VWAP - within the 5% band, a normal
+        # choppy-stock dip, not a real warning sign.
+        self.assertTrue(
+            strategy.volatility_scalp_vwap_supports_entry("OK", Decimal("9.70"))
+        )
+
+    def test_fails_open_with_no_vwap_data_yet(self):
+        strategy = TradingStrategy(self.config())
+        self.assertTrue(
+            strategy.volatility_scalp_vwap_supports_entry(
+                "NEVERSEEN", Decimal("10")
+            )
         )
 
 

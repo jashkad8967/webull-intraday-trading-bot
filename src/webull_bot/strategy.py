@@ -787,6 +787,31 @@ class TradingStrategy:
             return price <= vwap * (Decimal("1") + band)
         return price >= vwap * (Decimal("1") - band)
 
+    def volatility_scalp_vwap_supports_entry(
+        self, symbol: str, price: Decimal
+    ) -> bool:
+        """Intraday counterpart to sma_trend_supports_entry - by
+        request, after an end-of-day retrospective ("we just kept
+        buying at the wrong time"): the SMA filter only catches a
+        MULTI-DAY downtrend, nothing for a stock simply having a bad
+        DAY today specifically (an intraday decline that hasn't shown
+        up in the daily SMA yet). A stock trading meaningfully below
+        its own session VWAP is showing real intraday weakness, not
+        just a normal dip. Uses its own, much wider band
+        (VOLATILITY_SCALP_VWAP_BAND_PERCENT) than the general
+        vwap_supports_entry's VWAP_ENTRY_BAND_PERCENT (0.1%, tuned for
+        more liquid names) - a genuinely choppy penny stock's normal
+        dip-buy can easily sit several percent below its own VWAP
+        without that being a real warning sign. Fails OPEN (True) with
+        no VWAP data yet, same convention as every other entry gate.
+        """
+        vwap = self.vwap(symbol)
+        if vwap is None:
+            return True
+        return price >= vwap * (
+            Decimal("1") - self.config.volatility_scalp_vwap_band_percent
+        )
+
     def sma_trend_supports_entry(
         self, symbol: str, price: Decimal, direction: str = "BUY"
     ) -> bool:
