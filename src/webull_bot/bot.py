@@ -3215,6 +3215,18 @@ class AutoTrader:
                     # - only lets a dip-buy fire in the direction of (or
                     # with no data on) the larger trend, not against it.
                     and self.strategy.sma_trend_supports_entry(symbol, price, "BUY")
+                    # By request, after an end-of-day retrospective ("we
+                    # just kept buying at the wrong time"): the SMA
+                    # filter above only catches a MULTI-DAY downtrend -
+                    # nothing for a stock simply having a bad DAY today
+                    # specifically, which is what repeated same-day
+                    # losses on one symbol (BTCT, three times in one
+                    # session) actually looks like. A stock trading
+                    # meaningfully below its own session VWAP is real
+                    # intraday weakness, not just a normal dip.
+                    and self.strategy.volatility_scalp_vwap_supports_entry(
+                        symbol, price
+                    )
                     # THREE independent, OR'd entry triggers - by request,
                     # every extra qualifying signal means MORE trading
                     # opportunities, not a stricter combined bar: the
