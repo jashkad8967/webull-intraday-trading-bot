@@ -7529,7 +7529,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
             config=SimpleNamespace(price_sanity_cooldown_seconds=30),
             price_sanity_rejected_at={"AAPL": 100.0},
         )
-        ready = AutoTrader.entry_price_sanity_cooldown_ready.__get__(fake_bot)
+        ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         with unittest.mock.patch("time.monotonic", return_value=110.0):
             self.assertFalse(ready("AAPL"))
 
@@ -7540,18 +7540,18 @@ class ExecutionGuardrailTests(unittest.TestCase):
             config=SimpleNamespace(price_sanity_cooldown_seconds=30),
             price_sanity_rejected_at={"AAPL": 100.0},
         )
-        ready = AutoTrader.entry_price_sanity_cooldown_ready.__get__(fake_bot)
+        ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         with unittest.mock.patch("time.monotonic", return_value=131.0):
             self.assertTrue(ready("AAPL"))
 
-    def test_entry_price_sanity_cooldown_ready_for_a_never_rejected_symbol(self):
+    def test_price_sanity_cooldown_ready_for_a_never_rejected_symbol(self):
         from webull_bot.bot import AutoTrader
 
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(price_sanity_cooldown_seconds=30),
             price_sanity_rejected_at={},
         )
-        ready = AutoTrader.entry_price_sanity_cooldown_ready.__get__(fake_bot)
+        ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         self.assertTrue(ready("AAPL"))
 
     def test_entry_price_sanity_cooldown_is_per_symbol(self):
@@ -7561,7 +7561,7 @@ class ExecutionGuardrailTests(unittest.TestCase):
             config=SimpleNamespace(price_sanity_cooldown_seconds=30),
             price_sanity_rejected_at={"AAPL": 100.0},
         )
-        ready = AutoTrader.entry_price_sanity_cooldown_ready.__get__(fake_bot)
+        ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         with unittest.mock.patch("time.monotonic", return_value=110.0):
             self.assertTrue(ready("MSFT"))
 
@@ -7639,9 +7639,11 @@ class ExecutionGuardrailTests(unittest.TestCase):
             api=FakeApi(),
             iceberg_orders={},
             price_sanity_rejected_at={},
+            config=SimpleNamespace(price_sanity_cooldown_seconds=30),
             strategy=SimpleNamespace(minimum_lot_size=TradingStrategy.minimum_lot_size),
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
         return fake_bot
 
@@ -7726,9 +7728,13 @@ class ExecutionGuardrailTests(unittest.TestCase):
                 return "order-1"
 
         fake_bot = SimpleNamespace(
-            api=BadPriceApi(), iceberg_orders={}, price_sanity_rejected_at={}
+            api=BadPriceApi(),
+            iceberg_orders={},
+            price_sanity_rejected_at={},
+            config=SimpleNamespace(price_sanity_cooldown_seconds=30),
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         fake_bot.record_order_error = AutoTrader.record_order_error.__get__(fake_bot)
         place = AutoTrader.place_stock_scaled.__get__(fake_bot)
         with self.assertLogs("webull-bot", level="ERROR"):
