@@ -288,7 +288,7 @@ class AutoTrader:
         # unrelated breach.
         self.stop_condition_since: dict[str, float] = {}
         # Monotonic timestamp of a symbol's last price_sanity_ok
-        # rejection - see entry_price_sanity_cooldown_ready. Live
+        # rejection - see price_sanity_cooldown_ready. Live
         # incident: one illiquid symbol's quote sat just past the sanity
         # tolerance and got retried (and re-rejected) on every single
         # scan cycle for hours, with nothing backing it off.
@@ -2236,7 +2236,7 @@ class AutoTrader:
         not config, since this is a sanity backstop, not a tuning knob.
 
         Records the rejection in price_sanity_rejected_at - see
-        entry_price_sanity_cooldown_ready. Live incident: one illiquid
+        price_sanity_cooldown_ready. Live incident: one illiquid
         symbol's bid/ask sat consistently ~9-10% off its own last-trade
         price (a real market condition on a thin quote, not a bad
         broker read - past _sane_bid_or_ask's own, looser 8% tolerance,
@@ -2262,15 +2262,25 @@ class AutoTrader:
             return False
         return True
 
-    def entry_price_sanity_cooldown_ready(self, symbol: str) -> bool:
+    def price_sanity_cooldown_ready(self, symbol: str) -> bool:
         """False while symbol is still within PRICE_SANITY_COOLDOWN_SECONDS
         of its last price_sanity_ok rejection - without this, a symbol
         whose quote sits just past the sanity tolerance gets retried
         (and re-rejected) on literally every scan cycle forever, wasting
         a batch slot another, viable candidate could have used instead.
-        Not entering is always safe, so unlike the exit side's stalled-
-        order backstops, this only ever backs off - it never needs a
-        forced-through escalation path.
+
+        Live incident (this bug): originally entry-only (the docstring
+        used to claim "unlike the exit side's stalled-order backstops,
+        this only ever backs off" - that assumption was wrong in
+        practice). BMEA's profit-take order re-escalated and resubmitted
+        every ~15-20s continuously for over 5 HOURS, hitting this exact
+        price-sanity rejection ~570 times with zero backoff, because
+        place_stock_scaled itself never checked this cooldown - only the
+        entry code paths checked it themselves, before ever calling
+        place_stock_scaled. Now enforced directly inside
+        place_stock_scaled, so it applies uniformly to every order this
+        function submits - entries AND exits alike - not just whichever
+        callers happened to remember to check it first.
         """
         rejected_at = self.price_sanity_rejected_at.get(symbol)
         if rejected_at is None:
@@ -2349,7 +2359,18 @@ class AutoTrader:
         the polling loop with a sleep, since that would stall order
         monitoring, the dashboard, and every other symbol for the whole
         slice duration.
+
+        Also enforces price_sanity_cooldown_ready here, universally, for
+        every order this function submits - entries AND exits alike.
+        Live incident: BMEA's profit-take order re-escalated and
+        resubmitted every ~15-20s continuously for over 5 hours, hitting
+        the price-sanity rejection ~570 times with zero backoff, because
+        only entry code paths checked this cooldown themselves before
+        calling here - nothing stopped an exit from hammering the same
+        unreachable price forever.
         """
+        if not self.price_sanity_cooldown_ready(symbol):
+            return None
         total = Decimal(str(quantity))
         last_price = self.api.quote_price(quote)
         # Webull requires a 100-share minimum lot for any order (either
@@ -3190,7 +3211,7 @@ class AutoTrader:
                     and not regime_gate_active
                     and self.cooldown_ready(key)
                     and self.volatility_scalp_reentry_ready(key)
-                    and self.entry_price_sanity_cooldown_ready(symbol)
+                    and self.price_sanity_cooldown_ready(symbol)
                     and self.strategy.is_volatility_scalp_eligible(symbol)
                     # By request: "make sure the algo plays around in
                     # the spread while ensuring a profit, or a
@@ -3509,7 +3530,7 @@ class AutoTrader:
                         and self.cooldown_ready(key)
                         and not self.rate_capped(key)
                         and self.reentry_cooldown_ready(key)
-                        and self.entry_price_sanity_cooldown_ready(symbol)
+                        and self.price_sanity_cooldown_ready(symbol)
                         and self.strategy.obi_supports_entry(
                             self.obi_score_for(
                                 symbol,
@@ -3614,7 +3635,7 @@ class AutoTrader:
                         and self.cooldown_ready(key)
                         and not self.rate_capped(key)
                         and self.reentry_cooldown_ready(key)
-                        and self.entry_price_sanity_cooldown_ready(symbol)
+                        and self.price_sanity_cooldown_ready(symbol)
                         and self.strategy.obi_supports_entry(
                             self.obi_score_for(
                                 symbol,
@@ -3854,6 +3875,28 @@ class AutoTrader:
                             symbol,
                             self.consecutive_exit_failures.get(symbol, 0),
                         )
+                    # Live incident (this bug): exits submitted here via
+                    # the raw API call had NO fat-finger protection at
+                    # all - price_sanity_ok (and its cooldown backoff)
+                    # only ever got checked by callers going through
+                    # place_stock_scaled, which entries use but exits
+                    # never did. Cooldown checked FIRST (not after) so a
+                    # symbol already known to be failing this check
+                    # doesn't keep re-attempting and re-logging every
+                    # single cycle - the exact "570 rejections in one
+                    # day" pattern this fix targets. force_market is
+                    # always False for PROFIT now (see the earlier fix
+                    # removing it from this path), so limit_price is
+                    # guaranteed a real price here, not None - safe to
+                    # sanity-check.
+                    if not self.price_sanity_cooldown_ready(symbol):
+                        continue
+                    if not self.price_sanity_ok(symbol, price, limit_price):
+                        self.gate_rejections[
+                            "volatility scalp - profit exit price failed "
+                            "the sanity check"
+                        ] += 1
+                        continue
                     order_id = self.api.place_stock(
                         symbol,
                         exit_side,
@@ -3917,6 +3960,22 @@ class AutoTrader:
                             if symbol in self.stop_loss_escalated
                             else self.api.stock_stop_exit_price(quote)
                         )
+                    # Cooldown/sanity-check the stop's limit price just like
+                    # the profit-exit path now does - but only when there IS
+                    # a limit price. force_market's limit_price=None is a
+                    # deliberate guaranteed-execution market order (after
+                    # repeated unfilled attempts) and must never be blocked
+                    # here - this guard exists to catch a bad LIMIT price,
+                    # not to second-guess an intentional market order.
+                    if limit_price is not None:
+                        if not self.price_sanity_cooldown_ready(symbol):
+                            continue
+                        if not self.price_sanity_ok(symbol, price, limit_price):
+                            self.gate_rejections[
+                                "volatility scalp - stop exit price failed "
+                                "the sanity check"
+                            ] += 1
+                            continue
                     order_id = self.api.place_stock(
                         symbol,
                         exit_side,
