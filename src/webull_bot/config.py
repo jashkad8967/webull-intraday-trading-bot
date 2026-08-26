@@ -303,6 +303,16 @@ class Settings(BaseSettings):
     volatility_scalp_min_stdev_percent: Decimal = Field(
         default=Decimal("0.008"), gt=0, le=1
     )
+    # By request: "the stocks being chosen have very low volume, thus
+    # they do not fluctuate much, we need high volume stocks for more
+    # volatility." is_volatility_scalp_eligible previously only checked
+    # realized price stdev - a thin, illiquid name can show a large %
+    # stdev purely from a few small prints knocking a wide, empty
+    # spread around, not real tradeable movement. Requires cumulative
+    # volume (regular + extended, see TradingStrategy.metrics) to also
+    # clear this floor, all day (not just extended hours - see
+    # AutoTrader.trade_stocks' separate, harder extended-hours cutoff).
+    volatility_scalp_min_volume: int = Field(default=500_000, ge=0)
     # Originally lowered from 0.5% -> 0.2% by request ("constantly buy
     # the dip... even a little rise"), then raised back up here as a
     # structural fix, not a same-day band-aid: 0.2% is noise-level on a

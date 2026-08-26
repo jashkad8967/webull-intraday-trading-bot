@@ -91,6 +91,11 @@ class StrategyConfigMixin:
             volatility_scalp_enabled=True,
             volatility_scalp_lookback_samples=20,
             volatility_scalp_min_stdev_percent=Decimal("0.015"),
+            # Default 0 (no-op) so existing tests that feed a small,
+            # arbitrary volume via _feed's "volume": "1000" aren't
+            # affected - dedicated tests below override this to
+            # exercise the floor itself.
+            volatility_scalp_min_volume=0,
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
             volatility_scalp_averaging_step_multiplier=Decimal("0.5"),
             volatility_scalp_vwap_band_percent=Decimal("0.05"),
@@ -512,6 +517,33 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         self.assertIsNotNone(stdev)
         self.assertGreaterEqual(stdev, self.config().volatility_scalp_min_stdev_percent)
         self.assertTrue(strategy.is_volatility_scalp_eligible("WILD"))
+
+    def test_high_stdev_low_volume_symbol_is_not_eligible(self):
+        """By request: "the stocks being chosen have very low volume,
+        thus they do not fluctuate much, we need high volume stocks
+        for more volatility." A thin name can clear the stdev bar
+        purely from a few small prints, without real tradeable volume
+        behind the move.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_min_volume = 500_000
+        self._feed(strategy, "THINWILD", [10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8])
+        stdev = strategy.realized_volatility_percent("THINWILD")
+        self.assertIsNotNone(stdev)
+        self.assertGreaterEqual(stdev, self.config().volatility_scalp_min_stdev_percent)
+        # _feed only supplies "volume": "1000" per tick - well under the
+        # 500k floor.
+        self.assertFalse(strategy.is_volatility_scalp_eligible("THINWILD"))
+
+    def test_high_stdev_high_volume_symbol_is_eligible(self):
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_min_volume = 500_000
+        for price in (10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8):
+            strategy.update_stock_snapshot(
+                {"symbol": "LIQUIDWILD", "volume": "600000", "price": str(price)},
+                Decimal(str(price)),
+            )
+        self.assertTrue(strategy.is_volatility_scalp_eligible("LIQUIDWILD"))
 
     def test_disabled_in_config_is_never_eligible_even_when_choppy(self):
         strategy = TradingStrategy(self.config())
