@@ -221,10 +221,26 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("5"),
     )
+    # Already at 1.8:1 - clears the researched "most professional
+    # traders target at least 1:1.5-1:2 reward:risk" convention (a
+    # 40% win rate at 3:1 beats a 70% win rate at 0.5:1; risk:reward
+    # matters more than win rate alone for long-run expectancy).
     stock_target_stop_multiple: Decimal = Field(
         default=Decimal("1.8"),
         ge=Decimal("0.5"),
         le=Decimal("5"),
+    )
+    # By request: risk-based position sizing (the professional 1-2%
+    # rule) - size an entry so hitting the stop costs no more than this
+    # fraction of buying power, instead of however many shares a fixed
+    # dollar budget happens to afford. Set deliberately above the
+    # textbook 1-2% for THIS account's size: on a ~$200 account, 1%
+    # is $2/trade - barely actionable once spread and fees are
+    # accounted for. This is a documented, deliberate tradeoff for a
+    # small account, not a hidden compromise on the underlying
+    # principle. See TradingStrategy.risk_based_share_count.
+    stock_risk_per_trade_fraction: Decimal = Field(
+        default=Decimal("0.03"), gt=0, le=Decimal("0.25")
     )
     # Under this strategy's own stop discipline, a held position's live
     # price should never legitimately drift this far from its cost basis -
@@ -293,6 +309,21 @@ class Settings(BaseSettings):
     # case left to configure. Exits/repricing/position management for
     # anything already held are unaffected either way.
     volatility_scalp_lookback_samples: int = Field(default=20, ge=5, le=200)
+    # By request: "regime-dependent" strategy switching - momentum in
+    # trending conditions, mean-reversion in ranging ones (research:
+    # neither is universally better; each thrives in the condition it
+    # fits). Kaufman's Efficiency Ratio (net price movement over the
+    # window / sum of the window's absolute tick-to-tick movement) is
+    # the standard, well-documented regime input behind KAMA - reuses
+    # the same tick-price window volatility-scalp eligibility already
+    # maintains (TradingStrategy.volatility_price_history), so this
+    # costs zero additional API calls. ER near 1 = price moved directly
+    # (trending/efficient); near 0 = lots of back-and-forth with little
+    # net progress (ranging/choppy). 0.5 is the common convention.
+    trend_efficiency_trending_threshold: Decimal = Field(
+        default=Decimal("0.5"), gt=0, le=1
+    )
+    trend_efficiency_lookback_samples: int = Field(default=10, ge=3, le=100)
     # Lowered from 1.5% -> 0.8% by request - "if the bar for entry is
     # too restrictive, lower the bar." This is the hard AND gate every
     # entry signal sits behind (is_volatility_scalp_eligible), so it's
@@ -425,6 +456,18 @@ class Settings(BaseSettings):
     volatility_scalp_hard_stop_percent: Decimal = Field(
         default=Decimal("0.05"), gt=0, le=1
     )
+    # By request: bound worst-case per-symbol exposure from averaging
+    # down. Research finding acted on directly: "doubling down three
+    # times can turn a 7% position into an 18% loss... in a bad market
+    # that 50% can be 80%." Even fully averaged down to volatility_
+    # scalp_max_averaging_buys and hitting the hard-stop floor, a
+    # single symbol can't cost more than this fraction of buying
+    # power - see TradingStrategy.averaging_down_capacity, which may
+    # cap effective averaging BELOW the configured max on a small
+    # account. The "5" above becomes a ceiling, not a target.
+    volatility_scalp_max_symbol_risk_fraction: Decimal = Field(
+        default=Decimal("0.12"), gt=0, le=1
+    )
     # Live incident: GAUZ's routine 2-7% spread meant the general
     # STOCK_ENTRY_MAX_SPREAD_PERCENT (0.50%, tuned for a quote-glitch on
     # an otherwise normal, liquid stock) almost never let the exit
@@ -551,6 +594,18 @@ class Settings(BaseSettings):
     # bot.py) - there's no artificial wait layered on top of that.
     volatility_scalp_reentry_cooldown_seconds: int = Field(
         default=0, ge=0, le=300
+    )
+    # By request, after the DAIC incident (3 stop-losses in ~9 minutes
+    # on one symbol during a fast decline, erasing the day's gains):
+    # a narrow, symbol-specific exception to the zeroed cooldown above -
+    # only pauses fresh re-entry into a symbol that JUST stopped out,
+    # for a few minutes, long enough for a fast decline to finish
+    # shaking out. Deliberately NOT a same-day quarantine (rejected
+    # earlier as "a bandaid") and compatible with "keep trading through
+    # losses" - every other symbol and slot is unaffected. See
+    # AutoTrader.post_stop_reentry_ready.
+    volatility_scalp_post_stop_cooldown_seconds: int = Field(
+        default=300, ge=0, le=3600
     )
     # Warm-starts a symbol's volatility window from real M1 bars the
     # moment it's first scanned, instead of needing several live scan
@@ -709,8 +764,23 @@ class Settings(BaseSettings):
     order_history_reconcile_seconds: int = Field(
         default=1800, ge=60, le=86400
     )
-    daily_loss_circuit_breaker_enabled: bool = False
-    daily_max_loss_dollars: Decimal = Field(default=Decimal("50"), gt=0)
+    # By request, after finding this disabled both by code default and
+    # on the live host: "make the daily circuit breaker real." Research:
+    # a daily drawdown cap in the 3-5% convention is standard practice
+    # for automated trading risk management. Flipped to enabled by
+    # default, and the threshold changed from a flat dollar amount
+    # (which doesn't scale with account size - $50 was 25% of this
+    # account's equity, nowhere near a real daily limit) to a fraction
+    # of account equity - see daily_max_loss_fraction below and
+    # AutoTrader.handle_daily_loss_breaker.
+    daily_loss_circuit_breaker_enabled: bool = True
+    # Picked at the upper/more-permissive end of the 3-5% convention
+    # given this account's dual purpose (real capital to grow, but also
+    # a learning testbed where informative losses have value) - not the
+    # tightest possible setting, a deliberate, documented choice.
+    daily_max_loss_fraction: Decimal = Field(
+        default=Decimal("0.05"), gt=0, le=1
+    )
     market_requests_per_minute: int = Field(default=240, ge=1, le=300)
     option_instrument_requests_per_minute: int = Field(default=45, ge=1, le=60)
     stock_instrument_requests_per_30_seconds: int = Field(default=9, ge=1, le=10)

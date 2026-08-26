@@ -20,7 +20,7 @@ class LeverSpec:
 
 # Every field named here must be a real Settings field in config.py.
 # Deliberately excludes every safety/circuit-breaker field
-# (daily_loss_circuit_breaker_enabled, daily_max_loss_dollars,
+# (daily_loss_circuit_breaker_enabled, daily_max_loss_fraction,
 # min_cash_reserve_dollars, stop_loss_guard_*, wash_sale_*,
 # live_trading_enabled) - MarketResearchAgent._VALID_LEVERS never
 # offered the model those as an option, and this table enforces that
@@ -89,7 +89,7 @@ LEVER_SPECS: dict[str, LeverSpec] = {
 SAFETY_DENYLIST: frozenset[str] = frozenset(
     {
         "daily_loss_circuit_breaker_enabled",
-        "daily_max_loss_dollars",
+        "daily_max_loss_fraction",
         "min_cash_reserve_dollars",
         "stop_loss_guard_trade_limit",
         "stop_loss_guard_lookback_seconds",

@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
@@ -125,6 +126,9 @@ class AutoTrader:
         self.unmanaged_held_logged: set[str] = set()
         self.last_trade: dict[str, float] = {}
         self.last_exit_at: dict[str, float] = {}
+        # See post_stop_reentry_ready - keyed by bare symbol (not the
+        # "STOCK:SYMBOL" key), stamped only on a STOP-type record_trade.
+        self.last_volatility_stop_loss_at: dict[str, float] = {}
         self.trade_times: dict[str, deque] = defaultdict(deque)
         self.status = StatusWriter(
             self.config.status_file,
@@ -204,6 +208,12 @@ class AutoTrader:
         self.vixy_history: deque = deque(maxlen=30)
         self.options_enabled = True
         self.resolved_date = None
+        # See resolve_targets - tracks which date's slow, one-time
+        # universe/VOLFILT/SMA refresh is currently running on its
+        # background thread, so a cycle mid-way through that ~15-20
+        # minute window (at the current 5000-symbol universe size)
+        # doesn't kick off a second, redundant thread every cycle.
+        self._resolve_targets_in_progress_for = None
         self.last_close_attempt = 0.0
         self.last_fractional_sweep = 0.0
         self.last_extended_hours_profit_sweep = 0.0
@@ -544,8 +554,43 @@ class AutoTrader:
         }
 
     def resolve_targets(self, moment: datetime) -> None:
+        """Kicks off the once-daily universe/VOLFILT/SMA refresh on a
+        background thread and returns immediately - never blocks the
+        caller. Live incident: this used to run synchronously inline in
+        the main loop, meaning EVERY protective mechanism (stop-loss
+        checks, order-fill monitoring, repricing) was unavailable for
+        however long the whole sequence took - under a minute at the
+        old 500-symbol universe, but 15-20 minutes at today's 5000-
+        symbol universe. Confirmed live: real open positions (down as
+        much as -7.6%) sat completely unmonitored through that entire
+        window on every restart. See _resolve_targets_work for the
+        actual (unchanged) slow work; this wrapper only adds the
+        non-blocking dispatch.
+        """
         if self.resolved_date == moment.date():
             return
+        if self._resolve_targets_in_progress_for == moment.date():
+            return
+        self._resolve_targets_in_progress_for = moment.date()
+        threading.Thread(
+            target=self._resolve_targets_work,
+            args=(moment,),
+            daemon=True,
+        ).start()
+
+    def _resolve_targets_work(self, moment: datetime) -> None:
+        try:
+            self._resolve_targets_work_body(moment)
+        except Exception as exc:
+            log.error("LOAD   | resolve_targets failed | %s", exc)
+        finally:
+            # Cleared on both success and failure - a failure retries
+            # on the very next cycle instead of being permanently
+            # stuck for the rest of the day (resolved_date is only
+            # ever set on success, at the end of the body below).
+            self._resolve_targets_in_progress_for = None
+
+    def _resolve_targets_work_body(self, moment: datetime) -> None:
         requested_stocks = self.config.stocks()
         if requested_stocks == ["ALL"]:
             limit = self.config.stock_universe_limit()
@@ -1174,6 +1219,10 @@ class AutoTrader:
             # Feeds stop_loss_guard_active() - a real stop-loss fill (not a
             # manual sell or a profit-take), tracked regardless of symbol.
             self.recent_stop_losses.append(submitted_at)
+            # Feeds post_stop_reentry_ready() - see its docstring for
+            # the DAIC incident this guards against.
+            if key.startswith("STOCK:"):
+                self.last_volatility_stop_loss_at[key.split(":", 1)[1]] = submitted_at
         if (
             action in ("BUY", "SHORT", "MANUAL_BUY")
             and counts_toward_idle_cash_ramp
@@ -2044,6 +2093,8 @@ class AutoTrader:
         core_session_active: bool,
         fractional_slot_available: bool = True,
         fractional_supported: bool = True,
+        symbol: str = "",
+        buying_power: Decimal | None = None,
     ) -> tuple[Decimal, Decimal, bool]:
         """Splits capital between fractional and whole-share entry sizing
         instead of one style claiming every candidate during core hours.
@@ -2093,6 +2144,34 @@ class AutoTrader:
         quantity, buffered_price = self.strategy.stock_order_quantity(
             price, whole_share_budget
         )
+        # By request: risk-based position sizing (the professional 1-2%
+        # rule, adapted for this account's size - see
+        # stock_risk_per_trade_fraction) - an ADDITIONAL cap layered on
+        # top of the affordability/notional caps above, not a
+        # replacement for them. Sizes against the account's real total
+        # buying power (not the bucket-allocated entry_budget slice
+        # above), same as how the professional rule is normally stated
+        # ("risk 1% of the account"), using the stop distance
+        # stock_decision itself will use for this symbol.
+        if quantity > 0 and symbol and buying_power is not None:
+            stop_percent = self.strategy.adaptive_stop_percent(symbol)
+            stop_price = price * (Decimal("1") - stop_percent)
+            risk_cap = self.strategy.risk_based_share_count(
+                price,
+                stop_price,
+                buying_power,
+                self.config.stock_risk_per_trade_fraction,
+            )
+            if risk_cap < quantity:
+                quantity = risk_cap
+                min_lot = self.strategy.minimum_lot_size(price)
+                if 0 < quantity < min_lot:
+                    # The risk cap alone can't afford even the exchange-
+                    # mandated minimum lot for this price band - skip
+                    # rather than place an order the broker would
+                    # reject, same convention stock_order_quantity
+                    # itself already uses.
+                    quantity = 0
         return quantity, buffered_price, False
 
     def refresh_agent_discoveries(self) -> None:
@@ -2346,21 +2425,40 @@ class AutoTrader:
     def handle_daily_loss_breaker(self) -> bool:
         """Halt entries for the rest of the day once realized stop-loss
         exits alone (not counting the expected EOD closeout) add up past
-        DAILY_MAX_LOSS_DOLLARS. The per-position stop already bounds any
-        single loss; this bounds how many of those a bad day can rack up
-        before the bot stops opening new positions.
+        daily_max_loss_fraction of account equity. The per-position stop
+        already bounds any single loss; this bounds how many of those a
+        bad day can rack up before the bot stops opening new positions.
+
+        By request, after finding this circuit breaker disabled both by
+        code default and on the live host: enabled by default now, and
+        the threshold is a fraction of account equity (the researched
+        3-5% daily-drawdown convention) instead of a flat dollar amount
+        that doesn't scale with account size - $50 used to be 25% of
+        this account's equity, nowhere near a real daily limit. Falls
+        back to daily_realized_loss never tripping (rather than raising)
+        if account value isn't cached yet - same "no data -> don't
+        block" convention as every other gate, applied to a circuit
+        breaker's own inputs.
         """
         if not self.config.daily_loss_circuit_breaker_enabled:
             return False
         if self.daily_loss_breaker_triggered:
             return True
-        if self.daily_realized_loss < self.config.daily_max_loss_dollars:
+        if not self.cached_account_value or self.cached_account_value <= 0:
+            return False
+        max_loss_dollars = (
+            self.cached_account_value * self.config.daily_max_loss_fraction
+        )
+        if self.daily_realized_loss < max_loss_dollars:
             return False
         log.critical(
-            "CIRCUIT | DAILY LOSS LIMIT | realized=$%.2f >= limit=$%.2f | "
-            "halting new entries for the rest of the trading day",
+            "CIRCUIT | DAILY LOSS LIMIT | realized=$%.2f >= limit=$%.2f "
+            "(%.0f%% of $%.2f equity) | halting new entries for the "
+            "rest of the trading day",
             self.daily_realized_loss,
-            self.config.daily_max_loss_dollars,
+            max_loss_dollars,
+            self.config.daily_max_loss_fraction * 100,
+            self.cached_account_value,
         )
         submitted = self.api.close_all_positions(loss_callback=self.wash_sales.block)
         log.warning(
@@ -2507,6 +2605,34 @@ class AutoTrader:
         return (
             time.monotonic() - rejected_at
             >= float(self.config.price_sanity_cooldown_seconds)
+        )
+
+    def post_stop_reentry_ready(self, symbol: str) -> bool:
+        """False while symbol is still within
+        volatility_scalp_post_stop_cooldown_seconds of its last STOP-loss
+        exit. By request, after the DAIC incident: 3 stop-losses in
+        ~9 minutes on one symbol during a fast decline, erasing the
+        day's gains, because nothing throttled re-entry into the exact
+        same falling knife right after being stopped out of it - the
+        volatility-scalp cohort's re-entry cooldown is deliberately
+        zeroed for everything else ("orders can be made as frequently
+        as possible"), and this cohort explicitly bypasses quarantine/
+        the stop-loss guard/wash-sale blocks by request ("keep trading
+        through losses"). This is a narrow, deliberate exception to
+        that: it only pauses the ONE symbol that just stopped out, for
+        a few minutes, not the strategy - compatible with "keep trading
+        through losses" (the other 7 concurrent slots and every other
+        symbol are completely unaffected) while closing the specific
+        gap DAIC exposed. Fails open (True) for a symbol with no
+        recorded stop-loss yet, same convention as every other cooldown
+        gate in this file.
+        """
+        stopped_at = self.last_volatility_stop_loss_at.get(symbol)
+        if stopped_at is None:
+            return True
+        return (
+            time.monotonic() - stopped_at
+            >= float(self.config.volatility_scalp_post_stop_cooldown_seconds)
         )
 
     def record_order_error(self, symbol: str, exc: Exception) -> None:
@@ -3454,6 +3580,31 @@ class AutoTrader:
                     # "orders can be made as frequently as possible
                     # without a cooldown") still gate timing.
                     and not regime_gate_active
+                    # By request: "regime-dependent" strategy switching.
+                    # This dip-buy path IS the mean-reversion engine -
+                    # it only fresh-enters a symbol currently ranging/
+                    # choppy (or UNKNOWN, insufficient history - fails
+                    # open, not closed). A "buy the dip" thesis into a
+                    # symbol that's actually trending is buying into
+                    # continuation, not a bounce - the general EMA-
+                    # crossover (momentum) path handles trending symbols
+                    # instead. Averaging down on an already-open
+                    # position is unaffected (see the separate `quantity
+                    # > 0` block below) - closing out an existing
+                    # commitment isn't a fresh regime decision.
+                    and self.strategy.symbol_regime(symbol) != "TRENDING"
+                    # By request, after the DAIC incident (3 stop-losses
+                    # in ~9 minutes on one symbol during a fast decline,
+                    # erasing the day's gains): unlike every other loss-
+                    # driven gate above, deliberately kept even for this
+                    # cohort's "trade through losses" design - it's
+                    # narrow (pauses only the ONE symbol that just
+                    # stopped out, not the whole strategy) and doesn't
+                    # conflict with "keep buying dips through a losing
+                    # stretch" elsewhere. Without it, nothing stopped an
+                    # immediate re-entry into the exact same falling
+                    # knife seconds after being stopped out of it.
+                    and self.post_stop_reentry_ready(symbol)
                     and self.cooldown_ready(key)
                     and self.volatility_scalp_reentry_ready(key)
                     and self.price_sanity_cooldown_ready(symbol)
@@ -3578,6 +3729,31 @@ class AutoTrader:
                                 scalp_quantity,
                                 price,
                             )
+                # By request: bound worst-case per-symbol exposure from
+                # averaging down (research: "doubling down three times
+                # can turn a 7% position into an 18% loss"). Per-symbol,
+                # not the flat global cap above - a small account's real
+                # risk-fraction limit may bind before the configured
+                # ceiling ever would. Estimated at this cycle's would-be
+                # buy size/price (cheap, pure, no side effects - the
+                # real buy is sized again, identically, below once this
+                # gate has already passed).
+                volatility_scalp_symbol_averaging_cap = volatility_scalp_effective_max_averaging
+                if symbol in self.volatility_scalp_positions:
+                    estimated_average_down_quantity = self.strategy.volatility_scalp_share_count(
+                        price, buying_power=buying_power, intensity=volatility_scalp_intensity
+                    )
+                    per_buy_risk_dollars = (
+                        price
+                        * Decimal(estimated_average_down_quantity)
+                        * self.config.volatility_scalp_hard_stop_percent
+                    )
+                    volatility_scalp_symbol_averaging_cap = self.strategy.averaging_down_capacity(
+                        per_buy_risk_dollars,
+                        buying_power,
+                        self.config.volatility_scalp_max_symbol_risk_fraction,
+                        volatility_scalp_effective_max_averaging,
+                    )
                 if (
                     quantity > 0
                     # Same "no volatility scalp in extended hours" hard
@@ -3603,7 +3779,7 @@ class AutoTrader:
                     and symbol not in self.broker_conflict_symbols
                     and symbol not in self.entry_restricted_symbols
                     and self.volatility_scalp_average_down_count[symbol]
-                    < volatility_scalp_effective_max_averaging
+                    < volatility_scalp_symbol_averaging_cap
                     # Sanity-check fix: the fresh-entry gate above
                     # deliberately still checks regime_gate_active (a
                     # market-wide VIXY-spike gate is kept even though
@@ -3746,6 +3922,23 @@ class AutoTrader:
                             "regime gate - VIXY elevated vs recent range"
                         ] += 1
                         continue
+                    # By request: "regime-dependent" strategy switching -
+                    # this general EMA-crossover path IS the momentum
+                    # engine (a fresh cross/continuation signal), so it
+                    # only opens a FRESH position when this specific
+                    # symbol is actually trending - a momentum entry
+                    # into a choppy, range-bound symbol is exactly the
+                    # mismatched-thesis case research warns against.
+                    # UNKNOWN (insufficient history) stays eligible,
+                    # unchanged from before this gate existed - fails
+                    # open, not closed, same convention as every other
+                    # gate here.
+                    if self.strategy.symbol_regime(symbol) == "RANGING":
+                        self.gate_rejections[
+                            "symbol regime is ranging - momentum entry "
+                            "skipped, mean-reversion handles it instead"
+                        ] += 1
+                        continue
                     bucket = self.strategy.selection_bucket(symbol)
                     # By request, after pre-market losses: "only trading
                     # established stocks with more volume and popularity
@@ -3774,6 +3967,8 @@ class AutoTrader:
                         core_session_active,
                         fractional_position_count < max_fractional_positions,
                         fractional_supported,
+                        symbol=symbol,
+                        buying_power=buying_power,
                     )
                     if (
                         buy_quantity == 0
@@ -3882,6 +4077,14 @@ class AutoTrader:
                     if guard_active:
                         self.gate_rejections[
                             "stop-loss guard active - too many recent stops"
+                        ] += 1
+                        continue
+                    # Same regime gate as the BUY entry path above -
+                    # SHORT is the momentum engine's other direction.
+                    if self.strategy.symbol_regime(symbol) == "RANGING":
+                        self.gate_rejections[
+                            "symbol regime is ranging - momentum entry "
+                            "skipped, mean-reversion handles it instead"
                         ] += 1
                         continue
                     bucket = self.strategy.selection_bucket(symbol)

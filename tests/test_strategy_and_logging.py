@@ -96,6 +96,8 @@ class StrategyConfigMixin:
             # affected - dedicated tests below override this to
             # exercise the floor itself.
             volatility_scalp_min_dollar_volume=Decimal("0"),
+            trend_efficiency_trending_threshold=Decimal("0.5"),
+            trend_efficiency_lookback_samples=10,
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
             volatility_scalp_averaging_step_multiplier=Decimal("0.5"),
             volatility_scalp_vwap_band_percent=Decimal("0.05"),
@@ -1004,6 +1006,154 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
             ),
             80,
         )
+
+
+class RiskBasedShareCountTests(StrategyConfigMixin, unittest.TestCase):
+    """risk_based_share_count - the professional 1-2% position-sizing
+    rule: size so hitting the stop costs no more than risk_fraction of
+    buying_power, not however many shares a fixed budget affords.
+    """
+
+    def test_computes_shares_from_risk_dollars_over_stop_distance(self):
+        strategy = TradingStrategy(self.config())
+        # risk_dollars = 1000 * 0.03 = 30; stop_distance = 10 - 9.91 = 0.09
+        # -> 30 / 0.09 = 333.33 -> floor to 333.
+        shares = strategy.risk_based_share_count(
+            Decimal("10"), Decimal("9.91"), Decimal("1000"), Decimal("0.03")
+        )
+        self.assertEqual(shares, 333)
+
+    def test_zero_with_no_stop_distance(self):
+        strategy = TradingStrategy(self.config())
+        shares = strategy.risk_based_share_count(
+            Decimal("10"), Decimal("10"), Decimal("1000"), Decimal("0.03")
+        )
+        self.assertEqual(shares, 0)
+
+    def test_zero_with_no_buying_power(self):
+        strategy = TradingStrategy(self.config())
+        shares = strategy.risk_based_share_count(
+            Decimal("10"), Decimal("9.91"), Decimal("0"), Decimal("0.03")
+        )
+        self.assertEqual(shares, 0)
+
+    def test_larger_risk_fraction_allows_more_shares(self):
+        strategy = TradingStrategy(self.config())
+        smaller = strategy.risk_based_share_count(
+            Decimal("10"), Decimal("9.91"), Decimal("1000"), Decimal("0.01")
+        )
+        larger = strategy.risk_based_share_count(
+            Decimal("10"), Decimal("9.91"), Decimal("1000"), Decimal("0.06")
+        )
+        self.assertGreater(larger, smaller)
+
+
+class AveragingDownCapacityTests(StrategyConfigMixin, unittest.TestCase):
+    """averaging_down_capacity - by request: bound worst-case per-
+    symbol exposure from averaging down. Research finding acted on
+    directly: "doubling down three times can turn a 7% position into
+    an 18% loss."
+    """
+
+    def test_caps_below_the_configured_max_on_a_small_account(self):
+        strategy = TradingStrategy(self.config())
+        # buying_power=$200, max_symbol_risk_fraction=0.12 ->
+        # max_symbol_risk_dollars = $24. per_buy_risk_dollars=$10 ->
+        # total_buys_affordable = 2 -> capacity = 2 - 1 = 1, well below
+        # the configured ceiling of 5.
+        capacity = strategy.averaging_down_capacity(
+            Decimal("10"), Decimal("200"), Decimal("0.12"), 5
+        )
+        self.assertEqual(capacity, 1)
+
+    def test_never_exceeds_the_configured_ceiling_on_a_large_account(self):
+        strategy = TradingStrategy(self.config())
+        # Plenty of room - the configured ceiling (5) binds instead of
+        # the risk fraction.
+        capacity = strategy.averaging_down_capacity(
+            Decimal("1"), Decimal("1000000"), Decimal("0.12"), 5
+        )
+        self.assertEqual(capacity, 5)
+
+    def test_zero_when_even_one_averaging_buy_would_breach_the_fraction(self):
+        strategy = TradingStrategy(self.config())
+        capacity = strategy.averaging_down_capacity(
+            Decimal("100"), Decimal("200"), Decimal("0.12"), 5
+        )
+        self.assertEqual(capacity, 0)
+
+    def test_falls_back_to_the_configured_max_with_no_risk_data(self):
+        strategy = TradingStrategy(self.config())
+        self.assertEqual(
+            strategy.averaging_down_capacity(
+                Decimal("0"), Decimal("200"), Decimal("0.12"), 5
+            ),
+            5,
+        )
+        self.assertEqual(
+            strategy.averaging_down_capacity(
+                Decimal("10"), Decimal("0"), Decimal("0.12"), 5
+            ),
+            5,
+        )
+
+
+class TrendEfficiencyRegimeTests(StrategyConfigMixin, unittest.TestCase):
+    """trend_efficiency_ratio/symbol_regime - Kaufman's Efficiency
+    Ratio, the regime input behind "momentum in trending conditions,
+    mean-reversion in ranging ones." Reuses volatility_price_history,
+    no new data source.
+    """
+
+    def _feed(self, strategy, symbol, prices):
+        for price in prices:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+
+    def test_monotonic_move_is_fully_efficient_and_trending(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(
+            strategy, "TREND",
+            [10.0, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8, 10.9],
+        )
+        ratio = strategy.trend_efficiency_ratio("TREND")
+        self.assertIsNotNone(ratio)
+        self.assertAlmostEqual(float(ratio), 1.0, places=6)
+        self.assertEqual(strategy.symbol_regime("TREND"), "TRENDING")
+
+    def test_symmetric_oscillation_is_inefficient_and_ranging(self):
+        strategy = TradingStrategy(self.config())
+        # Ends exactly where it started (net movement 0) despite
+        # substantial back-and-forth - the choppy/ranging shape.
+        self._feed(
+            strategy, "CHOP",
+            [10, 10.2, 10, 10.2, 10, 10.2, 10, 10.2, 10, 10],
+        )
+        ratio = strategy.trend_efficiency_ratio("CHOP")
+        self.assertIsNotNone(ratio)
+        self.assertAlmostEqual(float(ratio), 0.0, places=6)
+        self.assertEqual(strategy.symbol_regime("CHOP"), "RANGING")
+
+    def test_unknown_with_insufficient_history(self):
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "NEW", [10, 10.1, 10.2])
+        self.assertIsNone(strategy.trend_efficiency_ratio("NEW"))
+        self.assertEqual(strategy.symbol_regime("NEW"), "UNKNOWN")
+
+    def test_unknown_for_a_never_seen_symbol(self):
+        strategy = TradingStrategy(self.config())
+        self.assertEqual(strategy.symbol_regime("NEVERSEEN"), "UNKNOWN")
+
+    def test_unknown_when_every_tick_in_the_window_is_flat(self):
+        """Zero total movement makes the ratio undefined (0/0), not a
+        real "ranging" reading - must fail open (UNKNOWN), not crash.
+        """
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "FLAT", [10.0] * 10)
+        self.assertIsNone(strategy.trend_efficiency_ratio("FLAT"))
+        self.assertEqual(strategy.symbol_regime("FLAT"), "UNKNOWN")
 
 
 class VolatilityScalpVwapGateTests(StrategyConfigMixin, unittest.TestCase):
@@ -3706,15 +3856,17 @@ class BotOvertradingCapTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
                 daily_loss_circuit_breaker_enabled=True,
-                daily_max_loss_dollars=Decimal("50"),
+                daily_max_loss_fraction=Decimal("0.05"),
             ),
             daily_loss_breaker_triggered=False,
             daily_realized_loss=Decimal("10"),
+            cached_account_value=Decimal("1000"),
             api=SimpleNamespace(close_all_positions=lambda loss_callback=None: []),
             wash_sales=SimpleNamespace(block=lambda *a, **k: None),
             last_account_refresh=0.0,
         )
         handle = AutoTrader.handle_daily_loss_breaker.__get__(fake_bot)
+        # 5% of $1000 = $50 threshold.
         self.assertFalse(handle())
         fake_bot.daily_realized_loss = Decimal("60")
         self.assertTrue(handle())
@@ -3723,16 +3875,44 @@ class BotOvertradingCapTests(unittest.TestCase):
         fake_bot.daily_realized_loss = Decimal("0")
         self.assertTrue(handle())
 
-    def test_daily_loss_breaker_disabled_by_default_behavior(self):
+    def test_daily_loss_breaker_respects_the_enabled_flag(self):
         from webull_bot.bot import AutoTrader
 
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
                 daily_loss_circuit_breaker_enabled=False,
-                daily_max_loss_dollars=Decimal("50"),
+                daily_max_loss_fraction=Decimal("0.05"),
             ),
             daily_loss_breaker_triggered=False,
             daily_realized_loss=Decimal("999"),
+            cached_account_value=Decimal("1000"),
+        )
+        handle = AutoTrader.handle_daily_loss_breaker.__get__(fake_bot)
+        self.assertFalse(handle())
+
+    def test_daily_loss_breaker_is_enabled_by_default(self):
+        """By request, after finding this circuit breaker disabled both
+        by code default and on the live host: it must default to
+        enabled, and the threshold must be a fraction of account
+        equity, not a flat dollar amount that doesn't scale with
+        account size.
+        """
+        settings = Settings()
+        self.assertTrue(settings.daily_loss_circuit_breaker_enabled)
+        self.assertGreater(settings.daily_max_loss_fraction, Decimal("0"))
+        self.assertLessEqual(settings.daily_max_loss_fraction, Decimal("1"))
+
+    def test_daily_loss_breaker_does_not_trip_without_a_cached_account_value(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                daily_loss_circuit_breaker_enabled=True,
+                daily_max_loss_fraction=Decimal("0.05"),
+            ),
+            daily_loss_breaker_triggered=False,
+            daily_realized_loss=Decimal("999"),
+            cached_account_value=None,
         )
         handle = AutoTrader.handle_daily_loss_breaker.__get__(fake_bot)
         self.assertFalse(handle())
@@ -4474,16 +4654,19 @@ class AllocationAndLoggingTests(unittest.TestCase):
         """At the old STOCK_TARGET_STOP_MULTIPLE=1.2, breakeven needs a
         ~45.5% win rate (1 / (1 + ratio)) - too thin a margin for normal
         noise/whipsaw, and a real cause of net-losing days even with
-        plenty of individual winning trades. 1.8 only needs ~35.7%.
-        Trading itself is never automatically halted - no circuit breaker
-        is enabled by default; this fix only improves the ratio each trade
-        is judged against.
+        plenty of individual winning trades. 1.8 only needs ~35.7%,
+        clearing the researched "most professional traders target at
+        least 1:1.5-1:2 reward:risk" convention. By request, after
+        finding it disabled both by code default and on the live host:
+        the daily-loss circuit breaker is now enabled by default too -
+        this strategy's reward:risk ratio being favorable doesn't mean
+        a genuinely bad day can't still happen.
         """
         config = Settings()
         self.assertEqual(config.stock_target_stop_multiple, Decimal("1.8"))
         breakeven_win_rate = 1 / (1 + config.stock_target_stop_multiple)
         self.assertLess(breakeven_win_rate, Decimal("0.36"))
-        self.assertFalse(config.daily_loss_circuit_breaker_enabled)
+        self.assertTrue(config.daily_loss_circuit_breaker_enabled)
 
     def test_default_watchlist_is_parsed_and_deduplicated_by_membership(self):
         config = Settings()
@@ -7424,6 +7607,7 @@ class StopLossGuardTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=0.0,
             recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
             position_opened_at={},
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
@@ -7557,6 +7741,7 @@ class SymbolQuarantineTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=0.0,
             recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
             position_opened_at={},
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
@@ -7576,6 +7761,104 @@ class SymbolQuarantineTests(unittest.TestCase):
         self.assertEqual(fake_bot.symbol_pnl_history["STOCK:AAPL"][0][1], Decimal("-1"))
         self.assertEqual(len(fake_bot.symbol_pnl_history["STOCK:MSFT"]), 1)
         self.assertEqual(fake_bot.symbol_pnl_history["STOCK:MSFT"][0][1], Decimal("2"))
+
+
+class PostStopReentryCooldownTests(unittest.TestCase):
+    """post_stop_reentry_ready - by request, after the DAIC incident (3
+    stop-losses in ~9 minutes on one symbol during a fast decline,
+    erasing the day's gains). Narrow and symbol-specific, unlike a
+    same-day quarantine (explicitly rejected earlier as "a bandaid").
+    """
+
+    def test_ready_when_never_stopped_out(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_volatility_stop_loss_at={},
+            config=SimpleNamespace(volatility_scalp_post_stop_cooldown_seconds=300),
+        )
+        ready = AutoTrader.post_stop_reentry_ready.__get__(fake_bot)
+        self.assertTrue(ready("DAIC"))
+
+    def test_blocked_immediately_after_a_stop_loss(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_volatility_stop_loss_at={"DAIC": time.monotonic()},
+            config=SimpleNamespace(volatility_scalp_post_stop_cooldown_seconds=300),
+        )
+        ready = AutoTrader.post_stop_reentry_ready.__get__(fake_bot)
+        self.assertFalse(ready("DAIC"))
+
+    def test_a_stop_on_a_different_symbol_does_not_block_this_one(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_volatility_stop_loss_at={"DAIC": time.monotonic()},
+            config=SimpleNamespace(volatility_scalp_post_stop_cooldown_seconds=300),
+        )
+        ready = AutoTrader.post_stop_reentry_ready.__get__(fake_bot)
+        self.assertTrue(ready("OTHER"))
+
+    def test_ready_again_once_the_cooldown_elapses(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_volatility_stop_loss_at={"DAIC": time.monotonic() - 301},
+            config=SimpleNamespace(volatility_scalp_post_stop_cooldown_seconds=300),
+        )
+        ready = AutoTrader.post_stop_reentry_ready.__get__(fake_bot)
+        self.assertTrue(ready("DAIC"))
+
+    def test_record_trade_stamps_the_cooldown_on_a_stop_loss_exit(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=0.0,
+            recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            submitted_order_ids_today=set(),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade(
+            "STOCK:DAIC", "order-1", "STOP", Decimal("9"),
+            pnl=Decimal("-1"), entry_price=Decimal("10"),
+        )
+
+        self.assertIn("DAIC", fake_bot.last_volatility_stop_loss_at)
+
+    def test_record_trade_does_not_stamp_on_a_profit_exit(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=0.0,
+            recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            submitted_order_ids_today=set(),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade(
+            "STOCK:DAIC", "order-1", "PROFIT", Decimal("11"),
+            pnl=Decimal("1"), entry_price=Decimal("10"),
+        )
+
+        self.assertNotIn("DAIC", fake_bot.last_volatility_stop_loss_at)
 
 
 class TimeAwareStopTests(StrategyConfigMixin, unittest.TestCase):
@@ -8864,6 +9147,56 @@ class EntrySizingSplitTests(unittest.TestCase):
         )
         self.assertFalse(fractional)
         # Full entry_budget=10000 used, uncapped -> floor(10000/51.5) = 194
+        self.assertEqual(quantity, 194)
+
+    def test_risk_based_sizing_caps_quantity_below_the_affordability_limit(self):
+        """By request: risk-based position sizing (the professional
+        1-2% rule) - hitting the stop should cost no more than
+        stock_risk_per_trade_fraction of buying_power, even when
+        affordability alone would allow a much larger order.
+        """
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0"),
+            stock_whole_share_core_session_fraction=Decimal("1"),
+            stock_quantity=100000,
+            max_order_notional=Decimal("1000000"),
+            stock_risk_per_trade_fraction=Decimal("0.03"),
+        )
+        size = self._size_fn(config)
+        # price=$10, default stock_stop_loss_min_percent=0.009 -> stop
+        # distance = $0.09/share. buying_power=$1000 (distinct from the
+        # huge entry_budget/whole_share_remaining below, since the risk
+        # cap sizes against total buying power, not the bucket budget) ->
+        # risk_dollars = 1000*0.03 = $30 -> risk cap = floor(30/0.09) = 333.
+        # Affordability alone (entry_budget=$1,000,000) would allow
+        # ~97,000+ shares - the risk cap must be what actually binds.
+        quantity, buffered_price, fractional = size(
+            Decimal("10"),
+            Decimal("1000000"),
+            Decimal("0"),
+            Decimal("1000000"),
+            True,
+            symbol="RISKY",
+            buying_power=Decimal("1000"),
+        )
+        self.assertFalse(fractional)
+        self.assertEqual(quantity, 333)
+
+    def test_risk_based_sizing_is_a_noop_without_a_symbol_or_buying_power(self):
+        """Backward-compatible: a caller that doesn't pass symbol/
+        buying_power (or passes buying_power=None) gets the old,
+        affordability-only sizing untouched.
+        """
+        config = Settings(
+            stock_core_session_position_fraction=Decimal("0"),
+            stock_whole_share_core_session_fraction=Decimal("1"),
+            stock_quantity=1000,
+            max_order_notional=Decimal("100000"),
+        )
+        size = self._size_fn(config)
+        quantity, buffered_price, fractional = size(
+            Decimal("50"), Decimal("10000"), Decimal("0"), Decimal("10000"), True
+        )
         self.assertEqual(quantity, 194)
 
     def test_max_fractional_position_slots_reserves_proportionally(self):
@@ -10198,6 +10531,113 @@ class StrategyTuningStateTests(unittest.TestCase):
             self.assertFalse(reloaded.ready("position size", 24))
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
+
+
+class ResolveTargetsNonBlockingTests(unittest.TestCase):
+    """resolve_targets - by request, after confirming live that real
+    open positions sat completely unmonitored for 15-20 minutes on
+    every restart: the once-daily universe/VOLFILT/SMA refresh must
+    never block the main loop's position-protection calls. Dispatches
+    to a background thread and returns immediately instead.
+    """
+
+    @staticmethod
+    def _fake_bot(started_dates):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            resolved_date=None,
+            _resolve_targets_in_progress_for=None,
+        )
+
+        def fake_work(moment):
+            started_dates.append(moment.date())
+
+        fake_bot._resolve_targets_work_body = fake_work
+        fake_bot._resolve_targets_work = AutoTrader._resolve_targets_work.__get__(
+            fake_bot
+        )
+        fake_bot.resolve_targets = AutoTrader.resolve_targets.__get__(fake_bot)
+        return fake_bot
+
+    def test_returns_immediately_without_waiting_for_the_thread(self):
+        import threading
+        import time as time_module
+
+        started_dates = []
+        release = threading.Event()
+
+        def slow_work(moment):
+            release.wait(timeout=2)
+            started_dates.append(moment.date())
+
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            resolved_date=None, _resolve_targets_in_progress_for=None
+        )
+        fake_bot._resolve_targets_work_body = slow_work
+        fake_bot._resolve_targets_work = AutoTrader._resolve_targets_work.__get__(
+            fake_bot
+        )
+        resolve_targets = AutoTrader.resolve_targets.__get__(fake_bot)
+
+        call_started = time_module.monotonic()
+        resolve_targets(datetime(2026, 8, 27))
+        elapsed = time_module.monotonic() - call_started
+
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(started_dates, [])
+        release.set()
+
+    def test_does_not_dispatch_a_second_thread_while_one_is_in_flight(self):
+        started_dates = []
+        fake_bot = self._fake_bot(started_dates)
+        import threading
+
+        gate = threading.Event()
+        original = fake_bot._resolve_targets_work_body
+
+        def gated_work(moment):
+            gate.wait(timeout=2)
+            original(moment)
+
+        fake_bot._resolve_targets_work_body = gated_work
+        moment = datetime(2026, 8, 27)
+
+        fake_bot.resolve_targets(moment)
+        fake_bot.resolve_targets(moment)
+        fake_bot.resolve_targets(moment)
+
+        self.assertEqual(fake_bot._resolve_targets_in_progress_for, moment.date())
+        gate.set()
+
+    def test_skips_entirely_once_already_resolved_for_the_date(self):
+        started_dates = []
+        fake_bot = self._fake_bot(started_dates)
+        moment = datetime(2026, 8, 27)
+        fake_bot.resolved_date = moment.date()
+
+        fake_bot.resolve_targets(moment)
+
+        self.assertEqual(started_dates, [])
+
+    def test_clears_in_progress_flag_on_failure_so_the_next_cycle_retries(self):
+        from webull_bot.bot import AutoTrader
+
+        def boom(moment):
+            raise RuntimeError("boom")
+
+        fake_bot = SimpleNamespace(
+            resolved_date=None, _resolve_targets_in_progress_for=None
+        )
+        fake_bot._resolve_targets_work_body = boom
+        work = AutoTrader._resolve_targets_work.__get__(fake_bot)
+
+        work(datetime(2026, 8, 27))
+
+        self.assertIsNone(fake_bot._resolve_targets_in_progress_for)
+        self.assertIsNone(fake_bot.resolved_date)
 
 
 if __name__ == "__main__":

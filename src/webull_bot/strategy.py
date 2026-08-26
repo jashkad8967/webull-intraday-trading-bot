@@ -199,6 +199,47 @@ class TradingStrategy:
         variance = sum((r - mean) ** 2 for r in returns) / len(returns)
         return Decimal(str(variance ** 0.5))
 
+    def trend_efficiency_ratio(self, symbol: str) -> Decimal | None:
+        """Kaufman's Efficiency Ratio: net price movement over the
+        lookback window divided by the sum of the window's absolute
+        tick-to-tick movement. Near 1 means price moved directly toward
+        wherever it ended up (efficient/trending); near 0 means it
+        wandered back and forth without much net progress (choppy/
+        ranging). Standard regime input behind KAMA - reuses the same
+        volatility_price_history window is_volatility_scalp_eligible
+        already maintains, so this costs zero additional API calls.
+
+        None (no reading yet) with fewer than
+        trend_efficiency_lookback_samples data points, or if every tick
+        in the window was flat (zero total movement - direction is
+        undefined, not "ranging").
+        """
+        window = self.volatility_price_history.get(symbol)
+        lookback = self.config.trend_efficiency_lookback_samples
+        if not window or len(window) < lookback:
+            return None
+        samples = list(window)[-lookback:]
+        net_movement = abs(samples[-1] - samples[0])
+        total_movement = sum(
+            abs(samples[i] - samples[i - 1]) for i in range(1, len(samples))
+        )
+        if total_movement <= 0:
+            return None
+        return Decimal(str(net_movement / total_movement))
+
+    def symbol_regime(self, symbol: str) -> str:
+        """"TRENDING", "RANGING", or "UNKNOWN" (insufficient history -
+        fails OPEN, same "no data -> don't block" convention as every
+        other gate in this file: both entry paths stay eligible rather
+        than neither).
+        """
+        ratio = self.trend_efficiency_ratio(symbol)
+        if ratio is None:
+            return "UNKNOWN"
+        if ratio >= self.config.trend_efficiency_trending_threshold:
+            return "TRENDING"
+        return "RANGING"
+
     def seed_volatility_window(self, symbol: str, closes: list[float]) -> None:
         """One-time warm start from real M1 bar closes (see
         AutoTrader.seed_volatility_windows) - only fires while the
@@ -706,6 +747,45 @@ class TradingStrategy:
             Decimal("1") + self.config.volatility_scalp_averaging_step_multiplier * level
         )
         return drop >= required
+
+    def averaging_down_capacity(
+        self,
+        per_buy_risk_dollars: Decimal,
+        buying_power: Decimal,
+        max_symbol_risk_fraction: Decimal,
+        max_averaging_buys: int,
+    ) -> int:
+        """Bounds how many ADDITIONAL averaging-down buys a single
+        symbol can take, on top of its already-configured ceiling
+        (max_averaging_buys), so total worst-case exposure to one
+        symbol - even fully averaged down and hitting the hard-stop
+        floor - can't exceed max_symbol_risk_fraction of buying_power.
+
+        Research finding acted on directly: "doubling down three times
+        can turn a 7% position into an 18% loss... in a bad market that
+        50% can be 80%." Each volatility-scalp buy (fresh entry and
+        every averaging-down add) targets roughly the same per-trade
+        notional (see volatility_scalp_share_count), so per_buy_risk_
+        dollars (that one buy's notional times the hard-stop-floor
+        percent) approximates every subsequent buy's incremental risk
+        too - total risk after N total buys is roughly
+        N * per_buy_risk_dollars.
+
+        Returns 0 (no more averaging at all) if even the second buy
+        (the first averaging-down add) would already breach the
+        fraction. This is a CAP on top of max_averaging_buys, not a
+        replacement - whichever is smaller wins; a small account's real
+        exposure limit may bind well before the configured "5" ever
+        would, and that's the point.
+        """
+        if per_buy_risk_dollars <= 0 or buying_power <= 0:
+            return max_averaging_buys
+        max_symbol_risk_dollars = buying_power * max_symbol_risk_fraction
+        total_buys_affordable = int(max_symbol_risk_dollars / per_buy_risk_dollars)
+        # -1 for the initial fresh entry itself, which has already
+        # happened and isn't part of "additional averaging capacity."
+        capacity = max(0, total_buys_affordable - 1)
+        return min(capacity, max_averaging_buys)
 
     def volatility_scalp_share_count(
         self,
@@ -1795,6 +1875,40 @@ class TradingStrategy:
         """
         min_lot = cls.minimum_lot_size(price)
         return min_lot > 1 and quantity < min_lot
+
+    def risk_based_share_count(
+        self,
+        price: Decimal,
+        stop_price: Decimal,
+        buying_power: Decimal,
+        risk_fraction: Decimal,
+    ) -> int:
+        """The professional 1-2% position-sizing rule: size an entry so
+        that hitting the stop costs no more than risk_fraction of
+        buying_power, not however many shares a fixed dollar budget
+        happens to afford. `risk_dollars = buying_power * risk_fraction`,
+        `shares = risk_dollars / abs(price - stop_price)`, floored to a
+        whole share.
+
+        By design, this is a CAP layered on top of the existing
+        affordability/max_order_notional caps (see stock_order_quantity),
+        not a replacement for them - a caller takes the min() of this
+        and its other sizing result. stock_risk_per_trade_fraction is
+        set deliberately above the professional 1-2% standard for this
+        account's size: a very small account's fixed per-trade costs
+        (spread, fees) make 1% barely actionable, so a somewhat larger
+        fraction is a documented, deliberate tradeoff, not a hidden
+        compromise.
+
+        Returns 0 if the stop distance is zero/invalid (can't size
+        against an undefined risk) - same "no data -> don't trade"
+        convention as every other gate in this file.
+        """
+        stop_distance = abs(price - stop_price)
+        if stop_distance <= 0 or buying_power <= 0:
+            return 0
+        risk_dollars = buying_power * risk_fraction
+        return int((risk_dollars / stop_distance).to_integral_value(rounding=ROUND_DOWN))
 
     def stock_order_quantity(
         self,
