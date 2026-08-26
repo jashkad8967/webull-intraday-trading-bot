@@ -693,14 +693,11 @@ class TradingStrategy:
         the flat target as-is.
 
         intensity (0-1, default 1 = full size) further scales the
-        target down - by request, "lessen the intensity" of trading
-        outside core hours without stopping it: entry signals and
-        frequency are completely unaffected by this, only how much
-        notional is targeted per $1+ trade (see the sub-$1 note below
-        for why this can't shrink every trade). The caller passes a
-        smaller value outside core hours (see AutoTrader.trade_stocks'
-        volatility_scalp_extended_hours_intensity use) and 1 during
-        core hours.
+        target down. AutoTrader.trade_stocks always passes 1 now -
+        volatility-scalp entries never fire outside core hours at all
+        (by request, after pre-market losses), so there's no dampened-
+        intensity case left to apply. The parameter itself stays, since
+        the sub-$1 rounding-up behavior below is keyed off it too.
 
         Under $1, always rounds UP to at least 100 shares regardless of
         how small the target (or intensity) computes to - Webull's own

@@ -3338,6 +3338,216 @@ class VolatilityScalpEntryRepriceTests(unittest.TestCase):
         self.assertEqual(placed, [])
 
 
+class RepriceRestingEntriesTests(unittest.TestCase):
+    """reprice_resting_entries - by request: general (non-volatility-
+    scalp) BUY/SHORT entries were resting passively at their original
+    price forever and getting cancelled outright after order_timeout_
+    seconds, instead of crossing further into the spread first. Live
+    incident: IBRX got cancelled for never filling 4 separate times in
+    ~15 minutes.
+    """
+
+    @staticmethod
+    def _fake_bot(working_orders, bid, ask, eligible=False, fractional_ok=True):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+
+        class FakeApi:
+            @staticmethod
+            def stock_quote(symbol):
+                return {"symbol": symbol}
+
+            @staticmethod
+            def quote_ask(q):
+                return ask
+
+            @staticmethod
+            def quote_bid(q):
+                return bid
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_stock(symbol, side, quantity, limit_price=None):
+                placed.append((symbol, side, quantity, limit_price))
+                return "order-new"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(order_monitor_seconds=Decimal("5")),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_entry_reprice=0.0,
+            strategy=SimpleNamespace(is_volatility_scalp_eligible=lambda s: eligible),
+            volatility_scalp_positions=set(),
+            working_orders=working_orders,
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
+        )
+        return fake_bot, cancelled, placed
+
+    def test_buy_chases_up_toward_a_higher_ask(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:IBRX",
+                "action": "BUY",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("8.00"),
+                "quantity": Decimal("10"),
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            working_orders, bid=Decimal("8.05"), ask=Decimal("8.10")
+        )
+        reprice = AutoTrader.reprice_resting_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(True)
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertEqual(placed, [("IBRX", "BUY", Decimal("10"), Decimal("8.10"))])
+        self.assertNotIn("order-1", fake_bot.working_orders)
+        self.assertEqual(
+            fake_bot.working_orders["order-new"]["limit_price"], Decimal("8.10")
+        )
+
+    def test_short_chases_down_toward_a_lower_bid(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:XYZ",
+                "action": "SHORT",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("20.00"),
+                "quantity": 5,
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            working_orders, bid=Decimal("19.90"), ask=Decimal("19.95")
+        )
+        reprice = AutoTrader.reprice_resting_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(True)
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertEqual(placed, [("XYZ", "SHORT", 5, Decimal("19.90"))])
+
+    def test_does_not_reprice_when_the_price_has_not_improved(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:IBRX",
+                "action": "BUY",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("8.10"),
+                "quantity": Decimal("10"),
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            working_orders, bid=Decimal("8.05"), ask=Decimal("8.10")
+        )
+        reprice = AutoTrader.reprice_resting_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(True)
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+    def test_defers_to_the_volatility_scalp_repricer_for_eligible_symbols(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:GAUZ",
+                "action": "BUY",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("0.40"),
+                "quantity": 100,
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            working_orders, bid=Decimal("0.44"), ask=Decimal("0.45"), eligible=True
+        )
+        reprice = AutoTrader.reprice_resting_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(True)
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+    def test_ignores_a_non_entry_order(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:IBRX",
+                "action": "PROFIT",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("8.00"),
+                "quantity": 10,
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            working_orders, bid=Decimal("8.05"), ask=Decimal("8.10")
+        )
+        reprice = AutoTrader.reprice_resting_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(True)
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+    def test_skips_a_fractional_buy_outside_core_hours(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:IBRX",
+                "action": "BUY",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("8.00"),
+                "quantity": Decimal("2.5"),
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            working_orders, bid=Decimal("8.05"), ask=Decimal("8.10")
+        )
+        reprice = AutoTrader.reprice_resting_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(False)
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+    def test_respects_its_own_throttle(self):
+        from webull_bot.bot import AutoTrader
+
+        working_orders = {
+            "order-1": {
+                "submitted_at": 0.0,
+                "key": "STOCK:IBRX",
+                "action": "BUY",
+                "cancel_requested_at": None,
+                "limit_price": Decimal("8.00"),
+                "quantity": 10,
+            }
+        }
+        fake_bot, cancelled, placed = self._fake_bot(
+            working_orders, bid=Decimal("8.05"), ask=Decimal("8.10")
+        )
+        fake_bot.last_entry_reprice = 99.0
+        reprice = AutoTrader.reprice_resting_entries.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(True)
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+
 class BotOvertradingCapTests(unittest.TestCase):
     def test_rate_capped_blocks_after_configured_trades_per_hour(self):
         from collections import defaultdict, deque
@@ -8778,6 +8988,108 @@ class FractionalPreCloseSweepTests(unittest.TestCase):
         sweep()
 
         self.assertEqual(calls["exclude_symbols"], {"BROKEN"})
+
+
+class ExtendedHoursProfitSweepTests(unittest.TestCase):
+    """close_profitable_positions_during_extended_hours - by request,
+    after pre-market losses: "capturing any profits to close out the
+    day as much as possible" outside core hours. Same shape as
+    FractionalPreCloseSweepTests but for ALL equity positions (not
+    just fractional ones), on its own dedicated cadence.
+    """
+
+    @staticmethod
+    def _fake_bot(positions, quotes=None, config=None):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            config=config
+            or SimpleNamespace(extended_hours_profit_sweep_seconds=60),
+            last_extended_hours_profit_sweep=time.monotonic() - 999999,
+            pending_stock_exits={"AAPL", "MSFT"},
+            wash_sales=SimpleNamespace(block=lambda *a, **k: None),
+        )
+        quotes = quotes or {}
+        fake_bot.api = SimpleNamespace(
+            positions=lambda: positions,
+            stock_quote=lambda symbol: {"symbol": symbol, "price": str(quotes.get(symbol, "0"))},
+            quote_price=lambda quote: Decimal(str(quote["price"])),
+        )
+        return fake_bot
+
+    def test_closes_only_profitable_equity_positions(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "1", "cost_price": "493.23"},
+            {"instrument_type": "EQUITY", "symbol": "BABA", "quantity": "1", "cost_price": "128.93"},
+            {"instrument_type": "OPTION", "symbol": "AAPL260918C00200000", "quantity": "0.5", "cost_price": "1.00"},
+        ]
+        quotes = {"MSFT": "497.33", "BABA": "122.20"}
+        fake_bot = self._fake_bot(positions, quotes)
+        calls = {}
+
+        def fake_close_all_positions(instrument_types, loss_callback=None, exclude_symbols=None):
+            calls["instrument_types"] = instrument_types
+            calls["exclude_symbols"] = exclude_symbols
+            return ["order-1"]
+
+        fake_bot.api.close_all_positions = fake_close_all_positions
+        sweep = AutoTrader.close_profitable_positions_during_extended_hours.__get__(fake_bot)
+
+        sweep()
+
+        self.assertEqual(calls["instrument_types"], {"EQUITY"})
+        self.assertEqual(calls["exclude_symbols"], {"BABA"})
+        self.assertNotIn("MSFT", fake_bot.pending_stock_exits)
+
+    def test_noop_when_every_position_is_underwater(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "BABA", "quantity": "1", "cost_price": "128.93"},
+        ]
+        fake_bot = self._fake_bot(positions, {"BABA": "122.20"})
+
+        def fail_if_called(*a, **k):
+            raise AssertionError("must not attempt to close anything")
+
+        fake_bot.api.close_all_positions = fail_if_called
+        sweep = AutoTrader.close_profitable_positions_during_extended_hours.__get__(fake_bot)
+
+        sweep()  # must not raise
+
+    def test_throttled_within_its_own_sweep_interval(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "1", "cost_price": "493.23"},
+        ]
+        fake_bot = self._fake_bot(positions, {"MSFT": "497.33"})
+        fake_bot.last_extended_hours_profit_sweep = time.monotonic()
+        calls = []
+        fake_bot.api.close_all_positions = lambda *a, **k: (calls.append(1), [])[1]
+        sweep = AutoTrader.close_profitable_positions_during_extended_hours.__get__(fake_bot)
+
+        sweep()
+
+        self.assertEqual(calls, [])
+
+    def test_survives_a_broker_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "1", "cost_price": "493.23"},
+        ]
+        fake_bot = self._fake_bot(positions, {"MSFT": "497.33"})
+
+        def boom(*a, **k):
+            raise RuntimeError("boom")
+
+        fake_bot.api.close_all_positions = boom
+        sweep = AutoTrader.close_profitable_positions_during_extended_hours.__get__(fake_bot)
+
+        sweep()  # must not raise
 
 
 class CloseAllPositionsExclusionTests(unittest.TestCase):

@@ -285,19 +285,13 @@ class Settings(BaseSettings):
     # effect, since a "very volatile" stock is exactly where that
     # protection matters most.
     volatility_scalp_enabled: bool = True
-    # By request: "these stocks will not be as volatile in extended
-    # hours [pre-market/after-hours], we can chill on them in that time
-    # period for a bit" - clarified to mean lessen the intensity, not
-    # stop trading. Scales DOWN the per-trade notional target (see
-    # TradingStrategy.volatility_scalp_share_count) outside core hours
-    # by this fraction - entry signals, frequency, and eligibility are
-    # completely unaffected, only how much is risked per trade. 1.0
-    # would mean no dampening at all; exits/repricing/position
-    # management for anything already held are never touched by this,
-    # only fresh entry and averaging-down sizing.
-    volatility_scalp_extended_hours_intensity: Decimal = Field(
-        default=Decimal("0.4"), gt=0, le=1
-    )
+    # By request, after pre-market losses ("no volatility scalp in
+    # extended hours"): superseded the earlier dampened-intensity dial
+    # that used to live here - fresh volatility-scalp entries and
+    # averaging-down now simply never fire outside core hours at all
+    # (see AutoTrader.trade_stocks), so there's no partial-intensity
+    # case left to configure. Exits/repricing/position management for
+    # anything already held are unaffected either way.
     volatility_scalp_lookback_samples: int = Field(default=20, ge=5, le=200)
     # Lowered from 1.5% -> 0.8% by request - "if the bar for entry is
     # too restrictive, lower the bar." This is the hard AND gate every
@@ -840,6 +834,17 @@ class Settings(BaseSettings):
     option_eod_close_time: str = "15:50"
     option_market_close_time: str = "16:00"
     eod_retry_seconds: int = Field(default=10, ge=2, le=120)
+    # By request, after pre-market losses: "capturing any profits to
+    # close out the day as much as possible" outside core hours - how
+    # often AutoTrader.close_profitable_positions_during_extended_hours
+    # checks open equity positions and closes anything currently
+    # sitting at a profit. Slower than eod_retry_seconds (that one's a
+    # tight end-of-day retry loop) since this runs continuously through
+    # the whole pre-market/after-hours session, not just a final
+    # closeout window.
+    extended_hours_profit_sweep_seconds: int = Field(
+        default=60, ge=5, le=3600
+    )
     market_holidays: str = ""
     wash_sale_block_days: int = Field(default=31, ge=31, le=365)
     wash_sale_state_file: str = "conf/wash_sale_blocks.json"
