@@ -3504,6 +3504,96 @@ class AutoTrader:
                     self.volatility_scalp_last_buy_price.pop(symbol, None)
                 if (
                     quantity == 0
+                    and core_session_active
+                    and symbol not in self.volatility_scalp_positions
+                    and not self.has_pending_buy_order(key)
+                    and symbol not in self.broker_conflict_symbols
+                    and symbol not in self.entry_restricted_symbols
+                    and len(self.volatility_scalp_positions)
+                    < volatility_scalp_effective_max_concurrent
+                    and open_count < self.config.max_open_positions
+                    and not regime_gate_active
+                ):
+                    # Diagnostic-only pass, by request after live evidence
+                    # of zero volatility-scalp entries over a multi-hour
+                    # window despite individually-eligible candidates
+                    # existing - unlike the general strategy's gate_
+                    # rejections, this cohort's own entry gate never
+                    # recorded WHY a candidate was rejected, out of ~10
+                    # independently-narrow conditions stacked together
+                    # (each new one added in a separate request, never
+                    # tested for their compounding effect together).
+                    # Purely additive: evaluates the same conditions in
+                    # the same order as the real gate immediately below
+                    # and records only the FIRST one that fails - never
+                    # affects the real gate or submits anything itself.
+                    for reason, ok in (
+                        (
+                            "scalp - symbol regime is trending, not ranging",
+                            self.strategy.symbol_regime(symbol) != "TRENDING",
+                        ),
+                        (
+                            "scalp - still in post-stop-loss cooldown",
+                            self.post_stop_reentry_ready(symbol),
+                        ),
+                        (
+                            "scalp - order-submission cooldown",
+                            self.cooldown_ready(key),
+                        ),
+                        (
+                            "scalp - reentry cooldown",
+                            self.volatility_scalp_reentry_ready(key),
+                        ),
+                        (
+                            "scalp - price-sanity cooldown",
+                            self.price_sanity_cooldown_ready(symbol),
+                        ),
+                        (
+                            "scalp - not eligible (stdev/dollar volume)",
+                            self.strategy.is_volatility_scalp_eligible(symbol),
+                        ),
+                        (
+                            "scalp - spread too wide",
+                            self.strategy.volatility_scalp_entry_spread_ok(symbol),
+                        ),
+                        (
+                            "scalp - against the daily SMA trend",
+                            self.strategy.sma_trend_supports_entry(
+                                symbol, price, "BUY"
+                            ),
+                        ),
+                        (
+                            "scalp - below session VWAP",
+                            self.strategy.volatility_scalp_vwap_supports_entry(
+                                symbol, price
+                            ),
+                        ),
+                        (
+                            "scalp - no dip/breakout/reversal trigger",
+                            (
+                                self.strategy.volatility_scalp_dip_signal(
+                                    symbol, price
+                                )
+                                or self.strategy.dual_thrust_breakout_signal(
+                                    symbol, price
+                                )
+                                or self.strategy.heikin_ashi_bullish_reversal_signal(
+                                    symbol
+                                )
+                            ),
+                        ),
+                        (
+                            "scalp - momentum still falling",
+                            self.strategy.volatility_scalp_momentum_stalled_or_rising(
+                                symbol, price
+                            ),
+                        ),
+                    ):
+                        if not ok:
+                            self.gate_rejections[reason] += 1
+                            break
+                if (
+                    quantity == 0
                     # By request, after pre-market losses: "no volatility
                     # scalp in extended hours." A hard, unconditional
                     # gate - unlike the earlier intensity-dampening
