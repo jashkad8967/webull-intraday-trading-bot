@@ -95,7 +95,7 @@ class StrategyConfigMixin:
             # arbitrary volume via _feed's "volume": "1000" aren't
             # affected - dedicated tests below override this to
             # exercise the floor itself.
-            volatility_scalp_min_volume=0,
+            volatility_scalp_min_dollar_volume=Decimal("0"),
             volatility_scalp_dip_entry_percent=Decimal("0.005"),
             volatility_scalp_averaging_step_multiplier=Decimal("0.5"),
             volatility_scalp_vwap_band_percent=Decimal("0.05"),
@@ -518,7 +518,7 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         self.assertGreaterEqual(stdev, self.config().volatility_scalp_min_stdev_percent)
         self.assertTrue(strategy.is_volatility_scalp_eligible("WILD"))
 
-    def test_high_stdev_low_volume_symbol_is_not_eligible(self):
+    def test_high_stdev_low_dollar_volume_symbol_is_not_eligible(self):
         """By request: "the stocks being chosen have very low volume,
         thus they do not fluctuate much, we need high volume stocks
         for more volatility." A thin name can clear the stdev bar
@@ -526,24 +526,47 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         behind the move.
         """
         strategy = TradingStrategy(self.config())
-        strategy.config.volatility_scalp_min_volume = 500_000
+        strategy.config.volatility_scalp_min_dollar_volume = Decimal("5000000")
         self._feed(strategy, "THINWILD", [10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8])
         stdev = strategy.realized_volatility_percent("THINWILD")
         self.assertIsNotNone(stdev)
         self.assertGreaterEqual(stdev, self.config().volatility_scalp_min_stdev_percent)
-        # _feed only supplies "volume": "1000" per tick - well under the
-        # 500k floor.
+        # _feed only supplies "volume": "1000" per tick - ~$10k dollar
+        # volume at this price, well under the $5M floor.
         self.assertFalse(strategy.is_volatility_scalp_eligible("THINWILD"))
 
-    def test_high_stdev_high_volume_symbol_is_eligible(self):
+    def test_high_stdev_high_dollar_volume_symbol_is_eligible(self):
         strategy = TradingStrategy(self.config())
-        strategy.config.volatility_scalp_min_volume = 500_000
+        strategy.config.volatility_scalp_min_dollar_volume = Decimal("5000000")
         for price in (10, 10.5, 9.6, 10.4, 9.7, 10.3, 9.8):
             strategy.update_stock_snapshot(
                 {"symbol": "LIQUIDWILD", "volume": "600000", "price": str(price)},
                 Decimal(str(price)),
             )
+        # 600,000 shares * ~$9.80 =~ $5.88M - clears the $5M floor.
         self.assertTrue(strategy.is_volatility_scalp_eligible("LIQUIDWILD"))
+
+    def test_high_share_volume_low_price_is_not_eligible(self):
+        """Live incident (this bug, caught the same day it shipped): a
+        raw SHARE-count floor doesn't scale with price. SOAR cleared
+        500,000 shares of "volume" at ~$0.28/share - only ~$140k of
+        real dollar liquidity, too thin to absorb this strategy's own
+        repeated order flow. Its PROFIT exit failed to fill even after
+        three escalation-and-reprice cycles, forcing a market-order
+        exit at a loss. A high SHARE count at a low price must still
+        fail the (now dollar-based) floor.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.config.volatility_scalp_min_dollar_volume = Decimal("5000000")
+        for price in (0.28, 0.29, 0.27, 0.28, 0.275, 0.282, 0.278):
+            strategy.update_stock_snapshot(
+                {"symbol": "SOAR", "volume": "600000", "price": str(price)},
+                Decimal(str(price)),
+            )
+        # 600,000 shares * ~$0.28 =~ $168k - nowhere near the $5M floor,
+        # even though the raw share count alone would have cleared the
+        # old, buggy 500,000-share threshold.
+        self.assertFalse(strategy.is_volatility_scalp_eligible("SOAR"))
 
     def test_disabled_in_config_is_never_eligible_even_when_choppy(self):
         strategy = TradingStrategy(self.config())

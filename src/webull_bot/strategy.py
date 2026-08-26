@@ -233,10 +233,25 @@ class TradingStrategy:
         # extended hours). Fails closed (not eligible) with no metrics
         # yet, same "no data -> don't trust it" convention as the
         # stdev check above.
+        #
+        # Live incident (this bug, caught the same day it shipped): a
+        # raw SHARE-count floor doesn't scale with price, so it's
+        # nearly meaningless for a penny stock - SOAR cleared 500,000
+        # shares of "volume" at ~$0.28/share, which is only ~$140k of
+        # real dollar liquidity. That thin a book couldn't absorb this
+        # strategy's own repeated buy/average-down/exit order flow: its
+        # PROFIT exit failed to fill even after three separate
+        # escalation-and-reprice cycles, forcing a market-order exit at
+        # a loss. Measuring DOLLAR volume (price x share volume)
+        # instead fixes this at any price level, not just penny names.
         metrics = self.metrics.get(symbol)
         if not metrics:
             return False
-        return metrics.get("volume", 0) >= self.config.volatility_scalp_min_volume
+        price = self.prices.get(symbol)
+        if not price or price <= 0:
+            return False
+        dollar_volume = Decimal(str(metrics.get("volume", 0))) * price
+        return dollar_volume >= self.config.volatility_scalp_min_dollar_volume
 
     def volatility_scalp_dip_signal(self, symbol: str, price: Decimal) -> bool:
         """True when price has pulled back at least
