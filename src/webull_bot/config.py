@@ -953,13 +953,21 @@ class Settings(BaseSettings):
     daily_pnl_state_file: str = "conf/daily_pnl.json"
     trade_history_state_file: str = "conf/trade_history.json"
     invalid_symbol_state_file: str = "conf/invalid_symbols.json"
-    # Fully-automatic strategy-review apply loop (explicitly confirmed by
-    # the user, twice, after being shown the risk - see
-    # src/webull_bot/strategy_tuning.py for the bounded lever table this
-    # gates). Not read by the live bot process itself - the autonomous
-    # apply script reads these to decide how aggressively to move a
-    # lever and how long to wait before touching the same one again.
-    strategy_tuning_auto_apply_enabled: bool = True
+    # DISABLED by request, after an independent risk review found fully-
+    # automatic live application of model-generated tuning to be the
+    # most urgent operational risk in the system - a synthetic test
+    # suite can prove config.py still behaves structurally after a
+    # change, it cannot prove the change improves live expectancy. This
+    # flag is now an actual functional gate (scripts/apply_strategy_
+    # review.py reads and enforces it directly) - previously it was
+    # declared but never read anywhere, giving false confidence that it
+    # controlled anything. The real, primary gate is
+    # .github/workflows/strategy-tuning-auto-apply.yml's own `if: false`
+    # on the job itself (see that file's header comment) - this is
+    # deliberate defense-in-depth on top of that, not the only gate.
+    # See src/webull_bot/strategy_tuning.py for the bounded lever table
+    # this would gate if ever re-enabled.
+    strategy_tuning_auto_apply_enabled: bool = False
     strategy_tuning_cooldown_hours: int = Field(default=24, ge=1, le=168)
     strategy_tuning_step_fraction: Decimal = Field(
         default=Decimal("0.10"), gt=0, le=Decimal("0.5")

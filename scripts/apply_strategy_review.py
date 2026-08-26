@@ -133,6 +133,25 @@ def main() -> int:
 
     outputs = {"changed": "false", "commit_message": ""}
 
+    config_text = _read_text(CONFIG_PATH)
+
+    # By request, after an independent risk review: a real, enforced
+    # gate, not decorative - this used to be declared in config.py but
+    # never actually checked anywhere. The workflow's own `if: false`
+    # on the job is the primary gate (see strategy-tuning-auto-apply.yml's
+    # header comment); this is deliberate defense-in-depth on top of
+    # that, checked against config.py's own current on-disk value so a
+    # local/manual run of this script is covered too, not just the
+    # workflow path.
+    if not _read_current_bool(config_text, "strategy_tuning_auto_apply_enabled"):
+        print(
+            "Strategy-tuning auto-apply is disabled "
+            "(strategy_tuning_auto_apply_enabled=False in config.py) - "
+            "refusing to compute or apply any adjustment."
+        )
+        _emit(outputs)
+        return 0
+
     status = json.loads(_read_text(Path(args.status)))
     review = ((status.get("agent") or {}).get("strategy_review")) or None
     if not review or review.get("severity") == "none":
@@ -153,7 +172,6 @@ def main() -> int:
         return 0
 
     live_env_text = _read_text(Path(args.live_env))
-    config_text = _read_text(CONFIG_PATH)
     state = StrategyTuningState(COOLDOWN_STATE_PATH)
     step_fraction = Decimal(args.step_fraction)
 

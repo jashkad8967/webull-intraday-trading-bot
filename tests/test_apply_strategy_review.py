@@ -141,6 +141,40 @@ class LiveEnvOverrideTests(unittest.TestCase):
         self.assertFalse(script._is_overridden_in_live_env("max_order_notional", env_text))
 
 
+class AutoApplyDisabledGateTests(unittest.TestCase):
+    """By request, after an independent risk review: strategy_tuning_
+    auto_apply_enabled must be a REAL, enforced gate in main(), not
+    just a declared-but-unread config field. The real config.py now
+    defaults this to False - main() must refuse to do anything (never
+    even reach the network-fetched status.json) while that holds,
+    regardless of what status.json/live.env say.
+    """
+
+    def test_main_refuses_when_disabled_in_the_real_config(self):
+        import io
+        import sys as sys_module
+        from contextlib import redirect_stdout
+
+        # No --status/--live-env files needed - main() must bail before
+        # ever trying to open them, since the real config.py's default
+        # is now False.
+        argv = [
+            "apply_strategy_review.py",
+            "--status", "/nonexistent/status.json",
+            "--live-env", "/nonexistent/live.env",
+        ]
+        original_argv = sys_module.argv
+        sys_module.argv = argv
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                exit_code = script.main()
+        finally:
+            sys_module.argv = original_argv
+        self.assertEqual(exit_code, 0)
+        self.assertIn("disabled", buffer.getvalue().lower())
+
+
 class SuggestionHashTests(unittest.TestCase):
     def test_identical_suggestions_hash_the_same(self):
         review = {"severity": "moderate", "suggested_changes": [{"lever": "position size"}]}
