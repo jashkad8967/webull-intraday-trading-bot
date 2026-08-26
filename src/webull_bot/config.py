@@ -368,8 +368,17 @@ class Settings(BaseSettings):
     volatility_scalp_momentum_stall_min_profit_fraction: Decimal = Field(
         default=Decimal("0.6"), gt=0, le=1
     )
+    # Raised 3 -> 8 by request, after finding buying power sitting idle
+    # ("not investing all the capital") - 3 concurrent slots capped how
+    # much of the account's capital the scalp strategy could ever have
+    # working at once, regardless of how much buying power remained.
+    # Per-trade sizing (volatility_scalp_target_notional_buying_power_
+    # fraction) and the total-exposure/position-value caps already
+    # backstop this independently - raising the slot count lets sizing
+    # actually reach those existing caps instead of stopping short of
+    # them for lack of an open slot.
     volatility_scalp_max_concurrent_positions: int = Field(
-        default=3, ge=1, le=20
+        default=8, ge=1, le=20
     )
     # By request: "if they dip a lot after you buy, average it out with
     # another buy" - caps how many additional buys a single held cohort

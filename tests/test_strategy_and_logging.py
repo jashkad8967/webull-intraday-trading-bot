@@ -7729,6 +7729,40 @@ class IdleCashRelaxationTests(unittest.TestCase):
 
         self.assertGreater(fake_bot.last_capital_deployed_at, time.monotonic() - 1)
 
+    def test_a_volatility_scalp_buy_does_not_reset_the_general_strategys_idle_timer(self):
+        """By request, after finding buying power sitting idle: the
+        idle-cash ramp only ever loosens the GENERAL strategy's own
+        entry gates, but a volatility-scalp fill (firing every few
+        minutes) was resetting this same clock anyway, starving the
+        general strategy's gates from ever relaxing even while its own
+        capital pool sat unused for hours.
+        """
+        from webull_bot.bot import AutoTrader
+
+        stale = time.monotonic() - 999999
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=stale,
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            consecutive_exit_failures=defaultdict(int),
+            submitted_order_ids_today=set(),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade(
+            "STOCK:GAUZ",
+            "order-1",
+            "BUY",
+            counts_toward_idle_cash_ramp=False,
+        )
+
+        self.assertEqual(fake_bot.last_capital_deployed_at, stale)
+
     def test_record_trade_does_not_reset_the_timer_on_an_exit(self):
         from webull_bot.bot import AutoTrader
 

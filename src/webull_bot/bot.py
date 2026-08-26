@@ -1157,6 +1157,7 @@ class AutoTrader:
         pnl: Decimal | None = None,
         entry_price: Decimal | None = None,
         quantity: Decimal | None = None,
+        counts_toward_idle_cash_ramp: bool = True,
     ) -> None:
         submitted_at = time.monotonic()
         self.last_trade[key] = submitted_at
@@ -1173,11 +1174,33 @@ class AutoTrader:
             # Feeds stop_loss_guard_active() - a real stop-loss fill (not a
             # manual sell or a profit-take), tracked regardless of symbol.
             self.recent_stop_losses.append(submitted_at)
-        if action in ("BUY", "SHORT", "MANUAL_BUY"):
+        if (
+            action in ("BUY", "SHORT", "MANUAL_BUY")
+            and counts_toward_idle_cash_ramp
+        ):
             # Resets the idle-cash gate-relaxation ramp (see
             # idle_cash_ramp_progress) - capital just got deployed, so
             # quality gates snap back to their normal strictness until
             # cash sits idle above MIN_CASH_RESERVE_DOLLARS again.
+            #
+            # Live incident (this bug, caught while investigating "not
+            # investing all the capital"): the ramp is only ever read
+            # by the GENERAL strategy's own entry gates (see the
+            # idle_relaxation_multiplier/amount passed to stock_
+            # decision in trade_stocks) - it has no effect on
+            # volatility-scalp's own, separate entry conditions. But a
+            # volatility-scalp BUY/average-down was resetting this same
+            # clock anyway, since both paths call record_trade with the
+            # same "BUY" action. With scalp trading firing every few
+            # minutes, the general strategy's idle-cash grace/ramp
+            # timer effectively never advanced, keeping ITS gates
+            # (spread, VWAP, SMA) at full strictness indefinitely even
+            # while real buying power sat unused for hours - scalp
+            # capital being deployed doesn't mean the general
+            # strategy's own capital pool isn't idle. Callers opt out
+            # via counts_toward_idle_cash_ramp=False (the volatility-
+            # scalp entry/averaging-down call sites) so only a genuine
+            # general-strategy deployment resets this clock.
             self.last_capital_deployed_at = submitted_at
         if action in ("BUY", "SHORT"):
             # Feeds TradingStrategy.adaptive_stop_percent's time-aware
@@ -1952,7 +1975,13 @@ class AutoTrader:
         longer it sits unspent, the more entry_spread_ok/entry_extension_ok/
         vwap_supports_entry/tick_direction_ok loosen - see their
         idle_relaxation_multiplier parameter. Resets to 0 the moment
-        record_trade() sees a new BUY/SHORT/MANUAL_BUY fill.
+        record_trade() sees a new BUY/SHORT/MANUAL_BUY fill that counts
+        toward this ramp - volatility-scalp fills deliberately don't (see
+        record_trade's counts_toward_idle_cash_ramp), since this ramp
+        only ever loosens the GENERAL strategy's own gates and scalp
+        activity firing every few minutes was otherwise starving it
+        from ever advancing, even while real buying power sat unused
+        for hours.
         """
         if not self.config.idle_cash_relaxation_enabled or buying_power <= 0:
             return Decimal("0")
@@ -3523,6 +3552,10 @@ class AutoTrader:
                                 "BUY",
                                 entry_price=self.volatility_scalp_entry_price(quote),
                                 quantity=scalp_quantity,
+                                # Doesn't reset the general strategy's
+                                # idle-cash relaxation clock - see
+                                # record_trade's docstring note.
+                                counts_toward_idle_cash_ramp=False,
                             )
                             self.volatility_scalp_positions.add(symbol)
                             self.volatility_scalp_last_buy_price[symbol] = price
@@ -3664,6 +3697,7 @@ class AutoTrader:
                                 "BUY",
                                 entry_price=self.volatility_scalp_entry_price(quote),
                                 quantity=average_down_quantity,
+                                counts_toward_idle_cash_ramp=False,
                             )
                             self.volatility_scalp_average_down_count[symbol] += 1
                             self.last_volatility_average_down[symbol] = (
