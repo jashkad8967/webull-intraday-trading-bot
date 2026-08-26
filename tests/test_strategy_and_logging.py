@@ -2598,6 +2598,10 @@ class RepriceRestingExitsTests(unittest.TestCase):
                 return quote
 
             @staticmethod
+            def stock_quotes_resilient(symbols, category):
+                return ([quote for _ in symbols], set())
+
+            @staticmethod
             def quote_ask(q):
                 return Decimal(str(q["ask"]))
 
@@ -2637,6 +2641,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             daily_realized_pnl=Decimal("0"),
             daily_realized_loss=Decimal("0"),
             is_fractional_quantity=AutoTrader.is_fractional_quantity,
+            stock_categories={},
             working_orders={
                 "order-1": {
                     "submitted_at": 0.0,
@@ -2647,6 +2652,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
                 }
             },
         )
+        fake_bot._batched_quotes = AutoTrader._batched_quotes.__get__(fake_bot)
         reprice = AutoTrader.reprice_resting_exits.__get__(fake_bot)
 
         positions = [
@@ -2693,6 +2699,10 @@ class RepriceRestingExitsTests(unittest.TestCase):
                 return quote
 
             @staticmethod
+            def stock_quotes_resilient(symbols, category):
+                return ([quote for _ in symbols], set())
+
+            @staticmethod
             def quote_ask(q):
                 return Decimal(str(q["ask"]))
 
@@ -2721,6 +2731,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             stop_exit_submitted={"ASHR": 5.0},
             daily_realized_pnl=Decimal("0"),
             daily_realized_loss=Decimal("0"),
+            stock_categories={},
             working_orders={
                 "order-1": {
                     "submitted_at": 0.0,
@@ -2731,6 +2742,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
                 }
             },
         )
+        fake_bot._batched_quotes = AutoTrader._batched_quotes.__get__(fake_bot)
         reprice = AutoTrader.reprice_resting_exits.__get__(fake_bot)
 
         with unittest.mock.patch("time.monotonic", return_value=100.0):
@@ -2850,6 +2862,10 @@ class RepriceRestingExitsTests(unittest.TestCase):
                 return quote
 
             @staticmethod
+            def stock_quotes_resilient(symbols, category):
+                return ([quote for _ in symbols], set())
+
+            @staticmethod
             def quote_ask(q):
                 return Decimal(str(q["ask"]))
 
@@ -2885,6 +2901,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
             daily_realized_pnl=Decimal("0"),
             daily_realized_loss=Decimal("0"),
             is_fractional_quantity=AutoTrader.is_fractional_quantity,
+            stock_categories={},
             working_orders={
                 "order-1": {
                     "submitted_at": 0.0,
@@ -2895,6 +2912,7 @@ class RepriceRestingExitsTests(unittest.TestCase):
                 }
             },
         )
+        fake_bot._batched_quotes = AutoTrader._batched_quotes.__get__(fake_bot)
         reprice = AutoTrader.reprice_resting_exits.__get__(fake_bot)
 
         # Entry cost (30.00) is above the current ask (29.95) - the stock
@@ -2949,6 +2967,10 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
                 return {"symbol": symbol, "bid": bid, "ask": ask}
 
             @staticmethod
+            def stock_quotes_resilient(symbols, category):
+                return ([FakeApi.stock_quote(s) for s in symbols], set())
+
+            @staticmethod
             def quote_bid(q):
                 return Decimal(str(q["bid"])) if q.get("bid") is not None else None
 
@@ -2991,9 +3013,11 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
             volatility_scalp_positions=set(),
             stop_loss_escalated=set(),
             is_fractional_quantity=AutoTrader.is_fractional_quantity,
+            stock_categories={},
             working_orders=working_orders,
         )
         fake_bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(fake_bot)
+        fake_bot._batched_quotes = AutoTrader._batched_quotes.__get__(fake_bot)
         return fake_bot, cancelled, placed
 
     def test_reprices_toward_a_new_fillable_price_for_an_eligible_symbol(self):
@@ -3199,6 +3223,10 @@ class VolatilityScalpEntryRepriceTests(unittest.TestCase):
                 return {"symbol": symbol}
 
             @staticmethod
+            def stock_quotes_resilient(symbols, category):
+                return ([FakeApi.stock_quote(s) for s in symbols], set())
+
+            @staticmethod
             def stock_limit_price(q, side):
                 return buy_limit_by_symbol.get(q["symbol"])
 
@@ -3220,8 +3248,10 @@ class VolatilityScalpEntryRepriceTests(unittest.TestCase):
                 is_volatility_scalp_eligible=lambda symbol: symbol in eligible_symbols
             ),
             volatility_scalp_positions=set(),
+            stock_categories={},
             working_orders=working_orders,
         )
+        fake_bot._batched_quotes = AutoTrader._batched_quotes.__get__(fake_bot)
         return fake_bot, cancelled, placed
 
     def test_lowers_the_limit_when_price_has_fallen(self):
@@ -3366,6 +3396,10 @@ class RepriceRestingEntriesTests(unittest.TestCase):
                 return {"symbol": symbol}
 
             @staticmethod
+            def stock_quotes_resilient(symbols, category):
+                return ([FakeApi.stock_quote(s) for s in symbols], set())
+
+            @staticmethod
             def quote_ask(q):
                 return ask
 
@@ -3391,7 +3425,9 @@ class RepriceRestingEntriesTests(unittest.TestCase):
             volatility_scalp_positions=set(),
             working_orders=working_orders,
             is_fractional_quantity=AutoTrader.is_fractional_quantity,
+            stock_categories={},
         )
+        fake_bot._batched_quotes = AutoTrader._batched_quotes.__get__(fake_bot)
         return fake_bot, cancelled, placed
 
     def test_buy_chases_up_toward_a_higher_ask(self):
@@ -7692,6 +7728,40 @@ class IdleCashRelaxationTests(unittest.TestCase):
         record_trade("STOCK:AAPL", "order-1", "BUY")
 
         self.assertGreater(fake_bot.last_capital_deployed_at, time.monotonic() - 1)
+
+    def test_a_volatility_scalp_buy_does_not_reset_the_general_strategys_idle_timer(self):
+        """By request, after finding buying power sitting idle: the
+        idle-cash ramp only ever loosens the GENERAL strategy's own
+        entry gates, but a volatility-scalp fill (firing every few
+        minutes) was resetting this same clock anyway, starving the
+        general strategy's gates from ever relaxing even while its own
+        capital pool sat unused for hours.
+        """
+        from webull_bot.bot import AutoTrader
+
+        stale = time.monotonic() - 999999
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=stale,
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            consecutive_exit_failures=defaultdict(int),
+            submitted_order_ids_today=set(),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade(
+            "STOCK:GAUZ",
+            "order-1",
+            "BUY",
+            counts_toward_idle_cash_ramp=False,
+        )
+
+        self.assertEqual(fake_bot.last_capital_deployed_at, stale)
 
     def test_record_trade_does_not_reset_the_timer_on_an_exit(self):
         from webull_bot.bot import AutoTrader

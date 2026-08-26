@@ -1157,6 +1157,7 @@ class AutoTrader:
         pnl: Decimal | None = None,
         entry_price: Decimal | None = None,
         quantity: Decimal | None = None,
+        counts_toward_idle_cash_ramp: bool = True,
     ) -> None:
         submitted_at = time.monotonic()
         self.last_trade[key] = submitted_at
@@ -1173,11 +1174,33 @@ class AutoTrader:
             # Feeds stop_loss_guard_active() - a real stop-loss fill (not a
             # manual sell or a profit-take), tracked regardless of symbol.
             self.recent_stop_losses.append(submitted_at)
-        if action in ("BUY", "SHORT", "MANUAL_BUY"):
+        if (
+            action in ("BUY", "SHORT", "MANUAL_BUY")
+            and counts_toward_idle_cash_ramp
+        ):
             # Resets the idle-cash gate-relaxation ramp (see
             # idle_cash_ramp_progress) - capital just got deployed, so
             # quality gates snap back to their normal strictness until
             # cash sits idle above MIN_CASH_RESERVE_DOLLARS again.
+            #
+            # Live incident (this bug, caught while investigating "not
+            # investing all the capital"): the ramp is only ever read
+            # by the GENERAL strategy's own entry gates (see the
+            # idle_relaxation_multiplier/amount passed to stock_
+            # decision in trade_stocks) - it has no effect on
+            # volatility-scalp's own, separate entry conditions. But a
+            # volatility-scalp BUY/average-down was resetting this same
+            # clock anyway, since both paths call record_trade with the
+            # same "BUY" action. With scalp trading firing every few
+            # minutes, the general strategy's idle-cash grace/ramp
+            # timer effectively never advanced, keeping ITS gates
+            # (spread, VWAP, SMA) at full strictness indefinitely even
+            # while real buying power sat unused for hours - scalp
+            # capital being deployed doesn't mean the general
+            # strategy's own capital pool isn't idle. Callers opt out
+            # via counts_toward_idle_cash_ramp=False (the volatility-
+            # scalp entry/averaging-down call sites) so only a genuine
+            # general-strategy deployment resets this clock.
             self.last_capital_deployed_at = submitted_at
         if action in ("BUY", "SHORT"):
             # Feeds TradingStrategy.adaptive_stop_percent's time-aware
@@ -1402,6 +1425,50 @@ class AutoTrader:
             except Exception as exc:
                 log.error("CANCEL | id=%s | %s", order_id, exc)
 
+    def _batched_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        """One (or a few, split by category) batched snapshot call for
+        multiple symbols, instead of a caller looping and calling
+        self.api.stock_quote(symbol) once per symbol. Each individual
+        call is a full separate network round-trip - with several
+        repricers/sweeps each doing this once per open position or
+        working order, every single main-loop cycle, this was a real
+        contributor to cycles taking far longer than poll_seconds (live
+        evidence: ~40s between scan cycles despite a 0.25s poll target).
+
+        Grouped by category (stock_quotes requires one category per
+        call) and capped at WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS per
+        group. A group's failure only drops that group's symbols from
+        the result - callers already treat a missing symbol as "no
+        quote yet, try again next cycle," the same as any other quote
+        failure.
+        """
+        unique_symbols = list(dict.fromkeys(symbols))
+        if not unique_symbols:
+            return {}
+        by_category: dict[str, list[str]] = defaultdict(list)
+        for symbol in unique_symbols:
+            by_category[self.stock_categories.get(symbol, "US_STOCK")].append(symbol)
+        quotes: dict[str, dict] = {}
+        for category, group in by_category.items():
+            for start in range(0, len(group), WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS):
+                chunk = group[start : start + WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS]
+                try:
+                    fetched, _invalid = self.api.stock_quotes_resilient(
+                        chunk, category
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "REPRICE| batched quote fetch failed | %s | %s",
+                        ",".join(chunk),
+                        exc,
+                    )
+                    continue
+                for quote in fetched:
+                    symbol = str(quote.get("symbol", "")).upper()
+                    if symbol:
+                        quotes[symbol] = quote
+        return quotes
+
     def reprice_resting_exits(
         self, positions: list[dict], core_session_active: bool = False
     ) -> None:
@@ -1433,6 +1500,7 @@ class AutoTrader:
         if now - self.last_reprice < float(self.config.order_monitor_seconds):
             return
         self.last_reprice = now
+        candidates: list[tuple[str, str, dict]] = []
         for order_id, order in list(self.working_orders.items()):
             action = order.get("action")
             key = str(order.get("key") or "")
@@ -1457,8 +1525,20 @@ class AutoTrader:
                 # live-eligible this cycle, so the two repricers never
                 # both try to manage the same resting order at once.
                 continue
+            candidates.append((order_id, symbol, order))
+        if not candidates:
+            return
+        # One batched snapshot call for every symbol this cycle needs,
+        # instead of one self.api.stock_quote(symbol) round-trip per
+        # candidate - see _batched_quotes.
+        quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
+        for order_id, symbol, order in candidates:
+            key = str(order.get("key") or "")
+            action = order.get("action")
             try:
-                quote = self.api.stock_quote(symbol)
+                quote = quotes.get(symbol)
+                if quote is None:
+                    continue
                 ask = self.api.quote_ask(quote)
                 if ask is None or ask == order.get("limit_price"):
                     continue
@@ -1534,6 +1614,7 @@ class AutoTrader:
         ):
             return
         self.last_volatility_reprice = now
+        candidates: list[tuple[str, str, dict]] = []
         for order_id, order in list(self.working_orders.items()):
             action = order.get("action")
             key = str(order.get("key") or "")
@@ -1556,8 +1637,17 @@ class AutoTrader:
                 and symbol not in self.volatility_scalp_positions
             ):
                 continue
+            candidates.append((order_id, symbol, order))
+        if not candidates:
+            return
+        quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
+        for order_id, symbol, order in candidates:
+            key = str(order.get("key") or "")
+            action = order.get("action")
             try:
-                quote = self.api.stock_quote(symbol)
+                quote = quotes.get(symbol)
+                if quote is None:
+                    continue
                 quantity, cost = self.api.stock_position(symbol, positions)
                 if quantity <= 0:
                     continue
@@ -1637,6 +1727,7 @@ class AutoTrader:
         ):
             return
         self.last_volatility_entry_reprice = now
+        candidates: list[tuple[str, str, dict]] = []
         for order_id, order in list(self.working_orders.items()):
             action = order.get("action")
             key = str(order.get("key") or "")
@@ -1657,8 +1748,18 @@ class AutoTrader:
             quantity = order.get("quantity")
             if not quantity or quantity <= 0:
                 continue
+            candidates.append((order_id, symbol, order))
+        if not candidates:
+            return
+        quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
+        for order_id, symbol, order in candidates:
+            key = str(order.get("key") or "")
+            action = order.get("action")
+            quantity = order.get("quantity")
             try:
-                quote = self.api.stock_quote(symbol)
+                quote = quotes.get(symbol)
+                if quote is None:
+                    continue
                 limit_price = self.api.stock_limit_price(quote, "BUY")
                 current_limit = order.get("limit_price")
                 if (
@@ -1727,6 +1828,7 @@ class AutoTrader:
         if now - self.last_entry_reprice < float(self.config.order_monitor_seconds):
             return
         self.last_entry_reprice = now
+        candidates: list[tuple[str, str, dict]] = []
         for order_id, order in list(self.working_orders.items()):
             action = order.get("action")
             key = str(order.get("key") or "")
@@ -1749,8 +1851,18 @@ class AutoTrader:
                 and not core_session_active
             ):
                 continue
+            candidates.append((order_id, symbol, order))
+        if not candidates:
+            return
+        quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
+        for order_id, symbol, order in candidates:
+            key = str(order.get("key") or "")
+            action = order.get("action")
+            quantity = order.get("quantity")
             try:
-                quote = self.api.stock_quote(symbol)
+                quote = quotes.get(symbol)
+                if quote is None:
+                    continue
                 current_limit = order.get("limit_price")
                 if action == "BUY":
                     target_price = self.api.quote_ask(quote)
@@ -1863,7 +1975,13 @@ class AutoTrader:
         longer it sits unspent, the more entry_spread_ok/entry_extension_ok/
         vwap_supports_entry/tick_direction_ok loosen - see their
         idle_relaxation_multiplier parameter. Resets to 0 the moment
-        record_trade() sees a new BUY/SHORT/MANUAL_BUY fill.
+        record_trade() sees a new BUY/SHORT/MANUAL_BUY fill that counts
+        toward this ramp - volatility-scalp fills deliberately don't (see
+        record_trade's counts_toward_idle_cash_ramp), since this ramp
+        only ever loosens the GENERAL strategy's own gates and scalp
+        activity firing every few minutes was otherwise starving it
+        from ever advancing, even while real buying power sat unused
+        for hours.
         """
         if not self.config.idle_cash_relaxation_enabled or buying_power <= 0:
             return Decimal("0")
@@ -3434,6 +3552,10 @@ class AutoTrader:
                                 "BUY",
                                 entry_price=self.volatility_scalp_entry_price(quote),
                                 quantity=scalp_quantity,
+                                # Doesn't reset the general strategy's
+                                # idle-cash relaxation clock - see
+                                # record_trade's docstring note.
+                                counts_toward_idle_cash_ramp=False,
                             )
                             self.volatility_scalp_positions.add(symbol)
                             self.volatility_scalp_last_buy_price[symbol] = price
@@ -3575,6 +3697,7 @@ class AutoTrader:
                                 "BUY",
                                 entry_price=self.volatility_scalp_entry_price(quote),
                                 quantity=average_down_quantity,
+                                counts_toward_idle_cash_ramp=False,
                             )
                             self.volatility_scalp_average_down_count[symbol] += 1
                             self.last_volatility_average_down[symbol] = (
