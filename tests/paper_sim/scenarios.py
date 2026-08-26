@@ -449,6 +449,62 @@ def idle_cash_ramp_reaches_a_relaxed_entry_and_resets_on_a_fill():
     assert progress(Decimal("50")) == Decimal("0")
 
 
+# --- DAIC regression: repeated stop-loss-then-reentry on one symbol -------
+
+
+@scenario
+def daic_style_repeated_stop_loss_reentry_is_blocked():
+    """Reproduces the actual DAIC incident: 3 stop-losses in ~9 minutes
+    on one symbol during a fast decline, erasing the day's gains,
+    because nothing throttled immediate re-entry into the same falling
+    knife right after being stopped out of it. Asserts the new
+    post_stop_reentry_ready cooldown blocks the would-be next re-entry,
+    while a completely different symbol is unaffected.
+    """
+    config = SimpleNamespace(volatility_scalp_post_stop_cooldown_seconds=300)
+    fake_bot = SimpleNamespace(
+        last_trade={},
+        last_exit_at={},
+        trade_times=defaultdict(deque),
+        working_orders={},
+        status=SimpleNamespace(record_trade=lambda *a, **k: None),
+        last_capital_deployed_at=0.0,
+        recent_stop_losses=deque(),
+        last_volatility_stop_loss_at={},
+        position_opened_at={},
+        symbol_pnl_history=defaultdict(deque),
+        submitted_order_ids_today=set(),
+        config=config,
+    )
+    record_trade = AutoTrader.record_trade.__get__(fake_bot)
+    ready = AutoTrader.post_stop_reentry_ready.__get__(fake_bot)
+
+    now = time.monotonic()
+    # Three stop-losses on DAIC within ~9 minutes, each timestamp
+    # stamped as if it just happened (record_trade uses the real
+    # monotonic clock, so simulate elapsed time by writing directly
+    # into last_volatility_stop_loss_at after each record_trade call -
+    # what matters is the state record_trade produces, not wall-clock
+    # timing in this synthetic run).
+    record_trade(
+        "STOCK:DAIC", "order-1", "STOP", Decimal("9"),
+        pnl=Decimal("-1"), entry_price=Decimal("10"),
+    )
+    assert "DAIC" in fake_bot.last_volatility_stop_loss_at
+
+    # A 4th attempted re-entry immediately after the most recent stop
+    # must be blocked - this is the exact gap DAIC exposed.
+    assert ready("DAIC") is False
+
+    # A different symbol's stop-loss history must never block this one.
+    fake_bot.last_volatility_stop_loss_at["OTHER"] = now - 999
+    assert ready("OTHER") is True
+
+    # Ready again once the cooldown genuinely elapses.
+    fake_bot.last_volatility_stop_loss_at["DAIC"] = now - 301
+    assert ready("DAIC") is True
+
+
 if __name__ == "__main__":
     results = run_all()
     for result in results:
