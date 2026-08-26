@@ -274,8 +274,8 @@ class TradingStrategy:
     def volatility_scalp_momentum_stalled_or_rising(
         self, symbol: str, price: Decimal
     ) -> bool:
-        """True once a dip has stopped making fresh lows for TWO
-        consecutive ticks, not just one - stalled (flat), at the
+        """True once a dip has stopped making fresh lows for THREE
+        consecutive ticks, not just two - stalled (flat), at the
         bottom, or already ticking back up - false while price is
         still actively falling tick-to-tick (a "falling knife"). By
         request: "we don't want to buy when there is downward
@@ -287,18 +287,20 @@ class TradingStrategy:
         instant it does, which is exactly the case this exists to
         block.
 
-        Recalibrated by a later request - "why is it selecting stocks
-        at such wrong times" - a single non-falling tick is weak,
-        noise-level confirmation (this cohort's whole selection
-        criterion is being choppy - one flat/up tick can just be a
-        bid/ask bounce, not a real stall). Requiring the current tick
-        AND the one before it to both hold above the low two ticks back
-        mirrors the same, symmetric strengthening already applied to
-        the exit-side stall check (volatility_scalp_momentum_stalling).
+        Recalibrated TWICE now - first from one tick to two ("why is it
+        selecting stocks at such wrong times"), then from two to three
+        by request after live evidence it was still buying mid-dip: a
+        cohort symbol gets force-scanned (and this window appended to)
+        essentially every poll cycle, so two non-falling samples can be
+        well under a second apart - easy for ordinary bid/ask noise to
+        satisfy even while the stock is still genuinely falling on any
+        timeframe a human would call "the dip." Three consecutive
+        non-declining ticks raises that bar without moving to a
+        timestamp-based confirmation window.
 
-        Fails OPEN (True, doesn't block) with no history yet, same "no
-        data -> don't block" convention as every other entry gate in
-        this file.
+        Fails OPEN (True, doesn't block) with fewer than 3 samples yet,
+        same "no data -> don't block" convention as every other entry
+        gate in this file.
         """
         window = self.volatility_price_history.get(symbol)
         if not window:
@@ -306,13 +308,14 @@ class TradingStrategy:
         samples = list(window)
         if samples and Decimal(str(samples[-1])) == price:
             samples = samples[:-1]
-        if len(samples) < 2:
+        if len(samples) < 3:
             return True
         previous = Decimal(str(samples[-1]))
         before_that = Decimal(str(samples[-2]))
-        if previous <= 0 or before_that <= 0:
+        earlier_still = Decimal(str(samples[-3]))
+        if previous <= 0 or before_that <= 0 or earlier_still <= 0:
             return True
-        return price >= previous >= before_that
+        return price >= previous >= before_that >= earlier_still
 
     def volatility_scalp_momentum_stalling(self, symbol: str, price: Decimal) -> bool:
         """Mirror of volatility_scalp_momentum_stalled_or_rising for the
