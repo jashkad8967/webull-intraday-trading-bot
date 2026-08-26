@@ -309,10 +309,23 @@ class Settings(BaseSettings):
     # realized price stdev - a thin, illiquid name can show a large %
     # stdev purely from a few small prints knocking a wide, empty
     # spread around, not real tradeable movement. Requires cumulative
-    # volume (regular + extended, see TradingStrategy.metrics) to also
-    # clear this floor, all day (not just extended hours - see
-    # AutoTrader.trade_stocks' separate, harder extended-hours cutoff).
-    volatility_scalp_min_volume: int = Field(default=500_000, ge=0)
+    # DOLLAR volume (price x share volume, regular + extended - see
+    # TradingStrategy.metrics/prices) to also clear this floor, all day
+    # (not just extended hours - see AutoTrader.trade_stocks' separate,
+    # harder extended-hours cutoff).
+    #
+    # Live incident: a first version of this floor measured raw SHARE
+    # count (500,000 shares) instead of dollar volume - meaningless for
+    # a penny stock. SOAR cleared 500k shares of "volume" at ~$0.28/
+    # share, only ~$140k of real dollar liquidity - too thin to absorb
+    # this strategy's own repeated order flow, and its PROFIT exit
+    # failed to fill even after three escalation-and-reprice cycles,
+    # forcing a market-order exit at a loss the same day this shipped.
+    # $5M/day is comfortably above that failure and scales correctly
+    # at any price level, not just penny names.
+    volatility_scalp_min_dollar_volume: Decimal = Field(
+        default=Decimal("5000000"), ge=0
+    )
     # Originally lowered from 0.5% -> 0.2% by request ("constantly buy
     # the dip... even a little rise"), then raised back up here as a
     # structural fix, not a same-day band-aid: 0.2% is noise-level on a
