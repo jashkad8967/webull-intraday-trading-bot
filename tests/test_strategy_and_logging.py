@@ -1170,9 +1170,9 @@ class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
     don't want to buy when there is downward momentum... buy when the
     dip is stalled or at the bottom, or even when the momentum starts
     to go up" and "if there is a profit and it doesn't seem to be going
-    much higher, then sell it off... before the next dip." Both compare
-    only against the single immediately-preceding tick, not a slower
-    multi-sample trend.
+    much higher, then sell it off... before the next dip." The entry
+    gate requires three consecutive non-declining ticks (recalibrated
+    twice now); the exit gate requires two.
     """
 
     def _feed(self, strategy, symbol, prices):
@@ -1193,10 +1193,10 @@ class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
 
     def test_entry_gate_allows_once_stalled_flat(self):
         strategy = TradingStrategy(self.config())
-        # THREE consecutive equal ticks (9.7, 9.7, 9.7) - the dip has
-        # stopped making fresh lows for two ticks running now (the
-        # stronger, recalibrated confirmation).
-        self._feed(strategy, "STALL", [10, 9.9, 9.8, 9.7, 9.7, 9.7])
+        # FOUR consecutive equal ticks (9.7 x4) - the dip has stopped
+        # making fresh lows for three ticks running now (the current,
+        # twice-recalibrated confirmation depth).
+        self._feed(strategy, "STALL", [10, 9.9, 9.8, 9.7, 9.7, 9.7, 9.7])
         self.assertTrue(
             strategy.volatility_scalp_momentum_stalled_or_rising(
                 "STALL", Decimal("9.7")
@@ -1205,13 +1205,28 @@ class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
 
     def test_entry_gate_allows_once_momentum_turns_up(self):
         strategy = TradingStrategy(self.config())
-        # A genuine two-tick upturn already recorded (9.7 -> 9.72),
-        # querying a further rise (9.75) - two non-declining steps in a
-        # row, not just one.
-        self._feed(strategy, "TURN", [10, 9.9, 9.8, 9.7, 9.72])
+        # A genuine three-tick upturn already recorded
+        # (9.7 -> 9.71 -> 9.73), querying a further rise (9.75) - three
+        # non-declining steps in a row, not just two.
+        self._feed(strategy, "TURN", [10, 9.9, 9.8, 9.7, 9.71, 9.73])
         self.assertTrue(
             strategy.volatility_scalp_momentum_stalled_or_rising(
                 "TURN", Decimal("9.75")
+            )
+        )
+
+    def test_entry_gate_still_blocks_on_only_two_non_falling_ticks(self):
+        """Recalibrated again by request, after live evidence entries
+        were still firing mid-dip - two non-declining ticks (the prior
+        confirmation depth) is no longer enough on its own; a cohort
+        symbol gets sampled almost every poll cycle, so two ticks can
+        be well under a second of real elapsed time.
+        """
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "TWOTICK", [10, 9.9, 9.8, 9.7, 9.7])
+        self.assertFalse(
+            strategy.volatility_scalp_momentum_stalled_or_rising(
+                "TWOTICK", Decimal("9.7")
             )
         )
 
