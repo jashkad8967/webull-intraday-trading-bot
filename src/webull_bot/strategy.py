@@ -274,29 +274,30 @@ class TradingStrategy:
     def volatility_scalp_momentum_stalled_or_rising(
         self, symbol: str, price: Decimal
     ) -> bool:
-        """True once a dip has stopped making fresh lows for THREE
-        consecutive ticks, not just two - stalled (flat), at the
-        bottom, or already ticking back up - false while price is
-        still actively falling tick-to-tick (a "falling knife"). By
-        request: "we don't want to buy when there is downward
-        momentum... we want to buy when the dip is stalled or at the
-        bottom, or even when the momentum starts to go up." An AND gate
+        """True the instant downward momentum stops being negative
+        after a genuine run of consecutive downticks - fires right as
+        the rise starts, not several ticks after it. By request: "we
+        want the momentum to stop being negative after consecutive
+        downticks, then we buy, almost as the rise starts." An AND gate
         alongside every entry trigger (dip/breakout/HA-reversal), not a
         replacement for any of them - a symbol can clear the dip-
         percent threshold and still be actively falling the very
         instant it does, which is exactly the case this exists to
         block.
 
-        Recalibrated TWICE now - first from one tick to two ("why is it
-        selecting stocks at such wrong times"), then from two to three
-        by request after live evidence it was still buying mid-dip: a
-        cohort symbol gets force-scanned (and this window appended to)
-        essentially every poll cycle, so two non-falling samples can be
-        well under a second apart - easy for ordinary bid/ask noise to
-        satisfy even while the stock is still genuinely falling on any
-        timeframe a human would call "the dip." Three consecutive
-        non-declining ticks raises that bar without moving to a
-        timestamp-based confirmation window.
+        Two-part check, not a single "N non-declining ticks" window
+        (which is what this used to be, recalibrated 1 -> 2 -> 3 ticks
+        across earlier requests - still too slow/noisy either way):
+
+        1. Requires the two ticks immediately before now to have been a
+           REAL consecutive decline (strictly falling, not flat) - this
+           is what proves a genuine falling-knife dip actually happened,
+           not noise. Without this, "stalled" and "never was falling in
+           the first place" were indistinguishable.
+        2. Then fires on the very FIRST tick that is no longer lower
+           than the one before it - a single-tick turn confirmation, so
+           entry lands right at the reversal instead of waiting out
+           several more ticks of confirmation and missing the move.
 
         Fails OPEN (True, doesn't block) with fewer than 3 samples yet,
         same "no data -> don't block" convention as every other entry
@@ -315,7 +316,10 @@ class TradingStrategy:
         earlier_still = Decimal(str(samples[-3]))
         if previous <= 0 or before_that <= 0 or earlier_still <= 0:
             return True
-        return price >= previous >= before_that >= earlier_still
+        was_falling = earlier_still > before_that > previous
+        if not was_falling:
+            return False
+        return price >= previous
 
     def volatility_scalp_momentum_stalling(self, symbol: str, price: Decimal) -> bool:
         """Mirror of volatility_scalp_momentum_stalled_or_rising for the

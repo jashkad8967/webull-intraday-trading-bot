@@ -1171,8 +1171,9 @@ class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
     dip is stalled or at the bottom, or even when the momentum starts
     to go up" and "if there is a profit and it doesn't seem to be going
     much higher, then sell it off... before the next dip." The entry
-    gate requires three consecutive non-declining ticks (recalibrated
-    twice now); the exit gate requires two.
+    gate requires a genuine two-step decline immediately beforehand,
+    then fires on the very first tick that stops declining ("almost as
+    the rise starts"); the exit gate requires two non-declining ticks.
     """
 
     def _feed(self, strategy, symbol, prices):
@@ -1191,55 +1192,45 @@ class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
             )
         )
 
-    def test_entry_gate_allows_once_stalled_flat(self):
+    def test_entry_gate_fires_the_instant_the_turn_happens(self):
+        """By request: "the momentum stop being negative after
+        consecutive downticks, then we buy, almost as the rise
+        starts." A genuine two-step decline (10 -> 9.9 -> 9.75) just
+        happened, and the very next tick merely stops falling (9.8,
+        just above the last low) - fires immediately, not several
+        ticks later.
+        """
         strategy = TradingStrategy(self.config())
-        # FOUR consecutive equal ticks (9.7 x4) - the dip has stopped
-        # making fresh lows for three ticks running now (the current,
-        # twice-recalibrated confirmation depth).
-        self._feed(strategy, "STALL", [10, 9.9, 9.8, 9.7, 9.7, 9.7, 9.7])
+        self._feed(strategy, "TURN", [10, 9.9, 9.75])
         self.assertTrue(
             strategy.volatility_scalp_momentum_stalled_or_rising(
-                "STALL", Decimal("9.7")
+                "TURN", Decimal("9.8")
             )
         )
 
     def test_entry_gate_allows_once_momentum_turns_up(self):
         strategy = TradingStrategy(self.config())
-        # A genuine three-tick upturn already recorded
-        # (9.7 -> 9.71 -> 9.73), querying a further rise (9.75) - three
-        # non-declining steps in a row, not just two.
-        self._feed(strategy, "TURN", [10, 9.9, 9.8, 9.7, 9.71, 9.73])
+        # Same genuine two-step decline, this time querying a clearer
+        # rise (9.75) rather than just a flat stall.
+        self._feed(strategy, "RISE", [10, 9.9, 9.7])
         self.assertTrue(
             strategy.volatility_scalp_momentum_stalled_or_rising(
-                "TURN", Decimal("9.75")
+                "RISE", Decimal("9.75")
             )
         )
 
-    def test_entry_gate_still_blocks_on_only_two_non_falling_ticks(self):
-        """Recalibrated again by request, after live evidence entries
-        were still firing mid-dip - two non-declining ticks (the prior
-        confirmation depth) is no longer enough on its own; a cohort
-        symbol gets sampled almost every poll cycle, so two ticks can
-        be well under a second of real elapsed time.
+    def test_entry_gate_blocks_without_a_genuine_prior_decline(self):
+        """By request: momentum must have actually been negative
+        (consecutive downticks) before the turn counts - a flat lead-
+        in followed by an uptick is not "the rise starting after a
+        dip," it's just noise, even though the current tick alone
+        isn't declining.
         """
         strategy = TradingStrategy(self.config())
-        self._feed(strategy, "TWOTICK", [10, 9.9, 9.8, 9.7, 9.7])
+        self._feed(strategy, "FLATLEAD", [10, 10, 9.9])
         self.assertFalse(
             strategy.volatility_scalp_momentum_stalled_or_rising(
-                "TWOTICK", Decimal("9.7")
-            )
-        )
-
-    def test_entry_gate_blocks_on_a_single_non_falling_tick(self):
-        """Recalibrated by request - "why is it selecting stocks at
-        such wrong times" - a single non-falling tick is weak, noise-
-        level confirmation and no longer enough on its own.
-        """
-        strategy = TradingStrategy(self.config())
-        self._feed(strategy, "SINGLE", [10, 9.9, 9.8, 9.7])
-        self.assertFalse(
-            strategy.volatility_scalp_momentum_stalled_or_rising(
-                "SINGLE", Decimal("9.75")
+                "FLATLEAD", Decimal("9.95")
             )
         )
 
