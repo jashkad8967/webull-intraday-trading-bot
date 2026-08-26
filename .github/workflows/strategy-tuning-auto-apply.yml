@@ -1,18 +1,22 @@
 name: Strategy-tuning auto-apply
 
-# Fully-automatic apply step for the strategy-review agent's suggestions
-# (see scripts/apply_strategy_review.py and src/webull_bot/strategy_tuning.py
-# for the full design - explicitly confirmed by the user, twice, after
-# being shown the risk of zero human review before a change reaches the
-# live account).
+# DISABLED by request, after an independent risk review: fully-automatic
+# live application of model-generated tuning was found to be the most
+# urgent operational risk in the system - a synthetic test suite can
+# prove config.py still behaves structurally after a change, it cannot
+# prove that change improves live expectancy, and this pipeline could
+# previously reach live trading with zero human review at any point in
+# the chain. Re-enabling requires BOTH flipping the `if: false` below
+# back to a real condition AND restoring the direct-push "Commit and
+# push" step below to something a human can review first (see its own
+# comment) - a deliberate two-step, git-tracked change, not a single
+# hidden repo-variable flip. Kept in the repo (not deleted) so the
+# underlying lever-adjustment math (strategy_tuning.py, already unit-
+# tested) stays available to run manually/on-demand instead.
 #
 # Runs independently of any Claude Code session (the point of using
 # GitHub Actions here instead of a session-scoped scheduled task) on a
 # fixed interval matching STRATEGY_REVIEW_INTERVAL_SECONDS (15 min).
-# Every adjustment this produces still goes through the exact same
-# validate -> paper-sim-gate -> merge-to-main -> deploy-live pipeline as
-# every other change - "automatic" removes the human click that starts
-# it, not the safety net that gates it.
 
 on:
   schedule:
@@ -21,10 +25,11 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   apply:
-    if: vars.STRATEGY_TUNING_AUTO_APPLY_ENABLED == 'true'
+    if: false
     runs-on: ubuntu-latest
     concurrency:
       group: strategy-tuning-auto-apply
@@ -76,14 +81,40 @@ jobs:
           PYTHONPATH=src python -m unittest discover -s tests
           python scripts/evaluate_paper_sim.py
 
-      - name: Commit and push (only after verification passes)
+      # By request, after an independent risk review: even if this
+      # workflow is ever re-enabled, a suggested tuning change must
+      # never reach live without a human clicking "merge" first - no
+      # direct push to paper-trading-lane. Opens a PR from a dedicated
+      # branch instead; paper-sim-gate.yml's own validate/paper-sim
+      # jobs still run against the PR automatically, but merge-to-main
+      # and deploy-live only fire once a human approves and merges it.
+      - name: Open a PR (only after verification passes) - never pushes directly
         if: steps.apply.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="strategy-tuning/auto-apply-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$branch"
           git add src/webull_bot/config.py conf/strategy_tuning_cooldown.json conf/strategy_tuning_last_seen.json
           git commit -m "${{ steps.apply.outputs.commit_message }}"
-          git push origin paper-trading-lane
+          git push origin "$branch"
+          {
+            echo "${{ steps.apply.outputs.commit_message }}"
+            echo
+            echo "This PR was opened automatically by the strategy-tuning auto-apply"
+            echo "workflow. It requires human review and an explicit merge before any"
+            echo "of it reaches paper-trading-lane, main, or the live account -"
+            echo "verification (compileall/tests/paper-sim) already ran and passed"
+            echo "above, but that only proves the code still behaves structurally, not"
+            echo "that this change improves live expectancy."
+          } > "$RUNNER_TEMP/pr_body.txt"
+          gh pr create \
+            --base paper-trading-lane \
+            --head "$branch" \
+            --title "Strategy-tuning auto-apply: $(date '+%Y-%m-%d %H:%M')" \
+            --body-file "$RUNNER_TEMP/pr_body.txt"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Publish job summary
         if: always()
@@ -92,7 +123,7 @@ jobs:
             echo "## Strategy-tuning auto-apply"
             echo
             if [ "${{ steps.apply.outputs.changed }}" == "true" ]; then
-              echo "Applied and pushed - paper-sim-gate.yml's own pipeline takes it from here."
+              echo "Opened a pull request for human review - nothing reaches paper-trading-lane/live until it's approved and merged."
               echo
               echo '```'
               echo "${{ steps.apply.outputs.commit_message }}"
