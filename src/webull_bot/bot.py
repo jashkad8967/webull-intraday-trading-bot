@@ -1402,6 +1402,50 @@ class AutoTrader:
             except Exception as exc:
                 log.error("CANCEL | id=%s | %s", order_id, exc)
 
+    def _batched_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        """One (or a few, split by category) batched snapshot call for
+        multiple symbols, instead of a caller looping and calling
+        self.api.stock_quote(symbol) once per symbol. Each individual
+        call is a full separate network round-trip - with several
+        repricers/sweeps each doing this once per open position or
+        working order, every single main-loop cycle, this was a real
+        contributor to cycles taking far longer than poll_seconds (live
+        evidence: ~40s between scan cycles despite a 0.25s poll target).
+
+        Grouped by category (stock_quotes requires one category per
+        call) and capped at WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS per
+        group. A group's failure only drops that group's symbols from
+        the result - callers already treat a missing symbol as "no
+        quote yet, try again next cycle," the same as any other quote
+        failure.
+        """
+        unique_symbols = list(dict.fromkeys(symbols))
+        if not unique_symbols:
+            return {}
+        by_category: dict[str, list[str]] = defaultdict(list)
+        for symbol in unique_symbols:
+            by_category[self.stock_categories.get(symbol, "US_STOCK")].append(symbol)
+        quotes: dict[str, dict] = {}
+        for category, group in by_category.items():
+            for start in range(0, len(group), WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS):
+                chunk = group[start : start + WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS]
+                try:
+                    fetched, _invalid = self.api.stock_quotes_resilient(
+                        chunk, category
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "REPRICE| batched quote fetch failed | %s | %s",
+                        ",".join(chunk),
+                        exc,
+                    )
+                    continue
+                for quote in fetched:
+                    symbol = str(quote.get("symbol", "")).upper()
+                    if symbol:
+                        quotes[symbol] = quote
+        return quotes
+
     def reprice_resting_exits(
         self, positions: list[dict], core_session_active: bool = False
     ) -> None:
@@ -1433,6 +1477,7 @@ class AutoTrader:
         if now - self.last_reprice < float(self.config.order_monitor_seconds):
             return
         self.last_reprice = now
+        candidates: list[tuple[str, str, dict]] = []
         for order_id, order in list(self.working_orders.items()):
             action = order.get("action")
             key = str(order.get("key") or "")
@@ -1457,8 +1502,20 @@ class AutoTrader:
                 # live-eligible this cycle, so the two repricers never
                 # both try to manage the same resting order at once.
                 continue
+            candidates.append((order_id, symbol, order))
+        if not candidates:
+            return
+        # One batched snapshot call for every symbol this cycle needs,
+        # instead of one self.api.stock_quote(symbol) round-trip per
+        # candidate - see _batched_quotes.
+        quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
+        for order_id, symbol, order in candidates:
+            key = str(order.get("key") or "")
+            action = order.get("action")
             try:
-                quote = self.api.stock_quote(symbol)
+                quote = quotes.get(symbol)
+                if quote is None:
+                    continue
                 ask = self.api.quote_ask(quote)
                 if ask is None or ask == order.get("limit_price"):
                     continue
@@ -1534,6 +1591,7 @@ class AutoTrader:
         ):
             return
         self.last_volatility_reprice = now
+        candidates: list[tuple[str, str, dict]] = []
         for order_id, order in list(self.working_orders.items()):
             action = order.get("action")
             key = str(order.get("key") or "")
@@ -1556,8 +1614,17 @@ class AutoTrader:
                 and symbol not in self.volatility_scalp_positions
             ):
                 continue
+            candidates.append((order_id, symbol, order))
+        if not candidates:
+            return
+        quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
+        for order_id, symbol, order in candidates:
+            key = str(order.get("key") or "")
+            action = order.get("action")
             try:
-                quote = self.api.stock_quote(symbol)
+                quote = quotes.get(symbol)
+                if quote is None:
+                    continue
                 quantity, cost = self.api.stock_position(symbol, positions)
                 if quantity <= 0:
                     continue
@@ -1637,6 +1704,7 @@ class AutoTrader:
         ):
             return
         self.last_volatility_entry_reprice = now
+        candidates: list[tuple[str, str, dict]] = []
         for order_id, order in list(self.working_orders.items()):
             action = order.get("action")
             key = str(order.get("key") or "")
@@ -1657,8 +1725,18 @@ class AutoTrader:
             quantity = order.get("quantity")
             if not quantity or quantity <= 0:
                 continue
+            candidates.append((order_id, symbol, order))
+        if not candidates:
+            return
+        quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
+        for order_id, symbol, order in candidates:
+            key = str(order.get("key") or "")
+            action = order.get("action")
+            quantity = order.get("quantity")
             try:
-                quote = self.api.stock_quote(symbol)
+                quote = quotes.get(symbol)
+                if quote is None:
+                    continue
                 limit_price = self.api.stock_limit_price(quote, "BUY")
                 current_limit = order.get("limit_price")
                 if (
@@ -1727,6 +1805,7 @@ class AutoTrader:
         if now - self.last_entry_reprice < float(self.config.order_monitor_seconds):
             return
         self.last_entry_reprice = now
+        candidates: list[tuple[str, str, dict]] = []
         for order_id, order in list(self.working_orders.items()):
             action = order.get("action")
             key = str(order.get("key") or "")
@@ -1749,8 +1828,18 @@ class AutoTrader:
                 and not core_session_active
             ):
                 continue
+            candidates.append((order_id, symbol, order))
+        if not candidates:
+            return
+        quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
+        for order_id, symbol, order in candidates:
+            key = str(order.get("key") or "")
+            action = order.get("action")
+            quantity = order.get("quantity")
             try:
-                quote = self.api.stock_quote(symbol)
+                quote = quotes.get(symbol)
+                if quote is None:
+                    continue
                 current_limit = order.get("limit_price")
                 if action == "BUY":
                     target_price = self.api.quote_ask(quote)
