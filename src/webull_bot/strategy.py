@@ -222,7 +222,21 @@ class TradingStrategy:
         stdev = self.realized_volatility_percent(symbol)
         if stdev is None:
             return False
-        return stdev >= self.config.volatility_scalp_min_stdev_percent
+        if stdev < self.config.volatility_scalp_min_stdev_percent:
+            return False
+        # By request: "the stocks being chosen have very low volume,
+        # thus they do not fluctuate much, we need high volume stocks
+        # for more volatility." A thin, illiquid name can clear the
+        # stdev bar above purely from a few small prints knocking a
+        # wide, empty spread around - real tradeable volatility needs
+        # real trading volume behind it too, all day (not just
+        # extended hours). Fails closed (not eligible) with no metrics
+        # yet, same "no data -> don't trust it" convention as the
+        # stdev check above.
+        metrics = self.metrics.get(symbol)
+        if not metrics:
+            return False
+        return metrics.get("volume", 0) >= self.config.volatility_scalp_min_volume
 
     def volatility_scalp_dip_signal(self, symbol: str, price: Decimal) -> bool:
         """True when price has pulled back at least
