@@ -122,6 +122,7 @@ class AutoTrader:
             log,
         )
         self.wash_skip_logged: set[str] = set()
+        self.unmanaged_held_logged: set[str] = set()
         self.last_trade: dict[str, float] = {}
         self.last_exit_at: dict[str, float] = {}
         self.trade_times: dict[str, deque] = defaultdict(deque)
@@ -205,6 +206,7 @@ class AutoTrader:
         self.resolved_date = None
         self.last_close_attempt = 0.0
         self.last_fractional_sweep = 0.0
+        self.last_extended_hours_profit_sweep = 0.0
         self.last_status_log = 0.0
         self.opening_grace_logged_date = None
         self.last_option_discovery = 0.0
@@ -213,6 +215,7 @@ class AutoTrader:
         self.last_reprice = 0.0
         self.last_volatility_reprice = 0.0
         self.last_volatility_entry_reprice = 0.0
+        self.last_entry_reprice = 0.0
         self.last_stall_boost = 0.0
         # See idle_cash_ramp_progress()/record_trade() - tracks how long
         # cash has sat above MIN_CASH_RESERVE_DOLLARS with nothing bought,
@@ -1699,6 +1702,104 @@ class AutoTrader:
             except Exception as exc:
                 log.error("SCALP  | %s | entry reprice failed | %s", symbol, exc)
 
+    def reprice_resting_entries(self, core_session_active: bool) -> None:
+        """Continuously re-quotes a resting general (non-volatility-
+        scalp) BUY/SHORT entry order to cross further into the spread
+        the longer it sits unfilled, instead of resting passively at
+        the original mid-price until the hard order_timeout_seconds
+        cancel gives up on it entirely with no attempt to improve the
+        price first. Live incident: IBRX (a DISCOVERY-bucket long
+        entry) got cancelled for never filling 4 separate times in
+        ~15 minutes, always at the same passive mid-price, because
+        nothing ever moved the resting order closer to a fillable
+        price in between. By request: covers both entry directions - a
+        BUY chases up toward the current ask, a SHORT chases down
+        toward the current bid.
+
+        Skips any symbol currently volatility-scalp eligible (or
+        already adopted into that cohort) - reprice_volatility_scalp_
+        entries handles those on its own, much faster, dedicated
+        cadence instead. Skips a fractional BUY outside core hours -
+        fractional cancel-and-replace can't succeed there either, same
+        constraint reprice_resting_exits already respects.
+        """
+        now = time.monotonic()
+        if now - self.last_entry_reprice < float(self.config.order_monitor_seconds):
+            return
+        self.last_entry_reprice = now
+        for order_id, order in list(self.working_orders.items()):
+            action = order.get("action")
+            key = str(order.get("key") or "")
+            if action not in ("BUY", "SHORT") or not key.startswith("STOCK:"):
+                continue
+            if order.get("cancel_requested_at") is not None:
+                continue
+            symbol = key.split(":", 1)[1]
+            if (
+                self.strategy.is_volatility_scalp_eligible(symbol)
+                or symbol in self.volatility_scalp_positions
+            ):
+                continue
+            quantity = order.get("quantity")
+            if not quantity or quantity <= 0:
+                continue
+            if (
+                action == "BUY"
+                and self.is_fractional_quantity(quantity)
+                and not core_session_active
+            ):
+                continue
+            try:
+                quote = self.api.stock_quote(symbol)
+                current_limit = order.get("limit_price")
+                if action == "BUY":
+                    target_price = self.api.quote_ask(quote)
+                    improved = (
+                        target_price is not None
+                        and current_limit is not None
+                        and target_price > current_limit
+                    )
+                else:
+                    target_price = self.api.quote_bid(quote)
+                    improved = (
+                        target_price is not None
+                        and current_limit is not None
+                        and target_price < current_limit
+                    )
+                if not improved:
+                    continue
+                self.api.cancel(order_id)
+                new_order_id = self.api.place_stock(
+                    symbol,
+                    action,
+                    quantity,
+                    limit_price=target_price,
+                )
+                self.working_orders.pop(order_id, None)
+                self.working_orders[new_order_id] = {
+                    "submitted_at": now,
+                    "key": key,
+                    "action": action,
+                    "cancel_requested_at": None,
+                    "limit_price": target_price,
+                    "pnl": order.get("pnl"),
+                    "quantity": quantity,
+                }
+                self.status.rekey_trade(order_id, new_order_id)
+                log.info(
+                    "REPRICE| %-8s | %-6s | limit=%s | id=%s",
+                    symbol,
+                    action,
+                    target_price,
+                    new_order_id,
+                )
+            except QuoteUnavailableError as exc:
+                log.warning(
+                    "REPRICE| %s | entry reprice skipped | %s", symbol, exc
+                )
+            except Exception as exc:
+                log.error("REPRICE| %s | entry reprice failed | %s", symbol, exc)
+
     def account_state(self) -> tuple[Decimal, list[dict]]:
         now = time.monotonic()
         if (
@@ -2756,17 +2857,13 @@ class AutoTrader:
         core_session_active: bool = False,
     ) -> Decimal:
         open_count = self.strategy.open_position_count(positions)
-        # By request: "lessen the intensity" of volatility-scalp trading
-        # outside core hours without stopping it - a single 0-1 dial
-        # scaling both per-trade sizing (volatility_scalp_share_count)
-        # and how many concurrent positions/averaging adds are allowed
-        # at once, applied only to fresh entries and averaging-down
-        # buys. 1 (full intensity) during core hours, unaffected.
-        volatility_scalp_intensity = (
-            Decimal("1")
-            if core_session_active
-            else self.config.volatility_scalp_extended_hours_intensity
-        )
+        # Superseded by the hard "no volatility scalp in extended hours"
+        # gate on the fresh-entry and averaging-down blocks below (by
+        # request, after pre-market losses) - fresh entries and
+        # averaging now only ever fire when core_session_active, so
+        # full intensity is always correct here; there's no longer a
+        # dampened outside-core-hours case to compute.
+        volatility_scalp_intensity = Decimal("1")
         volatility_scalp_effective_max_concurrent = max(
             1,
             int(
@@ -2878,14 +2975,34 @@ class AutoTrader:
             symbol for symbol in held_symbols if symbol and symbol not in batch
         ]
         if unmanaged_held:
-            log.warning(
-                "GUARD  | %s held position(s) had fallen out of the scanned "
-                "universe - forcing them back into this cycle's batch so "
-                "exit management resumes | %s",
-                len(unmanaged_held),
-                ",".join(sorted(unmanaged_held)),
+            # Throttled to once per symbol while the condition persists
+            # (same pattern as wash_skip_logged) - this still fires
+            # every single cycle underneath (the batch-injection itself
+            # is unconditional and unaffected), only the WARNING log
+            # line is deduped. Live incident: BSEM/GWRS sat outside the
+            # scan universe for hours, logging the identical warning
+            # every ~5s (3000+ times in one session) and burying real
+            # signal in the noise, even though the guard itself was
+            # working correctly the whole time.
+            newly_unmanaged = sorted(
+                set(unmanaged_held) - self.unmanaged_held_logged
             )
+            if newly_unmanaged:
+                log.warning(
+                    "GUARD  | %s held position(s) fell out of the scanned "
+                    "universe - forcing them back into the batch so exit "
+                    "management resumes | %s",
+                    len(newly_unmanaged),
+                    ",".join(newly_unmanaged),
+                )
+            self.unmanaged_held_logged = set(unmanaged_held)
             batch = list(batch) + unmanaged_held
+        else:
+            # Cleared once every held symbol is back in the scan
+            # universe, so a later recurrence (a different symbol, or
+            # the same one falling out again after recovering) logs
+            # again instead of staying silent forever.
+            self.unmanaged_held_logged = set()
         # Live incident: force-injecting the curated cohort AND every
         # volatility-scalp-eligible symbol (self.volatility_scalp_
         # symbols | self.volatility_scalp_recently_eligible, above) on
@@ -3143,6 +3260,16 @@ class AutoTrader:
                     self.volatility_scalp_last_buy_price.pop(symbol, None)
                 if (
                     quantity == 0
+                    # By request, after pre-market losses: "no volatility
+                    # scalp in extended hours." A hard, unconditional
+                    # gate - unlike the earlier intensity-dampening
+                    # approach this replaces, no fresh volatility-scalp
+                    # entry fires at all outside core hours. Exits and
+                    # position management for anything already held
+                    # (opened during core hours, or held over from an
+                    # earlier session) are completely unaffected - only
+                    # fresh entries are blocked here.
+                    and core_session_active
                     # Condensed onto eligibility alone (any symbol
                     # currently volatile enough to qualify), not the
                     # narrower curated self.volatility_scalp_symbols
@@ -3331,6 +3458,11 @@ class AutoTrader:
                             )
                 if (
                     quantity > 0
+                    # Same "no volatility scalp in extended hours" hard
+                    # gate as the fresh-entry block above - averaging
+                    # down is still a new BUY commitment, just against
+                    # an existing position instead of a flat one.
+                    and core_session_active
                     # symbol in self.volatility_scalp_positions is the
                     # real gate here (an open position this strategy
                     # itself opened, and is therefore eligible to average
@@ -3492,6 +3624,20 @@ class AutoTrader:
                         ] += 1
                         continue
                     bucket = self.strategy.selection_bucket(symbol)
+                    # By request, after pre-market losses: "only trading
+                    # established stocks with more volume and popularity
+                    # in extended hours." Outside core hours, a fresh
+                    # long entry only fires for the POPULAR bucket
+                    # (already gated on popular_stock_min_volume/
+                    # popular_stock_symbols - see TradingStrategy.
+                    # select_stock_symbols) - PENNY and DISCOVERY names
+                    # wait for core hours. Core hours are unaffected.
+                    if not core_session_active and bucket != "POPULAR":
+                        self.gate_rejections[
+                            "extended hours - only established/popular "
+                            "symbols trade outside core hours"
+                        ] += 1
+                        continue
                     entry_budget = min(
                         buying_power,
                         bucket_remaining.get(bucket, Decimal("0")),
@@ -3616,6 +3762,14 @@ class AutoTrader:
                         ] += 1
                         continue
                     bucket = self.strategy.selection_bucket(symbol)
+                    # Same "established/popular only" restriction as the
+                    # BUY entry gate above, for the same reason.
+                    if not core_session_active and bucket != "POPULAR":
+                        self.gate_rejections[
+                            "extended hours - only established/popular "
+                            "symbols trade outside core hours"
+                        ] += 1
+                        continue
                     entry_budget = min(
                         buying_power,
                         bucket_remaining.get(bucket, Decimal("0")),
@@ -5072,6 +5226,78 @@ class AutoTrader:
             ",".join(sorted(profitable_symbols)),
         )
 
+    def close_profitable_positions_during_extended_hours(self) -> None:
+        """By request, after pre-market losses: "capturing any profits
+        to close out the day as much as possible" outside core hours -
+        proactively closes any equity position currently sitting at a
+        profit during extended hours (pre-market or after-hours),
+        instead of waiting for its normal PROFIT target or letting it
+        ride toward an overnight hold. Only ever fires outside core
+        hours (see the call site's core_session_active check) and only
+        ever closes a confirmed GAIN - same reasoning as
+        close_fractional_positions_before_core_close: locking in a
+        profit before the session gets even thinner is the point,
+        forcing a realized loss isn't.
+        """
+        now = time.monotonic()
+        if (
+            now - self.last_extended_hours_profit_sweep
+            < float(self.config.extended_hours_profit_sweep_seconds)
+        ):
+            return
+        self.last_extended_hours_profit_sweep = now
+        try:
+            positions = self.api.positions()
+        except Exception as exc:
+            log.error("CLOSE  | extended-hours profit sweep failed | %s", exc)
+            return
+        equity_positions = [
+            item
+            for item in positions
+            if item.get("instrument_type") == "EQUITY"
+            and Decimal(str(item.get("quantity", "0"))) != 0
+        ]
+        if not equity_positions:
+            return
+        profitable_symbols: set[str] = set()
+        for item in equity_positions:
+            symbol = str(item.get("symbol", "")).upper()
+            cost = Decimal(str(item.get("cost_price") or "0"))
+            if cost <= 0:
+                continue
+            try:
+                price = self.api.quote_price(self.api.stock_quote(symbol))
+            except Exception as exc:
+                log.warning(
+                    "CLOSE  | extended-hours profit sweep | %-8s | quote "
+                    "failed, skipping this cycle | %s",
+                    symbol,
+                    exc,
+                )
+                continue
+            if price > cost:
+                profitable_symbols.add(symbol)
+        if not profitable_symbols:
+            return
+        exclude_symbols = {
+            str(item.get("symbol", "")).upper() for item in equity_positions
+        } - profitable_symbols
+        try:
+            submitted = self.api.close_all_positions(
+                {"EQUITY"},
+                loss_callback=self.wash_sales.block,
+                exclude_symbols=exclude_symbols,
+            )
+        except Exception as exc:
+            log.error("CLOSE  | extended-hours profit sweep failed | %s", exc)
+            return
+        self.pending_stock_exits -= profitable_symbols
+        log.info(
+            "CLOSE  | extended-hours profit sweep | submitted=%s | %s",
+            len(submitted),
+            ",".join(sorted(profitable_symbols)),
+        )
+
     def close_instruments(
         self,
         instrument_types: set[str],
@@ -5528,7 +5754,10 @@ class AutoTrader:
                     self.cached_positions, core_session_active
                 )
                 self.reprice_volatility_scalp_entries()
+                self.reprice_resting_entries(core_session_active)
                 self.escalate_stalled_stop_losses()
+                if not core_session_active:
+                    self.close_profitable_positions_during_extended_hours()
                 self.select_volatility_scalp_symbols()
                 self.reconcile_order_history()
                 self.log_trade_events()
