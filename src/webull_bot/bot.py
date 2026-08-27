@@ -2,6 +2,7 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
@@ -118,6 +119,77 @@ def _rekey_working_order(bot, old_order_id: str, new_order_id: str, entry: dict)
     with _working_orders_lock(bot):
         bot.working_orders.pop(old_order_id, None)
         bot.working_orders[new_order_id] = entry
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """True for Webull's 429 TOO_MANY_REQUESTS rejection - live evidence
+    this session: CLOSE (fractional pre-close sweep) and RECON (order
+    history reconciliation) both hit it right after a restart's initial
+    burst of setup calls.
+    """
+    text = str(exc).upper()
+    return "429" in text or "TOO_MANY_REQUESTS" in text
+
+
+def _retry_once_on_rate_limit(fn, *args, delay: float = 0.3, **kwargs):
+    """By request: "if there is any 429, make sure to refire that order
+    asap" - a single quick retry (not an unbounded loop, which would
+    itself contribute to the rate limit it's trying to recover from)
+    after a brief pause, specifically for the order-placement/
+    cancellation calls in the position-protection loop where a missed
+    action costs real money/opportunity (unlike a quote/position
+    lookup, which already fails soft and just retries next cycle
+    regardless). Re-raises whatever the second attempt raises (a non-
+    429 exception immediately, or the 429 again after the one retry) -
+    callers keep their own existing try/except handling unchanged.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        if not _is_rate_limited(exc):
+            raise
+        time.sleep(delay)
+        return fn(*args, **kwargs)
+
+
+# By request: "do not wait for the response to fire another request" -
+# scoped to the position-protection loop only (not the universe scan,
+# which already hit live 429 TOO_MANY_REQUESTS rate-limit errors - see
+# the CLOSE/RECON incidents this same session). Each repricer's per-
+# candidate cancel+place (and stock_position lookup) previously ran
+# ONE order at a time, each waiting out a full network round-trip
+# before the next candidate's requests even started - with N stale
+# orders needing action in the same cycle, that's N sequential round-
+# trips instead of ~1. Bounded worker count (not unbounded) so a cycle
+# with many candidates still can't multiply the account's real request
+# rate past what a human clicking through the same N actions by hand
+# would generate.
+_POSITION_PROTECTION_MAX_WORKERS = 4
+
+
+def _dispatch_concurrently(items: list, worker) -> None:
+    """Runs worker(item) for every item without waiting for one to
+    finish before starting the next (bounded by
+    _POSITION_PROTECTION_MAX_WORKERS) - worker is expected to handle
+    its own exceptions internally (every caller's per-candidate body
+    already does, via its own try/except), same as the sequential
+    for-loop this replaces. A single item's exception here would
+    otherwise only surface (and stop the whole batch) when its future
+    is collected - re-raising defeats "one bad candidate shouldn't
+    block the rest," so any exception a worker doesn't catch itself is
+    logged and swallowed here instead.
+    """
+    if not items:
+        return
+    with ThreadPoolExecutor(
+        max_workers=min(_POSITION_PROTECTION_MAX_WORKERS, len(items))
+    ) as pool:
+        futures = [pool.submit(worker, item) for item in items]
+        for future in futures:
+            try:
+                future.result()
+            except Exception as exc:  # pragma: no cover - workers self-handle
+                log.error("PROTECT| concurrent dispatch worker failed | %s", exc)
 
 
 class AutoTrader:
@@ -1636,7 +1708,7 @@ class AutoTrader:
             if last_cancel is not None and now - float(last_cancel) < 30:
                 continue
             try:
-                self.api.cancel(order_id)
+                _retry_once_on_rate_limit(self.api.cancel, order_id)
                 with _working_orders_lock(self):
                     live_order = self.working_orders.get(order_id)
                     if live_order is not None:
@@ -1758,26 +1830,28 @@ class AutoTrader:
         # instead of one self.api.stock_quote(symbol) round-trip per
         # candidate - see _batched_quotes.
         quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
-        for order_id, symbol, order in candidates:
+
+        def _reprice_one(candidate: tuple[str, str, dict]) -> None:
+            order_id, symbol, order = candidate
             key = str(order.get("key") or "")
             action = order.get("action")
             try:
                 quote = quotes.get(symbol)
                 if quote is None:
-                    continue
+                    return
                 ask = self.api.quote_ask(quote)
                 if ask is None or ask == order.get("limit_price"):
-                    continue
+                    return
                 quantity, cost = self.api.stock_position(symbol, positions)
                 if quantity <= 0:
-                    continue
+                    return
                 # Same fractional/core-hours constraint as trade_stocks'
                 # PROFIT exit: cancel-and-replace can't succeed on a
                 # fractional quantity outside core hours either, so leave
                 # the existing resting order alone rather than cancelling
                 # it for a replacement that will just get rejected.
                 if self.is_fractional_quantity(quantity) and not core_session_active:
-                    continue
+                    return
                 if cost > 0 and ask < cost:
                     # Never chase the ask down below entry cost - the
                     # existing resting order was already validly priced at
@@ -1785,9 +1859,10 @@ class AutoTrader:
                     # to a falling ask here could reprice a profit-take
                     # into a loss. Leave it resting and let escalation (or
                     # the ask recovering) handle it instead.
-                    continue
-                self.api.cancel(order_id)
-                new_order_id = self.api.place_stock(
+                    return
+                _retry_once_on_rate_limit(self.api.cancel, order_id)
+                new_order_id = _retry_once_on_rate_limit(
+                    self.api.place_stock,
                     symbol,
                     "SELL",
                     quantity,
@@ -1825,6 +1900,12 @@ class AutoTrader:
                 )
             except Exception as exc:
                 log.error("REPRICE| %s | %s", symbol, exc)
+
+        # By request: "do not wait for the response to fire another
+        # request" - fires every candidate's cancel+place concurrently
+        # instead of waiting out each one's full round-trip before the
+        # next candidate even starts. See _dispatch_concurrently.
+        _dispatch_concurrently(candidates, _reprice_one)
 
     def reprice_volatility_scalp_exits(
         self, positions: list[dict], core_session_active: bool = False
@@ -1873,19 +1954,21 @@ class AutoTrader:
         if not candidates:
             return
         quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
-        for order_id, symbol, order in candidates:
+
+        def _reprice_one(candidate: tuple[str, str, dict]) -> None:
+            order_id, symbol, order = candidate
             key = str(order.get("key") or "")
             action = order.get("action")
             try:
                 quote = quotes.get(symbol)
                 if quote is None:
-                    continue
+                    return
                 quantity, cost = self.api.stock_position(symbol, positions)
                 if quantity <= 0:
-                    continue
+                    return
                 exit_is_fractional = self.is_fractional_quantity(quantity)
                 if exit_is_fractional and not core_session_active:
-                    continue
+                    return
                 # Live incident (this bug, caught from a live report):
                 # "some sell orders are not repricing down in the
                 # spread." The old check here was a blunt "ask < cost ->
@@ -1915,9 +1998,10 @@ class AutoTrader:
                     ),
                 )
                 if limit_price is None or limit_price == order.get("limit_price"):
-                    continue
-                self.api.cancel(order_id)
-                new_order_id = self.api.place_stock(
+                    return
+                _retry_once_on_rate_limit(self.api.cancel, order_id)
+                new_order_id = _retry_once_on_rate_limit(
+                    self.api.place_stock,
                     symbol,
                     "SELL",
                     quantity,
@@ -1953,6 +2037,8 @@ class AutoTrader:
                     )
                 else:
                     log.error("SCALP  | %s | reprice failed | %s", symbol, exc)
+
+        _dispatch_concurrently(candidates, _reprice_one)
 
     def reprice_volatility_scalp_entries(self) -> None:
         """Actively re-quotes a resting cohort BUY order toward the
@@ -1998,14 +2084,16 @@ class AutoTrader:
         if not candidates:
             return
         quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
-        for order_id, symbol, order in candidates:
+
+        def _reprice_one(candidate: tuple[str, str, dict]) -> None:
+            order_id, symbol, order = candidate
             key = str(order.get("key") or "")
             action = order.get("action")
             quantity = order.get("quantity")
             try:
                 quote = quotes.get(symbol)
                 if quote is None:
-                    continue
+                    return
                 limit_price = self.api.stock_limit_price(quote, "BUY")
                 current_limit = order.get("limit_price")
                 if (
@@ -2013,9 +2101,10 @@ class AutoTrader:
                     or current_limit is None
                     or limit_price >= current_limit
                 ):
-                    continue
-                self.api.cancel(order_id)
-                new_order_id = self.api.place_stock(
+                    return
+                _retry_once_on_rate_limit(self.api.cancel, order_id)
+                new_order_id = _retry_once_on_rate_limit(
+                    self.api.place_stock,
                     symbol,
                     "BUY",
                     quantity,
@@ -2062,6 +2151,8 @@ class AutoTrader:
                     log.error(
                         "SCALP  | %s | entry reprice failed | %s", symbol, exc
                     )
+
+        _dispatch_concurrently(candidates, _reprice_one)
 
     def reprice_resting_entries(self, core_session_active: bool) -> None:
         """Continuously re-quotes a resting general (non-volatility-
@@ -2117,14 +2208,16 @@ class AutoTrader:
         if not candidates:
             return
         quotes = self._batched_quotes([symbol for _, symbol, _ in candidates])
-        for order_id, symbol, order in candidates:
+
+        def _reprice_one(candidate: tuple[str, str, dict]) -> None:
+            order_id, symbol, order = candidate
             key = str(order.get("key") or "")
             action = order.get("action")
             quantity = order.get("quantity")
             try:
                 quote = quotes.get(symbol)
                 if quote is None:
-                    continue
+                    return
                 current_limit = order.get("limit_price")
                 if action == "BUY":
                     target_price = self.api.quote_ask(quote)
@@ -2141,9 +2234,10 @@ class AutoTrader:
                         and target_price < current_limit
                     )
                 if not improved:
-                    continue
-                self.api.cancel(order_id)
-                new_order_id = self.api.place_stock(
+                    return
+                _retry_once_on_rate_limit(self.api.cancel, order_id)
+                new_order_id = _retry_once_on_rate_limit(
+                    self.api.place_stock,
                     symbol,
                     action,
                     quantity,
@@ -2187,6 +2281,8 @@ class AutoTrader:
                     log.error(
                         "REPRICE| %s | entry reprice failed | %s", symbol, exc
                     )
+
+        _dispatch_concurrently(candidates, _reprice_one)
 
     def account_state(self) -> tuple[Decimal, list[dict]]:
         now = time.monotonic()
@@ -3115,7 +3211,7 @@ class AutoTrader:
                     break
             if order_id:
                 try:
-                    self.api.cancel(order_id)
+                    _retry_once_on_rate_limit(self.api.cancel, order_id)
                 except Exception as exc:
                     if self.is_order_not_cancelable(exc):
                         log.warning(
