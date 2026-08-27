@@ -1029,6 +1029,53 @@ class TradingStrategy:
             upside_lean = Decimal("0")
         return (rating_lean + upside_lean) / Decimal("2") * bonus_max
 
+    def stock_scan_concurrent_batches(
+        self, total_symbols: int, core_session_active: bool
+    ) -> int:
+        """How many STOCK_BATCH_SIZE-sized quote batches trade_stocks
+        should fetch CONCURRENTLY this cycle - by request: "scan
+        through all [the universe]... as many as needed to scan
+        everything and filter it down, then dynamically less as it is
+        filtered down... does not need to be as intense in extended
+        hours."
+
+        Scales with the current universe size: enough concurrent
+        batches to cover the WHOLE universe once within roughly
+        stock_scan_target_full_coverage_cycles cycles. As the universe
+        shrinks (or simply stops growing once the daily download
+        finishes), fewer batches are needed to hit the same coverage
+        target - this is what "dynamically less as it is filtered
+        down" means in terms of this function's only input, since
+        prioritized_stock_batch's own activity-based ranking (not this
+        function) is what actually concentrates real candidates within
+        each batch.
+
+        Halved (rounded down, floor 1) outside core hours via
+        stock_scan_extended_hours_concurrency_fraction - by request,
+        matches the existing "no volatility scalp in extended hours...
+        only established/popular symbols" philosophy of scanning less
+        aggressively when there's less real opportunity to act on it.
+
+        Bounded by stock_scan_max_concurrent_batches regardless of
+        universe size - a hard safety cap on real Webull API request
+        volume, given it already returned live 429 TOO_MANY_REQUESTS
+        errors this session.
+        """
+        if total_symbols <= 0 or self.config.stock_batch_size <= 0:
+            return 1
+        cycles = max(1, self.config.stock_scan_target_full_coverage_cycles)
+        needed = -(-total_symbols // (self.config.stock_batch_size * cycles))
+        needed = max(1, needed)
+        if not core_session_active:
+            needed = max(
+                1,
+                int(
+                    needed
+                    * self.config.stock_scan_extended_hours_concurrency_fraction
+                ),
+            )
+        return min(needed, self.config.stock_scan_max_concurrent_batches)
+
     def prioritized_stock_batch(
         self,
         symbols: list[str],

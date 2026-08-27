@@ -1110,6 +1110,70 @@ class OrderNotCancelableTests(unittest.TestCase):
         self.assertFalse(AutoTrader.is_order_not_cancelable(Exception("timeout")))
 
 
+class StockScanConcurrentBatchesTests(unittest.TestCase):
+    """stock_scan_concurrent_batches - by request: "scan through all
+    [the universe]... split it up in parallel streams... as many as
+    needed to scan everything and filter it down, then dynamically
+    less as it is filtered down... does not need to be as intense in
+    extended hours."
+    """
+
+    @staticmethod
+    def _strategy(**overrides):
+        config = Settings(
+            stock_batch_size=100,
+            stock_scan_target_full_coverage_cycles=20,
+            stock_scan_max_concurrent_batches=8,
+            stock_scan_extended_hours_concurrency_fraction=Decimal("0.5"),
+            **overrides,
+        )
+        return TradingStrategy(config)
+
+    def test_small_universe_needs_only_one_batch(self):
+        strategy = self._strategy()
+        self.assertEqual(
+            strategy.stock_scan_concurrent_batches(300, core_session_active=True), 1
+        )
+
+    def test_scales_up_for_a_large_universe(self):
+        # 5000 symbols / (100 * 20) = 2.5 -> ceil to 3.
+        strategy = self._strategy()
+        self.assertEqual(
+            strategy.stock_scan_concurrent_batches(5000, core_session_active=True), 3
+        )
+
+    def test_capped_by_the_safety_max_even_for_a_huge_universe(self):
+        strategy = self._strategy()
+        self.assertEqual(
+            strategy.stock_scan_concurrent_batches(100000, core_session_active=True),
+            8,
+        )
+
+    def test_reduced_outside_core_hours(self):
+        strategy = self._strategy()
+        # 11000 / (100 * 20) = 5.5 -> ceil to 6, well under the max=8
+        # safety cap, so the extended-hours halving is actually visible
+        # instead of both sides just saturating at the cap.
+        core = strategy.stock_scan_concurrent_batches(11000, core_session_active=True)
+        extended = strategy.stock_scan_concurrent_batches(
+            11000, core_session_active=False
+        )
+        self.assertEqual(core, 6)
+        self.assertEqual(extended, 3)
+
+    def test_never_goes_below_one_even_outside_core_hours(self):
+        strategy = self._strategy()
+        self.assertGreaterEqual(
+            strategy.stock_scan_concurrent_batches(50, core_session_active=False), 1
+        )
+
+    def test_zero_universe_is_safe(self):
+        strategy = self._strategy()
+        self.assertEqual(
+            strategy.stock_scan_concurrent_batches(0, core_session_active=True), 1
+        )
+
+
 class AveragingDownCapacityTests(StrategyConfigMixin, unittest.TestCase):
     """averaging_down_capacity - by request: bound worst-case per-
     symbol exposure from averaging down. Research finding acted on
@@ -1845,6 +1909,25 @@ class CapBatchToSnapshotLimitTests(unittest.TestCase):
         held = [f"HELD{i}" for i in range(120)]
         result = AutoTrader.cap_batch_to_snapshot_limit(held, held)
         self.assertEqual(len(result), 120)
+
+    def test_a_custom_limit_allows_more_than_the_single_call_cap(self):
+        """By request: "scan through all [the universe]... split it up
+        in parallel streams" - trade_stocks now passes a multiple of
+        the single-call cap when firing several concurrent quote
+        batches this cycle (see stock_scan_concurrent_batches).
+        """
+        from webull_bot.bot import AutoTrader
+
+        batch = [f"S{i}" for i in range(250)]
+        result = AutoTrader.cap_batch_to_snapshot_limit(batch, [], limit=300)
+        self.assertEqual(result, batch)
+
+    def test_a_custom_limit_still_trims_past_it(self):
+        from webull_bot.bot import AutoTrader
+
+        batch = [f"S{i}" for i in range(350)]
+        result = AutoTrader.cap_batch_to_snapshot_limit(batch, [], limit=300)
+        self.assertEqual(len(result), 300)
 
 
 class HasPendingBuyOrderTests(unittest.TestCase):
