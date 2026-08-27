@@ -1048,6 +1048,68 @@ class RiskBasedShareCountTests(StrategyConfigMixin, unittest.TestCase):
         self.assertGreater(larger, smaller)
 
 
+class SizeStockEntryRiskCapTests(StrategyConfigMixin, unittest.TestCase):
+    """size_stock_entry - regression for a live bug (live evidence:
+    "CYCLE | failed | 'int' object has no attribute
+    'to_integral_value'" recurring on BNGO/WNW-style whole-share
+    fallback entries). risk_based_share_count returns a plain int; when
+    it becomes the binding cap, quantity must still come back as a
+    Decimal since every downstream caller (is_fractional_quantity,
+    record_trade, etc.) expects one.
+    """
+
+    def test_returns_a_decimal_even_when_the_risk_cap_is_the_binding_constraint(
+        self,
+    ):
+        from webull_bot.bot import AutoTrader
+
+        # A large affordable budget but a tiny risk_fraction forces the
+        # risk cap to bind below stock_order_quantity's own result.
+        config = Settings(stock_risk_per_trade_fraction=Decimal("0.001"))
+        strategy = TradingStrategy(config)
+        fake_bot = SimpleNamespace(
+            strategy=strategy,
+            config=config,
+            fractional_trading_enabled=False,
+        )
+        size_stock_entry = AutoTrader.size_stock_entry.__get__(fake_bot)
+        quantity, _price, _fractional = size_stock_entry(
+            Decimal("10"),
+            Decimal("1000"),
+            Decimal("0"),
+            Decimal("1000"),
+            True,
+            False,
+            True,
+            symbol="BNGO",
+            buying_power=Decimal("1000"),
+        )
+        self.assertIsInstance(quantity, Decimal)
+
+
+class OrderNotCancelableTests(unittest.TestCase):
+    """is_order_not_cancelable - by request, after live evidence: a
+    repricer/escalator cancelling an order that Webull has already
+    started filling gets OPENAPI_ORDER_CAN_NOT_CANCEL back - a benign
+    race, not a fault, so it should log as a WARNING (skip, order
+    already resolving) rather than an ERROR.
+    """
+
+    def test_true_for_the_webull_cancel_rejection_code(self):
+        from webull_bot.bot import AutoTrader
+
+        exc = Exception(
+            "HTTP Status: 417, Code: OPENAPI_ORDER_CAN_NOT_CANCEL, "
+            "Msg: Order cannot be cancelled!"
+        )
+        self.assertTrue(AutoTrader.is_order_not_cancelable(exc))
+
+    def test_false_for_an_unrelated_error(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(AutoTrader.is_order_not_cancelable(Exception("timeout")))
+
+
 class AveragingDownCapacityTests(StrategyConfigMixin, unittest.TestCase):
     """averaging_down_capacity - by request: bound worst-case per-
     symbol exposure from averaging down. Research finding acted on

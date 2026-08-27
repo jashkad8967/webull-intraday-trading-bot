@@ -1216,6 +1216,19 @@ class AutoTrader:
         )
 
     @staticmethod
+    def is_order_not_cancelable(exc: Exception) -> bool:
+        """True for Webull's OPENAPI_ORDER_CAN_NOT_CANCEL rejection - a
+        benign race, not a fault: the order is already filling or has
+        just filled by the time a repricer/escalator tries to cancel
+        it. The working order will resolve itself (fill and drop out
+        of open_ids, or genuinely still be cancelable) on the next
+        monitor_working_orders poll, so this is a WARNING, same
+        "expected, not a fault" convention as QuoteUnavailableError -
+        not an ERROR needing investigation.
+        """
+        return "ORDER_CAN_NOT_CANCEL" in str(exc).upper()
+
+    @staticmethod
     def is_short_selling_unsupported(exc: Exception) -> bool:
         """True for Webull's OAUTH_OPENAPI_NEW_NO_POSITION_MARGIN_ACCOUNT_
         CAN_NOT_SELL_SHORT_FOR_LT_2K rejection - short selling requires at
@@ -1845,7 +1858,15 @@ class AutoTrader:
                     new_order_id,
                 )
             except Exception as exc:
-                log.error("SCALP  | %s | reprice failed | %s", symbol, exc)
+                if self.is_order_not_cancelable(exc):
+                    log.warning(
+                        "SCALP  | %s | reprice skipped | order already "
+                        "resolving | %s",
+                        symbol,
+                        exc,
+                    )
+                else:
+                    log.error("SCALP  | %s | reprice failed | %s", symbol, exc)
 
     def reprice_volatility_scalp_entries(self) -> None:
         """Actively re-quotes a resting cohort BUY order toward the
@@ -1938,7 +1959,17 @@ class AutoTrader:
                 # every other entry gate in this strategy already uses.
                 log.warning("SCALP  | %s | entry reprice skipped | %s", symbol, exc)
             except Exception as exc:
-                log.error("SCALP  | %s | entry reprice failed | %s", symbol, exc)
+                if self.is_order_not_cancelable(exc):
+                    log.warning(
+                        "SCALP  | %s | entry reprice skipped | order "
+                        "already resolving | %s",
+                        symbol,
+                        exc,
+                    )
+                else:
+                    log.error(
+                        "SCALP  | %s | entry reprice failed | %s", symbol, exc
+                    )
 
     def reprice_resting_entries(self, core_session_active: bool) -> None:
         """Continuously re-quotes a resting general (non-volatility-
@@ -2047,7 +2078,17 @@ class AutoTrader:
                     "REPRICE| %s | entry reprice skipped | %s", symbol, exc
                 )
             except Exception as exc:
-                log.error("REPRICE| %s | entry reprice failed | %s", symbol, exc)
+                if self.is_order_not_cancelable(exc):
+                    log.warning(
+                        "REPRICE| %s | entry reprice skipped | order "
+                        "already resolving | %s",
+                        symbol,
+                        exc,
+                    )
+                else:
+                    log.error(
+                        "REPRICE| %s | entry reprice failed | %s", symbol, exc
+                    )
 
     def account_state(self) -> tuple[Decimal, list[dict]]:
         now = time.monotonic()
@@ -2232,6 +2273,16 @@ class AutoTrader:
         quantity, buffered_price = self.strategy.stock_order_quantity(
             price, whole_share_budget
         )
+        # stock_order_quantity is typed -> tuple[int, Decimal] (its own
+        # affordability math is integer-based) - normalize to Decimal
+        # here since every downstream caller of this whole-share
+        # quantity (is_fractional_quantity, record_trade's
+        # working_orders["quantity"], etc.) expects one. Without this,
+        # a plain int leaking into working_orders["quantity"] crashed
+        # a later is_fractional_quantity(quantity) call with "'int'
+        # object has no attribute 'to_integral_value'" - live evidence,
+        # traced to this line.
+        quantity = Decimal(quantity)
         # By request: risk-based position sizing (the professional 1-2%
         # rule, adapted for this account's size - see
         # stock_risk_per_trade_fraction) - an ADDITIONAL cap layered on
@@ -2251,7 +2302,7 @@ class AutoTrader:
                 self.config.stock_risk_per_trade_fraction,
             )
             if risk_cap < quantity:
-                quantity = risk_cap
+                quantity = Decimal(risk_cap)
                 min_lot = self.strategy.minimum_lot_size(price)
                 if 0 < quantity < min_lot:
                     # The risk cap alone can't afford even the exchange-
@@ -2259,7 +2310,7 @@ class AutoTrader:
                     # rather than place an order the broker would
                     # reject, same convention stock_order_quantity
                     # itself already uses.
-                    quantity = 0
+                    quantity = Decimal("0")
         return quantity, buffered_price, False
 
     def refresh_agent_discoveries(self) -> None:
@@ -2966,11 +3017,19 @@ class AutoTrader:
                 try:
                     self.api.cancel(order_id)
                 except Exception as exc:
-                    log.error(
-                        "STOP   | %s | escalation cancel failed | %s",
-                        symbol,
-                        exc,
-                    )
+                    if self.is_order_not_cancelable(exc):
+                        log.warning(
+                            "STOP   | %s | escalation cancel skipped | "
+                            "order already resolving | %s",
+                            symbol,
+                            exc,
+                        )
+                    else:
+                        log.error(
+                            "STOP   | %s | escalation cancel failed | %s",
+                            symbol,
+                            exc,
+                        )
                     continue
                 order = self.working_orders.pop(order_id, None)
                 # This order is being deliberately abandoned mid-flight (it
