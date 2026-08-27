@@ -590,75 +590,155 @@ class AutoTrader:
             # ever set on success, at the end of the body below).
             self._resolve_targets_in_progress_for = None
 
+    def _download_and_filter_universe(
+        self, limit: int, pool: int
+    ) -> tuple[dict[str, str], list[str], list[str]]:
+        """The "STOCK_SYMBOLS=ALL" universe download+filter pipeline,
+        extracted as a pure(ish) helper (reads self.invalid_symbols/
+        self.config only, never mutates self.stock_symbols/
+        self.stock_categories itself) so it can run more than once per
+        day at different sizes - see _resolve_targets_work_body (the
+        fast initial pass) and _grow_stock_universe (the background
+        continuation toward the full universe). Returns (categories,
+        stock_symbols, reserve_symbols).
+        """
+        log.info(
+            "LOAD   | downloading stocks and ETFs | limit=%s | pool=%s",
+            limit,
+            pool,
+        )
+        categories = self.api.stock_universe(
+            lambda category, count, category_limit: log.info(
+                "LOAD   | %-8s | %s/%s",
+                category,
+                count,
+                category_limit or "ALL",
+            ),
+            limit=pool,
+        )
+        preferred = self.config.popular_stocks()
+        preferred_categories = self.api.stock_categories(preferred)
+        added = 0
+        for symbol in preferred:
+            if symbol not in categories and symbol in preferred_categories:
+                categories[symbol] = preferred_categories[symbol]
+                added += 1
+        if added:
+            log.info(
+                "LOAD   | added %s popular symbols outside directory cap",
+                added,
+            )
+        if self.config.top_gainers_limit > 0:
+            gainers = self.safe_top_gainers(
+                self.config.top_gainers_limit,
+                self.config.stock_universe_page_size,
+            )
+            gainers_added = 0
+            for symbol in gainers:
+                if symbol not in categories:
+                    categories[symbol] = "US_STOCK"
+                    gainers_added += 1
+            if gainers_added:
+                log.info(
+                    "LOAD   | added %s top-gainer symbols outside directory cap",
+                    gainers_added,
+                )
+        if self.config.exclude_etfs:
+            etfs = [
+                symbol
+                for symbol, category in categories.items()
+                if category == "US_ETF"
+            ]
+            for symbol in etfs:
+                categories.pop(symbol, None)
+            if etfs:
+                log.info("LOAD   | excluded %s ETFs", len(etfs))
+        for symbol in self.invalid_symbols.symbols:
+            categories.pop(symbol, None)
+        eligible = [
+            symbol for symbol in categories if symbol not in self.invalid_symbols
+        ]
+        eligible = self.filter_with_popular_reinstated(eligible)
+        return categories, eligible[:limit], eligible[limit:]
+
+    def _grow_stock_universe(self, moment: datetime) -> None:
+        """Continues growing today's universe toward the full
+        MAX_SYMBOLS in the background, after _resolve_targets_work_body's
+        fast initial pass has already unblocked trading. By request,
+        after live evidence: at a large MAX_SYMBOLS, downloading and
+        VOLFILT-scoring the WHOLE universe before AutoTrader.stock_
+        symbols was populated at all took 15-20 minutes - position
+        protection never blocked on this (see resolve_targets), but no
+        NEW entry could fire the entire time either, since trade_stocks
+        had nothing to scan. Only ever called once per day, right after
+        the initial pass, from the same background thread - never blocks
+        the main loop either, same as resolve_targets itself.
+
+        Re-downloads at a progressively larger limit each step (simpler
+        and safer than trying to resume Webull's own pagination cursor
+        across separate calls) and MERGES newly-discovered symbols into
+        the already-active self.stock_symbols/self.stock_categories -
+        never replaces or resets what's already scanning, only adds to
+        it. Stops once the configured MAX_SYMBOLS is reached, or the
+        universe genuinely has no more symbols to add.
+        """
+        full_limit = self.config.stock_universe_limit()
+        initial_limit = min(full_limit, self.config.stock_universe_initial_limit)
+        if full_limit <= initial_limit:
+            return
+        pool = self.config.stock_universe_pool()
+        current_limit = initial_limit
+        batch = self.config.stock_universe_growth_batch_size
+        interval = self.config.stock_universe_growth_interval_seconds
+        while current_limit < full_limit and self.resolved_date == moment.date():
+            time.sleep(interval)
+            current_limit = min(full_limit, current_limit + batch)
+            try:
+                categories, symbols, reserve = self._download_and_filter_universe(
+                    current_limit, pool
+                )
+            except Exception as exc:
+                log.error("LOAD   | universe growth step failed | %s", exc)
+                continue
+            if self.resolved_date != moment.date():
+                # A new trading day started (or a fresh resolve_targets
+                # kicked off) while this growth step was in flight -
+                # abandon it rather than merge stale-day data into a
+                # new day's universe.
+                return
+            existing = set(self.stock_symbols)
+            new_symbols = [s for s in symbols if s not in existing]
+            if new_symbols:
+                self.stock_categories.update(categories)
+                self.stock_symbols = self.stock_symbols + new_symbols
+                self.reserve_symbols = reserve
+                log.info(
+                    "LOAD   | universe grown | +%s symbols | total=%s/%s",
+                    len(new_symbols),
+                    len(self.stock_symbols),
+                    full_limit,
+                )
+            if current_limit >= full_limit or len(symbols) < current_limit:
+                # Reached the configured cap, or the real universe is
+                # simply smaller than the cap - nothing more to grow.
+                return
+
     def _resolve_targets_work_body(self, moment: datetime) -> None:
         requested_stocks = self.config.stocks()
         if requested_stocks == ["ALL"]:
-            limit = self.config.stock_universe_limit()
+            full_limit = self.config.stock_universe_limit()
             pool = self.config.stock_universe_pool()
-            log.info(
-                "LOAD   | downloading stocks and ETFs | limit=%s | pool=%s",
-                limit,
-                pool,
+            # By request: start with a small, fast initial universe so
+            # trading can begin almost immediately, then grow toward
+            # the full MAX_SYMBOLS in the background (see
+            # _grow_stock_universe, kicked off at the end of this
+            # function) instead of blocking every new entry on
+            # downloading and VOLFILT-scoring the whole universe first.
+            limit = min(full_limit, self.config.stock_universe_initial_limit)
+            initial_pool = min(pool, max(limit, self.config.stock_universe_page_size))
+            self.stock_categories, self.stock_symbols, self.reserve_symbols = (
+                self._download_and_filter_universe(limit, initial_pool)
             )
-            self.stock_categories = self.api.stock_universe(
-                lambda category, count, category_limit: log.info(
-                    "LOAD   | %-8s | %s/%s",
-                    category,
-                    count,
-                    category_limit or "ALL",
-                ),
-                limit=pool,
-            )
-            preferred = self.config.popular_stocks()
-            preferred_categories = self.api.stock_categories(preferred)
-            added = 0
-            for symbol in preferred:
-                if (
-                    symbol not in self.stock_categories
-                    and symbol in preferred_categories
-                ):
-                    self.stock_categories[symbol] = preferred_categories[symbol]
-                    added += 1
-            if added:
-                log.info(
-                    "LOAD   | added %s popular symbols outside directory cap",
-                    added,
-                )
-            if self.config.top_gainers_limit > 0:
-                gainers = self.safe_top_gainers(
-                    self.config.top_gainers_limit,
-                    self.config.stock_universe_page_size,
-                )
-                gainers_added = 0
-                for symbol in gainers:
-                    if symbol not in self.stock_categories:
-                        self.stock_categories[symbol] = "US_STOCK"
-                        gainers_added += 1
-                if gainers_added:
-                    log.info(
-                        "LOAD   | added %s top-gainer symbols outside directory cap",
-                        gainers_added,
-                    )
-            if self.config.exclude_etfs:
-                etfs = [
-                    symbol
-                    for symbol, category in self.stock_categories.items()
-                    if category == "US_ETF"
-                ]
-                for symbol in etfs:
-                    self.stock_categories.pop(symbol, None)
-                if etfs:
-                    log.info("LOAD   | excluded %s ETFs", len(etfs))
-            for symbol in self.invalid_symbols.symbols:
-                self.stock_categories.pop(symbol, None)
-            eligible = [
-                symbol
-                for symbol in self.stock_categories
-                if symbol not in self.invalid_symbols
-            ]
-            eligible = self.filter_with_popular_reinstated(eligible)
-            self.stock_symbols = eligible[:limit]
-            self.reserve_symbols = eligible[limit:]
         else:
             log.info("LOAD   | resolving %s configured symbols", len(requested_stocks))
             requested_stocks = [
@@ -778,6 +858,14 @@ class AutoTrader:
             len(self.option_contracts),
             "ON" if self.discover_all_options else "OFF",
         )
+        # Trading is already unblocked at this point (stock_symbols is
+        # populated, resolved_date is set) - continue growing toward
+        # the full universe on this same background thread, still
+        # never blocking the main loop. No-ops immediately if
+        # STOCK_SYMBOLS isn't "ALL" or the initial pass already covered
+        # the full configured size.
+        if requested_stocks == ["ALL"]:
+            self._grow_stock_universe(moment)
 
     def discover_option_contracts(self) -> None:
         if (

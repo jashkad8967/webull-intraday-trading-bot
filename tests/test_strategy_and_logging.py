@@ -10640,5 +10640,159 @@ class ResolveTargetsNonBlockingTests(unittest.TestCase):
         self.assertIsNone(fake_bot.resolved_date)
 
 
+class ProgressiveUniverseLoadingTests(unittest.TestCase):
+    """_download_and_filter_universe / _grow_stock_universe - by
+    request, after live evidence: at a large MAX_SYMBOLS, downloading
+    and VOLFILT-scoring the WHOLE universe before AutoTrader.stock_
+    symbols was populated at all took 15-20 minutes, during which no
+    NEW entry could fire (position protection was already fixed
+    separately - see ResolveTargetsNonBlockingTests). Starts with a
+    small, fast initial universe and grows it in the background.
+    """
+
+    @staticmethod
+    def _fake_bot(universes_by_limit, config_overrides=None):
+        """universes_by_limit maps a requested `limit` to the list of
+        symbols api.stock_universe should return for that call (as if
+        each limit produces its own, larger, superset page) - the fake
+        stock_universe just returns categories for min(limit, len(all)).
+        """
+        from webull_bot.bot import AutoTrader
+
+        all_symbols = universes_by_limit["all"]
+
+        class FakeApi:
+            @staticmethod
+            def stock_universe(progress, limit):
+                chosen = all_symbols[:limit]
+                if progress:
+                    progress("US_LISTED", len(chosen), limit)
+                return {s: "US_STOCK" for s in chosen}
+
+            @staticmethod
+            def stock_categories(symbols):
+                return {}
+
+        config = SimpleNamespace(
+            popular_stocks=lambda: [],
+            top_gainers_limit=0,
+            exclude_etfs=False,
+            stock_universe_page_size=200,
+            stock_universe_initial_limit=config_overrides.get("initial", 2)
+            if config_overrides
+            else 2,
+            stock_universe_growth_batch_size=config_overrides.get("batch", 2)
+            if config_overrides
+            else 2,
+            stock_universe_growth_interval_seconds=1,
+        )
+        config.stock_universe_limit = lambda: (
+            config_overrides.get("full", len(all_symbols))
+            if config_overrides
+            else len(all_symbols)
+        )
+        config.stock_universe_pool = lambda: config.stock_universe_limit() + 10
+
+        class FakeInvalidSymbols:
+            symbols = set()
+
+            def __contains__(self, symbol):
+                return False
+
+        fake_bot = SimpleNamespace(
+            api=FakeApi(),
+            config=config,
+            invalid_symbols=FakeInvalidSymbols(),
+            safe_top_gainers=lambda limit, page_size: {},
+            filter_with_popular_reinstated=lambda candidates: candidates,
+            stock_symbols=[],
+            stock_categories={},
+            reserve_symbols=[],
+            resolved_date=None,
+        )
+        fake_bot._download_and_filter_universe = (
+            AutoTrader._download_and_filter_universe.__get__(fake_bot)
+        )
+        fake_bot._grow_stock_universe = AutoTrader._grow_stock_universe.__get__(
+            fake_bot
+        )
+        return fake_bot
+
+    def test_download_and_filter_splits_into_symbols_and_reserve(self):
+        fake_bot = self._fake_bot({"all": ["A", "B", "C", "D", "E"]})
+        categories, symbols, reserve = fake_bot._download_and_filter_universe(3, 10)
+        self.assertEqual(symbols, ["A", "B", "C"])
+        self.assertEqual(reserve, ["D", "E"])
+        self.assertEqual(len(categories), 5)
+
+    def test_growth_noop_when_initial_pass_already_covers_the_full_limit(self):
+        fake_bot = self._fake_bot(
+            {"all": ["A", "B"]}, {"initial": 5, "full": 2, "batch": 2}
+        )
+        fake_bot.stock_symbols = ["A", "B"]
+        moment = datetime(2026, 8, 27)
+        fake_bot.resolved_date = moment.date()
+        with unittest.mock.patch("time.sleep") as sleep_mock:
+            fake_bot._grow_stock_universe(moment)
+        sleep_mock.assert_not_called()
+
+    def test_growth_merges_new_symbols_without_touching_existing_ones(self):
+        all_symbols = [f"S{i}" for i in range(10)]
+        fake_bot = self._fake_bot(
+            {"all": all_symbols}, {"initial": 3, "full": 10, "batch": 3}
+        )
+        fake_bot.stock_symbols = all_symbols[:3]
+        fake_bot.stock_categories = {s: "US_STOCK" for s in all_symbols[:3]}
+        moment = datetime(2026, 8, 27)
+        fake_bot.resolved_date = moment.date()
+        with unittest.mock.patch("time.sleep"):
+            fake_bot._grow_stock_universe(moment)
+        # Original 3 symbols stay first/untouched, new ones appended -
+        # never a wholesale replace of an already-scanning universe.
+        self.assertEqual(fake_bot.stock_symbols[:3], all_symbols[:3])
+        self.assertEqual(set(fake_bot.stock_symbols), set(all_symbols))
+
+    def test_growth_stops_once_the_real_universe_is_smaller_than_the_cap(self):
+        fake_bot = self._fake_bot(
+            {"all": ["A", "B", "C"]}, {"initial": 1, "full": 100, "batch": 5}
+        )
+        fake_bot.stock_symbols = ["A"]
+        fake_bot.stock_categories = {"A": "US_STOCK"}
+        moment = datetime(2026, 8, 27)
+        fake_bot.resolved_date = moment.date()
+        with unittest.mock.patch("time.sleep"):
+            fake_bot._grow_stock_universe(moment)
+        self.assertEqual(set(fake_bot.stock_symbols), {"A", "B", "C"})
+
+    def test_growth_abandons_if_a_new_trading_day_started_mid_flight(self):
+        """A stale-day growth step must never merge into a fresh day's
+        universe - resolved_date changing mid-loop means a brand new
+        resolve_targets already took over.
+        """
+        all_symbols = [f"S{i}" for i in range(10)]
+        fake_bot = self._fake_bot(
+            {"all": all_symbols}, {"initial": 3, "full": 10, "batch": 3}
+        )
+        fake_bot.stock_symbols = all_symbols[:3]
+        fake_bot.stock_categories = {s: "US_STOCK" for s in all_symbols[:3]}
+        moment = datetime(2026, 8, 27)
+        fake_bot.resolved_date = moment.date()
+
+        call_count = {"n": 0}
+        original_sleep = fake_bot._grow_stock_universe
+
+        def sleep_and_flip(*a, **k):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                fake_bot.resolved_date = datetime(2026, 8, 28).date()
+
+        with unittest.mock.patch("time.sleep", side_effect=sleep_and_flip):
+            fake_bot._grow_stock_universe(moment)
+
+        # Only the original 3 symbols remain - the in-flight step never
+        # merged its (now-stale) results in.
+        self.assertEqual(set(fake_bot.stock_symbols), set(all_symbols[:3]))
+
+
 if __name__ == "__main__":
     unittest.main()

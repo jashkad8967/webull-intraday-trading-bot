@@ -36,6 +36,24 @@ class Settings(BaseSettings):
     max_symbols: int = Field(default=800, ge=0, le=50000)
     stock_universe_reserve: int = Field(default=400, ge=0, le=50000)
     stock_universe_page_size: int = Field(default=200, ge=25, le=1000)
+    # By request, after live evidence: at a large MAX_SYMBOLS (today's
+    # live value: 5000), the once-daily universe download + VOLFILT
+    # historical-volatility scoring of the WHOLE universe took 15-20
+    # minutes before AutoTrader.stock_symbols was populated at all -
+    # position protection was already fixed to never block on this
+    # (see resolve_targets), but no NEW entry could fire the entire
+    # time either, since trade_stocks had nothing to scan. Splits the
+    # once-daily load into a small, fast initial batch (unblocks
+    # trading in roughly a minute instead of 15-20) followed by
+    # continued growth toward the full MAX_SYMBOLS in the background -
+    # see AutoTrader._grow_stock_universe. Only applies when
+    # STOCK_SYMBOLS=ALL; an explicit symbol list is already small and
+    # fast to resolve.
+    stock_universe_initial_limit: int = Field(default=500, ge=1, le=50000)
+    stock_universe_growth_batch_size: int = Field(default=1000, ge=1, le=50000)
+    stock_universe_growth_interval_seconds: int = Field(
+        default=180, ge=30, le=3600
+    )
     stock_batch_size: int = Field(default=100, ge=1, le=300)
     stock_priority_fraction: float = Field(default=0.70, ge=0, le=0.90)
     stock_penny_fraction: float = Field(default=0.10, ge=0, le=0.50)
