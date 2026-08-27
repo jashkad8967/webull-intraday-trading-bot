@@ -305,6 +305,15 @@ class AutoTrader:
         # any position already held.
         self.entry_restricted_symbols: set[str] = set()
         self.stock_cursor = 0
+        # The real number of symbols trade_stocks actually fetched
+        # quotes for last cycle - can be several STOCK_BATCH_SIZE
+        # multiples now (see stock_scan_concurrent_batches), not always
+        # a flat STOCK_BATCH_SIZE. Read by the SCAN status log instead
+        # of recomputing a static min(stock_batch_size, ...), which
+        # would otherwise misreport real per-cycle scan coverage once
+        # the universe is large enough for more than one concurrent
+        # batch.
+        self.last_scan_batch_size = 0
         self.option_cursor = 0
         self.option_discovery_cursor = 0
         self.option_discovery_attempted: set[str] = set()
@@ -3637,6 +3646,7 @@ class AutoTrader:
             unmanaged_held,
             limit=concurrent_batches * WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS,
         )
+        self.last_scan_batch_size = len(batch)
         bucket_remaining = {
             bucket: buying_power * fraction
             for bucket, fraction in self.config.stock_capital_fractions().items()
@@ -6795,7 +6805,8 @@ class AutoTrader:
                     log.info(
                         "SCAN   | stocks=%s/%s | options=%s/%s | positions=%s | "
                         "buying power=$%.2f | pnl today=$%.2f | watchlist=%s | paused=%s",
-                        min(self.config.stock_batch_size, len(self.stock_symbols)),
+                        min(self.last_scan_batch_size, len(self.stock_symbols))
+                        or min(self.config.stock_batch_size, len(self.stock_symbols)),
                         len(self.stock_symbols),
                         min(self.config.option_batch_size, len(self.option_contracts)),
                         len(self.option_contracts),
