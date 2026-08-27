@@ -10927,5 +10927,53 @@ class WorkingOrdersConcurrencyTests(unittest.TestCase):
         self.assertTrue(all(not t.is_alive() for t in threads))
 
 
+class ProfitExitGiveUpThresholdTests(unittest.TestCase):
+    """should_force_market_exit - by request, after live evidence: WNW's
+    PROFIT exit escalated 5 times over 6+ minutes, every attempt at the
+    exact same unfillable limit price, with no give-up threshold at
+    all (unlike the STOP-loss path, which already had one). trade_
+    stocks' PROFIT branches now fall back to the current bid once this
+    returns True (see the "Live incident (WNW)" comment in bot.py) -
+    trade_stocks itself is too large to harness cheaply, so this locks
+    in the counter/threshold semantics the fix depends on: the same
+    consecutive_exit_failures counter escalate_stalled_stop_losses
+    already increments once per escalation (confirmed via
+    PostStopReentryCooldownTests-style direct state, not the full
+    wiring).
+    """
+
+    @staticmethod
+    def _fake_bot(failures, threshold=3):
+        return SimpleNamespace(
+            consecutive_exit_failures=defaultdict(int, {"WNW": failures}),
+            config=SimpleNamespace(
+                consecutive_exit_failure_market_threshold=threshold
+            ),
+            fractional_trading_enabled=True,
+        )
+
+    def test_not_tripped_before_the_threshold(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = self._fake_bot(2)
+        should_force = AutoTrader.should_force_market_exit.__get__(fake_bot)
+        self.assertFalse(should_force("WNW", False, True))
+
+    def test_tripped_at_wnw_s_actual_live_failure_count(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = self._fake_bot(5)
+        should_force = AutoTrader.should_force_market_exit.__get__(fake_bot)
+        self.assertTrue(should_force("WNW", False, True))
+
+    def test_never_trips_for_a_fractional_position_outside_core_hours(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = self._fake_bot(5)
+        should_force = AutoTrader.should_force_market_exit.__get__(fake_bot)
+        self.assertFalse(should_force("WNW", True, True))
+        self.assertFalse(should_force("WNW", False, False))
+
+
 if __name__ == "__main__":
     unittest.main()
