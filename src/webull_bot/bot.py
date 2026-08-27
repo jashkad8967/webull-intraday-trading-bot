@@ -2,6 +2,7 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from zoneinfo import ZoneInfo
@@ -83,6 +84,40 @@ ALWAYS_FLATTEN_BUCKETS = frozenset({"PAIRS_LONG", "PAIRS_SHORT"})
 # open-ended web search, and feeds agent_popular_symbols directly so that
 # signal keeps working even if the agent is disabled or a request fails.
 MARKET_PULSE_REFRESH_SECONDS = 120
+
+
+def _working_orders_lock(bot) -> object:
+    """getattr fallback (module-level, not a self-method - see below)
+    so working_orders touches can be locked without breaking the many
+    existing unit tests that bind an AutoTrader method directly onto a
+    bare SimpleNamespace fixture (AutoTrader.foo.__get__(fake_bot)).
+    A self-method here would itself need to be looked up as
+    self._working_orders_lock, which fails on a fixture that never
+    bound it - a plain module-level function taking bot as an argument
+    has no such requirement. Falls back to a no-op context manager
+    when bot has no working_orders_lock attribute at all (every
+    existing test fixture), so those tests run unchanged, single-
+    threaded, with no behavior change - only the real AutoTrader
+    (which sets a real threading.Lock in __init__) actually
+    serializes against the position-protection thread (see
+    AutoTrader._position_protection_loop).
+    """
+    lock = getattr(bot, "working_orders_lock", None)
+    return lock if lock is not None else nullcontext()
+
+
+def _rekey_working_order(bot, old_order_id: str, new_order_id: str, entry: dict) -> None:
+    """Swaps a cancel-and-replace repricer's working_orders entry
+    atomically under the lock - every repricer (reprice_resting_
+    exits/entries, reprice_volatility_scalp_exits/entries) does this
+    exact pop-old/set-new pair, and each one needs it locked now that
+    the position-protection thread runs concurrently with record_trade
+    on the main thread. Module-level for the same test-fixture-
+    compatibility reason as _working_orders_lock above.
+    """
+    with _working_orders_lock(bot):
+        bot.working_orders.pop(old_order_id, None)
+        bot.working_orders[new_order_id] = entry
 
 
 class AutoTrader:
@@ -250,6 +285,10 @@ class AutoTrader:
         self.cached_buying_power = Decimal("0")
         self.cached_raw_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
+        # Read by _position_protection_loop's background thread - see
+        # its docstring and run()'s "self.cached_core_session_active =
+        # core_session_active" assignment.
+        self.cached_core_session_active = False
         # Webull's own account-level today's total P&L, refreshed
         # alongside cached_buying_power/cached_positions in account_state
         # - see account_day_pnl_from_balance and write_status_snapshot's
@@ -260,6 +299,23 @@ class AutoTrader:
         # from buying_power (spendable cash only).
         self.cached_account_value: Decimal | None = None
         self.working_orders: dict[str, dict] = {}
+        # By request: "held positions should be checked every 0.25s
+        # separately, the rest of the scan can take its own time" -
+        # live evidence (CHOW) showed a single-threaded main loop lets
+        # position-protection (fill/cancel detection, exit repricing,
+        # stop-loss escalation) inherit the SLOW full-universe-scan
+        # cadence (SCAN cycles observed 30-90s+ despite POLL_SECONDS=
+        # 0.25), so a stuck exit order can sit unrefreshed for far
+        # longer than intended before the next chance to reprice or
+        # escalate it. Runs position protection on its own background
+        # thread at the real poll_seconds cadence (see
+        # _position_protection_loop/run) instead - this lock guards
+        # self.working_orders (and the few sibling dicts touched
+        # alongside it - stop_exit_submitted, stop_loss_escalated,
+        # consecutive_exit_failures) since that thread and the main
+        # thread's trade_stocks (via record_trade, for fresh entries)
+        # now mutate them concurrently.
+        self.working_orders_lock = threading.Lock()
         self.entries_paused = False
         self.circuit_breaker_time = 0.0
         self.last_circuit_research = 0.0
@@ -964,11 +1020,13 @@ class AutoTrader:
         for the same symbol (MTNB: 5 orders in ~70s, same price, no
         fill or cancel in between) with no cooldown left to stop it.
         """
+        with _working_orders_lock(self):
+            orders = list(self.working_orders.values())
         return any(
             order.get("key") == key
             and order.get("action") == "BUY"
             and order.get("cancel_requested_at") is None
-            for order in self.working_orders.values()
+            for order in orders
         )
 
     def volatility_scalp_entry_price(self, quote: dict) -> Decimal | None:
@@ -1361,18 +1419,23 @@ class AutoTrader:
             if key.startswith("STOCK:"):
                 self.consecutive_exit_failures.pop(key.split(":", 1)[1], None)
         self.trade_times[key].append(submitted_at)
-        self.working_orders[order_id] = {
-            "submitted_at": submitted_at,
-            "key": key,
-            "action": action,
-            "cancel_requested_at": None,
-            "limit_price": limit_price,
-            "pnl": pnl,
-            # Needed to resubmit a like-for-like replacement order when
-            # actively repricing a resting entry - see
-            # reprice_volatility_scalp_entries.
-            "quantity": quantity,
-        }
+        # Position-protection now runs on its own background thread
+        # (see _position_protection_loop) - lock the dict write itself
+        # since that thread's repricers/escalator also create/replace
+        # working_orders entries concurrently.
+        with _working_orders_lock(self):
+            self.working_orders[order_id] = {
+                "submitted_at": submitted_at,
+                "key": key,
+                "action": action,
+                "cancel_requested_at": None,
+                "limit_price": limit_price,
+                "pnl": pnl,
+                # Needed to resubmit a like-for-like replacement order when
+                # actively repricing a resting entry - see
+                # reprice_volatility_scalp_entries.
+                "quantity": quantity,
+            }
         instrument_type, symbol = key.split(":", 1)
         self.status.record_trade(
             instrument_type,
@@ -1471,6 +1534,9 @@ class AutoTrader:
         groups = self.api.open_orders()
         open_ids = set(self.api.open_order_ids(groups))
 
+        with _working_orders_lock(self):
+            known_order_ids = set(self.working_orders)
+
         for order_id in open_ids:
             if order_id in self.submitted_order_ids_today:
                 # A bot-submitted order, just not currently in
@@ -1488,7 +1554,7 @@ class AutoTrader:
                 # intraday, so it reliably distinguishes "ours, just
                 # untracked right now" from "genuinely never ours."
                 continue
-            if order_id not in self.working_orders:
+            if order_id not in known_order_ids:
                 # An order the bot never submitted itself and doesn't
                 # already know about - almost always a manual action
                 # taken directly in the Webull app (a dashboard-driven
@@ -1537,21 +1603,26 @@ class AutoTrader:
                         order_id,
                     )
                 else:
-                    self.working_orders[order_id] = {
-                        "submitted_at": now,
-                        "key": "",
-                        "action": "UNKNOWN",
-                        "cancel_requested_at": None,
-                    }
+                    with _working_orders_lock(self):
+                        self.working_orders[order_id] = {
+                            "submitted_at": now,
+                            "key": "",
+                            "action": "UNKNOWN",
+                            "cancel_requested_at": None,
+                        }
                     log.info(
                         "ORDER  | monitoring broker order | id=%s",
                         order_id,
                     )
 
-        for order_id, order in list(self.working_orders.items()):
+        with _working_orders_lock(self):
+            snapshot = list(self.working_orders.items())
+
+        for order_id, order in snapshot:
             if order_id not in open_ids:
                 self._release_pending_order(order)
-                del self.working_orders[order_id]
+                with _working_orders_lock(self):
+                    self.working_orders.pop(order_id, None)
                 self.last_account_refresh = 0.0
                 pnl = order.get("pnl")
                 if pnl:
@@ -1566,7 +1637,10 @@ class AutoTrader:
                 continue
             try:
                 self.api.cancel(order_id)
-                order["cancel_requested_at"] = now
+                with _working_orders_lock(self):
+                    live_order = self.working_orders.get(order_id)
+                    if live_order is not None:
+                        live_order["cancel_requested_at"] = now
                 log.warning(
                     "CANCEL | unfilled after %ss | id=%s",
                     self.config.order_timeout_seconds,
@@ -1651,7 +1725,9 @@ class AutoTrader:
             return
         self.last_reprice = now
         candidates: list[tuple[str, str, dict]] = []
-        for order_id, order in list(self.working_orders.items()):
+        with _working_orders_lock(self):
+            snapshot = list(self.working_orders.items())
+        for order_id, order in snapshot:
             action = order.get("action")
             key = str(order.get("key") or "")
             if action != "PROFIT" or not key.startswith("STOCK:"):
@@ -1717,19 +1793,23 @@ class AutoTrader:
                     quantity,
                     limit_price=ask,
                 )
-                self.working_orders.pop(order_id, None)
-                self.working_orders[new_order_id] = {
-                    "submitted_at": now,
-                    "key": key,
-                    "action": action,
-                    "cancel_requested_at": None,
-                    "limit_price": ask,
-                    # Carry the pnl already recorded at the original PROFIT
-                    # submission forward - this is the same logical exit,
-                    # not a new one, so if the repriced order itself never
-                    # fills it's still the correct amount to reverse.
-                    "pnl": order.get("pnl"),
-                }
+                _rekey_working_order(
+                    self,
+                    order_id,
+                    new_order_id,
+                    {
+                        "submitted_at": now,
+                        "key": key,
+                        "action": action,
+                        "cancel_requested_at": None,
+                        "limit_price": ask,
+                        # Carry the pnl already recorded at the original PROFIT
+                        # submission forward - this is the same logical exit,
+                        # not a new one, so if the repriced order itself never
+                        # fills it's still the correct amount to reverse.
+                        "pnl": order.get("pnl"),
+                    },
+                )
                 # The dashboard's trade-log entry is still filed under the
                 # cancelled order_id - repoint it, or a later reversal
                 # (which only ever learns new_order_id) can't find it to
@@ -1765,7 +1845,9 @@ class AutoTrader:
             return
         self.last_volatility_reprice = now
         candidates: list[tuple[str, str, dict]] = []
-        for order_id, order in list(self.working_orders.items()):
+        with _working_orders_lock(self):
+            snapshot = list(self.working_orders.items())
+        for order_id, order in snapshot:
             action = order.get("action")
             key = str(order.get("key") or "")
             if action != "PROFIT" or not key.startswith("STOCK:"):
@@ -1841,15 +1923,19 @@ class AutoTrader:
                     quantity,
                     limit_price=limit_price,
                 )
-                self.working_orders.pop(order_id, None)
-                self.working_orders[new_order_id] = {
-                    "submitted_at": now,
-                    "key": key,
-                    "action": action,
-                    "cancel_requested_at": None,
-                    "limit_price": limit_price,
-                    "pnl": order.get("pnl"),
-                }
+                _rekey_working_order(
+                    self,
+                    order_id,
+                    new_order_id,
+                    {
+                        "submitted_at": now,
+                        "key": key,
+                        "action": action,
+                        "cancel_requested_at": None,
+                        "limit_price": limit_price,
+                        "pnl": order.get("pnl"),
+                    },
+                )
                 self.status.rekey_trade(order_id, new_order_id)
                 log.info(
                     "SCALP  | %-8s | reprice | limit=%s | id=%s",
@@ -1886,7 +1972,9 @@ class AutoTrader:
             return
         self.last_volatility_entry_reprice = now
         candidates: list[tuple[str, str, dict]] = []
-        for order_id, order in list(self.working_orders.items()):
+        with _working_orders_lock(self):
+            snapshot = list(self.working_orders.items())
+        for order_id, order in snapshot:
             action = order.get("action")
             key = str(order.get("key") or "")
             if action != "BUY" or not key.startswith("STOCK:"):
@@ -1933,16 +2021,20 @@ class AutoTrader:
                     quantity,
                     limit_price=limit_price,
                 )
-                self.working_orders.pop(order_id, None)
-                self.working_orders[new_order_id] = {
-                    "submitted_at": now,
-                    "key": key,
-                    "action": action,
-                    "cancel_requested_at": None,
-                    "limit_price": limit_price,
-                    "pnl": order.get("pnl"),
-                    "quantity": quantity,
-                }
+                _rekey_working_order(
+                    self,
+                    order_id,
+                    new_order_id,
+                    {
+                        "submitted_at": now,
+                        "key": key,
+                        "action": action,
+                        "cancel_requested_at": None,
+                        "limit_price": limit_price,
+                        "pnl": order.get("pnl"),
+                        "quantity": quantity,
+                    },
+                )
                 self.status.rekey_trade(order_id, new_order_id)
                 log.info(
                     "SCALP  | %-8s | reprice entry | limit=%s | id=%s",
@@ -1997,7 +2089,9 @@ class AutoTrader:
             return
         self.last_entry_reprice = now
         candidates: list[tuple[str, str, dict]] = []
-        for order_id, order in list(self.working_orders.items()):
+        with _working_orders_lock(self):
+            snapshot = list(self.working_orders.items())
+        for order_id, order in snapshot:
             action = order.get("action")
             key = str(order.get("key") or "")
             if action not in ("BUY", "SHORT") or not key.startswith("STOCK:"):
@@ -2055,16 +2149,20 @@ class AutoTrader:
                     quantity,
                     limit_price=target_price,
                 )
-                self.working_orders.pop(order_id, None)
-                self.working_orders[new_order_id] = {
-                    "submitted_at": now,
-                    "key": key,
-                    "action": action,
-                    "cancel_requested_at": None,
-                    "limit_price": target_price,
-                    "pnl": order.get("pnl"),
-                    "quantity": quantity,
-                }
+                _rekey_working_order(
+                    self,
+                    order_id,
+                    new_order_id,
+                    {
+                        "submitted_at": now,
+                        "key": key,
+                        "action": action,
+                        "cancel_requested_at": None,
+                        "limit_price": target_price,
+                        "pnl": order.get("pnl"),
+                        "quantity": quantity,
+                    },
+                )
                 self.status.rekey_trade(order_id, new_order_id)
                 log.info(
                     "REPRICE| %-8s | %-6s | limit=%s | id=%s",
@@ -3005,7 +3103,9 @@ class AutoTrader:
                 continue
             order_id = None
             action = None
-            for oid, order in self.working_orders.items():
+            with _working_orders_lock(self):
+                snapshot = list(self.working_orders.items())
+            for oid, order in snapshot:
                 if order.get("key") == key and order.get("action") in (
                     "STOP",
                     "PROFIT",
@@ -3031,7 +3131,8 @@ class AutoTrader:
                             exc,
                         )
                     continue
-                order = self.working_orders.pop(order_id, None)
+                with _working_orders_lock(self):
+                    order = self.working_orders.pop(order_id, None)
                 # This order is being deliberately abandoned mid-flight (it
                 # never filled at the gentler price) - a fresh order fires
                 # its own PROFIT/STOP decision and records its own pnl next
@@ -5712,6 +5813,8 @@ class AutoTrader:
                 Decimal("0"),
             )
             self.status.record_balance(total_equity)
+        with _working_orders_lock(self):
+            working_orders_snapshot = list(self.working_orders.items())
         pending_order_rows = [
             {
                 "order_id": order_id,
@@ -5729,7 +5832,7 @@ class AutoTrader:
                 "age_seconds": round(now - float(order.get("submitted_at", now))),
                 "cancel_requested": order.get("cancel_requested_at") is not None,
             }
-            for order_id, order in self.working_orders.items()
+            for order_id, order in working_orders_snapshot
         ]
         self.status.write(
             mode=self.config.mode,
@@ -6303,6 +6406,50 @@ class AutoTrader:
         self.priority_scan_symbols.add(symbol)
         log.warning("CMD    | added %-8s to watchlist from dashboard", symbol)
 
+    def _position_protection_loop(self) -> None:
+        """Runs fill/cancel detection, exit repricing, and stop-loss
+        escalation on their OWN cadence (poll_seconds, default 0.25s),
+        independent of the main loop's much slower full-universe-scan
+        cadence (SCAN cycles observed 30-90s+ live). By request:
+        "held positions should be checked every 0.25s separately, the
+        rest of the scan can take its own time" - live evidence (CHOW)
+        showed a stuck PROFIT order sit unrefreshed far longer than
+        intended because monitor_working_orders/the repricers/
+        escalate_stalled_stop_losses previously ran inline in the same
+        single-threaded loop body as trade_stocks' slow, batched
+        universe scan, inheriting its cadence instead of the real
+        poll_seconds target.
+
+        Runs as a daemon thread (see run(), which starts this once and
+        removes these same calls from its own sequential body so they
+        never run twice concurrently). self.cached_positions and
+        self.cached_core_session_active are read-only snapshots here,
+        refreshed by the main thread each cycle - a single attribute
+        read is safe under the GIL without its own lock, same
+        "atomic reassignment" convention already used for
+        stock_symbols/stock_categories in resolve_targets. Everything
+        that actually touches self.working_orders (and reads/writes it
+        from the main thread's record_trade for fresh entries) goes
+        through _working_orders_lock/​_rekey_working_order instead.
+        """
+        while True:
+            started = time.monotonic()
+            try:
+                self.monitor_working_orders()
+                self.reprice_resting_exits(
+                    self.cached_positions, self.cached_core_session_active
+                )
+                self.reprice_volatility_scalp_exits(
+                    self.cached_positions, self.cached_core_session_active
+                )
+                self.reprice_volatility_scalp_entries()
+                self.reprice_resting_entries(self.cached_core_session_active)
+                self.escalate_stalled_stop_losses()
+            except Exception as exc:
+                log.error("PROTECT| position-protection cycle failed | %s", exc)
+            elapsed = time.monotonic() - started
+            time.sleep(max(0.0, float(self.config.poll_seconds) - elapsed))
+
     def run(self) -> None:
         log.info(
             "START  | mode=%s | poll=%ss | cooldown=%ss",
@@ -6310,6 +6457,9 @@ class AutoTrader:
             self.config.poll_seconds,
             self.config.trade_cooldown_seconds,
         )
+        threading.Thread(
+            target=self._position_protection_loop, daemon=True
+        ).start()
         while True:
             moment = self.now()
             if not self.is_trading_day(moment):
@@ -6356,6 +6506,11 @@ class AutoTrader:
                 minutes=self.config.opening_grace_minutes
             )
             core_session_active = option_open <= moment < option_close
+            # Read by _position_protection_loop (a separate thread) -
+            # see its docstring. Plain attribute assignment is atomic
+            # under the GIL, same convention already used for
+            # stock_symbols/stock_categories in resolve_targets.
+            self.cached_core_session_active = core_session_active
             if opening_grace_active and self.opening_grace_logged_date != moment.date():
                 self.opening_grace_logged_date = moment.date()
                 log.info(
@@ -6369,15 +6524,13 @@ class AutoTrader:
             cycle_started = time.monotonic()
             try:
                 self.resolve_targets(moment)
-                self.monitor_working_orders()
+                # monitor_working_orders/the repricers/escalate_stalled_
+                # stop_losses now run on their own fast, dedicated
+                # thread (see _position_protection_loop, started once
+                # above) - NOT called here too, or they'd run twice
+                # concurrently and double-cancel/double-reprice the
+                # same working orders.
                 self.process_iceberg_orders()
-                self.reprice_resting_exits(self.cached_positions, core_session_active)
-                self.reprice_volatility_scalp_exits(
-                    self.cached_positions, core_session_active
-                )
-                self.reprice_volatility_scalp_entries()
-                self.reprice_resting_entries(core_session_active)
-                self.escalate_stalled_stop_losses()
                 if not core_session_active:
                     self.close_profitable_positions_during_extended_hours()
                 self.select_volatility_scalp_symbols()
