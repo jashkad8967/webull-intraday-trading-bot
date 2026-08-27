@@ -4056,17 +4056,28 @@ class AutoTrader:
                         symbol not in self.volatility_scalp_last_buy_price
                         or price < self.volatility_scalp_last_buy_price[symbol]
                     )
-                    # By request: "not averaging down enough" - the
-                    # momentum-stall and spread-quality gates that apply
-                    # to FRESH entries (below) deliberately do NOT apply
-                    # here. A fresh entry is a brand-new commitment
-                    # where waiting for a stall/reasonable spread is
-                    # sound risk management; averaging down is adding to
-                    # a position already committed to, where the whole
-                    # point is catching the dip while it's still
-                    # happening, not waiting for it to finish falling
-                    # first. The strictly-lower-than-last-buy check just
-                    # above is the real quality gate here.
+                    # Reverses an earlier by-request decision ("not
+                    # averaging down enough") that deliberately let this
+                    # block skip the fresh-entry momentum-stall check,
+                    # on the theory that averaging down should catch a
+                    # dip "while it's still happening." Live evidence
+                    # this backfired: CELU averaged down 5 times in ~6
+                    # minutes and BTCT 6 times in ~35, each add landing
+                    # at a still-lower price than the one before it,
+                    # both eventually hard-stopping out and erasing the
+                    # day's gains (+$6.97 peak -> -$0.26). By request:
+                    # "average down when the declining momentum ends and
+                    # wait for the uptrend to sell the stock then" - same
+                    # stall check fresh entries already use (requires a
+                    # genuine consecutive decline to have just stopped
+                    # getting worse, fails open on too little history),
+                    # applied here too so a level only gets added once
+                    # THIS specific decline shows signs of stopping,
+                    # instead of on every strictly-lower tick regardless
+                    # of whether the fall is still accelerating.
+                    and self.strategy.volatility_scalp_momentum_stalled_or_rising(
+                        symbol, price
+                    )
                 ):
                     average_down_quantity = self.strategy.volatility_scalp_share_count(
                         price,
