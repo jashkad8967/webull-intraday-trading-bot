@@ -3990,6 +3990,55 @@ class AutoTrader:
                         self.config.volatility_scalp_max_symbol_risk_fraction,
                         volatility_scalp_effective_max_averaging,
                     )
+                    # Diagnostic-only pass, by request to actually see
+                    # which specific condition is blocking an averaging-
+                    # down add on a given cycle instead of inferring it
+                    # from aggregate counts - the fresh-entry gate above
+                    # already has this (see "scalp - momentum still
+                    # falling"), this block never did. Purely additive:
+                    # evaluates the same conditions in the same order as
+                    # the real gate immediately below and records only
+                    # the FIRST one that fails - never affects the real
+                    # gate or submits anything itself.
+                    for reason, ok in (
+                        (
+                            "scalp avgdown - averaging cap reached",
+                            self.volatility_scalp_average_down_count[symbol]
+                            < volatility_scalp_symbol_averaging_cap,
+                        ),
+                        (
+                            "scalp avgdown - reentry cooldown",
+                            (
+                                time.monotonic()
+                                - self.last_volatility_average_down.get(symbol, 0.0)
+                            )
+                            >= float(self.config.volatility_scalp_reentry_cooldown_seconds),
+                        ),
+                        (
+                            "scalp avgdown - not X% below average cost",
+                            self.strategy.volatility_scalp_average_down_signal(
+                                price,
+                                cost,
+                                level=self.volatility_scalp_average_down_count[symbol],
+                            ),
+                        ),
+                        (
+                            "scalp avgdown - not below last buy price",
+                            (
+                                symbol not in self.volatility_scalp_last_buy_price
+                                or price < self.volatility_scalp_last_buy_price[symbol]
+                            ),
+                        ),
+                        (
+                            "scalp avgdown - momentum still falling",
+                            self.strategy.volatility_scalp_momentum_stalled_or_rising(
+                                symbol, price
+                            ),
+                        ),
+                    ):
+                        if not ok:
+                            self.gate_rejections[reason] += 1
+                            break
                 if (
                     quantity > 0
                     # Same "no volatility scalp in extended hours" hard
