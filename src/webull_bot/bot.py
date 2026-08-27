@@ -4745,6 +4745,36 @@ class AutoTrader:
                         # own "never chase below cost" guard) keeps
                         # waiting instead of forcing a loss.
                         limit_price = max(ask, target) if ask else target
+                    # Live incident (WNW): a PROFIT exit escalated 5
+                    # times over 6+ minutes, every attempt resubmitted
+                    # at the EXACT same unfillable limit price (the
+                    # bid/ask never actually crossed it) - "never
+                    # force-market a profit-take" (see above) correctly
+                    # avoids converting a stuck profit-take into an
+                    # unprotected any-price market order, but had no
+                    # give-up threshold at all, so it can wait forever
+                    # even once it's clearly not a temporary stall. Also
+                    # blocked the user's own manual sell override the
+                    # whole time (see _manual_sell's "exit already
+                    # pending" skip). By request: "it should be sold,
+                    # maybe lower than the margin" - once
+                    # should_force_market_exit's SAME threshold used for
+                    # genuine stop-losses trips (consecutive_exit_
+                    # failures, incremented once per escalation - see
+                    # escalate_stalled_stop_losses), fall back to the
+                    # current bid: still a real, currently-executable
+                    # price (not a blind market order that could print
+                    # far worse on a thin/illiquid name), just no longer
+                    # gated on clearing the profit target.
+                    if (
+                        not is_short_position
+                        and self.should_force_market_exit(
+                            symbol, exit_is_fractional, core_session_active
+                        )
+                    ):
+                        bid = self.api.quote_bid(quote)
+                        if bid:
+                            limit_price = bid
                     if force_market:
                         log.warning(
                             "ORDER  | %s | never filled %s times in a row - "
