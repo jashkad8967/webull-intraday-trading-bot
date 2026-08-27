@@ -10856,5 +10856,76 @@ class ProgressiveUniverseLoadingTests(unittest.TestCase):
         self.assertEqual(set(fake_bot.stock_symbols), set(all_symbols[:3]))
 
 
+class WorkingOrdersConcurrencyTests(unittest.TestCase):
+    """By request: "held positions should be checked every 0.25s
+    separately, the rest of the scan can take its own time" -
+    position-protection (monitor_working_orders/the repricers/
+    escalate_stalled_stop_losses) now runs on its own background
+    thread (AutoTrader._position_protection_loop), concurrently with
+    the main thread's record_trade calls for fresh entries. Both sides
+    touch self.working_orders - this is a real regression test (two
+    actual OS threads hammering the real record_trade/_rekey_working_
+    order module-level functions against a real threading.Lock), not
+    just a single-threaded unit test, since the whole point of this
+    change is concurrent-safety that a single-threaded test can't
+    exercise.
+    """
+
+    def test_concurrent_record_trade_and_rekey_never_corrupt_or_crash(self):
+        import threading as _threading
+
+        from webull_bot.bot import AutoTrader, _rekey_working_order
+
+        fake_bot = SimpleNamespace(
+            working_orders={},
+            working_orders_lock=_threading.Lock(),
+            last_trade={},
+            submitted_order_ids_today=set(),
+            last_exit_at={},
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
+            last_capital_deployed_at=0.0,
+            trade_times=defaultdict(deque),
+            consecutive_exit_failures=defaultdict(int),
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+        errors: list[Exception] = []
+
+        def writer_thread(n):
+            try:
+                for i in range(200):
+                    order_id = f"writer{n}-{i}"
+                    record_trade(f"STOCK:SYM{n}", order_id, "BUY", quantity=1)
+            except Exception as exc:  # pragma: no cover - test failure path
+                errors.append(exc)
+
+        def rekey_thread(n):
+            try:
+                for i in range(200):
+                    old_id = f"writer{n}-{i}"
+                    new_id = f"rekey{n}-{i}"
+                    _rekey_working_order(
+                        fake_bot, old_id, new_id, {"key": f"STOCK:SYM{n}"}
+                    )
+            except Exception as exc:  # pragma: no cover - test failure path
+                errors.append(exc)
+
+        threads = []
+        for n in range(4):
+            threads.append(_threading.Thread(target=writer_thread, args=(n,)))
+            threads.append(_threading.Thread(target=rekey_thread, args=(n,)))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        # No thread hung (all joined within the timeout).
+        self.assertTrue(all(not t.is_alive() for t in threads))
+
+
 if __name__ == "__main__":
     unittest.main()
