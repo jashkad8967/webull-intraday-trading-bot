@@ -3529,10 +3529,6 @@ class AutoTrader:
                     # affects the real gate or submits anything itself.
                     for reason, ok in (
                         (
-                            "scalp - symbol regime is trending, not ranging",
-                            self.strategy.symbol_regime(symbol) != "TRENDING",
-                        ),
-                        (
                             "scalp - still in post-stop-loss cooldown",
                             self.post_stop_reentry_ready(symbol),
                         ),
@@ -3670,19 +3666,22 @@ class AutoTrader:
                     # "orders can be made as frequently as possible
                     # without a cooldown") still gate timing.
                     and not regime_gate_active
-                    # By request: "regime-dependent" strategy switching.
-                    # This dip-buy path IS the mean-reversion engine -
-                    # it only fresh-enters a symbol currently ranging/
-                    # choppy (or UNKNOWN, insufficient history - fails
-                    # open, not closed). A "buy the dip" thesis into a
-                    # symbol that's actually trending is buying into
-                    # continuation, not a bounce - the general EMA-
-                    # crossover (momentum) path handles trending symbols
-                    # instead. Averaging down on an already-open
-                    # position is unaffected (see the separate `quantity
-                    # > 0` block below) - closing out an existing
-                    # commitment isn't a fresh regime decision.
-                    and self.strategy.symbol_regime(symbol) != "TRENDING"
+                    # Deliberately does NOT check symbol_regime here (a
+                    # Kaufman-Efficiency-Ratio "trending vs ranging" gate
+                    # exists and IS applied to the general momentum path
+                    # below) - live evidence, and a bug, not just a
+                    # design choice: it produced zero volatility-scalp
+                    # entries for a full session. It directly contradicts
+                    # an earlier, more specific, already-documented
+                    # design decision - volatility_scalp_dip_signal's own
+                    # docstring explicitly wants to dip-buy a stock
+                    # "trending hard in one direction all day" (live
+                    # example: HOWL, up ~100% intraday) - exactly the
+                    # case a high efficiency ratio (TRENDING) describes.
+                    # This mean-reversion path's whole thesis is buying
+                    # pullbacks WITHIN a move, trending or not; only the
+                    # general EMA-crossover path actually needs to know
+                    # whether a symbol is trending.
                     # By request, after the DAIC incident (3 stop-losses
                     # in ~9 minutes on one symbol during a fast decline,
                     # erasing the day's gains): unlike every other loss-
