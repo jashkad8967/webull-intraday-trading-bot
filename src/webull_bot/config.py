@@ -55,6 +55,30 @@ class Settings(BaseSettings):
         default=180, ge=30, le=3600
     )
     stock_batch_size: int = Field(default=100, ge=1, le=300)
+    # By request: "scan through all [the universe], split it up in
+    # parallel streams... as many as needed to scan everything and
+    # filter it down, then dynamically less as it is filtered down...
+    # does not need to be as intense in extended hours." A single
+    # trade_stocks cycle previously fetched exactly one STOCK_BATCH_SIZE
+    # (100, Webull's own hard per-call snapshot cap) worth of quotes -
+    # at a large, still-growing universe (up to MAX_SYMBOLS), that's a
+    # small fraction of the universe covered per cycle. Fires multiple
+    # STOCK_SNAPSHOT_MAX_SYMBOLS-sized quote batches CONCURRENTLY
+    # instead (see AutoTrader.stock_scan_concurrent_batches/trade_
+    # stocks) - the batch count scales with how large the current
+    # universe is (more concurrent batches while it's still large/
+    # freshly grown, dynamically fewer as prioritized_stock_batch's own
+    # activity-based ranking naturally concentrates real candidates),
+    # bounded by stock_scan_max_concurrent_batches as a hard safety cap
+    # on real request volume (Webull's API already returned live 429
+    # TOO_MANY_REQUESTS errors this session - see _is_rate_limited).
+    stock_scan_target_full_coverage_cycles: int = Field(
+        default=20, ge=1, le=500
+    )
+    stock_scan_max_concurrent_batches: int = Field(default=8, ge=1, le=50)
+    stock_scan_extended_hours_concurrency_fraction: Decimal = Field(
+        default=Decimal("0.5"), ge=0, le=1
+    )
     stock_priority_fraction: float = Field(default=0.70, ge=0, le=0.90)
     stock_penny_fraction: float = Field(default=0.10, ge=0, le=0.50)
     penny_stock_max_price: Decimal = Field(default=Decimal("5"), gt=0)

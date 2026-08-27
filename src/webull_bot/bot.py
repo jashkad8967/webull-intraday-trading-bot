@@ -1058,25 +1058,30 @@ class AutoTrader:
 
     @staticmethod
     def cap_batch_to_snapshot_limit(
-        batch: list[str], unmanaged_held: list[str]
+        batch: list[str],
+        unmanaged_held: list[str],
+        limit: int = WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS,
     ) -> list[str]:
-        """Caps a scan batch at WebullAPI's own hard 100-symbol snapshot
-        limit, always keeping every currently-held position first (a
-        real position losing quote coverage - see the "fell out of the
-        scanned universe" GUARD warning just above this call site - is
-        the more severe failure mode) and only trimming the lower-
-        priority remainder. Without this, force-injecting the curated
-        cohort/eligible-symbol set on top of an already-full batch could
-        push the combined size past the limit, making the ENTIRE quote
-        fetch for that cycle raise and fail - losing price data for
-        every symbol in the batch, not just the extra ones.
+        """Caps a scan batch at `limit` (defaults to WebullAPI's own
+        hard 100-symbol snapshot limit for a single quote-fetch call -
+        see trade_stocks, which passes a multiple of that when firing
+        several concurrent quote batches this cycle - see
+        stock_scan_concurrent_batches), always keeping every currently-
+        held position first (a real position losing quote coverage -
+        see the "fell out of the scanned universe" GUARD warning just
+        above this call site - is the more severe failure mode) and
+        only trimming the lower-priority remainder. Without this,
+        force-injecting the curated cohort/eligible-symbol set on top
+        of an already-full batch could push the combined size past
+        what this cycle's quote fetch(es) can cover, losing price data
+        for every symbol past the limit, not just the extra ones.
         """
-        if len(batch) <= WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS:
+        if len(batch) <= limit:
             return batch
         held_set = set(unmanaged_held)
         prioritized = [symbol for symbol in batch if symbol in held_set]
         rest = [symbol for symbol in batch if symbol not in held_set]
-        room = max(0, WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS - len(prioritized))
+        room = max(0, limit - len(prioritized))
         return prioritized + rest[:room]
 
     def has_pending_buy_order(self, key: str) -> bool:
@@ -3497,13 +3502,41 @@ class AutoTrader:
             # and more so here since analyst data moves far slower than
             # VIXY. Cheap, in-memory only - see AnalystDataService.snapshot.
             self.strategy.analyst_priority = self.analyst_service.snapshot()
-        batch, self.stock_cursor = self.strategy.prioritized_stock_batch(
-            self.stock_symbols,
-            self.stock_cursor,
-            positions,
-            self.agent_assessment,
-            self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist,
+        # By request: "scan through all [the universe]... split it up
+        # in parallel streams... as many as needed to scan everything
+        # and filter it down, then dynamically less as it is filtered
+        # down... does not need to be as intense in extended hours."
+        # One rotation of prioritized_stock_batch previously covered
+        # only a single STOCK_BATCH_SIZE slice of a universe that can
+        # be much larger (up to MAX_SYMBOLS) - see
+        # stock_scan_concurrent_batches for how the rotation count
+        # scales with the universe size, dynamically fewer once it
+        # stops growing, and reduced further outside core hours.
+        # Deduped while preserving order across rotations (a symbol
+        # could legitimately repeat if the cursor wraps within one
+        # cycle on a small/shrunk universe).
+        scan_watch_symbols = (
+            self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist
         )
+        concurrent_batches = self.strategy.stock_scan_concurrent_batches(
+            len(self.stock_symbols), core_session_active
+        )
+        batch = []
+        seen_in_batch: set[str] = set()
+        for _ in range(concurrent_batches):
+            rotation, self.stock_cursor = self.strategy.prioritized_stock_batch(
+                self.stock_symbols,
+                self.stock_cursor,
+                positions,
+                self.agent_assessment,
+                scan_watch_symbols,
+            )
+            if not rotation:
+                break
+            for symbol in rotation:
+                if symbol not in seen_in_batch:
+                    seen_in_batch.add(symbol)
+                    batch.append(symbol)
         if self.priority_scan_symbols:
             # A symbol just added via the dashboard has zero accumulated
             # activity score yet, so it ranks at the very bottom of
@@ -3599,7 +3632,11 @@ class AutoTrader:
         # limit (WebullAPI.stock_quotes) - the ENTIRE quote fetch for
         # that cycle then raised and failed, losing price data for every
         # symbol in the batch, not just the extra ones.
-        batch = self.cap_batch_to_snapshot_limit(batch, unmanaged_held)
+        batch = self.cap_batch_to_snapshot_limit(
+            batch,
+            unmanaged_held,
+            limit=concurrent_batches * WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS,
+        )
         bucket_remaining = {
             bucket: buying_power * fraction
             for bucket, fraction in self.config.stock_capital_fractions().items()
@@ -3661,33 +3698,94 @@ class AutoTrader:
         grouped: dict[str, list[str]] = {"US_STOCK": [], "US_ETF": []}
         for symbol in batch:
             grouped[self.stock_categories.get(symbol, "US_STOCK")].append(symbol)
-        try:
-            for category, category_symbols in grouped.items():
-                category_quotes, category_invalid = (
-                    self.api.stock_quotes_resilient(category_symbols, category)
+        # By request: "scan through all [the universe]... split it up
+        # in parallel streams" - a large batch (now up to
+        # concurrent_batches * STOCK_SNAPSHOT_MAX_SYMBOLS symbols, see
+        # above) is chunked back down to Webull's own per-call cap and
+        # every chunk's quote fetch fires CONCURRENTLY, instead of one
+        # chunk waiting out the previous chunk's full round-trip first.
+        # A single chunk's own failure only drops that chunk's symbols
+        # (same "one group's failure shouldn't cost every other
+        # group's data" convention _batched_quotes already uses) -
+        # except MarketDataPermissionError, which is a systemic
+        # account-level problem, not a per-chunk one, and must still
+        # propagate/stop the bot exactly like before this change.
+        chunks: list[tuple[str, list[str]]] = []
+        for category, category_symbols in grouped.items():
+            for start in range(0, len(category_symbols), WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS):
+                chunk_symbols = category_symbols[
+                    start : start + WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS
+                ]
+                if chunk_symbols:
+                    chunks.append((category, chunk_symbols))
+        chunk_results: list[tuple[list[dict], set[str]] | None] = [None] * len(chunks)
+        chunk_errors: list[Exception | None] = [None] * len(chunks)
+
+        def _fetch_chunk(index: int) -> None:
+            category, chunk_symbols = chunks[index]
+            try:
+                chunk_results[index] = self.api.stock_quotes_resilient(
+                    chunk_symbols, category
                 )
-                quotes.extend(category_quotes)
-                if category_invalid:
-                    if self.config.exclude_etfs and category == "US_STOCK":
-                        invalid.update(category_invalid)
-                        continue
-                    alternate = "US_ETF" if category == "US_STOCK" else "US_STOCK"
+            except Exception as exc:
+                chunk_errors[index] = exc
+
+        if chunks:
+            with ThreadPoolExecutor(
+                max_workers=min(len(chunks), self.config.stock_scan_max_concurrent_batches)
+            ) as pool:
+                list(pool.map(_fetch_chunk, range(len(chunks))))
+        permission_error = next(
+            (exc for exc in chunk_errors if isinstance(exc, MarketDataPermissionError)),
+            None,
+        )
+        if permission_error is not None:
+            raise permission_error
+        if chunks and all(err is not None for err in chunk_errors):
+            # Every single chunk failed (not just one) - same "give up
+            # this cycle" behavior the old single-call version had on
+            # any failure, since there's no usable data at all.
+            log.error(
+                "STOCKS | quote batch failed | %s", chunk_errors[0]
+            )
+            return buying_power
+        for index, (category, _chunk_symbols) in enumerate(chunks):
+            if chunk_errors[index] is not None:
+                log.warning(
+                    "STOCKS | quote chunk failed | %s | %s",
+                    category,
+                    chunk_errors[index],
+                )
+                continue
+            category_quotes, category_invalid = chunk_results[index]
+            quotes.extend(category_quotes)
+            if category_invalid:
+                if self.config.exclude_etfs and category == "US_STOCK":
+                    invalid.update(category_invalid)
+                    continue
+                alternate = "US_ETF" if category == "US_STOCK" else "US_STOCK"
+                try:
                     alternate_quotes, alternate_invalid = (
                         self.api.stock_quotes_resilient(
                             sorted(category_invalid),
                             alternate,
                         )
                     )
-                    quotes.extend(alternate_quotes)
-                    corrected = category_invalid - alternate_invalid
-                    for symbol in corrected:
-                        self.stock_categories[symbol] = alternate
-                    invalid.update(alternate_invalid)
-        except Exception as exc:
-            if isinstance(exc, MarketDataPermissionError):
-                raise
-            log.error("STOCKS | quote batch failed | %s", exc)
-            return buying_power
+                except Exception as exc:
+                    if isinstance(exc, MarketDataPermissionError):
+                        raise
+                    log.warning(
+                        "STOCKS | alternate-category quote fetch failed | %s | %s",
+                        alternate,
+                        exc,
+                    )
+                    invalid.update(category_invalid)
+                    continue
+                quotes.extend(alternate_quotes)
+                corrected = category_invalid - alternate_invalid
+                for symbol in corrected:
+                    self.stock_categories[symbol] = alternate
+                invalid.update(alternate_invalid)
         if invalid:
             self.invalid_stock_symbols.update(invalid)
             self.invalid_symbols.add(invalid)
