@@ -359,15 +359,29 @@ class TradingStrategy:
         (which is what this used to be, recalibrated 1 -> 2 -> 3 ticks
         across earlier requests - still too slow/noisy either way):
 
-        1. Requires the two ticks immediately before now to have been a
-           REAL consecutive decline (strictly falling, not flat) - this
-           is what proves a genuine falling-knife dip actually happened,
-           not noise. Without this, "stalled" and "never was falling in
+        1. Requires a REAL net decline across the 3-sample window (the
+           earliest sample above the most recent one) - this is what
+           proves a genuine falling-knife dip actually happened, not
+           noise. Without this, "stalled" and "never was falling in
            the first place" were indistinguishable.
         2. Then fires on the very FIRST tick that is no longer lower
            than the one before it - a single-tick turn confirmation, so
            entry lands right at the reversal instead of waiting out
            several more ticks of confirmation and missing the move.
+
+        By request, after live evidence ("it is not averaging down at
+        all"): part 1 originally required EVERY intermediate step to
+        be strictly decreasing (earlier > middle > last), not just net
+        decline - live evidence over a full session showed this
+        essentially never registered a stall in real market data (one
+        flat tick or one-cent bounce anywhere in a 3-sample window
+        failed the whole check), blocking averaging down almost
+        continuously right up to a stop-loss instead of the occasional
+        genuine no-stall case it was meant for. Relaxed to net decline
+        across the window (earliest sample above the most recent one),
+        tolerating a single intermediate wobble within a real decline -
+        still requires actual net downward movement, not flat/noise-
+        only, just no longer a strict staircase.
 
         Fails OPEN (True, doesn't block) with fewer than 3 samples yet,
         same "no data -> don't block" convention as every other entry
@@ -382,11 +396,10 @@ class TradingStrategy:
         if len(samples) < 3:
             return True
         previous = Decimal(str(samples[-1]))
-        before_that = Decimal(str(samples[-2]))
         earlier_still = Decimal(str(samples[-3]))
-        if previous <= 0 or before_that <= 0 or earlier_still <= 0:
+        if previous <= 0 or earlier_still <= 0:
             return True
-        was_falling = earlier_still > before_that > previous
+        was_falling = earlier_still > previous
         if not was_falling:
             return False
         return price >= previous

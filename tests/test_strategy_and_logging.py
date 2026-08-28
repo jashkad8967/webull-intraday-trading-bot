@@ -1774,18 +1774,45 @@ class VolatilityScalpMomentumGateTests(StrategyConfigMixin, unittest.TestCase):
             )
         )
 
-    def test_entry_gate_blocks_without_a_genuine_prior_decline(self):
-        """By request: momentum must have actually been negative
-        (consecutive downticks) before the turn counts - a flat lead-
-        in followed by an uptick is not "the rise starting after a
-        dip," it's just noise, even though the current tick alone
-        isn't declining.
+    def test_entry_gate_blocks_without_any_net_decline(self):
+        """By request: momentum must have actually shown a real net
+        decline before the turn counts - flat/rising prices with no
+        real dip is not "the rise starting after a dip," it's just
+        noise, even though the current tick alone isn't declining.
+
+        Recalibrated by request, after live evidence ("it is not
+        averaging down at all"): this used to require EVERY
+        intermediate step to be strictly decreasing, so a flat lead-in
+        tick (10, 10, 9.9) blocked here too - live evidence showed that
+        was too strict for real market data (one flat/noise tick
+        anywhere in the window failed the whole check almost
+        continuously). Now only a genuine net decline is required
+        (tolerating an intermediate wobble within a real decline), so
+        this test uses a window with NO net decline at all (10, 10,
+        10.1) to still exercise the "no real dip happened" block.
         """
         strategy = TradingStrategy(self.config())
-        self._feed(strategy, "FLATLEAD", [10, 10, 9.9])
+        self._feed(strategy, "FLATLEAD", [10, 10, 10.1])
         self.assertFalse(
             strategy.volatility_scalp_momentum_stalled_or_rising(
-                "FLATLEAD", Decimal("9.95")
+                "FLATLEAD", Decimal("10.2")
+            )
+        )
+
+    def test_entry_gate_allows_a_decline_with_one_intermediate_wobble(self):
+        """By request, after live evidence ("it is not averaging down
+        at all"): a single flat/up tick within an otherwise real
+        decline must not fail the whole "was this a genuine dip" check
+        anymore - net decline across the window is what matters, not a
+        strict staircase every single step.
+        """
+        strategy = TradingStrategy(self.config())
+        # 10 -> 9.95 (up-wobble) -> 9.8: net decline (10 -> 9.8) despite
+        # the middle tick not being lower than the first.
+        self._feed(strategy, "WOBBLE", [10, 9.95, 9.8])
+        self.assertTrue(
+            strategy.volatility_scalp_momentum_stalled_or_rising(
+                "WOBBLE", Decimal("9.85")
             )
         )
 
