@@ -615,8 +615,22 @@ class Settings(BaseSettings):
     # buy) to this fraction of account value - averaging is still
     # allowed up to VOLATILITY_SCALP_MAX_AVERAGING_BUYS, but never to
     # the point of concentrating most of the account in one name.
+    #
+    # By request, after live evidence ("even it is supposed to avg down
+    # it is not executing it"): this check runs AFTER the real
+    # averaging-down gate (which has its own AVGDOWN diagnostic) and
+    # was silently zeroing the buy quantity with no logging at all - a
+    # candidate could clear every gate condition and still never place
+    # an order. The 35% default was calibrated for the OLD 5-buy
+    # ladder (roughly 5 buys * ~7% of account value each); raising
+    # volatility_scalp_max_averaging_buys to 10 without widening this
+    # too meant a deep, real decline could hit THIS cap well before
+    # exhausting the new averaging capacity, silently undoing that
+    # fix. Raised 35% -> 50% - still meaningfully below the whole-
+    # cohort ceiling just below (60%), so one symbol still can't
+    # consume the entire cohort's exposure allowance alone.
     volatility_scalp_max_position_fraction: Decimal = Field(
-        default=Decimal("0.35"), gt=0, le=1
+        default=Decimal("0.50"), gt=0, le=1
     )
     # Per-symbol caps alone don't bound worst case: with up to
     # VOLATILITY_SCALP_MAX_CONCURRENT_POSITIONS symbols each individually
