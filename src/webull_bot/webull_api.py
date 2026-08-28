@@ -2,6 +2,7 @@ import logging
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from uuid import uuid4
@@ -662,20 +663,49 @@ class WebullAPI:
         from webull.data.common.category import Category
         from webull.data.common.timespan import Timespan
 
-        results: dict[str, float] = {}
         unique = list(dict.fromkeys(symbol.upper() for symbol in symbols))
         count = str(max(days + 1, 6))
-        for start in range(0, len(unique), 20):
-            batch = unique[start : start + 20]
-            page = self._history_bars_resilient(
-                batch,
-                Category.US_STOCK.name,
-                Timespan.D.name,
-                count,
-            )
+        results: dict[str, float] = {}
+        for page in self._history_bars_chunks_concurrently(
+            unique, Category.US_STOCK.name, Timespan.D.name, count
+        ):
             for symbol, amplitude in self._parse_amplitudes(page, days).items():
                 results[symbol] = amplitude
         return results
+
+    def _history_bars_chunks_concurrently(
+        self, unique_symbols: list[str], category: str, timespan: str, count: str
+    ) -> list[list]:
+        """Chunks unique_symbols into 20-symbol pages and fetches them
+        all CONCURRENTLY instead of one at a time - by request: "use
+        more concurrent streams for other tasks as well as needed."
+        Shared by historical_volatility/sma_trend/recent_minute_closes,
+        all of which previously ran this exact chunk loop sequentially
+        - for a large batch (sma_trend covers the WHOLE universe once
+        daily, up to MAX_SYMBOLS), that was 50-250+ sequential network
+        round-trips. _history_bars_resilient already fully catches its
+        own exceptions per chunk (never raises - falls back to []), so
+        firing chunks concurrently is safe: one chunk's failure only
+        drops that chunk's symbols, same as running them sequentially.
+        Bounded worker count (not unbounded), same real-request-volume
+        reasoning as trade_stocks' own concurrent scan dispatch.
+        """
+        chunks = [
+            unique_symbols[start : start + 20]
+            for start in range(0, len(unique_symbols), 20)
+        ]
+        if not chunks:
+            return []
+        pages: list[list] = [[] for _ in chunks]
+
+        def _fetch_chunk(index: int) -> None:
+            pages[index] = self._history_bars_resilient(
+                chunks[index], category, timespan, count
+            )
+
+        with ThreadPoolExecutor(max_workers=min(len(chunks), 8)) as pool:
+            list(pool.map(_fetch_chunk, range(len(chunks))))
+        return pages
 
     def _history_bars_resilient(
         self,
@@ -783,14 +813,9 @@ class WebullAPI:
         results: dict[str, float] = {}
         unique = list(dict.fromkeys(symbol.upper() for symbol in symbols))
         count = str(max(days, 6))
-        for start in range(0, len(unique), 20):
-            batch = unique[start : start + 20]
-            page = self._history_bars_resilient(
-                batch,
-                Category.US_STOCK.name,
-                Timespan.D.name,
-                count,
-            )
+        for page in self._history_bars_chunks_concurrently(
+            unique, Category.US_STOCK.name, Timespan.D.name, count
+        ):
             for symbol, sma in self._parse_closes(page, days).items():
                 results[symbol] = sma
         return results
@@ -830,14 +855,10 @@ class WebullAPI:
 
         results: dict[str, list[float]] = {}
         unique = list(dict.fromkeys(symbol.upper() for symbol in symbols))
-        for start in range(0, len(unique), 20):
-            batch = unique[start : start + 20]
-            page = self._history_bars_resilient(
-                batch,
-                category,
-                Timespan.M1.name,
-                str(count),
-            )
+        pages = self._history_bars_chunks_concurrently(
+            unique, category, Timespan.M1.name, str(count)
+        )
+        for page in pages:
             for entry in page or []:
                 if not isinstance(entry, dict):
                     continue

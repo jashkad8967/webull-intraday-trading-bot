@@ -535,8 +535,26 @@ class Settings(BaseSettings):
     # backstop this independently - raising the slot count lets sizing
     # actually reach those existing caps instead of stopping short of
     # them for lack of an open slot.
+    #
+    # By request, urgent, after live evidence: "it has sold twice for
+    # heavy losses without averaging down." Traced the exact numbers -
+    # FNGR (a sub-$1 stock, forced into Webull's 100-share minimum lot
+    # regardless of account size, ~$45 notional at its price) needed
+    # to average down with only $47.80 remaining buying power (5
+    # concurrent scalp positions already open, spreading an ~$187
+    # account thin). That single forced-minimum buy alone would have
+    # consumed 94% of what was left, blowing straight past the 12%
+    # per-symbol risk budget - averaging_down_capacity correctly
+    # computed ZERO room before any averaging could even start, not
+    # because of a broken cap, but because too many concurrent
+    # positions had already spread the account's real capital too
+    # thin to defend any single one of them. Lowered 8 -> 3 - fewer
+    # concurrent slots means genuinely more capital stays available
+    # behind each open position, so a forced-minimum-lot averaging buy
+    # on a low-priced stock doesn't immediately exhaust the risk
+    # budget the moment it's needed.
     volatility_scalp_max_concurrent_positions: int = Field(
-        default=8, ge=1, le=20
+        default=3, ge=1, le=20
     )
     # By request: "if they dip a lot after you buy, average it out with
     # another buy" - caps how many additional buys a single held cohort
