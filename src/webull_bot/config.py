@@ -545,7 +545,20 @@ class Settings(BaseSettings):
     # fixed lot size, instead of an unbounded chase. 0 disables
     # averaging entirely. Raised 3 -> 5 by request - "not averaging
     # down enough."
-    volatility_scalp_max_averaging_buys: int = Field(default=5, ge=0, le=10)
+    #
+    # By request, after urgent live evidence ("it is still not
+    # averaging down properly, make sure it tries to average down
+    # before the stop loss"): live AVGDOWN diagnostic showed FNGR
+    # blocked on "averaging cap reached" for 6+ minutes straight before
+    # its stop-loss fired - averaging_down_capacity's own account-risk-
+    # derived ceiling (see volatility_scalp_max_symbol_risk_fraction)
+    # came out well above 5 for this account's actual buying power at
+    # the time, confirming the CONFIGURED "5" itself, not real risk
+    # capacity, was the binding constraint. Raised 5 -> 10 (the field's
+    # own max) - averaging_down_capacity's risk-based cap (still fully
+    # in effect, unchanged) remains the real backstop on worst-case
+    # exposure regardless of this ceiling.
+    volatility_scalp_max_averaging_buys: int = Field(default=10, ge=0, le=10)
     # Research finding (compared against freqtrade's documented DCA
     # pattern after "basically only taking losses" was reported live):
     # a mature DCA implementation never fully suppresses the stop-loss
