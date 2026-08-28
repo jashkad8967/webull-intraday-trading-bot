@@ -551,14 +551,26 @@ class Settings(BaseSettings):
     # a mature DCA implementation never fully suppresses the stop-loss
     # during averaging - it keeps a wide-but-always-active hard stop
     # live from entry as a catastrophic-loss backstop distinct from the
-    # per-level re-buy logic. Sized to comfortably not interfere with
-    # the DCA ladder (5 levels * 0.2%/level covers roughly 1% of
-    # adverse movement) while still capping true worst-case loss - a
-    # drop beyond this means a real breakdown, not a normal dip, and
-    # the actual stop-loss is let through instead of staying suppressed
-    # until every averaging attempt is exhausted.
+    # per-level re-buy logic. A drop beyond this means a real
+    # breakdown, not a normal dip, and the actual stop-loss is let
+    # through instead of staying suppressed until every averaging
+    # attempt is exhausted.
+    #
+    # By request, after live evidence ("way too chill with stop loss
+    # right now instead of averaging down first"): the DCA ladder's
+    # per-level required drop (volatility_scalp_dip_entry_percent *
+    # (1 + averaging_step_multiplier * level) - 1%, 1.5%, 2%, 2.5%, 3%
+    # across the 5 default levels, each measured against the average
+    # cost AFTER the prior add) barely fit inside the original 5%
+    # backstop - by the time a fast decline reached the later levels'
+    # required drop, the cumulative real move from the ORIGINAL entry
+    # price could already exceed 5%, hitting the backstop before more
+    # than 1-2 levels ever got a real chance to fire. Raised 5% -> 8%
+    # to give the whole ladder genuine room to operate across a fast
+    # decline, not just the first level or two, while still keeping a
+    # real catastrophic-loss backstop rather than removing it.
     volatility_scalp_hard_stop_percent: Decimal = Field(
-        default=Decimal("0.05"), gt=0, le=1
+        default=Decimal("0.08"), gt=0, le=1
     )
     # By request: bound worst-case per-symbol exposure from averaging
     # down. Research finding acted on directly: "doubling down three
