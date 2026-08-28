@@ -784,6 +784,26 @@ class Settings(BaseSettings):
         ge=1,
         le=10,
     )
+    # By request: "we do not want intense play in extended hours, but
+    # we want play for sure." Live evidence: over a ~7.5 hour pre-
+    # market stretch, "spread too wide to scalp profitably" (entry_
+    # spread_ok, the GENERAL momentum path's entry gate - despite the
+    # "scalp" wording in that decision reason string, it has nothing
+    # to do with the separate volatility-scalp cohort, which is
+    # already fully blocked outside core hours by its own hard gate)
+    # rejected candidates roughly 2-3x more than every other reason
+    # combined - STOCK_ENTRY_MAX_SPREAD_PERCENT's tight 0.5% default
+    # is realistic for core hours' real liquidity, but genuinely hard
+    # for almost anything to clear before real two-sided volume shows
+    # up pre-market. Modestly loosens (not fully opens) the spread bar
+    # outside core hours only - the existing "only established/
+    # popular symbols trade outside core hours" bucket restriction
+    # already keeps this to established names, not a free-for-all.
+    extended_hours_spread_multiplier: Decimal = Field(
+        default=Decimal("3"),
+        ge=1,
+        le=10,
+    )
     option_take_profit_percent: Decimal = Field(default=Decimal("0.75"), gt=0)
     option_stop_loss_percent: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
     # Forced exit once a held contract is this many days or fewer from

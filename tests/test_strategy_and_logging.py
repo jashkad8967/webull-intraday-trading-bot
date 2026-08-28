@@ -74,6 +74,7 @@ class StrategyConfigMixin:
             short_selling_enabled=False,
             opening_grace_spread_multiplier=Decimal("2"),
             opening_grace_extension_multiplier=Decimal("2"),
+            extended_hours_spread_multiplier=Decimal("3"),
             option_take_profit_percent=Decimal("0.75"),
             option_stop_loss_percent=Decimal("0.50"),
             option_min_hold_dte=2,
@@ -2516,6 +2517,48 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         self.assertFalse(strategy.entry_spread_ok(key))
         self.assertTrue(
             strategy.entry_spread_ok(key, False, Decimal("2"))
+        )
+
+    def test_extended_hours_widens_spread_gate(self):
+        """By request: "we do not want intense play in extended hours,
+        but we want play for sure" - live evidence: "spread too wide
+        to scalp profitably" rejected candidates ~2-3x more than every
+        other reason combined over a multi-hour pre-market stretch,
+        since the tight core-hours 0.15% (test config)/0.5% (real
+        default) threshold is realistic for real liquidity but hard to
+        clear pre-market. core_session_active=False widens it via
+        extended_hours_spread_multiplier, same "max with whatever else
+        is active" convention as opening_grace/idle-cash relaxation.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["WIDE"] = {"spread_percent": 0.40}
+        key = "STOCK:WIDE"
+        # 0.40 clears neither the bare 0.15 threshold nor core-hours
+        # defaults (idle multiplier 1) - but 0.15*3=0.45 does, once
+        # outside core hours.
+        self.assertFalse(strategy.entry_spread_ok(key))
+        self.assertFalse(strategy.entry_spread_ok(key, core_session_active=True))
+        self.assertTrue(strategy.entry_spread_ok(key, core_session_active=False))
+
+    def test_extended_hours_multiplier_does_not_apply_during_core_hours(self):
+        strategy = TradingStrategy(self.config())
+        # 0.60 clears NEITHER the bare threshold (0.15) NOR the
+        # extended-hours-widened one (0.15*3=0.45) - core_session_
+        # active=True must not accidentally apply the wider bound.
+        strategy.metrics["VERYWIDE"] = {"spread_percent": 0.60}
+        key = "STOCK:VERYWIDE"
+        self.assertFalse(strategy.entry_spread_ok(key, core_session_active=True))
+
+    def test_extended_hours_and_idle_cash_relaxation_take_the_larger_multiplier(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["WIDE"] = {"spread_percent": 0.40}
+        key = "STOCK:WIDE"
+        # extended_hours_spread_multiplier=3 alone already covers 0.40
+        # (0.15*3=0.45) - a smaller idle multiplier shouldn't override it.
+        self.assertTrue(
+            strategy.entry_spread_ok(
+                key, False, Decimal("1.1"), core_session_active=False
+            )
         )
 
     def test_idle_cash_relaxation_and_opening_grace_take_the_larger_multiplier(self):

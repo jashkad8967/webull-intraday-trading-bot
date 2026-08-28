@@ -3981,6 +3981,7 @@ class AutoTrader:
                     idle_relaxation_multiplier,
                     idle_relaxation_amount,
                     seconds_since_entry,
+                    core_session_active,
                 )
                 # Condensed onto eligibility alone (any symbol currently
                 # volatile enough to qualify - see is_volatility_scalp_
