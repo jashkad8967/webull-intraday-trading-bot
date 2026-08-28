@@ -1164,6 +1164,71 @@ class FreshEntryBlackoutActiveTests(unittest.TestCase):
         )
 
 
+class DiversificationCappedEntryBudgetTests(unittest.TestCase):
+    """diversification_capped_entry_budget - by request: "out of 7500
+    stocks it should easily be able to find enough stocks to invest
+    everything." Live evidence: a single FDX entry consumed ~43% of
+    the whole account's buying power in one trade - the fraction cap
+    fixes that, but live evidence ALSO showed the fraction alone can
+    fall under fractional_shares_min_notional on a small remaining
+    balance (buying_power=$45, 15% = $6.75 < $25 min), which would
+    have stranded capital instead of deploying it - "100% of buying
+    power should be used." The floor fixes that second issue.
+    """
+
+    def test_normal_case_uses_the_fraction(self):
+        from webull_bot.bot import AutoTrader
+
+        budget = AutoTrader.diversification_capped_entry_budget(
+            Decimal("200"), Decimal("0.15"), Decimal("25")
+        )
+        self.assertEqual(budget, Decimal("30"))
+
+    def test_matches_the_live_fdx_incident_shape(self):
+        """A ~$186 account with a 15% cap should never again let one
+        entry claim anywhere near $80 the way the live FDX buy did.
+        """
+        from webull_bot.bot import AutoTrader
+
+        budget = AutoTrader.diversification_capped_entry_budget(
+            Decimal("186"), Decimal("0.15"), Decimal("25")
+        )
+        self.assertLess(budget, Decimal("30"))
+
+    def test_floor_kicks_in_when_the_fraction_falls_under_the_minimum(self):
+        """Live evidence: buying_power=$45, 15% = $6.75, well under
+        the $25 fractional minimum - the fraction alone would zero out
+        every further entry for the rest of the day instead of using
+        the remaining capital.
+        """
+        from webull_bot.bot import AutoTrader
+
+        budget = AutoTrader.diversification_capped_entry_budget(
+            Decimal("45"), Decimal("0.15"), Decimal("25")
+        )
+        self.assertEqual(budget, Decimal("25"))
+
+    def test_floor_never_exceeds_what_is_actually_left(self):
+        """A tiny remaining balance (below the floor itself) must
+        still be usable up to everything that's left, not just
+        zeroed out because it can't reach the full floor either.
+        """
+        from webull_bot.bot import AutoTrader
+
+        budget = AutoTrader.diversification_capped_entry_budget(
+            Decimal("10"), Decimal("0.15"), Decimal("25")
+        )
+        self.assertEqual(budget, Decimal("10"))
+
+    def test_zero_buying_power_is_safe(self):
+        from webull_bot.bot import AutoTrader
+
+        budget = AutoTrader.diversification_capped_entry_budget(
+            Decimal("0"), Decimal("0.15"), Decimal("25")
+        )
+        self.assertEqual(budget, Decimal("0"))
+
+
 class RefreshPremarketGainersTests(unittest.TestCase):
     """refresh_premarket_gainers - by request: "get the top gainers
     before the day starts and look to invest in that for quick
