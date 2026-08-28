@@ -72,8 +72,21 @@ class Settings(BaseSettings):
     # bounded by stock_scan_max_concurrent_batches as a hard safety cap
     # on real request volume (Webull's API already returned live 429
     # TOO_MANY_REQUESTS errors this session - see _is_rate_limited).
+    # By request, after live evidence: at the original default (20),
+    # concurrent batching only kicks in past batch_size*20=2000
+    # symbols - with a live universe still growing toward MAX_SYMBOLS
+    # (5000) and sitting at ~1846 for a long stretch along the way,
+    # this meant scanning stayed at a single 100-symbol batch per
+    # cycle the whole time, not the "more candidates, more trades more
+    # frequently" a genuinely concurrent multi-batch scan should
+    # deliver. Lowered to 5 - concurrency now starts mattering at
+    # batch_size*5=500 symbols (already active almost immediately
+    # after the fast initial universe load) and scales up faster as
+    # the universe grows, while stock_scan_max_concurrent_batches (8)
+    # and the 429-retry logic (_retry_once_on_rate_limit) still bound
+    # the real request-volume risk.
     stock_scan_target_full_coverage_cycles: int = Field(
-        default=20, ge=1, le=500
+        default=5, ge=1, le=500
     )
     stock_scan_max_concurrent_batches: int = Field(default=8, ge=1, le=50)
     stock_scan_extended_hours_concurrency_fraction: Decimal = Field(
