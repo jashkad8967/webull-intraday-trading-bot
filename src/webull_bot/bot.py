@@ -4620,10 +4620,25 @@ class AutoTrader:
                         buying_power=buying_power,
                         intensity=volatility_scalp_intensity,
                     )
+                    # By request: "even it is supposed to avg down it is
+                    # not executing it" - the real averaging-down GATE
+                    # (immediately above) has its own AVGDOWN diagnostic,
+                    # but once the gate passes, THESE three checks can
+                    # still silently zero the quantity out with no
+                    # logging at all - a candidate could clear every
+                    # AVGDOWN condition and still never actually place an
+                    # order, invisibly. Logged here (not affecting the
+                    # real zeroing logic itself) so a silent-execution-
+                    # failure complaint can be diagnosed with real
+                    # evidence instead of guesswork, same reasoning as
+                    # the AVGDOWN diagnostic itself.
                     if average_down_quantity > 0 and price * Decimal(
                         average_down_quantity
                     ) * Decimal("1.03") > buying_power:
                         average_down_quantity = 0
+                        self.avgdown_gate_rejections[
+                            "scalp avgdown - sized qty not affordable"
+                        ] += 1
                     if (
                         average_down_quantity > 0
                         and not self.volatility_scalp_position_value_ok(
@@ -4631,6 +4646,10 @@ class AutoTrader:
                         )
                     ):
                         average_down_quantity = 0
+                        self.avgdown_gate_rejections[
+                            "scalp avgdown - would exceed per-symbol "
+                            "position value cap"
+                        ] += 1
                     if (
                         average_down_quantity > 0
                         and not self.volatility_scalp_total_exposure_ok(
@@ -4638,6 +4657,10 @@ class AutoTrader:
                         )
                     ):
                         average_down_quantity = 0
+                        self.avgdown_gate_rejections[
+                            "scalp avgdown - would exceed whole-cohort "
+                            "exposure cap"
+                        ] += 1
                     if average_down_quantity > 0:
                         order_id = self.place_stock_scaled(
                             symbol,
@@ -4676,6 +4699,16 @@ class AutoTrader:
                                 price,
                                 self.volatility_scalp_average_down_count[symbol],
                             )
+                        else:
+                            # place_stock_scaled returns None silently
+                            # (price-sanity cooldown or a fat-finger
+                            # check) - same "even it is supposed to avg
+                            # down it is not executing it" visibility
+                            # gap as the three checks above.
+                            self.avgdown_gate_rejections[
+                                "scalp avgdown - order placement declined "
+                                "(price-sanity check)"
+                            ] += 1
                 if decision.action == "BUY" and quantity == 0:
                     if symbol in self.entry_restricted_symbols:
                         continue
