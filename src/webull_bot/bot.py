@@ -403,6 +403,10 @@ class AutoTrader:
         self.last_day_end_log_date = None
         self.seed_popular_symbols: set[str] = set()
         self.agent_popular_symbols: set[str] = set()
+        # See refresh_premarket_gainers - today's rank_type="PRE_MARKET"
+        # screener results, refreshed once/day.
+        self.premarket_gainers: set[str] = set()
+        self.premarket_gainers_date = None
         self.market_pulse_cache: dict[str, list[dict]] = {
             "gainers": [],
             "losers": [],
@@ -624,6 +628,23 @@ class AutoTrader:
             log.warning("LOAD   | top-gainers screener failed this cycle | %s", exc)
             return {}
 
+    def safe_premarket_gainers(self, limit: int, page_size: int) -> dict[str, dict]:
+        """Same screener as safe_top_gainers, but Webull's own
+        rank_type="PRE_MARKET" (today's biggest movers in the
+        pre-market session specifically) instead of the default
+        DAY_1/regular-session ranking safe_top_gainers already feeds
+        into the daily universe rebuild - see refresh_premarket_
+        gainers. A screener hiccup here must never crash the trading
+        loop either.
+        """
+        try:
+            return self.api.top_gainers(limit, page_size, rank_type="PRE_MARKET")
+        except Exception as exc:
+            log.warning(
+                "LOAD   | pre-market gainers screener failed | %s", exc
+            )
+            return {}
+
     def safe_top_losers(self, limit: int, page_size: int) -> dict[str, dict]:
         try:
             return self.api.top_losers(limit, page_size)
@@ -689,6 +710,59 @@ class AutoTrader:
         self.strategy.most_active_symbols = {
             str(symbol).upper() for symbol in most_active
         }
+
+    def refresh_premarket_gainers(self, moment: datetime) -> None:
+        """By request: "get the top gainers before the day starts and
+        look to invest in that for quick profit." Distinct from
+        safe_top_gainers (Webull's default DAY_1/regular-session
+        ranking, already folded anonymously into the once-daily full
+        universe download) - this uses Webull's own rank_type=
+        "PRE_MARKET" screener, fetched once per day as early as this
+        method gets called (well before market_open in practice, since
+        run() calls it before its own market_open gate below), so
+        today's actual pre-market movers get a head start instead of
+        competing for attention with the other several thousand
+        symbols in the general scan rotation.
+
+        Feeds seed_popular_symbols (POPULAR-bucket eligible, so these
+        can trade in extended hours too - see the "only established/
+        popular symbols trade outside core hours" gate in trade_
+        stocks) and gets merged into stock_symbols/stock_categories
+        directly (a symbol might not already be in the fast initial
+        universe load) so trade_stocks' own force_scan mechanism
+        (already used for the volatility-scalp cohort) can pick it up
+        below.
+        """
+        if self.premarket_gainers_date == moment.date():
+            return
+        if self.config.premarket_gainers_limit <= 0:
+            self.premarket_gainers_date = moment.date()
+            return
+        gainers = self.safe_premarket_gainers(
+            self.config.premarket_gainers_limit,
+            self.config.stock_universe_page_size,
+        )
+        self.premarket_gainers_date = moment.date()
+        if not gainers:
+            return
+        self.premarket_gainers = {str(symbol).upper() for symbol in gainers}
+        self.seed_popular_symbols |= self.premarket_gainers
+        new_to_universe = [
+            symbol
+            for symbol in self.premarket_gainers
+            if symbol not in self.stock_categories
+        ]
+        for symbol in new_to_universe:
+            self.stock_categories[symbol] = "US_STOCK"
+        if new_to_universe:
+            self.stock_symbols = self.stock_symbols + new_to_universe
+        log.info(
+            "LOAD   | pre-market gainers | %s symbols (%s new to the "
+            "universe) | %s",
+            len(self.premarket_gainers),
+            len(new_to_universe),
+            ",".join(sorted(self.premarket_gainers)[:10]),
+        )
 
     def resolve_targets(self, moment: datetime) -> None:
         """Kicks off the once-daily universe/VOLFILT/SMA refresh on a
@@ -1357,6 +1431,29 @@ class AutoTrader:
             symbol,
             symbol,
             exc,
+        )
+
+    @staticmethod
+    def fresh_entry_blackout_active(
+        minutes_until_close: float,
+        blackout_minutes: float,
+        core_session_active: bool,
+    ) -> bool:
+        """By request, after live evidence (WNW/WKHS stopping out
+        shortly after core hours ended): true once fewer than
+        blackout_minutes remain in the core session - blocks FRESH
+        entries only (not averaging down, not any exit), since a
+        brand-new position opened this close to the bell has almost no
+        runway to reach its target before conditions change. Always
+        False once core_session_active is already False - the existing
+        "only established/popular symbols trade outside core hours"
+        gate already covers that case, and a negative minutes_until_
+        close (core hours already ended) shouldn't itself trigger this
+        for a symbol that gate already lets through.
+        """
+        return (
+            core_session_active
+            and 0 <= minutes_until_close < blackout_minutes
         )
 
     @staticmethod
@@ -3503,6 +3600,29 @@ class AutoTrader:
             self.config.idle_cash_max_gate_multiplier - Decimal("1")
         )
         idle_relaxation_amount = ramp_progress * self.config.idle_cash_max_tick_relaxation
+        # By request, after live evidence (WNW/WKHS stopping out
+        # shortly after core hours ended): block FRESH entries only
+        # (not averaging down, not any exit) once fewer than
+        # stock_entry_blackout_minutes_before_close minutes remain in
+        # the core session - see the general BUY/SHORT and volatility-
+        # scalp fresh-entry gates below. Computed once per cycle, not
+        # per symbol - a market-wide clock read, not a per-symbol one,
+        # same convention as regime_gate_active above. Irrelevant (and
+        # harmless) whenever core_session_active is already False -
+        # the existing "only established/popular symbols trade outside
+        # core hours" gate already covers that case.
+        moment = self.now()
+        option_close_moment = self.session_moment(
+            moment, self.config.option_market_close_time
+        )
+        minutes_until_close = (
+            option_close_moment - moment
+        ).total_seconds() / 60
+        fresh_entry_blackout_active = self.fresh_entry_blackout_active(
+            minutes_until_close,
+            float(self.config.stock_entry_blackout_minutes_before_close),
+            core_session_active,
+        )
         self.refresh_agent_discoveries()
         if self.analyst_service is not None:
             # One cycle stale relative to any fetch a symbol's own
@@ -3563,7 +3683,17 @@ class AutoTrader:
             if injected:
                 batch = list(batch) + injected
             self.priority_scan_symbols.clear()
-        force_scan = self.volatility_scalp_symbols | self.volatility_scalp_recently_eligible
+        # premarket_gainers included here too - by request, "get the
+        # top gainers before the day starts and look to invest in that
+        # for quick profit" - today's actual pre-market movers get
+        # scanned every cycle instead of only via prioritized_stock_
+        # batch's normal ranking, same reasoning as the volatility-
+        # scalp cohort just below.
+        force_scan = (
+            self.volatility_scalp_symbols
+            | self.volatility_scalp_recently_eligible
+            | self.premarket_gainers
+        )
         if force_scan:
             # Left to prioritized_stock_batch's normal ranking, any one
             # of these might only get re-evaluated once every several
@@ -3981,6 +4111,10 @@ class AutoTrader:
                     # affects the real gate or submits anything itself.
                     for reason, ok in (
                         (
+                            "scalp - core session closing soon",
+                            not fresh_entry_blackout_active,
+                        ),
+                        (
                             "scalp - still in post-stop-loss cooldown",
                             self.post_stop_reentry_ready(symbol),
                         ),
@@ -4052,6 +4186,15 @@ class AutoTrader:
                     # earlier session) are completely unaffected - only
                     # fresh entries are blocked here.
                     and core_session_active
+                    # By request, after live evidence (WNW/WKHS stopping
+                    # out shortly after core hours ended): a fresh entry
+                    # this close to the bell has almost no runway to
+                    # reach its target before conditions change - see
+                    # fresh_entry_blackout_active above. Averaging down
+                    # on an already-open position is unaffected (a
+                    # separate, later gate) - this only blocks a BRAND
+                    # NEW commitment.
+                    and not fresh_entry_blackout_active
                     # Condensed onto eligibility alone (any symbol
                     # currently volatile enough to qualify), not the
                     # narrower curated self.volatility_scalp_symbols
@@ -4555,6 +4698,12 @@ class AutoTrader:
                             "symbols trade outside core hours"
                         ] += 1
                         continue
+                    if fresh_entry_blackout_active:
+                        self.gate_rejections[
+                            "core session closing soon - no new fresh "
+                            "entries this close to the bell"
+                        ] += 1
+                        continue
                     entry_budget = min(
                         buying_power,
                         bucket_remaining.get(bucket, Decimal("0")),
@@ -4695,6 +4844,12 @@ class AutoTrader:
                         self.gate_rejections[
                             "extended hours - only established/popular "
                             "symbols trade outside core hours"
+                        ] += 1
+                        continue
+                    if fresh_entry_blackout_active:
+                        self.gate_rejections[
+                            "core session closing soon - no new fresh "
+                            "entries this close to the bell"
                         ] += 1
                         continue
                     entry_budget = min(
@@ -6717,6 +6872,13 @@ class AutoTrader:
             )
 
             if moment < market_open:
+                # By request: "get the top gainers before the day
+                # starts" - fetched here specifically so it still runs
+                # during the pre-market wait below, not skipped by the
+                # early continue on this branch. Once-per-day guarded
+                # internally (see refresh_premarket_gainers), so this
+                # is a no-op on every later tick of the same wait.
+                self.refresh_premarket_gainers(moment)
                 time.sleep(min(60, max(1, (market_open - moment).total_seconds())))
                 continue
 
@@ -6758,6 +6920,13 @@ class AutoTrader:
             cycle_started = time.monotonic()
             try:
                 self.resolve_targets(moment)
+                # Fallback call site for a restart that lands AFTER
+                # market_open (common - most deploys land mid-session,
+                # not during the pre-market wait above) - without this,
+                # refresh_premarket_gainers would never fire that day
+                # at all. Its own internal once-per-day guard makes
+                # this a no-op on every cycle after the first.
+                self.refresh_premarket_gainers(moment)
                 # monitor_working_orders/the repricers/escalate_stalled_
                 # stop_losses now run on their own fast, dedicated
                 # thread (see _position_protection_loop, started once

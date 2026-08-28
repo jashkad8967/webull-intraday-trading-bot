@@ -1110,6 +1110,164 @@ class OrderNotCancelableTests(unittest.TestCase):
         self.assertFalse(AutoTrader.is_order_not_cancelable(Exception("timeout")))
 
 
+class FreshEntryBlackoutActiveTests(unittest.TestCase):
+    """fresh_entry_blackout_active - by request, after live evidence
+    (WNW/WKHS stopping out shortly after core hours ended): a fresh
+    entry this close to the bell has almost no runway to reach its
+    target before conditions change. Blocks fresh entries only -
+    averaging down and every exit path are unaffected (this function
+    only feeds the fresh-entry gates, never the averaging-down or exit
+    decision paths).
+    """
+
+    def test_active_just_before_close(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertTrue(
+            AutoTrader.fresh_entry_blackout_active(5, 15, core_session_active=True)
+        )
+
+    def test_inactive_with_plenty_of_runway_left(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.fresh_entry_blackout_active(120, 15, core_session_active=True)
+        )
+
+    def test_inactive_right_at_the_boundary(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.fresh_entry_blackout_active(15, 15, core_session_active=True)
+        )
+
+    def test_inactive_outside_core_hours_even_with_negative_minutes(self):
+        """A negative minutes_until_close (core hours already ended)
+        must not itself trigger this - the separate "only established/
+        popular symbols trade outside core hours" gate already covers
+        that case.
+        """
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.fresh_entry_blackout_active(
+                -30, 15, core_session_active=False
+            )
+        )
+
+    def test_inactive_when_core_session_is_not_active_regardless_of_minutes(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.fresh_entry_blackout_active(2, 15, core_session_active=False)
+        )
+
+
+class RefreshPremarketGainersTests(unittest.TestCase):
+    """refresh_premarket_gainers - by request: "get the top gainers
+    before the day starts and look to invest in that for quick
+    profit." Webull's screener supports rank_type="PRE_MARKET"
+    directly, distinct from the DAY_1/regular-session gainers already
+    anonymously folded into the daily universe rebuild.
+    """
+
+    @staticmethod
+    def _fake_bot(gainers_result=None, limit=50):
+        calls = {"n": 0}
+
+        def fake_safe_premarket_gainers(fetch_limit, page_size):
+            calls["n"] += 1
+            return gainers_result if gainers_result is not None else {}
+
+        return (
+            SimpleNamespace(
+                premarket_gainers=set(),
+                premarket_gainers_date=None,
+                seed_popular_symbols=set(),
+                stock_symbols=["AAPL", "MSFT"],
+                stock_categories={"AAPL": "US_STOCK", "MSFT": "US_STOCK"},
+                config=SimpleNamespace(
+                    premarket_gainers_limit=limit,
+                    stock_universe_page_size=200,
+                ),
+                safe_premarket_gainers=fake_safe_premarket_gainers,
+            ),
+            calls,
+        )
+
+    def test_fetches_and_merges_new_symbols_into_the_universe(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, calls = self._fake_bot(
+            gainers_result={"NCPL": {}, "CHOW": {}}
+        )
+        refresh = AutoTrader.refresh_premarket_gainers.__get__(fake_bot)
+        moment = datetime(2026, 8, 28)
+
+        refresh(moment)
+
+        self.assertEqual(fake_bot.premarket_gainers, {"NCPL", "CHOW"})
+        self.assertTrue({"NCPL", "CHOW"} <= fake_bot.seed_popular_symbols)
+        self.assertIn("NCPL", fake_bot.stock_symbols)
+        self.assertIn("CHOW", fake_bot.stock_symbols)
+        self.assertEqual(fake_bot.premarket_gainers_date, moment.date())
+        self.assertEqual(calls["n"], 1)
+
+    def test_does_not_duplicate_a_symbol_already_in_the_universe(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, _ = self._fake_bot(gainers_result={"AAPL": {}})
+        refresh = AutoTrader.refresh_premarket_gainers.__get__(fake_bot)
+        refresh(datetime(2026, 8, 28))
+
+        self.assertEqual(fake_bot.stock_symbols.count("AAPL"), 1)
+
+    def test_only_fetches_once_per_day(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, calls = self._fake_bot(gainers_result={"NCPL": {}})
+        refresh = AutoTrader.refresh_premarket_gainers.__get__(fake_bot)
+        moment = datetime(2026, 8, 28, 4, 0)
+
+        refresh(moment)
+        refresh(datetime(2026, 8, 28, 9, 0))
+
+        self.assertEqual(calls["n"], 1)
+
+    def test_refetches_on_a_new_day(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, calls = self._fake_bot(gainers_result={"NCPL": {}})
+        refresh = AutoTrader.refresh_premarket_gainers.__get__(fake_bot)
+
+        refresh(datetime(2026, 8, 28))
+        refresh(datetime(2026, 8, 29))
+
+        self.assertEqual(calls["n"], 2)
+
+    def test_disabled_when_limit_is_zero(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, calls = self._fake_bot(gainers_result={"NCPL": {}}, limit=0)
+        refresh = AutoTrader.refresh_premarket_gainers.__get__(fake_bot)
+
+        refresh(datetime(2026, 8, 28))
+
+        self.assertEqual(calls["n"], 0)
+        self.assertEqual(fake_bot.premarket_gainers, set())
+
+    def test_a_failed_screener_leaves_state_untouched(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, _ = self._fake_bot(gainers_result={})
+        refresh = AutoTrader.refresh_premarket_gainers.__get__(fake_bot)
+
+        refresh(datetime(2026, 8, 28))
+
+        self.assertEqual(fake_bot.premarket_gainers, set())
+        self.assertEqual(fake_bot.seed_popular_symbols, set())
+
+
 class StockScanConcurrentBatchesTests(unittest.TestCase):
     """stock_scan_concurrent_batches - by request: "scan through all
     [the universe]... split it up in parallel streams... as many as

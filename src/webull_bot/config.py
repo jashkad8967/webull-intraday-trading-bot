@@ -148,6 +148,17 @@ class Settings(BaseSettings):
         le=1,
     )
     top_gainers_limit: int = Field(default=200, ge=0, le=5000)
+    # By request: "get the top gainers before the day starts and look
+    # to invest in that for quick profit." Distinct from
+    # top_gainers_limit above (Webull's default DAY_1/regular-session
+    # ranking, anonymously folded into the whole universe) - Webull's
+    # screener also supports rank_type="PRE_MARKET" directly (today's
+    # biggest pre-market movers specifically), fetched once/day and
+    # fed into seed_popular_symbols + force-scanned every cycle - see
+    # AutoTrader.refresh_premarket_gainers. Smaller default than
+    # top_gainers_limit - a curated priority list, not a universe-
+    # filler.
+    premarket_gainers_limit: int = Field(default=50, ge=0, le=1000)
     fractional_shares_enabled: bool = True
     fractional_shares_min_notional: Decimal = Field(default=Decimal("25"), ge=Decimal("5"))
     option_batch_size: int = Field(default=20, ge=1, le=20)
@@ -326,6 +337,22 @@ class Settings(BaseSettings):
         default=Decimal("0.50"),
         gt=0,
         le=Decimal("5"),
+    )
+    # By request, after live evidence: WNW (and, per the user's
+    # account, WKHS) stopped out shortly after core hours ended,
+    # consistent with a fresh entry opened with little runway left
+    # before the session's liquidity/spread conditions get materially
+    # worse - core_session_active was only ever a boolean (in/out of
+    # the window), with no awareness of HOW MUCH of the window was
+    # actually left when a brand-new position was opened. A fresh
+    # entry this close to close has almost no time to reach its
+    # profit target before conditions change, unlike one opened
+    # earlier in the session. Fresh entries ONLY (general BUY/SHORT
+    # and volatility-scalp) - averaging down on an existing position
+    # (already committed to earlier, when there was more runway) and
+    # every exit path are deliberately unaffected.
+    stock_entry_blackout_minutes_before_close: int = Field(
+        default=15, ge=0, le=120
     )
     stock_entry_max_extension_percent: Decimal = Field(
         default=Decimal("0.01"),
