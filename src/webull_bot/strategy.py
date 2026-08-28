@@ -1520,6 +1520,7 @@ class TradingStrategy:
         idle_relaxation_multiplier: Decimal = Decimal("1"),
         idle_relaxation_amount: Decimal = Decimal("0"),
         seconds_since_entry: float | None = None,
+        core_session_active: bool = True,
     ) -> Decision:
         trend = self.trend_signal(key, price)
         symbol = key.split(":", 1)[-1]
@@ -1693,7 +1694,7 @@ class TradingStrategy:
                     )
             return Decision("HOLD", "short position between target and stop", target)
         if not self.entry_spread_ok(
-            key, opening_grace_active, idle_relaxation_multiplier
+            key, opening_grace_active, idle_relaxation_multiplier, core_session_active
         ):
             return Decision("HOLD", "spread too wide to scalp profitably")
         if trend == "SHORT" and self.config.short_selling_enabled:
@@ -1756,6 +1757,7 @@ class TradingStrategy:
         key: str,
         opening_grace_active: bool = False,
         idle_relaxation_multiplier: Decimal = Decimal("1"),
+        core_session_active: bool = True,
     ) -> bool:
         symbol = key.split(":", 1)[-1]
         spread = self.metrics.get(symbol, {}).get("spread_percent")
@@ -1765,6 +1767,17 @@ class TradingStrategy:
         multiplier = idle_relaxation_multiplier
         if opening_grace_active:
             multiplier = max(multiplier, self.config.opening_grace_spread_multiplier)
+        # By request: "we do not want intense play in extended hours,
+        # but we want play for sure" - modestly loosens (not fully
+        # opens) the spread bar outside core hours, since real pre-
+        # market liquidity genuinely can't clear the tight core-hours
+        # threshold most of the time. Takes the max with any other
+        # active multiplier (same convention as opening_grace above),
+        # not a separate additive bonus.
+        if not core_session_active:
+            multiplier = max(
+                multiplier, self.config.extended_hours_spread_multiplier
+            )
         threshold *= multiplier
         try:
             return Decimal(str(spread)) <= threshold
