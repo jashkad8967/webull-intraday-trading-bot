@@ -469,6 +469,12 @@ class AutoTrader:
         # prioritized_stock_batch.
         self.priority_scan_symbols: set[str] = set()
         self.gate_rejections: dict[str, int] = defaultdict(int)
+        # Separate from gate_rejections above - by request, "it is not
+        # averaging down at all" - the averaging-down diagnostic (see
+        # trade_stocks) otherwise gets crowded out of the top-5 GATES
+        # summary by the far more numerous fresh-entry rejection
+        # reasons every cycle. See the AVGDOWN log line in run().
+        self.avgdown_gate_rejections: dict[str, int] = defaultdict(int)
         self.broker_conflict_symbols: set[str] = set()
         # Throttles the SANITY warning below so a persistently bad broker
         # read logs a periodic reminder instead of one line per scan cycle.
@@ -4518,7 +4524,7 @@ class AutoTrader:
                         ),
                     ):
                         if not ok:
-                            self.gate_rejections[reason] += 1
+                            self.avgdown_gate_rejections[reason] += 1
                             break
                 if (
                     quantity > 0
@@ -7041,6 +7047,29 @@ class AutoTrader:
                             ),
                         )
                         self.gate_rejections.clear()
+                    # By request: "it is not averaging down at all" -
+                    # by request. Its own dedicated counter/summary
+                    # (not the shared gate_rejections dict above) - the
+                    # averaging-down diagnostic (see trade_stocks)
+                    # otherwise gets crowded out of the top-5 GATES
+                    # summary by the far more numerous fresh-entry
+                    # rejection reasons every single cycle, leaving
+                    # zero real visibility into why averaging down
+                    # isn't firing despite being logged.
+                    if self.avgdown_gate_rejections:
+                        avgdown_top_reasons = sorted(
+                            self.avgdown_gate_rejections.items(),
+                            key=lambda item: item[1],
+                            reverse=True,
+                        )[:5]
+                        log.info(
+                            "AVGDOWN| not adding because | %s",
+                            " | ".join(
+                                f"{reason}={count}"
+                                for reason, count in avgdown_top_reasons
+                            ),
+                        )
+                        self.avgdown_gate_rejections.clear()
             except Exception as exc:
                 if isinstance(exc, MarketDataPermissionError):
                     log.critical("STOP   | %s", exc)
