@@ -147,6 +147,28 @@ class Settings(BaseSettings):
         ge=0,
         le=1,
     )
+    # By request: "out of 7500 stocks it should easily be able to find
+    # enough stocks to invest everything" - live evidence: a single
+    # FDX entry consumed ~43% of the whole account's buying power in
+    # one trade ($186 -> $106.51), because entry_budget (see the
+    # general BUY/SHORT entry gates in trade_stocks) was only ever
+    # capped by bucket_remaining (up to stock_popular_capital_fraction,
+    # 70% by default, of the WHOLE bucket's allocation - not per
+    # position) and the live buying_power itself, with no per-position
+    # diversification cap. With capital this concentrated into 1-2
+    # trades, there's little left for the other several thousand
+    # scanned candidates to ever get funded, even though plenty of them
+    # individually clear every other gate. Caps any single fresh
+    # entry's budget at this fraction of the CURRENT (already cycle-
+    # shrinking) buying_power - naturally self-reducing as more
+    # capital gets deployed within the same cycle, spreading what's
+    # left across more symbols instead of one candidate absorbing most
+    # of a bucket's whole allocation.
+    stock_max_position_fraction_of_buying_power: Decimal = Field(
+        default=Decimal("0.15"),
+        gt=0,
+        le=1,
+    )
     top_gainers_limit: int = Field(default=200, ge=0, le=5000)
     # By request: "get the top gainers before the day starts and look
     # to invest in that for quick profit." Distinct from
