@@ -4708,6 +4708,13 @@ class AutoTrader:
                     entry_budget = min(
                         buying_power,
                         bucket_remaining.get(bucket, Decimal("0")),
+                        # By request: "it should easily be able to find
+                        # enough stocks to invest everything" - a real
+                        # per-position diversification cap, not just
+                        # the bucket-level one - see stock_max_position_
+                        # fraction_of_buying_power.
+                        buying_power
+                        * self.config.stock_max_position_fraction_of_buying_power,
                     )
                     fractional_supported = symbol not in self.fractional_unsupported_symbols
                     buy_quantity, buffered_price, fractional = self.size_stock_entry(
@@ -4856,6 +4863,13 @@ class AutoTrader:
                     entry_budget = min(
                         buying_power,
                         bucket_remaining.get(bucket, Decimal("0")),
+                        # By request: "it should easily be able to find
+                        # enough stocks to invest everything" - a real
+                        # per-position diversification cap, not just
+                        # the bucket-level one - see stock_max_position_
+                        # fraction_of_buying_power.
+                        buying_power
+                        * self.config.stock_max_position_fraction_of_buying_power,
                     )
                     # Whole-share sizing only - Webull's fractional-share
                     # trading is a long-only retail feature, there's no
