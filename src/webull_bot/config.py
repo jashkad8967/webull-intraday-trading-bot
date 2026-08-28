@@ -687,8 +687,22 @@ class Settings(BaseSettings):
     volatility_scalp_target_notional_buying_power_fraction: Decimal = Field(
         default=Decimal("0.15"), gt=0, le=Decimal("1")
     )
+    # By request: "we don't only want it to stick with the same cohort
+    # throughout the day, it should also add to the cohort, which is
+    # why we also have such a big universe." select_volatility_scalp_
+    # symbols already re-ranks the cohort from data across the WHOLE
+    # scanned universe (not just today's starting picks) and fully
+    # replaces stale members with newly-hot ones - the mechanism the
+    # user is asking for already existed - but the original 1800s (30
+    # minute) cadence made that feel static relative to how fast
+    # everything else in this bot moves (1s scalp repricing, 0.25s
+    # position protection). Lowered to 300s (5 minutes) - meaningfully
+    # more dynamic without excessive churn. An open position in a
+    # symbol that drops out of the cohort is never stranded either way -
+    # volatility_scalp_positions (a separate, position-based set) keeps
+    # it fully managed regardless of current cohort membership.
     volatility_scalp_reselect_seconds: int = Field(
-        default=1800, ge=60, le=86400
+        default=300, ge=60, le=86400
     )
     # Zeroed by explicit request - "orders can be made as frequently as
     # possible without a cooldown." The only remaining gap between a
