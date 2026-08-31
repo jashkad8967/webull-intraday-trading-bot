@@ -1535,6 +1535,7 @@ class TradingStrategy:
         seconds_since_entry: float | None = None,
         core_session_active: bool = True,
         profit_target_multiplier: Decimal = Decimal("1"),
+        stop_tighten_multiplier: Decimal = Decimal("1"),
     ) -> Decision:
         trend = self.trend_signal(key, price)
         symbol = key.split(":", 1)[-1]
@@ -1545,7 +1546,18 @@ class TradingStrategy:
             # target hit at exactly the percentage-based price would still
             # net a loss once the flat fee comes out of the actual fill.
             fee_per_share = self.config.sell_fee_dollars / quantity
-            stop_percent = self.adaptive_stop_percent(symbol, seconds_since_entry)
+            # By request: "when we have a certain profit we should
+            # also not allow stops to be too low" - stop_tighten_
+            # multiplier (<1 once significantly ahead for the day -
+            # see AutoTrader.stop_tighten_multiplier) shrinks the
+            # stop distance, protecting more of an already-built lead
+            # from a reversal. 1 (no change) otherwise. Kept separate
+            # from raw_stop_percent (used below for the profit
+            # target) so tightening the stop and widening the target
+            # are independent effects, not multiplicatively canceling
+            # each other out through a shared base value.
+            raw_stop_percent = self.adaptive_stop_percent(symbol, seconds_since_entry)
+            stop_percent = raw_stop_percent * stop_tighten_multiplier
             # A fractional (core-session dollar-sized) position targets a
             # much smaller move than a whole-share one - it can only be
             # exited during core hours at all (see is_fractional_quantity
@@ -1588,7 +1600,7 @@ class TradingStrategy:
                 if is_fractional
                 else max(
                     floor_percent,
-                    stop_percent
+                    raw_stop_percent
                     * self.config.stock_target_stop_multiple
                     * profit_target_multiplier,
                 )
@@ -1658,11 +1670,14 @@ class TradingStrategy:
             # long position's.
             short_quantity = -quantity
             fee_per_share = self.config.sell_fee_dollars / short_quantity
-            stop_percent = self.adaptive_stop_percent(symbol, seconds_since_entry)
+            # See the long-side comment above - raw_stop_percent keeps
+            # the target computation independent of stop-tightening.
+            raw_stop_percent = self.adaptive_stop_percent(symbol, seconds_since_entry)
+            stop_percent = raw_stop_percent * stop_tighten_multiplier
             target_percent = max(
                 self.config.stock_min_net_profit_percent
                 + self.config.stock_estimated_round_trip_cost_percent,
-                stop_percent
+                raw_stop_percent
                 * self.config.stock_target_stop_multiple
                 * profit_target_multiplier,
             )

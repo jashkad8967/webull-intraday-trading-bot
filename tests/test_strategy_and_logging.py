@@ -1297,6 +1297,55 @@ class LateCoreSessionTransitionTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertGreaterEqual(widened.target_price, normal.target_price)
 
+    def test_stop_tighten_multiplier_moves_the_stop_price_closer_to_cost(self):
+        """By request: "when we have a certain profit we should also
+        not allow stops to be too low." A long position's stop is
+        below cost - tightening (< 1) should move it UP, closer to
+        cost, not further away.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:TIGHT"
+        strategy.metrics[key.split(":", 1)[1]] = {"spread_percent": 0.0}
+        # Normal stop (0.15% floor) = 100*(1-0.0015) = 99.85; tightened
+        # (0.5x) = 100*(1-0.00075) = 99.925 - a price between the two
+        # only breaches the tightened stop.
+        price = Decimal("99.9")
+        normal = strategy.stock_decision(key, price, 10, Decimal("100"))
+        tightened = strategy.stock_decision(
+            key, price, 10, Decimal("100"),
+            stop_tighten_multiplier=Decimal("0.5"),
+        )
+        self.assertNotEqual(normal.action, "LOSS")
+        self.assertEqual(tightened.action, "LOSS")
+
+    def test_tightening_the_stop_does_not_shrink_the_widened_target(self):
+        """By request: "when we have a certain profit... not allow
+        stops to be too low" combined with "let winners run further" -
+        both apply simultaneously once significantly ahead. Regression:
+        target used to be computed FROM the already-tightened stop_
+        percent, so tightening (0.7x) and widening (1.5x) partially
+        canceled each other out (0.7*1.5=1.05, barely wider than
+        normal) instead of being independent effects.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:BOTH"
+        strategy.metrics[key.split(":", 1)[1]] = {"spread_percent": 0.0}
+        normal = strategy.stock_decision(key, Decimal("100"), 10, Decimal("90"))
+        both = strategy.stock_decision(
+            key, Decimal("100"), 10, Decimal("90"),
+            profit_target_multiplier=Decimal("1.5"),
+            stop_tighten_multiplier=Decimal("0.7"),
+        )
+        widen_only = strategy.stock_decision(
+            key, Decimal("100"), 10, Decimal("90"),
+            profit_target_multiplier=Decimal("1.5"),
+        )
+        # The target with both effects active must match the target
+        # with ONLY widening active - tightening the stop must not
+        # quietly shrink it back down.
+        self.assertEqual(both.target_price, widen_only.target_price)
+        self.assertGreater(both.target_price, normal.target_price)
+
 
 class RefreshPremarketGainersTests(unittest.TestCase):
     """refresh_premarket_gainers - by request: "get the top gainers
