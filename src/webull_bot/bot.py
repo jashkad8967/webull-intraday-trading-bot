@@ -4700,6 +4700,10 @@ class AutoTrader:
                             self.post_stop_reentry_ready(symbol),
                         ),
                         (
+                            "scalp - wash-sale blocked",
+                            not self.wash_sales.blocked_until(symbol),
+                        ),
+                        (
                             "scalp - order-submission cooldown",
                             self.cooldown_ready(key),
                         ),
@@ -4830,17 +4834,32 @@ class AutoTrader:
                     # THROUGH a losing stretch - unlike every other
                     # entry path, this deliberately does NOT check
                     # guard_active (account-wide stop-loss guard),
-                    # symbol_quarantined (recent-loss pause), a wash-
-                    # sale block, or rate_capped (hourly trade cap),
-                    # since all of those exist specifically to slow
-                    # down or pause trading after losses - exactly what
-                    # this strategy is meant to keep doing anyway. Only
-                    # cooldown_ready (a cross-order-submission race
-                    # guard, not a loss-driven pause -
-                    # trade_cooldown_seconds defaults to 0) and
+                    # symbol_quarantined (recent-loss pause), or
+                    # rate_capped (hourly trade cap), since those exist
+                    # specifically to slow down or pause trading after
+                    # losses - exactly what this strategy is meant to
+                    # keep doing anyway. Only cooldown_ready (a cross-
+                    # order-submission race guard, not a loss-driven
+                    # pause - trade_cooldown_seconds defaults to 0) and
                     # volatility_scalp_reentry_ready (zeroed by request -
                     # "orders can be made as frequently as possible
                     # without a cooldown") still gate timing.
+                    #
+                    # REVERSED, by request ("does the wash sale block
+                    # actually fulfill its purpose"): a wash-sale block
+                    # WAS on this same bypass list until today - live
+                    # evidence showed CLGN stop out and get a wash-sale
+                    # block written 5 separate times in one session
+                    # (11:11, 11:56, 12:05, 12:12, 12:58), and every
+                    # single one was a no-op, since this path never
+                    # checked it. Re-added as a real gate here - a
+                    # symbol that just stopped out via THIS path can't
+                    # be re-bought via THIS path either for wash_sale_
+                    # block_days. Averaging down on an already-open
+                    # position is a separate, later gate and is
+                    # unaffected either way - this only blocks a BRAND
+                    # NEW fresh entry.
+                    and not self.wash_sales.blocked_until(symbol)
                     and not regime_gate_active
                     # Deliberately does NOT check symbol_regime here (a
                     # Kaufman-Efficiency-Ratio "trending vs ranging" gate
