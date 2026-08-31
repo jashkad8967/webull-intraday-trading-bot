@@ -407,6 +407,10 @@ class AutoTrader:
         # screener results, refreshed once/day.
         self.premarket_gainers: set[str] = set()
         self.premarket_gainers_date = None
+        # See refresh_agent_predicted_gainers - the research agent's
+        # own speculative once/day pre-market gainer predictions.
+        self.agent_predicted_gainers: set[str] = set()
+        self.agent_predicted_gainers_date = None
         self.market_pulse_cache: dict[str, list[dict]] = {
             "gainers": [],
             "losers": [],
@@ -768,6 +772,49 @@ class AutoTrader:
             len(self.premarket_gainers),
             len(new_to_universe),
             ",".join(sorted(self.premarket_gainers)[:10]),
+        )
+
+    def refresh_agent_predicted_gainers(self, moment: datetime) -> None:
+        """By request: "pre trading should not be too intense, and it
+        should just set up the main gainers for the day, in fact have
+        the research agent return stocks likely to be top gainers
+        before core hours start, then put those stocks in some sort of
+        priority list to also look at." Complementary to refresh_
+        premarket_gainers (Webull's own real PRE_MARKET screener data)
+        - this is the research agent's own speculative pick list, once
+        per day, same "priority list" mechanism (seed_popular_symbols +
+        merged into stock_symbols/stock_categories so trade_stocks'
+        force_scan can pick it up).
+        """
+        if self.agent_predicted_gainers_date == moment.date():
+            return
+        self.agent_predicted_gainers_date = moment.date()
+        if self.market_agent is None:
+            return
+        try:
+            symbols = self.market_agent.predict_likely_gainers()
+        except Exception as exc:
+            log.warning("LOAD   | agent gainer prediction failed | %s", exc)
+            return
+        if not symbols:
+            return
+        self.agent_predicted_gainers = {str(symbol).upper() for symbol in symbols}
+        self.seed_popular_symbols |= self.agent_predicted_gainers
+        new_to_universe = [
+            symbol
+            for symbol in self.agent_predicted_gainers
+            if symbol not in self.stock_categories
+        ]
+        for symbol in new_to_universe:
+            self.stock_categories[symbol] = "US_STOCK"
+        if new_to_universe:
+            self.stock_symbols = self.stock_symbols + new_to_universe
+        log.info(
+            "LOAD   | agent-predicted gainers | %s symbols (%s new to "
+            "the universe) | %s",
+            len(self.agent_predicted_gainers),
+            len(new_to_universe),
+            ",".join(sorted(self.agent_predicted_gainers)),
         )
 
     def resolve_targets(self, moment: datetime) -> None:
@@ -1438,6 +1485,28 @@ class AutoTrader:
             symbol,
             exc,
         )
+
+    @staticmethod
+    def profit_target_multiplier(
+        daily_realized_pnl: Decimal,
+        account_value: Decimal | None,
+        threshold_fraction: Decimal,
+        widen_multiplier: Decimal,
+    ) -> Decimal:
+        """By request: "we basically just want to be able to stay in a
+        significant profit until eod" -> "let winners run further
+        before taking profit." Once today's realized pnl reaches
+        threshold_fraction of account_value, returns widen_multiplier
+        (applied to the general path's stop-scaled profit target in
+        stock_decision) instead of 1 (no change). Fails safe (returns
+        1) with an unknown/non-positive account value - never widens
+        based on a stale or missing read.
+        """
+        if account_value is None or account_value <= 0:
+            return Decimal("1")
+        if daily_realized_pnl >= account_value * threshold_fraction:
+            return widen_multiplier
+        return Decimal("1")
 
     @staticmethod
     def fresh_entry_blackout_active(
@@ -3638,6 +3707,15 @@ class AutoTrader:
             self.config.idle_cash_max_gate_multiplier - Decimal("1")
         )
         idle_relaxation_amount = ramp_progress * self.config.idle_cash_max_tick_relaxation
+        # By request: "stay in a significant profit until eod" -> "let
+        # winners run further before taking profit." See stock_
+        # decision's profit_target_multiplier param.
+        profit_target_multiplier = self.profit_target_multiplier(
+            self.daily_realized_pnl,
+            self.cached_account_value,
+            self.config.daily_significant_profit_fraction,
+            self.config.profit_target_widen_multiplier,
+        )
         # By request, after live evidence (WNW/WKHS stopping out
         # shortly after core hours ended): block FRESH entries only
         # (not averaging down, not any exit) once fewer than
@@ -3660,6 +3738,29 @@ class AutoTrader:
             minutes_until_close,
             float(self.config.stock_entry_blackout_minutes_before_close),
             core_session_active,
+        )
+        # By request: "start transitioning away from core hours
+        # strategy around 30 minutes before end of core hours." Softer
+        # than fresh_entry_blackout_active above (which HARD-blocks
+        # every fresh entry once inside its own, shorter window) - this
+        # instead makes the last late_core_session_transition_minutes
+        # of core hours behave like extended hours for entry-quality
+        # purposes: only the POPULAR bucket gets fresh entries (same
+        # "only established/popular symbols trade outside core hours"
+        # gate the general BUY/SHORT paths already have), and the
+        # spread tolerance widens the same way it does outside core
+        # hours (via effective_core_session_active, passed to stock_
+        # decision in place of the real core_session_active). Position
+        # management/exits are completely unaffected - only entry
+        # QUALITY winds down early, nothing stops working.
+        late_core_session_transition_active = (
+            core_session_active
+            and 0
+            <= minutes_until_close
+            < float(self.config.late_core_session_transition_minutes)
+        )
+        effective_core_session_active = (
+            core_session_active and not late_core_session_transition_active
         )
         self.refresh_agent_discoveries()
         if self.analyst_service is not None:
@@ -3731,6 +3832,7 @@ class AutoTrader:
             self.volatility_scalp_symbols
             | self.volatility_scalp_recently_eligible
             | self.premarket_gainers
+            | self.agent_predicted_gainers
         )
         if force_scan:
             # Left to prioritized_stock_batch's normal ranking, any one
@@ -4019,7 +4121,8 @@ class AutoTrader:
                     idle_relaxation_multiplier,
                     idle_relaxation_amount,
                     seconds_since_entry,
-                    core_session_active,
+                    effective_core_session_active,
+                    profit_target_multiplier,
                 )
                 # Condensed onto eligibility alone (any symbol currently
                 # volatile enough to qualify - see is_volatility_scalp_
@@ -4764,7 +4867,7 @@ class AutoTrader:
                     # popular_stock_symbols - see TradingStrategy.
                     # select_stock_symbols) - PENNY and DISCOVERY names
                     # wait for core hours. Core hours are unaffected.
-                    if not core_session_active and bucket != "POPULAR":
+                    if not effective_core_session_active and bucket != "POPULAR":
                         self.gate_rejections[
                             "extended hours - only established/popular "
                             "symbols trade outside core hours"
@@ -4917,7 +5020,7 @@ class AutoTrader:
                     bucket = self.strategy.selection_bucket(symbol)
                     # Same "established/popular only" restriction as the
                     # BUY entry gate above, for the same reason.
-                    if not core_session_active and bucket != "POPULAR":
+                    if not effective_core_session_active and bucket != "POPULAR":
                         self.gate_rejections[
                             "extended hours - only established/popular "
                             "symbols trade outside core hours"
@@ -6961,6 +7064,7 @@ class AutoTrader:
                 # internally (see refresh_premarket_gainers), so this
                 # is a no-op on every later tick of the same wait.
                 self.refresh_premarket_gainers(moment)
+                self.refresh_agent_predicted_gainers(moment)
                 time.sleep(min(60, max(1, (market_open - moment).total_seconds())))
                 continue
 
@@ -7009,6 +7113,7 @@ class AutoTrader:
                 # at all. Its own internal once-per-day guard makes
                 # this a no-op on every cycle after the first.
                 self.refresh_premarket_gainers(moment)
+                self.refresh_agent_predicted_gainers(moment)
                 # monitor_working_orders/the repricers/escalate_stalled_
                 # stop_losses now run on their own fast, dedicated
                 # thread (see _position_protection_loop, started once

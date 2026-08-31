@@ -389,6 +389,36 @@ class Settings(BaseSettings):
     stock_entry_blackout_minutes_before_close: int = Field(
         default=15, ge=0, le=120
     )
+    # By request: "start transitioning away from core hours strategy
+    # around 30 minutes before end of core hours." Softer/earlier than
+    # stock_entry_blackout_minutes_before_close above (a hard block on
+    # every fresh entry, closer to the bell) - this window instead
+    # makes entry QUALITY behave like extended hours (POPULAR-bucket-
+    # only fresh entries, wider spread tolerance) without stopping
+    # trading outright. Must stay >= the hard-blackout window above so
+    # the softer transition always starts before (or exactly at) the
+    # hard cutoff, never after it.
+    late_core_session_transition_minutes: int = Field(
+        default=30, ge=0, le=180
+    )
+    # By request: "we basically just want to be able to stay in a
+    # significant profit until eod" -> clarified as "let winners run
+    # further before taking profit" once the day is already
+    # significantly ahead. Once today's realized pnl reaches this
+    # fraction of account value, general-path (whole-share/fractional,
+    # not the volatility-scalp cohort - see stock_decision's
+    # profit_target_multiplier param) profit targets widen by
+    # profit_target_widen_multiplier instead of taking the normal,
+    # earlier target - the account is already ahead for the day, so a
+    # working position gets more room to grow that lead instead of
+    # being sold at the same target size it would use starting from
+    # flat/behind.
+    daily_significant_profit_fraction: Decimal = Field(
+        default=Decimal("0.03"), gt=0, le=1
+    )
+    profit_target_widen_multiplier: Decimal = Field(
+        default=Decimal("1.5"), ge=1, le=5
+    )
     stock_entry_max_extension_percent: Decimal = Field(
         default=Decimal("0.01"),
         ge=0,
@@ -905,8 +935,16 @@ class Settings(BaseSettings):
     # outside core hours only - the existing "only established/
     # popular symbols trade outside core hours" bucket restriction
     # already keeps this to established names, not a free-for-all.
+    # By request, recalibrated: "pre trading should not be too
+    # intense, and it should just set up the main gainers for the
+    # day" - pre-market's job shifts toward identifying candidates
+    # (refresh_premarket_gainers/refresh_agent_predicted_gainers) for
+    # when core hours actually start, not aggressive trading itself.
+    # Lowered 3x -> 2x - still more room than the tight core-hours
+    # 0.5% default (real pre-market liquidity genuinely can't clear
+    # that), just less loosened than before.
     extended_hours_spread_multiplier: Decimal = Field(
-        default=Decimal("3"),
+        default=Decimal("2"),
         ge=1,
         le=10,
     )
@@ -1025,7 +1063,12 @@ class Settings(BaseSettings):
     # performance, not per-symbol setups, so there's no reason to research
     # more often just because the market's more active).
     strategy_review_enabled: bool = True
-    strategy_review_interval_seconds: int = Field(default=900, ge=60, le=3600)
+    # By request: "space out the research agent sentiment to every 30
+    # minutes." Raised 900s (15min) -> 1800s (30min) - also frees up
+    # daily request/token budget headroom for the new once-daily
+    # predict_likely_gainers call (see AutoTrader.refresh_agent_
+    # predicted_gainers), which shares this same Groq account budget.
+    strategy_review_interval_seconds: int = Field(default=1800, ge=60, le=3600)
     # How many of the most recent StatusWriter.trades entries go into each
     # review's payload - small and fixed on purpose: this runs 4x/hour,
     # so the prompt has to stay bounded regardless of how many trades a

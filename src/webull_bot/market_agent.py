@@ -170,6 +170,118 @@ class MarketResearchAgent:
                 return None
             return dict(result)
 
+    def predict_likely_gainers(self) -> list[str] | None:
+        """By request: "have the research agent return stocks likely
+        to be top gainers before core hours start... put those stocks
+        in some sort of priority list to also look at." One-shot per
+        day, called once during the pre-market wait (see AutoTrader.
+        refresh_agent_predicted_gainers) - synchronous, not routed
+        through the queued strategy_review worker, since this only
+        ever needs to run once daily and a brief blocking call during
+        the pre-market wait is fine.
+
+        Shares the SAME daily request-count/rolling-token budget as
+        submit_strategy_review (checked via the same counters) -
+        Groq's account-level budget is one shared pool regardless of
+        which capability spends it, and interval-based pacing doesn't
+        apply here since this is inherently a once-per-day call.
+
+        Honest limitation: no search tool is enabled here either (same
+        cost-control reasoning as strategy_review - see request_kwargs
+        below), so this is the model's own general pattern-recognition
+        over well-known volatile/catalyst-prone tickers, NOT live
+        pre-market data - that's already covered separately and more
+        reliably by the deterministic rank_type="PRE_MARKET" screener
+        (see AutoTrader.refresh_premarket_gainers). A complementary,
+        lower-confidence signal, not a replacement.
+        """
+        today = self._session_date(datetime.now(self._timezone))
+        if self._request_date != today:
+            self._request_date = today
+            self._requests_today = 0
+            self._limit_logged_date = None
+            self._rate_limit_blocked = False
+        if self._rate_limit_blocked:
+            return None
+        if self._requests_today >= self.config.agent_daily_request_limit:
+            return None
+        if self._rolling_tokens_used() >= self.config.agent_daily_token_budget:
+            return None
+        self._requests_today += 1
+        prompt = (
+            "Output compact, single-line JSON only - no pretty-"
+            "printing, no indentation, no newlines or spaces around "
+            "punctuation. This account has a strict daily token "
+            "budget shared across every request today.\n"
+            "List up to 15 US-listed stock ticker symbols you would "
+            "expect to be among today's most volatile/highest-"
+            "percentage movers, based on known upcoming catalysts "
+            "(earnings, FDA decisions, product launches, sector "
+            "momentum) or historically high-beta/meme-stock behavior. "
+            "This is a speculative pre-market watchlist for a "
+            "scalping bot to prioritize scanning once trading starts, "
+            "not a guarantee or live quote data - you have no search "
+            "tool and no real-time market access for this request.\n"
+            "Return exactly: {\"symbols\": [\"TICK1\",\"TICK2\",...]}"
+        )
+        request_kwargs = {
+            "model": self.config.groq_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Return JSON only, compact single-line with no "
+                        "whitespace or pretty-printing - this account "
+                        "has a strict shared daily token budget."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "response_format": {"type": "json_object"},
+            "max_completion_tokens": 1000,
+            "temperature": 0.2,
+        }
+        if "compound" in self.config.groq_model.lower():
+            request_kwargs["compound_custom"] = {"tools": {"enabled_tools": []}}
+        if "gpt-oss" in self.config.groq_model.lower():
+            request_kwargs["reasoning_effort"] = self.config.groq_reasoning_effort
+        self.log.info(
+            "AGENT  | requesting pre-market gainer predictions | daily=%s/%s",
+            self._requests_today,
+            self.config.agent_daily_request_limit,
+        )
+        try:
+            response = self.client.chat.completions.create(**request_kwargs)
+        except Exception as exc:
+            self._handle_review_error(exc)
+            return None
+        usage = getattr(response, "usage", None)
+        tokens_used = int(getattr(usage, "total_tokens", 0) or 0) if usage else 0
+        if tokens_used:
+            self._token_usage_log.append((time.monotonic(), tokens_used))
+        content = response.choices[0].message.content
+        try:
+            raw = self._extract_json_object(content) or content
+            parsed = json.loads(raw)
+        except Exception as exc:
+            self.log.warning(
+                "AGENT  | gainer prediction skipped | invalid JSON | %s", exc
+            )
+            return None
+        symbols = parsed.get("symbols") if isinstance(parsed, dict) else None
+        if not isinstance(symbols, list):
+            return None
+        cleaned = [
+            str(symbol).upper().strip()
+            for symbol in symbols
+            if isinstance(symbol, str) and symbol.strip()
+        ][:15]
+        self.log.info(
+            "AGENT  | predicted gainers | %s",
+            ", ".join(cleaned) if cleaned else "(none returned)",
+        )
+        return cleaned
+
     def _worker(self) -> None:
         while True:
             state = self._work.get()
