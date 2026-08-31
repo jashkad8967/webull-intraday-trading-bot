@@ -2669,6 +2669,141 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
             strategy.recent_momentum_supports_entry("BREAKDOWN", "BUY")
         )
 
+    @staticmethod
+    def _micro_exhaustion_config(base, **overrides):
+        """StrategyConfigMixin.config() is a curated SimpleNamespace,
+        not a real Settings() with defaults for every field - every
+        field volatility_scalp_micro_exhaustion_confirmed/
+        update_volume_delta read has to be set explicitly, same
+        convention every other test in this class already follows.
+        """
+        base.volatility_scalp_micro_exhaustion_filter_enabled = overrides.get(
+            "filter_enabled", True
+        )
+        base.volatility_scalp_micro_exhaustion_lookback_seconds = overrides.get(
+            "lookback_seconds", 300
+        )
+        base.volatility_scalp_micro_exhaustion_velocity_percent = overrides.get(
+            "velocity_percent", Decimal("0.025")
+        )
+        base.volatility_scalp_micro_exhaustion_wick_ratio = overrides.get(
+            "wick_ratio", Decimal("0.40")
+        )
+        base.volatility_scalp_micro_exhaustion_volume_multiplier = overrides.get(
+            "volume_multiplier", Decimal("2.5")
+        )
+        base.volatility_scalp_micro_exhaustion_volume_ema_alpha = overrides.get(
+            "volume_ema_alpha", Decimal("0.2")
+        )
+        return base
+
+    def test_update_volume_delta_first_call_only_sets_baseline(self):
+        """First snapshot has no prior reading to diff against - by
+        design, no delta/EMA update happens until the second call, the
+        "deploy-resilient initialization" every restart needs.
+        """
+        strategy = TradingStrategy(self._micro_exhaustion_config(self.config()))
+        strategy.update_volume_delta("VOL", Decimal("1000"))
+        self.assertNotIn("VOL", strategy.volume_delta_ema)
+        self.assertNotIn("VOL", strategy.volume_delta_latest)
+        self.assertEqual(strategy.volume_delta_baseline["VOL"], Decimal("1000"))
+
+    def test_update_volume_delta_second_call_computes_delta_and_ema(self):
+        strategy = TradingStrategy(self._micro_exhaustion_config(self.config()))
+        strategy.update_volume_delta("VOL", Decimal("1000"))
+        strategy.update_volume_delta("VOL", Decimal("1300"))
+        self.assertEqual(strategy.volume_delta_latest["VOL"], Decimal("300"))
+        # First real EMA reading just equals the delta itself (no prior
+        # EMA to blend with yet).
+        self.assertEqual(strategy.volume_delta_ema["VOL"], Decimal("300"))
+
+    def test_update_volume_delta_resets_baseline_on_day_rollover(self):
+        """A cumulative volume reading LOWER than the prior one means
+        the trading day rolled over (or stale data) - restart the
+        baseline instead of recording a nonsensical negative delta.
+        """
+        strategy = TradingStrategy(self._micro_exhaustion_config(self.config()))
+        strategy.update_volume_delta("VOL", Decimal("5000"))
+        strategy.update_volume_delta("VOL", Decimal("6000"))
+        strategy.update_volume_delta("VOL", Decimal("100"))
+        self.assertEqual(strategy.volume_delta_baseline["VOL"], Decimal("100"))
+        # The stale/rollover call must not corrupt the EMA from before.
+        self.assertEqual(strategy.volume_delta_ema["VOL"], Decimal("1000"))
+
+    def test_micro_exhaustion_gate_fires_when_all_three_conditions_met(self):
+        config = self._micro_exhaustion_config(self.config())
+        strategy = TradingStrategy(config)
+        # Local high 100 -> low 95 (a 5% drop, past the 2.5% velocity
+        # bar) -> recovered to 97 (a 40% wick off the low, exactly at
+        # the bar: (97-95)/(100-95) = 0.4).
+        strategy.recent_tick_history["EXHAUST"].append((0.0, Decimal("100")))
+        strategy.recent_tick_history["EXHAUST"].append((10.0, Decimal("95")))
+        strategy.volume_delta_ema["EXHAUST"] = Decimal("100")
+        strategy.volume_delta_latest["EXHAUST"] = Decimal("300")
+        self.assertTrue(
+            strategy.volatility_scalp_micro_exhaustion_confirmed(
+                "EXHAUST", Decimal("97"), 20.0
+            )
+        )
+
+    def test_micro_exhaustion_gate_blocks_a_normal_dip_with_no_volume_spike(self):
+        """Same price action as the passing case above, but the volume
+        delta never actually spiked - a normal dip, not a capitulation
+        event, must NOT pass just from price action alone.
+        """
+        config = self._micro_exhaustion_config(self.config())
+        strategy = TradingStrategy(config)
+        strategy.recent_tick_history["NOVOL"].append((0.0, Decimal("100")))
+        strategy.recent_tick_history["NOVOL"].append((10.0, Decimal("95")))
+        strategy.volume_delta_ema["NOVOL"] = Decimal("100")
+        strategy.volume_delta_latest["NOVOL"] = Decimal("100")
+        self.assertFalse(
+            strategy.volatility_scalp_micro_exhaustion_confirmed(
+                "NOVOL", Decimal("97"), 20.0
+            )
+        )
+
+    def test_micro_exhaustion_gate_ignores_samples_outside_the_lookback_window(self):
+        """A sample older than the lookback window must not count
+        toward the local high/low - proves the time-anchored filtering
+        (not sample count) actually works.
+        """
+        config = self._micro_exhaustion_config(self.config(), lookback_seconds=60)
+        strategy = TradingStrategy(config)
+        # A much older, unrelated high far outside the 60s window -
+        # must be excluded, leaving fewer than 2 valid samples and
+        # failing open.
+        strategy.recent_tick_history["STALE"].append((0.0, Decimal("200")))
+        strategy.volume_delta_ema["STALE"] = Decimal("100")
+        strategy.volume_delta_latest["STALE"] = Decimal("300")
+        self.assertTrue(
+            strategy.volatility_scalp_micro_exhaustion_confirmed(
+                "STALE", Decimal("97"), 1000.0
+            )
+        )
+
+    def test_micro_exhaustion_gate_off_by_default_passes_regardless_of_data(self):
+        config = self._micro_exhaustion_config(self.config(), filter_enabled=False)
+        strategy = TradingStrategy(config)
+        strategy.recent_tick_history["ANY"].append((0.0, Decimal("100")))
+        strategy.recent_tick_history["ANY"].append((10.0, Decimal("95")))
+        strategy.volume_delta_ema["ANY"] = Decimal("100")
+        strategy.volume_delta_latest["ANY"] = Decimal("100")
+        self.assertTrue(
+            strategy.volatility_scalp_micro_exhaustion_confirmed(
+                "ANY", Decimal("97"), 20.0
+            )
+        )
+
+    def test_micro_exhaustion_gate_does_not_block_entry_without_data(self):
+        config = self._micro_exhaustion_config(self.config())
+        strategy = TradingStrategy(config)
+        self.assertTrue(
+            strategy.volatility_scalp_micro_exhaustion_confirmed(
+                "UNSEEN", Decimal("5"), 100.0
+            )
+        )
+
     def test_trend_signal_fires_short_on_a_fresh_bearish_cross(self):
         strategy = TradingStrategy(self.config())
         key = "STOCK:TEST"

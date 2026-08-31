@@ -142,6 +142,46 @@ class Settings(BaseSettings):
     recent_momentum_max_decline_percent: Decimal = Field(
         default=Decimal("0.05"), gt=0, le=1
     )
+    # By request: a 4th, stricter confirmation gate sitting downstream
+    # of volatility_scalp_dip_signal specifically (not breakout/reversal,
+    # which stay untouched) - proves a dip is actual liquidity
+    # exhaustion (a sharp drop, a real bounce off the floor, and a
+    # volume spike that's already fading) rather than just "X% off a
+    # local high." See TradingStrategy.volatility_scalp_micro_
+    # exhaustion_confirmed and AutoTrader.update_recent_tick_history/
+    # update_volume_delta. Zero additional API calls - built entirely
+    # from data the existing scan pass already returns.
+    volatility_scalp_micro_exhaustion_filter_enabled: bool = True
+    # How far back (real elapsed seconds, not sample count) the local
+    # high/low is measured - see recent_tick_history's own comment for
+    # why this can't be a sample count in this codebase.
+    volatility_scalp_micro_exhaustion_lookback_seconds: int = Field(
+        default=300, ge=10, le=3600
+    )
+    # Required drop from the lookback window's local high to the
+    # current price - a real, sharp move within the window, not routine
+    # noise.
+    volatility_scalp_micro_exhaustion_velocity_percent: Decimal = Field(
+        default=Decimal("0.025"), gt=0, le=1
+    )
+    # Required recovery off the lookback window's local low, as a
+    # fraction of its full high-low range - proves the price has
+    # already sprung back partway before this entry, not still
+    # actively falling.
+    volatility_scalp_micro_exhaustion_wick_ratio: Decimal = Field(
+        default=Decimal("0.40"), gt=0, le=1
+    )
+    # Required multiple of the smoothed baseline volume delta - a real
+    # capitulation spike, not routine trading.
+    volatility_scalp_micro_exhaustion_volume_multiplier: Decimal = Field(
+        default=Decimal("2.5"), gt=0, le=50
+    )
+    # Smoothing factor for the rolling volume-delta EMA (see
+    # AutoTrader.update_volume_delta) - higher reacts faster to a
+    # sudden spike, lower stays steadier against routine noise.
+    volatility_scalp_micro_exhaustion_volume_ema_alpha: Decimal = Field(
+        default=Decimal("0.2"), gt=0, le=1
+    )
     # Directional short-selling in the main EMA/SMA stock strategy - a
     # fresh bearish EMA cross opens a short instead of just being skipped.
     # Off by default: the account needs margin/short approval, and Webull

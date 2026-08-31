@@ -97,6 +97,42 @@ class TradingStrategy:
         self.volatility_price_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=config.volatility_scalp_lookback_samples)
         )
+        # By request: micro-exhaustion dip confirmation. A SEPARATE
+        # structure from volatility_price_history above, deliberately -
+        # that deque only gets appended once per symbol per SLOW scan
+        # pass (confirmed live: 30-90s+ between passes), so its 20
+        # samples span an irregular, unpredictable real-time window (a
+        # few minutes to tens of minutes), not a clean short window.
+        # Several already-tuned functions (dip_signal, momentum_
+        # stalled_or_rising, eligibility) assume bare floats there;
+        # retrofitting timestamps into it risks regressing all of them.
+        # This new deque stores (monotonic_timestamp, price) tuples
+        # instead, so velocity/wick math below can filter by ACTUAL
+        # elapsed wall-clock time regardless of how irregular the
+        # append cadence is - see AutoTrader.update_recent_tick_history
+        # and volatility_scalp_micro_exhaustion_confirmed.
+        self.recent_tick_history: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=50)
+        )
+        # Per-symbol volume-delta tracking for the same confirmation
+        # gate - Webull's snapshot volume is cumulative for the day, so
+        # a meaningful "volume spike" has to be derived from the DELTA
+        # between consecutive snapshots, smoothed into a rolling
+        # baseline (a simple EMA). Updated by AutoTrader.update_volume_
+        # delta, once per symbol per snapshot - deliberately NOT touched
+        # by the gate-check function itself (see its docstring): the
+        # existing diagnostic-visibility gate tuples in bot.py already
+        # evaluate every condition TWICE per cycle (once for the real
+        # gate, once for the log-only "why isn't this firing" summary),
+        # so a stateful gate here would silently double-count every
+        # cycle and corrupt the EMA.
+        self.volume_delta_baseline: dict[str, Decimal] = {}
+        self.volume_delta_ema: dict[str, Decimal] = {}
+        # The most recent single-cycle delta itself (a spike candidate,
+        # compared against volume_delta_ema's smoothed baseline) -
+        # separate from the EMA so the gate isn't comparing the
+        # baseline against itself.
+        self.volume_delta_latest: dict[str, Decimal] = {}
 
     def clear_market_state(self) -> None:
         self.activity.clear()
@@ -107,6 +143,10 @@ class TradingStrategy:
         self.crossover_counts.clear()
         self.tick_history.clear()
         self.volatility_price_history.clear()
+        self.recent_tick_history.clear()
+        self.volume_delta_baseline.clear()
+        self.volume_delta_ema.clear()
+        self.volume_delta_latest.clear()
 
     @staticmethod
     def rotating_batch(items: list, cursor: int, batch_size: int) -> tuple[list, int]:
@@ -994,6 +1034,124 @@ class TradingStrategy:
         if direction == "SHORT":
             return momentum <= threshold
         return momentum >= -threshold
+
+    def update_recent_tick_history(
+        self, symbol: str, price: Decimal, moment: float
+    ) -> None:
+        """Appends (moment, price) to recent_tick_history - see its
+        own __init__ comment for why this is a SEPARATE structure from
+        volatility_price_history. moment is a time.monotonic() reading,
+        passed in by the caller rather than read here, so a caller
+        processing a whole batch can share one consistent timestamp
+        across every symbol in it instead of a slightly-different one
+        per call.
+        """
+        if price is None or price <= 0:
+            return
+        self.recent_tick_history[symbol].append((moment, price))
+
+    def update_volume_delta(self, symbol: str, cumulative_volume: Decimal) -> None:
+        """Derives an incremental volume-delta reading from Webull's
+        cumulative day-volume snapshot field, smoothed into a rolling
+        EMA baseline - see volatility_price_history's __init__ comment
+        for why this can't just be a moving average over a bare sample
+        window. First call for a symbol only sets the baseline (a
+        single snapshot has no prior reading to diff against) - no
+        delta or EMA update happens until the second call, same
+        "deploy-resilient" initialization every restart needs.
+        """
+        if cumulative_volume is None or cumulative_volume < 0:
+            return
+        previous = self.volume_delta_baseline.get(symbol)
+        self.volume_delta_baseline[symbol] = cumulative_volume
+        if previous is None or cumulative_volume < previous:
+            # cumulative_volume < previous means the day rolled over
+            # (or this is stale data) - restart the baseline instead of
+            # recording a nonsensical negative delta.
+            return
+        delta = cumulative_volume - previous
+        self.volume_delta_latest[symbol] = delta
+        alpha = self.config.volatility_scalp_micro_exhaustion_volume_ema_alpha
+        prior_ema = self.volume_delta_ema.get(symbol)
+        self.volume_delta_ema[symbol] = (
+            delta if prior_ema is None else alpha * delta + (1 - alpha) * prior_ema
+        )
+
+    def volatility_scalp_micro_exhaustion_confirmed(
+        self, symbol: str, price: Decimal, moment: float
+    ) -> bool:
+        """4th confirmation gate, downstream of volatility_scalp_dip_
+        signal specifically (breakout/reversal are unaffected) - by
+        request, proves a dip-signal candidate is actual liquidity
+        exhaustion (a sharp drop, a real bounce off the floor, and a
+        volume spike that's already fading), not just "X% off a local
+        high" on its own.
+
+        Pure, side-effect-free read of state maintained by update_
+        recent_tick_history/update_volume_delta - deliberately, since
+        bot.py's existing gate-visibility pattern evaluates every
+        condition TWICE per cycle (the real gate, and a diagnostic-only
+        tuple that logs why entries aren't firing) - a stateful check
+        here would double-count on every single cycle.
+
+        Three AND'd conditions, all measured over the last
+        VOLATILITY_SCALP_MICRO_EXHAUSTION_LOOKBACK_SECONDS of real
+        elapsed time (moment is a time.monotonic() reading, same clock
+        recent_tick_history's timestamps use):
+        1. Velocity: price has dropped at least VELOCITY_PERCENT from
+           the window's local high.
+        2. Wick/absorption: price has already recovered at least
+           WICK_RATIO of the window's full high-low range off the
+           local low - proves a floor has already formed, not still
+           falling.
+        3. Volume: the most recent single-cycle volume-delta reading is
+           at least VOLUME_MULTIPLIER times its OWN smoothed rolling
+           baseline (volume_delta_ema) - a real capitulation spike
+           against this symbol's typical recent trading rate, not a
+           fixed number that means something different for a $0.30
+           stock than a $30 one.
+
+        Fails OPEN (True) with the filter disabled or insufficient
+        data (fewer than 2 samples in the lookback window, or no
+        volume-delta EMA yet) - same "no data -> don't block"
+        convention as every other entry gate in this file.
+        """
+        if not self.config.volatility_scalp_micro_exhaustion_filter_enabled:
+            return True
+        if price is None or price <= 0:
+            return True
+        lookback = float(
+            self.config.volatility_scalp_micro_exhaustion_lookback_seconds
+        )
+        samples = self.recent_tick_history.get(symbol)
+        if not samples:
+            return True
+        valid_prices = [p for t, p in samples if moment - t <= lookback]
+        if len(valid_prices) < 2:
+            return True
+        local_high = max(valid_prices)
+        local_low = min(valid_prices)
+        if local_high <= 0:
+            return True
+        velocity_drop = (price - local_high) / local_high
+        price_range = local_high - local_low
+        wick_ratio = (price - local_low) / price_range if price_range > 0 else Decimal("0")
+        volume_ema = self.volume_delta_ema.get(symbol)
+        latest_delta = self.volume_delta_latest.get(symbol)
+        if volume_ema is None or volume_ema <= 0 or latest_delta is None:
+            return True
+        velocity_threshold = (
+            self.config.volatility_scalp_micro_exhaustion_velocity_percent
+        )
+        wick_threshold = self.config.volatility_scalp_micro_exhaustion_wick_ratio
+        volume_threshold = (
+            volume_ema * self.config.volatility_scalp_micro_exhaustion_volume_multiplier
+        )
+        return (
+            velocity_drop <= -velocity_threshold
+            and wick_ratio >= wick_threshold
+            and latest_delta >= volume_threshold
+        )
 
     def priority_score(self, symbol: str, assessment: dict | None) -> float:
         score = self.activity.get(symbol, 0.0)
