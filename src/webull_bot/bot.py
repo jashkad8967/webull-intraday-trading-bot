@@ -4218,12 +4218,55 @@ class AutoTrader:
                     # this strategy directly - closing the asymmetry
                     # that quick-profit-take alone was blind to.
                     self.volatility_scalp_positions.add(symbol)
+                    # Live incident (VVOS): this used to hardcode
+                    # averaging_available=True for ANY cohort position,
+                    # so the hard-stop-floor suppression above always
+                    # gave a position the FULL 8% of room regardless of
+                    # whether it could actually still average down.
+                    # VVOS's averaging-down gate hit "cap reached" after
+                    # just 1 add (thin buying power on a ~$200 account
+                    # left almost no room under the 12% per-symbol risk
+                    # budget - see averaging_down_capacity), yet the
+                    # exit override kept holding it, unprotected, for
+                    # another ~19 minutes and several more points of
+                    # adverse move, all the way to the 8% floor - room
+                    # that was meant for a DCA ladder that had already
+                    # stopped adding. Re-derives the SAME capacity check
+                    # the entry-side averaging gate uses (see the
+                    # identical calculation below in this method) so the
+                    # stop suppression only stays in effect while there
+                    # is still real averaging capacity left; once
+                    # exhausted, the position falls back to its normal,
+                    # tighter adaptive stop instead of riding the full
+                    # DCA-sized floor for no further protection.
+                    averaging_available = True
+                    if symbol in self.volatility_scalp_positions:
+                        estimated_average_down_quantity = self.strategy.volatility_scalp_share_count(
+                            price,
+                            buying_power=self.cached_buying_power,
+                            intensity=Decimal("1"),
+                        )
+                        per_buy_risk_dollars = (
+                            price
+                            * Decimal(estimated_average_down_quantity)
+                            * self.config.volatility_scalp_hard_stop_percent
+                        )
+                        remaining_capacity = self.strategy.averaging_down_capacity(
+                            per_buy_risk_dollars,
+                            self.cached_buying_power,
+                            self.config.volatility_scalp_max_symbol_risk_fraction,
+                            self.config.volatility_scalp_max_averaging_buys,
+                        )
+                        averaging_available = (
+                            self.volatility_scalp_average_down_count[symbol]
+                            < remaining_capacity
+                        )
                     decision = self.strategy.volatility_scalp_exit_override(
                         decision,
                         quantity,
                         cost,
                         price,
-                        averaging_available=True,
+                        averaging_available=averaging_available,
                         symbol=symbol,
                     )
                 if decision.action == "LOSS":
