@@ -4598,6 +4598,7 @@ class AutoTrader:
             self.seed_volatility_windows(
                 [symbol for symbol in batch if symbol in quote_by_symbol]
             )
+        batch_moment = time.monotonic()
         for symbol in batch:
             if symbol in self.broker_conflict_symbols:
                 continue
@@ -4607,6 +4608,24 @@ class AutoTrader:
                     continue
                 price = self.api.quote_price(quote)
                 self.strategy.update_stock_snapshot(quote, price)
+                # By request: micro-exhaustion dip confirmation - see
+                # TradingStrategy.volatility_scalp_micro_exhaustion_
+                # confirmed. Updated here, once per symbol per real
+                # snapshot (not inside the gate-check function itself -
+                # see that method's docstring for why a stateful gate
+                # would double-count against bot.py's existing
+                # diagnostic-visibility tuples). batch_moment is a
+                # single time.monotonic() reading shared across this
+                # whole batch rather than a fresh one per symbol.
+                if price is not None and price > 0:
+                    self.strategy.update_recent_tick_history(
+                        symbol, price, batch_moment
+                    )
+                snapshot_volume = self.strategy.metrics.get(symbol, {}).get("volume")
+                if snapshot_volume is not None:
+                    self.strategy.update_volume_delta(
+                        symbol, Decimal(str(snapshot_volume))
+                    )
                 if self.strategy.is_volatility_scalp_eligible(symbol):
                     self.volatility_scalp_recently_eligible.add(symbol)
                 else:
@@ -4861,8 +4880,13 @@ class AutoTrader:
                         (
                             "scalp - no dip/breakout/reversal trigger",
                             (
-                                self.strategy.volatility_scalp_dip_signal(
-                                    symbol, price
+                                (
+                                    self.strategy.volatility_scalp_dip_signal(
+                                        symbol, price
+                                    )
+                                    and self.strategy.volatility_scalp_micro_exhaustion_confirmed(
+                                        symbol, price, batch_moment
+                                    )
                                 )
                                 or self.strategy.dual_thrust_breakout_signal(
                                     symbol, price
@@ -5069,8 +5093,23 @@ class AutoTrader:
                     # opening-range breakout (the mirror case - a fresh
                     # push to a new high instead of a pullback), and a
                     # Heikin-Ashi confirmed bullish reversal candle.
+                    #
+                    # By request: a 4th confirmation gate sits ONLY
+                    # behind the dip-signal branch specifically - "when
+                    # the flat percentage-off-local-high fires True, it
+                    # runs this... validation." Breakout and reversal
+                    # are independent setups (a fresh push to a new
+                    # high, or a confirmed reversal candle) that don't
+                    # need liquidity-exhaustion proof the same way a
+                    # raw "X% off a local high" dip does - see
+                    # volatility_scalp_micro_exhaustion_confirmed.
                     and (
-                        self.strategy.volatility_scalp_dip_signal(symbol, price)
+                        (
+                            self.strategy.volatility_scalp_dip_signal(symbol, price)
+                            and self.strategy.volatility_scalp_micro_exhaustion_confirmed(
+                                symbol, price, batch_moment
+                            )
+                        )
                         or self.strategy.dual_thrust_breakout_signal(symbol, price)
                         or self.strategy.heikin_ashi_bullish_reversal_signal(symbol)
                     )
