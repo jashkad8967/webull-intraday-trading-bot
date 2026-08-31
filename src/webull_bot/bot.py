@@ -2529,27 +2529,33 @@ class AutoTrader:
                         order_id,
                     )
                 else:
-                    # Live incident ("this is way too trigger happy with
-                    # stopping now"): stop_loss_confirmed skips its own
-                    # wick-confirmation wait ENTIRELY for the volatility-
-                    # scalp cohort (see its docstring - MYND) - a choice
-                    # tuned when the only consumer of a LOSS decision was
-                    # the slow scan, itself only running every 30-90s+,
-                    # which already acted as an implicit noise filter
-                    # between checks. This method runs every 0.25s with
-                    # no such gap, so that same skip now lets a single
-                    # bad tick fire an instant stop with zero
-                    # confirmation. Requires the SAME confirmation
-                    # window here regardless of scalp membership -
-                    # deliberately not calling stop_loss_confirmed at
-                    # all, so the slow loop's own scalp-skip stays
-                    # exactly as tuned; only this fast path changes.
-                    since = self.stop_condition_since.get(symbol)
-                    if self.config.stop_loss_confirmation_enabled and (
-                        since is None
-                        or time.monotonic() - since
-                        < float(self.config.stop_loss_confirmation_seconds)
-                    ):
+                    # REVERTED (live incident: "why is it still taking
+                    # so many losses" / "1 out of 5-10 profiting and the
+                    # losing ones lose way more"). The previous version
+                    # of this branch required time-based wick
+                    # confirmation for scalp-cohort symbols here, in
+                    # response to an earlier "too trigger happy" report.
+                    # That reintroduced the exact "MYND" bug stop_loss_
+                    # confirmed's OWN docstring already documents: for a
+                    # genuinely choppy symbol, price re-crosses the stop
+                    # line often enough that a continuous confirmation
+                    # window never completes - confirmed live, checked
+                    # 20 minutes of logs after that change: zero "LOSS
+                    # (fast)" fires despite two real scalp stop-losses
+                    # (CLGN, NCRA) both going through 6-19s LATE via the
+                    # slow loop instead. At 0.25s sampling the reset
+                    # happens even more easily than at the slow loop's
+                    # 30-90s cadence the MYND fix was originally tuned
+                    # against - net effect: profit-taking got faster
+                    # today, loss-taking for scalp symbols silently
+                    # stayed exactly as slow as before, producing fast/
+                    # small wins against slow/large losses. Back to
+                    # calling stop_loss_confirmed directly - identical
+                    # to the slow loop's own, already-tuned behavior
+                    # (skips confirmation for scalp, applies it for
+                    # everything else) - so this fast path's stop
+                    # actually fires for the cohort it matters most for.
+                    if not self.stop_loss_confirmed(symbol):
                         return
                     limit_price = self.api.stock_stop_exit_price(quote)
                     if not self.price_sanity_ok(symbol, price, limit_price):
