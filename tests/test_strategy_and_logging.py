@@ -14,6 +14,7 @@ from datetime import time as datetime_time
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from webull_bot.commands import CommandQueue
 from webull_bot.config import Settings
@@ -1229,6 +1230,74 @@ class DiversificationCappedEntryBudgetTests(unittest.TestCase):
         self.assertEqual(budget, Decimal("0"))
 
 
+class ProfitTargetMultiplierTests(unittest.TestCase):
+    """profit_target_multiplier - by request: "we basically just want
+    to be able to stay in a significant profit until eod" -> "let
+    winners run further before taking profit."
+    """
+
+    def test_no_widening_when_pnl_is_below_the_threshold(self):
+        from webull_bot.bot import AutoTrader
+
+        multiplier = AutoTrader.profit_target_multiplier(
+            Decimal("2"), Decimal("200"), Decimal("0.03"), Decimal("1.5")
+        )
+        self.assertEqual(multiplier, Decimal("1"))
+
+    def test_widens_once_pnl_crosses_the_threshold(self):
+        from webull_bot.bot import AutoTrader
+
+        multiplier = AutoTrader.profit_target_multiplier(
+            Decimal("7"), Decimal("200"), Decimal("0.03"), Decimal("1.5")
+        )
+        self.assertEqual(multiplier, Decimal("1.5"))
+
+    def test_widens_exactly_at_the_threshold(self):
+        from webull_bot.bot import AutoTrader
+
+        multiplier = AutoTrader.profit_target_multiplier(
+            Decimal("6"), Decimal("200"), Decimal("0.03"), Decimal("1.5")
+        )
+        self.assertEqual(multiplier, Decimal("1.5"))
+
+    def test_no_widening_with_a_loss(self):
+        from webull_bot.bot import AutoTrader
+
+        multiplier = AutoTrader.profit_target_multiplier(
+            Decimal("-10"), Decimal("200"), Decimal("0.03"), Decimal("1.5")
+        )
+        self.assertEqual(multiplier, Decimal("1"))
+
+    def test_fails_safe_with_unknown_account_value(self):
+        from webull_bot.bot import AutoTrader
+
+        multiplier = AutoTrader.profit_target_multiplier(
+            Decimal("100"), None, Decimal("0.03"), Decimal("1.5")
+        )
+        self.assertEqual(multiplier, Decimal("1"))
+
+
+class LateCoreSessionTransitionTests(StrategyConfigMixin, unittest.TestCase):
+    """Recalibrated stock_decision fresh-entry gating - by request:
+    "start transitioning away from core hours strategy around 30
+    minutes before end of core hours." Verifies profit_target_
+    multiplier actually reaches stock_decision's target computation.
+    """
+
+    def test_profit_target_multiplier_widens_the_general_path_target(self):
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:WIDE"
+        strategy.metrics[key.split(":", 1)[1]] = {"spread_percent": 0.0}
+        normal = strategy.stock_decision(
+            key, Decimal("100"), 10, Decimal("90"),
+        )
+        widened = strategy.stock_decision(
+            key, Decimal("100"), 10, Decimal("90"),
+            profit_target_multiplier=Decimal("1.5"),
+        )
+        self.assertGreaterEqual(widened.target_price, normal.target_price)
+
+
 class RefreshPremarketGainersTests(unittest.TestCase):
     """refresh_premarket_gainers - by request: "get the top gainers
     before the day starts and look to invest in that for quick
@@ -1332,6 +1401,112 @@ class RefreshPremarketGainersTests(unittest.TestCase):
 
         self.assertEqual(fake_bot.premarket_gainers, set())
         self.assertEqual(fake_bot.seed_popular_symbols, set())
+
+
+class RefreshAgentPredictedGainersTests(unittest.TestCase):
+    """refresh_agent_predicted_gainers - by request: "have the
+    research agent return stocks likely to be top gainers before core
+    hours start, then put those stocks in some sort of priority list
+    to also look at." Complementary to refresh_premarket_gainers (the
+    same priority-list mechanism, fed by the research agent instead of
+    Webull's own screener).
+    """
+
+    @staticmethod
+    def _fake_bot(predicted_symbols=None, agent=None):
+        calls = {"n": 0}
+
+        class FakeAgent:
+            def predict_likely_gainers(self):
+                calls["n"] += 1
+                return predicted_symbols
+
+        return (
+            SimpleNamespace(
+                agent_predicted_gainers=set(),
+                agent_predicted_gainers_date=None,
+                seed_popular_symbols=set(),
+                stock_symbols=["AAPL", "MSFT"],
+                stock_categories={"AAPL": "US_STOCK", "MSFT": "US_STOCK"},
+                market_agent=FakeAgent() if agent is None else agent,
+            ),
+            calls,
+        )
+
+    def test_fetches_and_merges_new_symbols_into_the_universe(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, calls = self._fake_bot(predicted_symbols=["NCPL", "chow"])
+        refresh = AutoTrader.refresh_agent_predicted_gainers.__get__(fake_bot)
+        moment = datetime(2026, 8, 28)
+
+        refresh(moment)
+
+        self.assertEqual(fake_bot.agent_predicted_gainers, {"NCPL", "CHOW"})
+        self.assertTrue({"NCPL", "CHOW"} <= fake_bot.seed_popular_symbols)
+        self.assertIn("NCPL", fake_bot.stock_symbols)
+        self.assertIn("CHOW", fake_bot.stock_symbols)
+        self.assertEqual(fake_bot.agent_predicted_gainers_date, moment.date())
+        self.assertEqual(calls["n"], 1)
+
+    def test_only_fetches_once_per_day(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, calls = self._fake_bot(predicted_symbols=["NCPL"])
+        refresh = AutoTrader.refresh_agent_predicted_gainers.__get__(fake_bot)
+
+        refresh(datetime(2026, 8, 28, 4, 0))
+        refresh(datetime(2026, 8, 28, 9, 0))
+
+        self.assertEqual(calls["n"], 1)
+
+    def test_refetches_on_a_new_day(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, calls = self._fake_bot(predicted_symbols=["NCPL"])
+        refresh = AutoTrader.refresh_agent_predicted_gainers.__get__(fake_bot)
+
+        refresh(datetime(2026, 8, 28))
+        refresh(datetime(2026, 8, 29))
+
+        self.assertEqual(calls["n"], 2)
+
+    def test_disabled_when_agent_is_none(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, _ = self._fake_bot()
+        fake_bot.market_agent = None
+        refresh = AutoTrader.refresh_agent_predicted_gainers.__get__(fake_bot)
+
+        refresh(datetime(2026, 8, 28))
+
+        self.assertEqual(fake_bot.agent_predicted_gainers, set())
+        self.assertEqual(fake_bot.agent_predicted_gainers_date, datetime(2026, 8, 28).date())
+
+    def test_none_result_leaves_state_untouched(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, _ = self._fake_bot(predicted_symbols=None)
+        refresh = AutoTrader.refresh_agent_predicted_gainers.__get__(fake_bot)
+
+        refresh(datetime(2026, 8, 28))
+
+        self.assertEqual(fake_bot.agent_predicted_gainers, set())
+        self.assertEqual(fake_bot.seed_popular_symbols, set())
+
+    def test_agent_exception_is_swallowed(self):
+        from webull_bot.bot import AutoTrader
+
+        class BrokenAgent:
+            def predict_likely_gainers(self):
+                raise RuntimeError("boom")
+
+        fake_bot, _ = self._fake_bot(agent=BrokenAgent())
+        refresh = AutoTrader.refresh_agent_predicted_gainers.__get__(fake_bot)
+
+        refresh(datetime(2026, 8, 28))  # must not raise
+
+        self.assertEqual(fake_bot.agent_predicted_gainers, set())
 
 
 class StockScanConcurrentBatchesTests(unittest.TestCase):
@@ -5044,6 +5219,108 @@ class StrategyReviewAgentTests(unittest.TestCase):
         )
 
         self.assertLessEqual(captured["max_completion_tokens"], 4000)
+
+
+class PredictLikelyGainersTests(unittest.TestCase):
+    """MarketResearchAgent.predict_likely_gainers - by request: "have
+    the research agent return stocks likely to be top gainers before
+    core hours start." One-shot per day, shares the same daily
+    request/token budget as submit_strategy_review.
+    """
+
+    _FIXED_MOMENT = datetime(2026, 8, 30, 14, 0, tzinfo=timezone.utc)
+
+    @classmethod
+    def _fake_agent(cls, response_content, requests_today=0, token_usage=None):
+        agent = MarketResearchAgent.__new__(MarketResearchAgent)
+        agent.config = SimpleNamespace(
+            agent_daily_request_limit=250,
+            agent_daily_token_budget=100000,
+            groq_model="openai/gpt-oss-120b",
+            groq_reasoning_effort="low",
+            market_open_time="04:00",
+        )
+        agent.config.session_time = (
+            lambda value: datetime_time(*(int(p) for p in value.split(":")))
+        )
+        agent.log = logging.getLogger("test-agent")
+        agent._requests_today = requests_today
+        # Same session as _FIXED_MOMENT (both after 04:00 UTC-session-
+        # open on the same calendar day) - so predict_likely_gainers'
+        # own new-day reset never fires, and requests_today/token_usage
+        # passed in above are exactly what the real check sees.
+        agent._request_date = cls._FIXED_MOMENT.date()
+        agent._limit_logged_date = None
+        agent._rate_limit_blocked = False
+        agent._token_limit_logged_at = 0.0
+        agent._token_usage_log = list(token_usage or [])
+        agent._timezone = timezone.utc
+
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+                self.usage = None
+
+        def fake_create(**kwargs):
+            return FakeResponse(response_content)
+
+        agent.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+        )
+        return agent
+
+    def _predict(self, agent):
+        with unittest.mock.patch(
+            "webull_bot.market_agent.datetime"
+        ) as mock_datetime:
+            mock_datetime.now.return_value = self._FIXED_MOMENT
+            return agent.predict_likely_gainers()
+
+    def test_parses_a_valid_symbol_list(self):
+        agent = self._fake_agent('{"symbols":["AAPL","tsla"]}')
+        result = self._predict(agent)
+        self.assertEqual(result, ["AAPL", "TSLA"])
+        self.assertEqual(agent._requests_today, 1)
+
+    def test_caps_at_15_symbols(self):
+        symbols = [f"SYM{i}" for i in range(20)]
+        agent = self._fake_agent(json.dumps({"symbols": symbols}))
+        result = self._predict(agent)
+        self.assertEqual(len(result), 15)
+
+    def test_invalid_json_returns_none_without_crashing(self):
+        agent = self._fake_agent("not json")
+        result = self._predict(agent)
+        self.assertIsNone(result)
+
+    def test_missing_symbols_key_returns_none(self):
+        agent = self._fake_agent('{"other":[]}')
+        result = self._predict(agent)
+        self.assertIsNone(result)
+
+    def test_skipped_when_daily_request_budget_exhausted(self):
+        agent = self._fake_agent(
+            '{"symbols":["AAPL"]}', requests_today=250
+        )
+        result = self._predict(agent)
+        self.assertIsNone(result)
+        self.assertEqual(agent._requests_today, 250)
+
+    def test_skipped_when_rolling_token_budget_exhausted(self):
+        agent = self._fake_agent(
+            '{"symbols":["AAPL"]}',
+            token_usage=[(time.monotonic(), 100000)],
+        )
+        result = self._predict(agent)
+        self.assertIsNone(result)
 
 
 class AllocationAndLoggingTests(unittest.TestCase):

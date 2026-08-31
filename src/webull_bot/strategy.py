@@ -1534,6 +1534,7 @@ class TradingStrategy:
         idle_relaxation_amount: Decimal = Decimal("0"),
         seconds_since_entry: float | None = None,
         core_session_active: bool = True,
+        profit_target_multiplier: Decimal = Decimal("1"),
     ) -> Decision:
         trend = self.trend_signal(key, price)
         symbol = key.split(":", 1)[-1]
@@ -1573,10 +1574,24 @@ class TradingStrategy:
             # position's target is just the flat cost-recovery floor -
             # fires on any solidly fee-covered gain - with no additional
             # stop-scaled requirement layered on top of it.
+            # By request: "we basically just want to be able to stay in
+            # a significant profit until eod" -> "let winners run
+            # further before taking profit." profit_target_multiplier
+            # (>1 once the day is already significantly ahead - see
+            # AutoTrader.profit_target_multiplier) widens the stop-
+            # scaled component only, never the flat fractional/cost-
+            # recovery floor - a small account's fee-covered floor
+            # exists for basic solvency, not something a "run further"
+            # mode should ever push out past.
             target_percent = (
                 floor_percent
                 if is_fractional
-                else max(floor_percent, stop_percent * self.config.stock_target_stop_multiple)
+                else max(
+                    floor_percent,
+                    stop_percent
+                    * self.config.stock_target_stop_multiple
+                    * profit_target_multiplier,
+                )
             )
             base_target = average_cost * (Decimal("1") + target_percent) + fee_per_share
             stop = average_cost * (Decimal("1") - stop_percent)
@@ -1647,7 +1662,9 @@ class TradingStrategy:
             target_percent = max(
                 self.config.stock_min_net_profit_percent
                 + self.config.stock_estimated_round_trip_cost_percent,
-                stop_percent * self.config.stock_target_stop_multiple,
+                stop_percent
+                * self.config.stock_target_stop_multiple
+                * profit_target_multiplier,
             )
             base_target = average_cost * (Decimal("1") - target_percent) - fee_per_share
             stop = average_cost * (Decimal("1") + stop_percent)
