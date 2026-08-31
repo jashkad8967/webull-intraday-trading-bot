@@ -3510,6 +3510,74 @@ class AutoTrader:
                 (action or "pending").lower(),
                 threshold,
             )
+            # Live incident (CLGN): this log line has always claimed
+            # "escalating to an aggressive crossing price," but nothing
+            # below it ever actually placed one - the cancelled order
+            # was simply abandoned here, leaving the position with NO
+            # resting exit at all until trade_stocks' own quote loop
+            # (SCAN cadence, observed 30-90s+ live) happened to reach
+            # this symbol again. CLGN's PROFIT order stalled while still
+            # genuinely above cost, got cancelled here, and then sat
+            # completely unprotected for the next ~34 seconds while the
+            # price crashed straight through cost and past the hard-
+            # stop floor before the slow loop ever noticed - turning a
+            # real, in-hand profit into a much larger loss. Reusing the
+            # full stock_decision/pricing pipeline here isn't safe to
+            # duplicate quickly (it carries its own careful, live-
+            # incident-tuned safeguards - price sanity, lot-restriction,
+            # stop-loss wick confirmation), so this stays narrow and
+            # provably safe: only acts when the position has ALREADY
+            # dropped to or below cost (an undeniable loss already
+            # forming, not a guess), and only ever fires the same
+            # aggressive-cross SELL price genuine stop escalations
+            # already use elsewhere - never touches the profit-
+            # preserving path when price is still genuinely above cost,
+            # which keeps waiting for the slow loop's existing, already-
+            # correct _stall_exit_price logic exactly as before.
+            try:
+                quantity, cost = self.api.stock_position(symbol, self.cached_positions)
+                if quantity > 0 and cost > 0:
+                    quote = self._batched_quotes([symbol]).get(symbol)
+                    if quote is not None:
+                        price = self.api.quote_price(quote)
+                        if price is not None and price <= cost:
+                            limit_price = self.api.stock_limit_price(quote, "SELL")
+                            if limit_price is not None and self.price_sanity_ok(
+                                symbol, price, limit_price
+                            ):
+                                new_order_id = self.api.place_stock(
+                                    symbol,
+                                    "SELL",
+                                    quantity,
+                                    limit_price=limit_price,
+                                    fractional=self.is_fractional_quantity(quantity),
+                                )
+                                self.pending_stock_exits.add(symbol)
+                                self.stop_exit_submitted[symbol] = time.monotonic()
+                                pnl = self.record_realized_exit(
+                                    cost, limit_price, quantity
+                                )
+                                self.record_trade(
+                                    key,
+                                    new_order_id,
+                                    "STOP",
+                                    limit_price,
+                                    pnl=pnl,
+                                    entry_price=cost,
+                                    quantity=quantity,
+                                )
+                                log.warning(
+                                    "STOP   | %s | already at/below cost after "
+                                    "the stall - selling immediately instead "
+                                    "of waiting for the next scan",
+                                    symbol,
+                                )
+            except Exception as exc:
+                log.error(
+                    "STOP   | %s | immediate post-escalation sell failed | %s",
+                    symbol,
+                    exc,
+                )
 
     def reconcile_order_history(self) -> None:
         """Log-only audit: cross-checks today's Webull order history
