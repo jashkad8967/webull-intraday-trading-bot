@@ -88,7 +88,21 @@ class Settings(BaseSettings):
     stock_scan_target_full_coverage_cycles: int = Field(
         default=5, ge=1, le=500
     )
-    stock_scan_max_concurrent_batches: int = Field(default=8, ge=1, le=50)
+    # By request: "we want entry and profit to be quicker" - live
+    # evidence showed a full trade_stocks cycle (needed to detect a
+    # FRESH entry signal, or a held position's FIRST crossing into
+    # profit/loss territory before any exit order exists to actively
+    # manage) only completing every 30-90+ seconds, well past the point
+    # this cap (8) becomes the binding constraint on a large universe -
+    # at stock_batch_size=100, needed concurrent batches already
+    # exceeds 8 whenever the universe is above ~4000 symbols with the
+    # default 5-cycle coverage target, so this cap was the actual
+    # throughput ceiling for most of the day, not the coverage-cycles
+    # target above it. Raised 8 -> 12 (a 50% increase in real request
+    # volume) - still well short of the field's own max (50), and
+    # _retry_once_on_rate_limit already backstops the live 429
+    # TOO_MANY_REQUESTS risk this was originally capped against.
+    stock_scan_max_concurrent_batches: int = Field(default=12, ge=1, le=50)
     stock_scan_extended_hours_concurrency_fraction: Decimal = Field(
         default=Decimal("0.5"), ge=0, le=1
     )

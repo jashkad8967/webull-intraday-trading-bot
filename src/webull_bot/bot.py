@@ -354,6 +354,7 @@ class AutoTrader:
         self.last_reprice = 0.0
         self.last_volatility_reprice = 0.0
         self.last_volatility_entry_reprice = 0.0
+        self.last_held_exit_scan = 0.0
         self.last_entry_reprice = 0.0
         self.last_stall_boost = 0.0
         # See idle_cash_ramp_progress()/record_trade() - tracks how long
@@ -383,6 +384,24 @@ class AutoTrader:
         # its docstring and run()'s "self.cached_core_session_active =
         # core_session_active" assignment.
         self.cached_core_session_active = False
+        # By request: "we want entry and profit to be quicker." These
+        # mirror cached_core_session_active above - trade_stocks (main
+        # thread) computes each of these once per cycle already; the
+        # new evaluate_held_stock_exits (background thread, see
+        # _position_protection_loop) reads the cached copies so a held
+        # position's FIRST crossing into profit/loss territory (the
+        # step that used to only get detected once every 30-90+ seconds
+        # on the slow full-universe scan) can be detected and acted on
+        # at the fast 0.25s cadence instead, without needing its own
+        # separate, possibly-inconsistent recomputation of any of them.
+        # Plain attribute assignment stays atomic under the GIL, same
+        # convention as cached_core_session_active.
+        self.cached_opening_grace_active = False
+        self.cached_idle_relaxation_multiplier = Decimal("1")
+        self.cached_idle_relaxation_amount = Decimal("0")
+        self.cached_effective_core_session_active = False
+        self.cached_profit_target_multiplier = Decimal("1")
+        self.cached_stop_tighten_multiplier = Decimal("1")
         # Webull's own account-level today's total P&L, refreshed
         # alongside cached_buying_power/cached_positions in account_state
         # - see account_day_pnl_from_balance and write_status_snapshot's
@@ -2302,6 +2321,218 @@ class AutoTrader:
 
         _dispatch_concurrently(candidates, _reprice_one)
 
+    def evaluate_held_stock_exits(self) -> None:
+        """By request: "we want entry and profit to be quicker." Detects
+        a held LONG stock position's FIRST crossing into profit/loss
+        territory - the step that previously only happened inside
+        trade_stocks' slow, full-universe scan (live evidence: 30-90s+
+        between cycles) - and places its exit order right here, on the
+        fast poll_seconds cadence, instead of waiting for the scan to
+        come back around. Once an order actually exists, it was already
+        being actively managed fast (reprice_volatility_scalp_exits/
+        reprice_resting_exits at 1s/5s, escalate_stalled_stop_losses at
+        15s) - this closes the one remaining slow step: the very first
+        detection.
+
+        Deliberately narrow scope to keep this safe to run unreviewed
+        on live capital: LONG stock positions only (no shorts/covers -
+        their pricing/WASH-blocking differs enough that duplicating it
+        here isn't worth the added risk for a first pass), whole-share
+        only (no fractional lot-restriction edge cases). Anything
+        outside this scope is simply skipped here and falls back to the
+        exact same slow-loop handling as before - a pure addition,
+        never a regression, since the slow loop's own handling for
+        every position is completely unchanged and still runs.
+
+        Reuses the exact same TradingStrategy.stock_decision/
+        volatility_scalp_exit_override calls the slow loop uses (same
+        cached multipliers - see cached_profit_target_multiplier's
+        __init__ comment - so the decision computed here is identical
+        to what the slow loop would eventually compute), and the same
+        _stall_exit_price/stock_stop_exit_price pricing plus price-
+        sanity/lot-restriction/stop-confirmation gates the slow loop
+        already relies on - never a new pricing path, only the existing
+        one running sooner. Also stamps stop_condition_since itself
+        (mirroring the slow loop's own stamp) so the stop-loss
+        confirmation window starts counting from the FIRST fast-loop
+        detection, not from whenever the slow loop happens to also
+        notice the same breach.
+        """
+        now = time.monotonic()
+        if now - self.last_held_exit_scan < float(self.config.poll_seconds):
+            return
+        self.last_held_exit_scan = now
+        with _working_orders_lock(self):
+            working_snapshot = list(self.working_orders.values())
+        keys_with_orders = {
+            str(order.get("key"))
+            for order in working_snapshot
+            if order.get("action") in ("PROFIT", "STOP")
+        }
+        candidates = []
+        for item in self.cached_positions:
+            if item.get("instrument_type") != "EQUITY":
+                continue
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            quantity = Decimal(str(item.get("quantity", "0")))
+            if quantity <= 0:
+                continue
+            key = f"STOCK:{symbol}"
+            if key in keys_with_orders or symbol in self.pending_stock_exits:
+                continue
+            candidates.append(symbol)
+        if not candidates:
+            return
+        quotes = self._batched_quotes(candidates)
+
+        def _evaluate_one(symbol: str) -> None:
+            key = f"STOCK:{symbol}"
+            try:
+                quote = quotes.get(symbol)
+                if quote is None:
+                    return
+                quantity, cost = self.api.stock_position(symbol, self.cached_positions)
+                if quantity <= 0 or cost <= 0:
+                    return
+                if self.is_fractional_quantity(quantity):
+                    return
+                price = self.api.quote_price(quote)
+                if price is None:
+                    return
+                opened_at = self.position_opened_at.get(key)
+                seconds_since_entry = (
+                    time.monotonic() - opened_at if opened_at is not None else None
+                )
+                decision = self.strategy.stock_decision(
+                    key,
+                    price,
+                    quantity,
+                    cost,
+                    self.agent_assessment(symbol),
+                    self.cached_opening_grace_active,
+                    self.cached_idle_relaxation_multiplier,
+                    self.cached_idle_relaxation_amount,
+                    seconds_since_entry,
+                    self.cached_effective_core_session_active,
+                    self.cached_profit_target_multiplier,
+                    self.cached_stop_tighten_multiplier,
+                )
+                is_scalp_cohort = self.strategy.is_volatility_scalp_eligible(
+                    symbol
+                ) or symbol in self.volatility_scalp_positions
+                if is_scalp_cohort:
+                    self.volatility_scalp_positions.add(symbol)
+                    estimated_average_down_quantity = self.strategy.volatility_scalp_share_count(
+                        price,
+                        buying_power=self.cached_buying_power,
+                        intensity=Decimal("1"),
+                    )
+                    per_buy_risk_dollars = (
+                        price
+                        * Decimal(estimated_average_down_quantity)
+                        * self.config.volatility_scalp_hard_stop_percent
+                    )
+                    remaining_capacity = self.strategy.averaging_down_capacity(
+                        per_buy_risk_dollars,
+                        self.cached_buying_power,
+                        self.config.volatility_scalp_max_symbol_risk_fraction,
+                        self.config.volatility_scalp_max_averaging_buys,
+                    )
+                    averaging_available = (
+                        self.volatility_scalp_average_down_count[symbol]
+                        < remaining_capacity
+                    )
+                    decision = self.strategy.volatility_scalp_exit_override(
+                        decision,
+                        quantity,
+                        cost,
+                        price,
+                        averaging_available=averaging_available,
+                        symbol=symbol,
+                    )
+                if decision.action == "LOSS":
+                    if symbol not in self.stop_condition_since:
+                        self.stop_condition_since[symbol] = time.monotonic()
+                else:
+                    self.stop_condition_since.pop(symbol, None)
+                if decision.action not in ("PROFIT", "LOSS"):
+                    return
+                if self.strategy.exit_blocked_by_lot_restriction(quantity, price):
+                    return
+                if not self.price_sanity_cooldown_ready(symbol):
+                    return
+                fee_per_share = self.config.sell_fee_dollars / quantity
+                if decision.action == "PROFIT":
+                    min_profit = cost * self.config.volatility_scalp_target_percent
+                    if is_scalp_cohort:
+                        limit_price = self._stall_exit_price(
+                            quote,
+                            cost,
+                            min_profit,
+                            fee_per_share,
+                            max_spread_percent=(
+                                self.config.volatility_scalp_max_exit_spread_percent
+                            ),
+                        )
+                    else:
+                        ask = self.api.quote_ask(quote)
+                        target = decision.target_price
+                        if target is None:
+                            return
+                        limit_price = max(ask, target) if ask else target
+                    if limit_price is None:
+                        return
+                    if not self.price_sanity_ok(symbol, price, limit_price):
+                        return
+                    order_id = self.api.place_stock(
+                        symbol, "SELL", quantity, limit_price=limit_price
+                    )
+                    self.pending_stock_exits.add(symbol)
+                    self.stop_exit_submitted[symbol] = time.monotonic()
+                    pnl = self.record_realized_exit(cost, limit_price, quantity)
+                    self.record_trade(
+                        key, order_id, "PROFIT", limit_price, pnl=pnl,
+                        entry_price=cost, quantity=quantity,
+                    )
+                    log.info(
+                        "REPRICE| %-8s | PROFIT (fast) | limit=%s | id=%s",
+                        symbol,
+                        limit_price,
+                        order_id,
+                    )
+                else:
+                    if not self.stop_loss_confirmed(symbol):
+                        return
+                    limit_price = self.api.stock_stop_exit_price(quote)
+                    if not self.price_sanity_ok(symbol, price, limit_price):
+                        return
+                    order_id = self.api.place_stock(
+                        symbol, "SELL", quantity, limit_price=limit_price
+                    )
+                    self.pending_stock_exits.add(symbol)
+                    self.stop_exit_submitted[symbol] = time.monotonic()
+                    pnl = self.record_realized_exit(cost, limit_price, quantity)
+                    self.record_trade(
+                        key, order_id, "STOP", limit_price, pnl=pnl,
+                        entry_price=cost, quantity=quantity,
+                    )
+                    log.warning(
+                        "STOP   | %-8s | LOSS (fast) | limit=%s | id=%s",
+                        symbol,
+                        limit_price,
+                        order_id,
+                    )
+            except Exception as exc:
+                log.error(
+                    "PROTECT| %s | fast held-exit evaluation failed | %s",
+                    symbol,
+                    exc,
+                )
+
+        _dispatch_concurrently(candidates, _evaluate_one)
+
     def reprice_volatility_scalp_entries(self) -> None:
         """Actively re-quotes a resting cohort BUY order toward the
         current market instead of waiting passively for price to come
@@ -3882,6 +4113,15 @@ class AutoTrader:
         effective_core_session_active = (
             core_session_active and not late_core_session_transition_active
         )
+        # See evaluate_held_stock_exits/cached_opening_grace_active's
+        # __init__ comment - refreshed every cycle so the fast
+        # position-protection thread always reads this cycle's values.
+        self.cached_opening_grace_active = opening_grace_active
+        self.cached_idle_relaxation_multiplier = idle_relaxation_multiplier
+        self.cached_idle_relaxation_amount = idle_relaxation_amount
+        self.cached_effective_core_session_active = effective_core_session_active
+        self.cached_profit_target_multiplier = profit_target_multiplier
+        self.cached_stop_tighten_multiplier = stop_tighten_multiplier
         self.refresh_agent_discoveries()
         if self.analyst_service is not None:
             # One cycle stale relative to any fetch a symbol's own
@@ -7178,6 +7418,7 @@ class AutoTrader:
             started = time.monotonic()
             try:
                 self.monitor_working_orders()
+                self.evaluate_held_stock_exits()
                 self.reprice_resting_exits(
                     self.cached_positions, self.cached_core_session_active
                 )
