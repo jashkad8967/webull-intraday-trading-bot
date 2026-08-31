@@ -2537,6 +2537,7 @@ class AutoTrader:
                     order_id = self.api.place_stock(
                         symbol, "SELL", quantity, limit_price=limit_price
                     )
+                    self.wash_sales.block(symbol, "stop-loss exit submitted")
                     self.pending_stock_exits.add(symbol)
                     self.stop_exit_submitted[symbol] = time.monotonic()
                     pnl = self.record_realized_exit(cost, limit_price, quantity)
@@ -3808,6 +3809,9 @@ class AutoTrader:
                                     quantity,
                                     limit_price=limit_price,
                                     fractional=self.is_fractional_quantity(quantity),
+                                )
+                                self.wash_sales.block(
+                                    symbol, "stop-loss exit submitted"
                                 )
                                 self.pending_stock_exits.add(symbol)
                                 self.stop_exit_submitted[symbol] = time.monotonic()
