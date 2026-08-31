@@ -23,7 +23,12 @@ from webull_bot.pairs import (
     PairsStrategy,
 )
 from webull_bot.status import StatusWriter
-from webull_bot.strategy import OBI_DEPTH_LEVELS, OPTION_VIXY_SYMBOL, TradingStrategy
+from webull_bot.strategy import (
+    OBI_DEPTH_LEVELS,
+    OPTION_VIXY_SYMBOL,
+    Decision,
+    TradingStrategy,
+)
 from webull_bot.trade_events import TradeEventStreamService
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import (
@@ -3799,7 +3804,62 @@ class AutoTrader:
                     quote = self._batched_quotes([symbol]).get(symbol)
                     if quote is not None:
                         price = self.api.quote_price(quote)
-                        if price is not None and price <= cost:
+                        # Live incident ("still selling too fast and not
+                        # waiting to average down"): this used to sell
+                        # the instant price <= cost, full stop - no
+                        # regard for the volatility-scalp cohort's
+                        # entire "average down instead of stopping out"
+                        # design (volatility_scalp_exit_override,
+                        # already respected everywhere else a LOSS
+                        # decision is handled). SST bought 14:52:46,
+                        # stalled, escalated 37s later, and got sold
+                        # immediately here without ever getting a chance
+                        # to average down - a real regression this fix
+                        # introduced. Now runs the SAME override the
+                        # rest of the codebase uses before selling: a
+                        # scalp-cohort position only sells here if
+                        # averaging capacity is already exhausted or the
+                        # hard-stop floor is genuinely breached, exactly
+                        # matching the slow loop's own logic. A non-
+                        # scalp position (no averaging plan behind it)
+                        # is unaffected - still sells immediately, since
+                        # there's nothing to wait for.
+                        should_sell = price is not None and price <= cost
+                        if should_sell and (
+                            self.strategy.is_volatility_scalp_eligible(symbol)
+                            or symbol in self.volatility_scalp_positions
+                        ):
+                            self.volatility_scalp_positions.add(symbol)
+                            estimated_average_down_quantity = self.strategy.volatility_scalp_share_count(
+                                price,
+                                buying_power=self.cached_buying_power,
+                                intensity=Decimal("1"),
+                            )
+                            per_buy_risk_dollars = (
+                                price
+                                * Decimal(estimated_average_down_quantity)
+                                * self.config.volatility_scalp_hard_stop_percent
+                            )
+                            remaining_capacity = self.strategy.averaging_down_capacity(
+                                per_buy_risk_dollars,
+                                self.cached_buying_power,
+                                self.config.volatility_scalp_max_symbol_risk_fraction,
+                                self.config.volatility_scalp_max_averaging_buys,
+                            )
+                            averaging_available = (
+                                self.volatility_scalp_average_down_count[symbol]
+                                < remaining_capacity
+                            )
+                            override = self.strategy.volatility_scalp_exit_override(
+                                Decision("LOSS", "already at/below cost", price),
+                                quantity,
+                                cost,
+                                price,
+                                averaging_available=averaging_available,
+                                symbol=symbol,
+                            )
+                            should_sell = override.action == "LOSS"
+                        if should_sell:
                             limit_price = self.api.stock_limit_price(quote, "SELL")
                             if limit_price is not None and self.price_sanity_ok(
                                 symbol, price, limit_price
