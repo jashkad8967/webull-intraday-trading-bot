@@ -2529,7 +2529,27 @@ class AutoTrader:
                         order_id,
                     )
                 else:
-                    if not self.stop_loss_confirmed(symbol):
+                    # Live incident ("this is way too trigger happy with
+                    # stopping now"): stop_loss_confirmed skips its own
+                    # wick-confirmation wait ENTIRELY for the volatility-
+                    # scalp cohort (see its docstring - MYND) - a choice
+                    # tuned when the only consumer of a LOSS decision was
+                    # the slow scan, itself only running every 30-90s+,
+                    # which already acted as an implicit noise filter
+                    # between checks. This method runs every 0.25s with
+                    # no such gap, so that same skip now lets a single
+                    # bad tick fire an instant stop with zero
+                    # confirmation. Requires the SAME confirmation
+                    # window here regardless of scalp membership -
+                    # deliberately not calling stop_loss_confirmed at
+                    # all, so the slow loop's own scalp-skip stays
+                    # exactly as tuned; only this fast path changes.
+                    since = self.stop_condition_since.get(symbol)
+                    if self.config.stop_loss_confirmation_enabled and (
+                        since is None
+                        or time.monotonic() - since
+                        < float(self.config.stop_loss_confirmation_seconds)
+                    ):
                         return
                     limit_price = self.api.stock_stop_exit_price(quote)
                     if not self.price_sanity_ok(symbol, price, limit_price):
