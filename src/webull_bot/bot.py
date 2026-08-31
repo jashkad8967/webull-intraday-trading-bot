@@ -2099,8 +2099,16 @@ class AutoTrader:
         every re-quote would record the same realized P&L multiple times
         for one logical exit.
         """
+        # By request: "bring repricing to the 0.25 lane as well" -
+        # this used to throttle on order_monitor_seconds (5s, shared
+        # with monitor_working_orders' fill-detection cadence) even
+        # though it already runs inside the fast poll_seconds (0.25s)
+        # position-protection loop - now re-quotes every tick of that
+        # loop instead of only once every 5s.
         now = time.monotonic()
-        if now - self.last_reprice < float(self.config.order_monitor_seconds):
+        if now - self.last_reprice < float(
+            getattr(self.config, "poll_seconds", Decimal("0.25"))
+        ):
             return
         self.last_reprice = now
         candidates: list[tuple[str, str, dict]] = []
@@ -2684,8 +2692,12 @@ class AutoTrader:
         fractional cancel-and-replace can't succeed there either, same
         constraint reprice_resting_exits already respects.
         """
+        # By request: "bring repricing to the 0.25 lane as well" - see
+        # reprice_resting_exits' identical note above.
         now = time.monotonic()
-        if now - self.last_entry_reprice < float(self.config.order_monitor_seconds):
+        if now - self.last_entry_reprice < float(
+            getattr(self.config, "poll_seconds", Decimal("0.25"))
+        ):
             return
         self.last_entry_reprice = now
         candidates: list[tuple[str, str, dict]] = []

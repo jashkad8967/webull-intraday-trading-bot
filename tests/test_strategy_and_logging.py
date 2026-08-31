@@ -4449,7 +4449,10 @@ class RepriceRestingEntriesTests(unittest.TestCase):
         fake_bot, cancelled, placed = self._fake_bot(
             working_orders, bid=Decimal("8.05"), ask=Decimal("8.10")
         )
-        fake_bot.last_entry_reprice = 99.0
+        # Throttle is now poll_seconds (0.25s, lowered by request - "bring
+        # repricing to the 0.25 lane as well"), not order_monitor_seconds -
+        # 0.1s elapsed still needs to be inside that smaller window.
+        fake_bot.last_entry_reprice = 99.9
         reprice = AutoTrader.reprice_resting_entries.__get__(fake_bot)
         with unittest.mock.patch("time.monotonic", return_value=100.0):
             reprice(True)
