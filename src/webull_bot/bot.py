@@ -330,6 +330,19 @@ class AutoTrader:
         # minute window (at the current 5000-symbol universe size)
         # doesn't kick off a second, redundant thread every cycle.
         self._resolve_targets_in_progress_for = None
+        # Live incident (VVOS): the day's very first volatility-scalp
+        # dip entries can fire before _resolve_targets_work_body's bulk
+        # seed_volatility_windows call (also gated behind resolve_
+        # targets' background thread) has populated real history for
+        # the symbol - volatility_scalp_momentum_stalled_or_rising fails
+        # OPEN (doesn't block) below 3 samples, so those first-of-the-
+        # day entries get NO real momentum-stall confirmation at all,
+        # just the raw dip-percent check - VVOS entered while still
+        # actively falling, not on a confirmed low. False until the
+        # bulk seed completes for moment.date(); see the new "scalp -
+        # daily volatility window seed still in progress" fresh-entry
+        # gate in trade_stocks.
+        self.volatility_windows_seeded_date = None
         self.last_close_attempt = 0.0
         self.last_fractional_sweep = 0.0
         self.last_extended_hours_profit_sweep = 0.0
@@ -1094,6 +1107,7 @@ class AutoTrader:
                 len(self.stock_symbols),
             )
             self.seed_volatility_windows(self.stock_symbols)
+        self.volatility_windows_seeded_date = moment.date()
         self.stock_cursor = 0
         self.option_cursor = 0
         self.option_discovery_cursor = 0
@@ -4337,6 +4351,10 @@ class AutoTrader:
                         (
                             "scalp - core session closing soon",
                             not fresh_entry_blackout_active,
+                        ),
+                        (
+                            "scalp - daily volatility window seed still in progress",
+                            self.volatility_windows_seeded_date == self.resolved_date,
                         ),
                         (
                             "scalp - still in post-stop-loss cooldown",
