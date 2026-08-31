@@ -2483,100 +2483,63 @@ class AutoTrader:
                         self.stop_condition_since[symbol] = time.monotonic()
                 else:
                     self.stop_condition_since.pop(symbol, None)
-                if decision.action not in ("PROFIT", "LOSS"):
+                # By request: "we still need to prioritize profit over
+                # cutting losses, so we may need to wait in some cases
+                # rather than quickly sell off" / "get rid of the loss
+                # fast please." This fast path now only ever acts on
+                # PROFIT - a LOSS decision still gets stamped into
+                # stop_condition_since above (so the slow loop's own
+                # confirmation timer starts counting from the same
+                # moment this fast loop first saw it, losing no real
+                # time there), but the actual STOP order submission is
+                # deliberately left to the slow loop only, giving a
+                # losing position the slow loop's own full cycle to
+                # recover before anything fires - fast to take profit,
+                # patient to cut losses, by explicit request.
+                if decision.action != "PROFIT":
                     return
                 if self.strategy.exit_blocked_by_lot_restriction(quantity, price):
                     return
                 if not self.price_sanity_cooldown_ready(symbol):
                     return
                 fee_per_share = self.config.sell_fee_dollars / quantity
-                if decision.action == "PROFIT":
-                    min_profit = cost * self.config.volatility_scalp_target_percent
-                    if is_scalp_cohort:
-                        limit_price = self._stall_exit_price(
-                            quote,
-                            cost,
-                            min_profit,
-                            fee_per_share,
-                            max_spread_percent=(
-                                self.config.volatility_scalp_max_exit_spread_percent
-                            ),
-                        )
-                    else:
-                        ask = self.api.quote_ask(quote)
-                        target = decision.target_price
-                        if target is None:
-                            return
-                        limit_price = max(ask, target) if ask else target
-                    if limit_price is None:
-                        return
-                    if not self.price_sanity_ok(symbol, price, limit_price):
-                        return
-                    order_id = self.api.place_stock(
-                        symbol, "SELL", quantity, limit_price=limit_price
-                    )
-                    self.pending_stock_exits.add(symbol)
-                    self.stop_exit_submitted[symbol] = time.monotonic()
-                    pnl = self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(
-                        key, order_id, "PROFIT", limit_price, pnl=pnl,
-                        entry_price=cost, quantity=quantity,
-                    )
-                    log.info(
-                        "REPRICE| %-8s | PROFIT (fast) | limit=%s | id=%s",
-                        symbol,
-                        limit_price,
-                        order_id,
+                min_profit = cost * self.config.volatility_scalp_target_percent
+                if is_scalp_cohort:
+                    limit_price = self._stall_exit_price(
+                        quote,
+                        cost,
+                        min_profit,
+                        fee_per_share,
+                        max_spread_percent=(
+                            self.config.volatility_scalp_max_exit_spread_percent
+                        ),
                     )
                 else:
-                    # REVERTED (live incident: "why is it still taking
-                    # so many losses" / "1 out of 5-10 profiting and the
-                    # losing ones lose way more"). The previous version
-                    # of this branch required time-based wick
-                    # confirmation for scalp-cohort symbols here, in
-                    # response to an earlier "too trigger happy" report.
-                    # That reintroduced the exact "MYND" bug stop_loss_
-                    # confirmed's OWN docstring already documents: for a
-                    # genuinely choppy symbol, price re-crosses the stop
-                    # line often enough that a continuous confirmation
-                    # window never completes - confirmed live, checked
-                    # 20 minutes of logs after that change: zero "LOSS
-                    # (fast)" fires despite two real scalp stop-losses
-                    # (CLGN, NCRA) both going through 6-19s LATE via the
-                    # slow loop instead. At 0.25s sampling the reset
-                    # happens even more easily than at the slow loop's
-                    # 30-90s cadence the MYND fix was originally tuned
-                    # against - net effect: profit-taking got faster
-                    # today, loss-taking for scalp symbols silently
-                    # stayed exactly as slow as before, producing fast/
-                    # small wins against slow/large losses. Back to
-                    # calling stop_loss_confirmed directly - identical
-                    # to the slow loop's own, already-tuned behavior
-                    # (skips confirmation for scalp, applies it for
-                    # everything else) - so this fast path's stop
-                    # actually fires for the cohort it matters most for.
-                    if not self.stop_loss_confirmed(symbol):
+                    ask = self.api.quote_ask(quote)
+                    target = decision.target_price
+                    if target is None:
                         return
-                    limit_price = self.api.stock_stop_exit_price(quote)
-                    if not self.price_sanity_ok(symbol, price, limit_price):
-                        return
-                    order_id = self.api.place_stock(
-                        symbol, "SELL", quantity, limit_price=limit_price
-                    )
-                    self.wash_sales.block(symbol, "stop-loss exit submitted")
-                    self.pending_stock_exits.add(symbol)
-                    self.stop_exit_submitted[symbol] = time.monotonic()
-                    pnl = self.record_realized_exit(cost, limit_price, quantity)
-                    self.record_trade(
-                        key, order_id, "STOP", limit_price, pnl=pnl,
-                        entry_price=cost, quantity=quantity,
-                    )
-                    log.warning(
-                        "STOP   | %-8s | LOSS (fast) | limit=%s | id=%s",
-                        symbol,
-                        limit_price,
-                        order_id,
-                    )
+                    limit_price = max(ask, target) if ask else target
+                if limit_price is None:
+                    return
+                if not self.price_sanity_ok(symbol, price, limit_price):
+                    return
+                order_id = self.api.place_stock(
+                    symbol, "SELL", quantity, limit_price=limit_price
+                )
+                self.pending_stock_exits.add(symbol)
+                self.stop_exit_submitted[symbol] = time.monotonic()
+                pnl = self.record_realized_exit(cost, limit_price, quantity)
+                self.record_trade(
+                    key, order_id, "PROFIT", limit_price, pnl=pnl,
+                    entry_price=cost, quantity=quantity,
+                )
+                log.info(
+                    "REPRICE| %-8s | PROFIT (fast) | limit=%s | id=%s",
+                    symbol,
+                    limit_price,
+                    order_id,
+                )
             except Exception as exc:
                 log.error(
                     "PROTECT| %s | fast held-exit evaluation failed | %s",
