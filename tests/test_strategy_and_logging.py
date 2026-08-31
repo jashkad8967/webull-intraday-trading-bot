@@ -2624,6 +2624,51 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         strategy = TradingStrategy(config)
         self.assertTrue(strategy.sma_trend_supports_entry("UNSEEN", Decimal("5")))
 
+    def test_recent_momentum_gate_blocks_a_steep_recent_decline(self):
+        """By request: "look at tickers in the last 10 mins for
+        momentum... to analyze the upcoming trend." A 10% decline over
+        the lookback window is steeper than the 5% default threshold -
+        a real breakdown, not a normal dip.
+        """
+        config = self.config()
+        config.recent_momentum_filter_enabled = True
+        config.recent_momentum_max_decline_percent = Decimal("0.05")
+        strategy = TradingStrategy(config)
+        strategy.recent_momentum["BREAKDOWN"] = Decimal("-0.10")
+        self.assertFalse(
+            strategy.recent_momentum_supports_entry("BREAKDOWN", "BUY")
+        )
+
+    def test_recent_momentum_gate_allows_a_normal_dip(self):
+        """A moderate 2% pullback is exactly the setup this cohort
+        exists to dip-buy - must NOT be blocked just for being negative.
+        """
+        config = self.config()
+        config.recent_momentum_filter_enabled = True
+        config.recent_momentum_max_decline_percent = Decimal("0.05")
+        strategy = TradingStrategy(config)
+        strategy.recent_momentum["NORMALDIP"] = Decimal("-0.02")
+        self.assertTrue(
+            strategy.recent_momentum_supports_entry("NORMALDIP", "BUY")
+        )
+
+    def test_recent_momentum_gate_does_not_block_entry_without_data(self):
+        config = self.config()
+        config.recent_momentum_filter_enabled = True
+        strategy = TradingStrategy(config)
+        self.assertTrue(
+            strategy.recent_momentum_supports_entry("UNSEEN", "BUY")
+        )
+
+    def test_recent_momentum_gate_off_by_default_passes_regardless_of_data(self):
+        config = self.config()
+        config.recent_momentum_filter_enabled = False
+        strategy = TradingStrategy(config)
+        strategy.recent_momentum["BREAKDOWN"] = Decimal("-0.50")
+        self.assertTrue(
+            strategy.recent_momentum_supports_entry("BREAKDOWN", "BUY")
+        )
+
     def test_trend_signal_fires_short_on_a_fresh_bearish_cross(self):
         strategy = TradingStrategy(self.config())
         key = "STOCK:TEST"
@@ -6151,6 +6196,94 @@ class HistoricalVolatilityTests(unittest.TestCase):
         refresh(["NVDA"])
 
         self.assertEqual(fake_bot.strategy.sma_trend, {"OLD": Decimal("5")})
+
+    def test_refresh_recent_momentum_merges_into_existing_cache(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            recent_momentum_filter_enabled=True,
+            recent_momentum_refresh_seconds=120,
+            recent_momentum_lookback_minutes=10,
+        )
+        fake_bot.strategy = SimpleNamespace(recent_momentum={"OLD": Decimal("0.01")})
+        fake_bot.last_recent_momentum_refresh = 0.0
+        fake_bot.api = SimpleNamespace(
+            recent_minute_closes=lambda symbols, category, count: {
+                "NVDA": [100.0, 102.0, 105.0]
+            }
+        )
+        refresh = AutoTrader.refresh_recent_momentum.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=1000.0):
+            refresh(["NVDA"])
+
+        self.assertEqual(
+            fake_bot.strategy.recent_momentum["NVDA"], Decimal("0.05")
+        )
+        self.assertEqual(
+            fake_bot.strategy.recent_momentum["OLD"], Decimal("0.01")
+        )
+
+    def test_refresh_recent_momentum_noop_when_disabled(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(recent_momentum_filter_enabled=False)
+
+        def boom(*args, **kwargs):
+            raise AssertionError("must not call the API when disabled")
+
+        fake_bot.api = SimpleNamespace(recent_minute_closes=boom)
+        refresh = AutoTrader.refresh_recent_momentum.__get__(fake_bot)
+
+        refresh(["NVDA"])
+
+    def test_refresh_recent_momentum_respects_its_own_throttle(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            recent_momentum_filter_enabled=True,
+            recent_momentum_refresh_seconds=120,
+            recent_momentum_lookback_minutes=10,
+        )
+        fake_bot.strategy = SimpleNamespace(recent_momentum={})
+        fake_bot.last_recent_momentum_refresh = 999.0
+
+        def boom(*args, **kwargs):
+            raise AssertionError("must not call the API inside the throttle window")
+
+        fake_bot.api = SimpleNamespace(recent_minute_closes=boom)
+        refresh = AutoTrader.refresh_recent_momentum.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=1000.0):
+            refresh(["NVDA"])
+
+    def test_refresh_recent_momentum_keeps_prior_values_on_failure(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = AutoTrader.__new__(AutoTrader)
+        fake_bot.config = SimpleNamespace(
+            recent_momentum_filter_enabled=True,
+            recent_momentum_refresh_seconds=120,
+            recent_momentum_lookback_minutes=10,
+        )
+        fake_bot.strategy = SimpleNamespace(recent_momentum={"OLD": Decimal("0.01")})
+        fake_bot.last_recent_momentum_refresh = 0.0
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("Webull API error 500: boom")
+
+        fake_bot.api = SimpleNamespace(recent_minute_closes=boom)
+        refresh = AutoTrader.refresh_recent_momentum.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=1000.0):
+            refresh(["NVDA"])
+
+        self.assertEqual(
+            fake_bot.strategy.recent_momentum, {"OLD": Decimal("0.01")}
+        )
 
 
 class StockScreenerTests(StrategyConfigMixin, unittest.TestCase):

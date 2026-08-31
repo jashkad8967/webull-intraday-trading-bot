@@ -71,6 +71,12 @@ class TradingStrategy:
         # clear_market_state's once-daily reset so a failed refresh keeps
         # yesterday's (still roughly valid) SMA rather than going empty.
         self.sma_trend: dict[str, Decimal] = {}
+        # Percent net change over the last RECENT_MOMENTUM_LOOKBACK_
+        # MINUTES minutes, refreshed by AutoTrader.refresh_recent_
+        # momentum - see recent_momentum_supports_entry. Same "not
+        # cleared by the once-daily reset" convention as sma_trend
+        # above, but refreshed much more often (minutes, not days).
+        self.recent_momentum: dict[str, Decimal] = {}
         # Webull's most-active screener, refreshed independently every
         # MARKET_PULSE_REFRESH_SECONDS by AutoTrader.refresh_market_pulse -
         # not tied to clear_market_state's once-daily reset, same as
@@ -958,6 +964,36 @@ class TradingStrategy:
         if direction == "SHORT":
             return price <= sma
         return price >= sma
+
+    def recent_momentum_supports_entry(
+        self, symbol: str, direction: str = "BUY"
+    ) -> bool:
+        """By request: "look at tickers in the last 10 mins for
+        momentum... to analyze the upcoming trend." sma_trend_supports_
+        entry above covers the historical/multi-day trend, and volatility_
+        scalp_vwap_supports_entry covers the whole session - this fills
+        the gap in between. recent_momentum (see AutoTrader.refresh_
+        recent_momentum) is the net % change over the last RECENT_
+        MOMENTUM_LOOKBACK_MINUTES minutes of real 1-minute bars.
+
+        Deliberately NOT "block any recent decline" - dip-buying a
+        short-term pullback is this cohort's entire purpose, so a
+        moderate decline is the setup, not a warning sign. Only blocks
+        a BUY when the recent decline is steeper than RECENT_MOMENTUM_
+        MAX_DECLINE_PERCENT - a real, fast breakdown over the last few
+        minutes, not routine chop. Fails OPEN (True) with the filter
+        disabled or no data yet, same convention as every other entry
+        gate in this file.
+        """
+        if not self.config.recent_momentum_filter_enabled:
+            return True
+        momentum = self.recent_momentum.get(symbol)
+        if momentum is None:
+            return True
+        threshold = self.config.recent_momentum_max_decline_percent
+        if direction == "SHORT":
+            return momentum <= threshold
+        return momentum >= -threshold
 
     def priority_score(self, symbol: str, assessment: dict | None) -> float:
         score = self.activity.get(symbol, 0.0)
