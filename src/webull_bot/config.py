@@ -124,6 +124,24 @@ class Settings(BaseSettings):
     # frequency on a chop-heavy universe).
     sma_trend_filter_enabled: bool = True
     sma_trend_days: int = Field(default=50, ge=5, le=250)
+    # By request: "look at tickers in the last 10 mins for momentum...
+    # to analyze the upcoming trend." The daily SMA above already covers
+    # the historical/multi-day trend, and session VWAP (see volatility_
+    # scalp_vwap_supports_entry) already covers "the whole day" - this
+    # fills the one genuinely missing timeframe in between: whether the
+    # last RECENT_MOMENTUM_LOOKBACK_MINUTES minutes look like a normal
+    # dip or an actively accelerating breakdown. Deliberately NOT "block
+    # any recent decline" - this cohort exists specifically to dip-buy a
+    # short-term decline, so a moderate pullback is the setup, not a
+    # warning sign. Only blocks a decline steeper than RECENT_MOMENTUM_
+    # MAX_DECLINE_PERCENT over the lookback window - a real, fast
+    # breakdown, not routine chop.
+    recent_momentum_filter_enabled: bool = True
+    recent_momentum_lookback_minutes: int = Field(default=10, ge=2, le=60)
+    recent_momentum_refresh_seconds: int = Field(default=120, ge=30, le=1800)
+    recent_momentum_max_decline_percent: Decimal = Field(
+        default=Decimal("0.05"), gt=0, le=1
+    )
     # Directional short-selling in the main EMA/SMA stock strategy - a
     # fresh bearish EMA cross opens a short instead of just being skipped.
     # Off by default: the account needs margin/short approval, and Webull
