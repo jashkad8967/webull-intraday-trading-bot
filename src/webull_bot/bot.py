@@ -1509,6 +1509,29 @@ class AutoTrader:
         return Decimal("1")
 
     @staticmethod
+    def stop_tighten_multiplier(
+        daily_realized_pnl: Decimal,
+        account_value: Decimal | None,
+        threshold_fraction: Decimal,
+        tighten_multiplier: Decimal,
+    ) -> Decimal:
+        """By request: "when we have a certain profit we should also
+        not allow stops to be too low" - the same "significantly
+        ahead for the day" trigger as profit_target_multiplier above,
+        but tightens the general path's stop distance (< 1, e.g. 0.7 =
+        30% tighter) instead of widening the target - once the account
+        is already ahead, a reversal shouldn't be allowed to give back
+        as much of that lead as a normal-conditions stop would permit.
+        Same fail-safe behavior (returns 1, no change) with an
+        unknown/non-positive account value.
+        """
+        if account_value is None or account_value <= 0:
+            return Decimal("1")
+        if daily_realized_pnl >= account_value * threshold_fraction:
+            return tighten_multiplier
+        return Decimal("1")
+
+    @staticmethod
     def fresh_entry_blackout_active(
         minutes_until_close: float,
         blackout_minutes: float,
@@ -1937,7 +1960,14 @@ class AutoTrader:
                     order_id,
                 )
             except Exception as exc:
-                log.error("CANCEL | id=%s | %s", order_id, exc)
+                if self.is_order_not_cancelable(exc):
+                    log.warning(
+                        "CANCEL | id=%s | order already resolving | %s",
+                        order_id,
+                        exc,
+                    )
+                else:
+                    log.error("CANCEL | id=%s | %s", order_id, exc)
 
     def _batched_quotes(self, symbols: list[str]) -> dict[str, dict]:
         """One (or a few, split by category) batched snapshot call for
@@ -3716,6 +3746,14 @@ class AutoTrader:
             self.config.daily_significant_profit_fraction,
             self.config.profit_target_widen_multiplier,
         )
+        # By request: "when we have a certain profit we should also
+        # not allow stops to be too low." Same trigger as above.
+        stop_tighten_multiplier = self.stop_tighten_multiplier(
+            self.daily_realized_pnl,
+            self.cached_account_value,
+            self.config.daily_significant_profit_fraction,
+            self.config.stop_tighten_multiplier,
+        )
         # By request, after live evidence (WNW/WKHS stopping out
         # shortly after core hours ended): block FRESH entries only
         # (not averaging down, not any exit) once fewer than
@@ -4123,6 +4161,7 @@ class AutoTrader:
                     seconds_since_entry,
                     effective_core_session_active,
                     profit_target_multiplier,
+                    stop_tighten_multiplier,
                 )
                 # Condensed onto eligibility alone (any symbol currently
                 # volatile enough to qualify - see is_volatility_scalp_

@@ -419,6 +419,19 @@ class Settings(BaseSettings):
     profit_target_widen_multiplier: Decimal = Field(
         default=Decimal("1.5"), ge=1, le=5
     )
+    # By request: "when we have a certain profit we should also not
+    # allow stops to be too low" - same daily_significant_profit_
+    # fraction trigger as the target-widening above, but tightens the
+    # general path's stop distance instead (< 1 = tighter) - see
+    # AutoTrader.stop_tighten_multiplier/stock_decision's stop_
+    # tighten_multiplier param. Combined with profit_target_widen_
+    # multiplier above, once the account is already significantly
+    # ahead for the day: smaller downside (tighter stop), bigger
+    # upside (wider target) - an intentionally asymmetric risk:reward
+    # once there's already a lead worth protecting.
+    stop_tighten_multiplier: Decimal = Field(
+        default=Decimal("0.7"), gt=0, le=1
+    )
     stock_entry_max_extension_percent: Decimal = Field(
         default=Decimal("0.01"),
         ge=0,
