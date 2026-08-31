@@ -1715,6 +1715,32 @@ class AutoTrader:
         if action in ("PROFIT", "STOP", "MANUAL_SELL"):
             self.last_exit_at[key] = submitted_at
             self.position_opened_at.pop(key, None)
+            # Live incident (this bug, caught right after shipping
+            # evaluate_held_stock_exits): self.cached_positions only
+            # gets refreshed once per SLOW trade_stocks cycle (30-90s+
+            # live), but evaluate_held_stock_exits runs on the fast
+            # 0.25s loop and decides whether to submit a fresh sell
+            # purely from that cached snapshot's quantity. A position
+            # exited here (fast loop or slow loop, either one) stayed
+            # showing its OLD positive quantity in cached_positions
+            # until the next slow refresh - so the fast loop kept
+            # seeing it as still held and tried to sell it again,
+            # several times, on symbols already fully closed (INN, OIS,
+            # RDHL, SOAR all hit OPENAPI_NEW_NO_POSITION_MARGIN_
+            # ACCOUNT_CAN_NOT_SELL_SHORT_FOR_LT_2K - Webull correctly
+            # read "sell with nothing held" as an attempted short).
+            # Zeroing the matching entry in place here, on every exit
+            # record regardless of which loop triggered it, keeps
+            # cached_positions self-correcting immediately instead of
+            # waiting out the slow refresh window.
+            if key.startswith("STOCK:"):
+                exited_symbol = key.split(":", 1)[1]
+                for item in getattr(self, "cached_positions", None) or []:
+                    if (
+                        item.get("instrument_type") == "EQUITY"
+                        and str(item.get("symbol", "")).upper() == exited_symbol
+                    ):
+                        item["quantity"] = "0"
             if pnl is not None:
                 # Feeds symbol_quarantined() - every realized exit's P&L,
                 # partitioned per-key so one bad symbol can't drag down
