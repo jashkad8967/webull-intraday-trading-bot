@@ -853,9 +853,12 @@ class Settings(BaseSettings):
     # other resting PROFIT order uses, since this strategy exists
     # specifically to capture a fast-moving, choppy stock's small moves
     # "cent by cent" rather than rest passively - see
-    # AutoTrader.reprice_volatility_scalp_exits.
+    # AutoTrader.reprice_volatility_scalp_exits. Lowered 1 -> 0.25
+    # (the field's own floor) by request: "bring repricing to the 0.25
+    # lane as well" - matches poll_seconds/the rest of the fast
+    # position-protection loop's cadence exactly.
     volatility_scalp_reprice_seconds: Decimal = Field(
-        default=Decimal("1"), ge=Decimal("0.25"), le=Decimal("30")
+        default=Decimal("0.25"), ge=Decimal("0.25"), le=Decimal("30")
     )
     # During core trading hours, size new stock entries as this fraction of
     # total account buying power (a genuinely fractional/decimal quantity),
