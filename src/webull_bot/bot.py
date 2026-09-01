@@ -2088,6 +2088,21 @@ class AutoTrader:
             age = now - float(order["submitted_at"])
             if age < float(self.config.order_timeout_seconds):
                 continue
+            # By request: "it is still cancelling after 2 mins when i
+            # place an order for a stock, it should not" / "when i
+            # touch a stock stop doing anything with it while i am
+            # there." Missed this call site when the manual-touch pause
+            # first shipped - this generic order_timeout_seconds (120s)
+            # cancel loop runs for ANY tracked order regardless of who
+            # placed it, so a symbol the user just manually touched
+            # (including one they placed themselves, if it ever ends up
+            # tracked here) still got auto-cancelled on the same 120s
+            # clock as everything else.
+            order_key = str(order.get("key") or "")
+            if order_key.startswith("STOCK:") and _manual_touch_active(
+                self, order_key.split(":", 1)[1]
+            ):
+                continue
             last_cancel = order.get("cancel_requested_at")
             if last_cancel is not None and now - float(last_cancel) < 30:
                 continue
@@ -5458,22 +5473,48 @@ class AutoTrader:
                             "exposure cap"
                         ] += 1
                     if average_down_quantity > 0:
+                        # By request: "why is average down buying at
+                        # the top of the spread?" - this used to share
+                        # volatility_scalp_entry_price (the aggressive,
+                        # ask-crossing price) with fresh entries. That
+                        # urgency makes sense for a fresh entry (miss
+                        # the fill, miss the move entirely), but works
+                        # directly against averaging down's whole point
+                        # - improving the blended cost - by paying the
+                        # single worst available price on every add.
+                        # The averaging-down signal already requires
+                        # price to have dropped a real amount below the
+                        # average cost first (not the same split-second
+                        # urgency as a fresh momentum entry), so the
+                        # general strategy's own passive bid/ask
+                        # midpoint pricing (stock_limit_price) fits
+                        # better here - falls back to the old
+                        # aggressive price only if the quote's bid/ask
+                        # is invalid, so this is never MORE likely to
+                        # skip a fill than before, just cheaper when it
+                        # succeeds.
+                        try:
+                            average_down_price = self.api.stock_limit_price(
+                                quote, "BUY"
+                            )
+                        except Exception:
+                            average_down_price = self.volatility_scalp_entry_price(
+                                quote
+                            )
                         order_id = self.place_stock_scaled(
                             symbol,
                             "BUY",
                             average_down_quantity,
                             key,
                             quote,
-                            limit_price_override=self.volatility_scalp_entry_price(
-                                quote
-                            ),
+                            limit_price_override=average_down_price,
                         )
                         if order_id is not None:
                             self.record_trade(
                                 key,
                                 order_id,
                                 "BUY",
-                                entry_price=self.volatility_scalp_entry_price(quote),
+                                entry_price=average_down_price,
                                 quantity=average_down_quantity,
                                 counts_toward_idle_cash_ramp=False,
                             )
