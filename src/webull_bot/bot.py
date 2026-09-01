@@ -6613,6 +6613,26 @@ class AutoTrader:
             directions[underlying] = self.strategy.option_direction_signal(
                 f"OPTU:{underlying}", underlying_price
             )
+        # By request ("watch... why didn't you let me know"): direct
+        # visibility into whether the direction-signal pipeline is
+        # actually alive, instead of inferring health from the absence
+        # of an order - a real CALL/PUT crossover being genuinely rare
+        # on calm blue-chip names looks IDENTICAL, from the outside, to
+        # something silently broken (a quote batch quietly returning
+        # too few symbols, a history dict never actually accumulating).
+        # Logged once/cycle regardless of outcome, same "state, not
+        # just events" visibility SCAN/GATES already give the stock side.
+        signal_counts: dict[str, int] = defaultdict(int)
+        for value in directions.values():
+            signal_counts[value] += 1
+        log.info(
+            "OPTIONS | direction signals | quoted=%s/%s | CALL=%s PUT=%s HOLD=%s",
+            len(underlying_quote_by_symbol),
+            len(underlyings),
+            signal_counts.get("CALL", 0),
+            signal_counts.get("PUT", 0),
+            signal_counts.get("HOLD", 0),
+        )
         today = date.today()
         for contract in batch:
             option_symbol = contract["symbol"]
