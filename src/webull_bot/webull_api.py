@@ -1024,6 +1024,22 @@ class WebullAPI:
         candidates: dict[str, list[dict]] = {kind: [] for kind in option_types}
         for item in self.option_contracts(underlying=underlying):
             expiration = date.fromisoformat(item["expiration_date"])
+            # Live incident: Webull's contract listing marks some
+            # contracts tradable_status="OC" that its OWN quote
+            # endpoint then rejects outright as INVALID_SYMBOL
+            # (observed: "2AVGO260908C00389030", "2AMD260910C00513030"
+            # - a leading digit and a non-round strike, matching the
+            # real OCC convention for a non-standard/adjusted contract
+            # series, not a parsing bug on this side). Worse than just
+            # skipping that one contract: option_quotes fetches a whole
+            # BATCH at once, and Webull rejects the entire batch call
+            # if even one symbol in it is invalid - silently blocking
+            # every OTHER, genuinely valid contract riding along in the
+            # same batch. A standard contract's symbol always starts
+            # with its own underlying ticker exactly; requiring that
+            # here filters these out before they ever get selected.
+            if not str(item.get("symbol", "")).startswith(underlying):
+                continue
             if (
                 item.get("option_type") in candidates
                 and item.get("tradable_status") == "OC"
