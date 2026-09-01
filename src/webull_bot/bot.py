@@ -348,12 +348,6 @@ class AutoTrader:
         self.option_cursor = 0
         self.option_discovery_cursor = 0
         self.option_discovery_attempted: set[str] = set()
-        # By request: "we want options for more popular stocks only" -
-        # see discover_option_contracts and its own set-site comment in
-        # _resolve_targets_work_body. None means "no curated subset,
-        # fall back to the full stock_symbols" (the STOCK_SYMBOLS=ALL
-        # case).
-        self.option_discovery_universe: list[str] | None = None
         self.discover_all_options = False
         self.option_iv_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=30)
@@ -1145,23 +1139,6 @@ class AutoTrader:
                     for symbol in self.stock_symbols
                     if self.stock_categories.get(symbol) != "US_ETF"
                 ]
-        # By request: "we want options for more popular stocks only
-        # like in snp and dow, and some from nyse." Captured BEFORE the
-        # watchlist-reinstatement block below merges in ~100+ older,
-        # small-cap watchlist symbols (and before pre-market/agent-
-        # predicted gainers get merged in elsewhere in run()) - live
-        # evidence caught discovery picking up ATER/OPRX/FRVO/YMM/ECVT,
-        # none of which are anywhere near the curated STOCK_SYMBOLS
-        # list, because discover_option_contracts was reading the same
-        # self.stock_symbols the general STOCK strategy legitimately
-        # uses (which is SUPPOSED to include those extra sources for
-        # stock scanning). Options discovery gets its own, narrower
-        # candidate list instead - falls back to the full stock_symbols
-        # when STOCK_SYMBOLS=ALL, since there's no curated subset to
-        # restrict to in that mode.
-        self.option_discovery_universe = (
-            list(self.stock_symbols) if requested_stocks != ["ALL"] else None
-        )
         self.stock_symbols, pairs_excluded = self.exclude_pairs_symbols(
             self.stock_symbols
         )
@@ -1271,13 +1248,33 @@ class AutoTrader:
 
     def discover_option_contracts(self) -> None:
         # By request: "we want options for more popular stocks only
-        # like in snp and dow, and some from nyse" - option_discovery_
-        # universe (the curated STOCK_SYMBOLS list, captured before
-        # pre-market/agent-predicted gainers and watchlist reinstatement
-        # merge into stock_symbols) instead of stock_symbols itself.
-        # Falls back to stock_symbols when there's no curated subset
-        # (STOCK_SYMBOLS=ALL).
-        candidates = self.option_discovery_universe or self.stock_symbols
+        # like in snp and dow, and some from nyse." Computed fresh from
+        # config here (not read off self.stock_symbols) - self.
+        # stock_symbols is legitimately mutated by MULTIPLE sources for
+        # the general STOCK strategy's own purposes (pre-market gainers,
+        # agent-predicted gainers, reinstated watchlist symbols), and a
+        # background thread (resolve_targets) also reassigns it
+        # concurrently with those. A live incident (this bug, caught
+        # right after an earlier fix attempt): a one-time snapshot of
+        # self.stock_symbols taken inside _resolve_targets_work_body
+        # still leaked AIDX (a pre-market-gainer symbol, nowhere near
+        # the curated list) into discovery, because the main thread's
+        # refresh_premarket_gainers mutation landed in the race window
+        # before the snapshot was taken - a genuine, unsynchronized
+        # cross-thread race, not a logic bug in the filtering itself.
+        # config.stocks() is a pure function of static config (just a
+        # string split) - computing it fresh every call is cheap (at
+        # most ~500 items) and immune to that race entirely, since it
+        # never reads any thread-shared mutable state.
+        requested_stocks = self.config.stocks()
+        if requested_stocks == ["ALL"]:
+            candidates = self.stock_symbols
+        else:
+            candidates = [
+                symbol
+                for symbol in requested_stocks
+                if symbol not in self.invalid_symbols
+            ]
         if not self.options_enabled or not self.discover_all_options or not candidates:
             return
         if (
