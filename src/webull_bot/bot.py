@@ -543,6 +543,15 @@ class AutoTrader:
         # summary by the far more numerous fresh-entry rejection
         # reasons every cycle. See the AVGDOWN log line in run().
         self.avgdown_gate_rejections: dict[str, int] = defaultdict(int)
+        # By request: "scan through everything... figure out what you
+        # missed" - live evidence showed real option CALL/PUT signals
+        # firing constantly (169/186 cycles), zero orders ever placed,
+        # and NO visibility into any of the gates between a signal and
+        # an order (unlike the stock side's GATES summary). Own
+        # dedicated counter, same "avgdown_gate_rejections" pattern -
+        # would otherwise get crowded out of the shared gate_rejections
+        # summary by the far more numerous stock-side reasons.
+        self.option_gate_rejections: dict[str, int] = defaultdict(int)
         self.broker_conflict_symbols: set[str] = set()
         # Throttles the SANITY warning below so a persistently bad broker
         # read logs a periodic reminder instead of one line per scan cycle.
@@ -6653,7 +6662,25 @@ class AutoTrader:
                     self.option_iv_history[option_symbol].append(current_iv)
                 if quantity == 0:
                     self.pending_option_exits.discard(option_symbol)
+                    # By request ("scan through everything... figure out
+                    # what you missed"): live evidence showed real CALL/
+                    # PUT signals firing constantly all day (169/186
+                    # cycles had at least one), yet zero option orders
+                    # ever placed - something downstream of the signal
+                    # was silently blocking every single one, with NO
+                    # diagnostic visibility on any of these gates
+                    # (unlike the stock side's GATES summary). Every
+                    # rejection point below now counts into option_
+                    # gate_rejections (a dedicated dict, same pattern as
+                    # avgdown_gate_rejections, so it doesn't get
+                    # crowded out of the shared gate_rejections summary
+                    # by the far more numerous stock-side reasons) -
+                    # logged periodically to actually see which gate is
+                    # the real blocker instead of guessing.
                     if days_to_expiration <= self.config.option_min_hold_dte:
+                        self.option_gate_rejections[
+                            "too close to expiration"
+                        ] += 1
                         continue
                     underlying = contract["underlying_symbol"]
                     direction = directions.get(underlying, "HOLD")
@@ -6662,6 +6689,9 @@ class AutoTrader:
                         (contract_type == "CALL" and direction == "CALL")
                         or (contract_type == "PUT" and direction == "PUT")
                     ):
+                        self.option_gate_rejections[
+                            "no direction signal for this underlying"
+                        ] += 1
                         continue
                     tick_score = self.strategy.tick_direction_score(
                         f"OPTU:{underlying}"
@@ -6675,21 +6705,30 @@ class AutoTrader:
                     if not self.strategy.option_entry_confirmed(
                         direction, tick_score, obi_score
                     ):
+                        self.option_gate_rejections[
+                            "tick/order-flow confirmation failed"
+                        ] += 1
                         continue
                     if not self.strategy.option_delta_ok(
                         self.api.option_delta(quote)
                     ):
+                        self.option_gate_rejections["delta out of range"] += 1
                         continue
                     if not self.strategy.option_iv_percentile_ok(
                         self.option_iv_history[option_symbol], current_iv
                     ):
+                        self.option_gate_rejections["IV percentile failed"] += 1
                         continue
                     if not self.strategy.option_market_regime_ok(
                         self.vixy_history, current_vixy
                     ):
+                        self.option_gate_rejections[
+                            "market regime (VIXY) gate active"
+                        ] += 1
                         continue
                     blocked_until = self.wash_sales.blocked_until(underlying)
                     if blocked_until:
+                        self.option_gate_rejections["wash-sale blocked"] += 1
                         if underlying not in self.wash_skip_logged:
                             self.wash_skip_logged.add(underlying)
                             log.info(
@@ -6703,11 +6742,13 @@ class AutoTrader:
                         self.gate_rejections[
                             "stop-loss guard active - too many recent stops"
                         ] += 1
+                        self.option_gate_rejections["stop-loss guard active"] += 1
                         continue
                     if self.symbol_quarantined(key):
                         self.gate_rejections[
                             "symbol quarantined - recent net losses on this symbol"
                         ] += 1
+                        self.option_gate_rejections["symbol quarantined"] += 1
                         continue
                     limit_price = self.api.option_limit_price(quote, "BUY")
                     buy_quantity, contract_cost = (
@@ -6716,6 +6757,21 @@ class AutoTrader:
                             buying_power,
                         )
                     )
+                    if buy_quantity <= 0:
+                        self.option_gate_rejections[
+                            "sizing produced zero contracts (price/buying "
+                            "power/risk cap)"
+                        ] += 1
+                    elif open_count >= self.config.max_open_positions:
+                        self.option_gate_rejections["max open positions"] += 1
+                    elif not self.cooldown_ready(key):
+                        self.option_gate_rejections[
+                            "order-submission cooldown"
+                        ] += 1
+                    elif self.rate_capped(key):
+                        self.option_gate_rejections["hourly rate cap"] += 1
+                    elif not self.reentry_cooldown_ready(key):
+                        self.option_gate_rejections["reentry cooldown"] += 1
                     if (
                         open_count < self.config.max_open_positions
                         and buy_quantity > 0
@@ -8014,6 +8070,20 @@ class AutoTrader:
                             ),
                         )
                         self.avgdown_gate_rejections.clear()
+                    if self.option_gate_rejections:
+                        option_top_reasons = sorted(
+                            self.option_gate_rejections.items(),
+                            key=lambda item: item[1],
+                            reverse=True,
+                        )[:5]
+                        log.info(
+                            "OPTIONS| not entering because | %s",
+                            " | ".join(
+                                f"{reason}={count}"
+                                for reason, count in option_top_reasons
+                            ),
+                        )
+                        self.option_gate_rejections.clear()
             except Exception as exc:
                 if isinstance(exc, MarketDataPermissionError):
                     log.critical("STOP   | %s", exc)
