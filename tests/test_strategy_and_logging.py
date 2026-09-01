@@ -3623,6 +3623,101 @@ class StopLossConfirmationTests(unittest.TestCase):
             self.assertTrue(fake_bot.stop_loss_confirmed("ASHR"))
 
 
+class ManualTouchPauseTests(unittest.TestCase):
+    """By request: "when i touch a stock stop doing anything with it
+    while i am there." _manual_touch_active is module-level (not a
+    self-method) so every repricer/escalation call site works
+    unchanged against the many existing bare-SimpleNamespace fixtures
+    - see its own docstring.
+    """
+
+    def test_true_within_the_pause_window(self):
+        from webull_bot.bot import _manual_touch_active
+
+        fake_bot = SimpleNamespace(
+            manual_touch_at={"AAPL": 100.0},
+            config=SimpleNamespace(manual_touch_pause_seconds=300),
+        )
+        with unittest.mock.patch("time.monotonic", return_value=200.0):
+            self.assertTrue(_manual_touch_active(fake_bot, "AAPL"))
+
+    def test_false_once_the_pause_window_elapses(self):
+        from webull_bot.bot import _manual_touch_active
+
+        fake_bot = SimpleNamespace(
+            manual_touch_at={"AAPL": 100.0},
+            config=SimpleNamespace(manual_touch_pause_seconds=300),
+        )
+        with unittest.mock.patch("time.monotonic", return_value=500.0):
+            self.assertFalse(_manual_touch_active(fake_bot, "AAPL"))
+
+    def test_false_for_a_symbol_never_touched(self):
+        from webull_bot.bot import _manual_touch_active
+
+        fake_bot = SimpleNamespace(
+            manual_touch_at={},
+            config=SimpleNamespace(manual_touch_pause_seconds=300),
+        )
+        self.assertFalse(_manual_touch_active(fake_bot, "AAPL"))
+
+    def test_false_when_the_fixture_never_set_manual_touch_at(self):
+        """Every pre-existing test fixture across this file - a bare
+        SimpleNamespace bound to a single AutoTrader method - has no
+        manual_touch_at attribute at all. Must default to "not
+        touched," not raise.
+        """
+        from webull_bot.bot import _manual_touch_active
+
+        fake_bot = SimpleNamespace(config=SimpleNamespace())
+        self.assertFalse(_manual_touch_active(fake_bot, "AAPL"))
+
+    def test_record_trade_stamps_manual_touch_on_manual_buy_and_sell(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            submitted_order_ids_today=set(),
+            last_exit_at={},
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(list),
+            recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
+            manual_touch_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            consecutive_exit_failures=defaultdict(int),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+        with unittest.mock.patch("time.monotonic", return_value=42.0):
+            record_trade("STOCK:AAPL", "order-1", "MANUAL_BUY")
+        self.assertEqual(fake_bot.manual_touch_at["AAPL"], 42.0)
+        with unittest.mock.patch("time.monotonic", return_value=99.0):
+            record_trade("STOCK:AAPL", "order-2", "MANUAL_SELL")
+        self.assertEqual(fake_bot.manual_touch_at["AAPL"], 99.0)
+
+    def test_record_trade_does_not_stamp_a_bot_driven_trade(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            submitted_order_ids_today=set(),
+            last_exit_at={},
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(list),
+            recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
+            manual_touch_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            consecutive_exit_failures=defaultdict(int),
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+        record_trade("STOCK:AAPL", "order-1", "BUY")
+        self.assertEqual(fake_bot.manual_touch_at, {})
+
+
 class RepriceRestingExitsTests(unittest.TestCase):
     def test_reprice_cancels_and_replaces_at_new_ask_without_recording_pnl_again(self):
         """The continuous re-quote loop must cancel + resubmit the resting

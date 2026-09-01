@@ -1231,6 +1231,18 @@ class Settings(BaseSettings):
     symbol_quarantine_min_trades: int = Field(default=3, ge=1, le=50)
     symbol_quarantine_loss_dollars: Decimal = Field(default=Decimal("0.50"), gt=0)
     symbol_quarantine_cooldown_seconds: int = Field(default=900, ge=60, le=21600)
+    # By request: "when i touch a stock stop doing anything with it
+    # while i am there." A manual action (a real order placed directly
+    # in the Webull app, detected by monitor_working_orders, OR a
+    # dashboard manual buy/sell - both already recorded as MANUAL_BUY/
+    # MANUAL_SELL via record_trade) stamps a per-symbol timestamp; every
+    # automated action on that symbol - fresh entries, averaging down,
+    # repricing, exits, escalation - pauses for this many seconds
+    # afterward, treated as a proxy for "the user is actively there."
+    # Deliberately pauses PROTECTIVE exits too, not just new entries -
+    # "stop doing anything" was explicit, and the window is bounded
+    # (5 minutes by default), not an indefinite hands-off.
+    manual_touch_pause_seconds: int = Field(default=300, ge=0, le=3600)
     # Widens the stop immediately after entry (avoids getting shaken out by
     # quote noise right at fill) then tightens back to adaptive_stop_percent's
     # normal value as the position ages - see AutoTrader.position_opened_at

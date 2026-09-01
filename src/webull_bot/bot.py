@@ -126,6 +126,27 @@ def _rekey_working_order(bot, old_order_id: str, new_order_id: str, entry: dict)
         bot.working_orders[new_order_id] = entry
 
 
+def _manual_touch_active(bot, symbol: str) -> bool:
+    """By request: "when i touch a stock stop doing anything with it
+    while i am there." Module-level, not a self-method, for the same
+    test-fixture-compatibility reason as _working_orders_lock above -
+    every repricer/escalation call site calls this on `bot`, which in
+    many existing tests is a bare SimpleNamespace with only one method
+    bound via .__get__, not a real AutoTrader. getattr defaults to "no
+    touch recorded" (False) when the fixture never set manual_touch_at
+    at all, so every existing test keeps its original behavior
+    unchanged - only a real AutoTrader (which does set manual_touch_at
+    in __init__ and stamps it in record_trade) actually pauses.
+    """
+    touched_at = getattr(bot, "manual_touch_at", {}).get(symbol)
+    if touched_at is None:
+        return False
+    pause_seconds = float(
+        getattr(bot.config, "manual_touch_pause_seconds", 300)
+    )
+    return time.monotonic() - touched_at < pause_seconds
+
+
 def _is_rate_limited(exc: Exception) -> bool:
     """True for Webull's 429 TOO_MANY_REQUESTS rejection - live evidence
     this session: CLOSE (fractional pre-close sweep) and RECON (order
@@ -309,6 +330,11 @@ class AutoTrader:
         # entries are blocked but exits must keep working normally for
         # any position already held.
         self.entry_restricted_symbols: set[str] = set()
+        # By request: "when i touch a stock stop doing anything with it
+        # while i am there." Stamped by record_trade on any MANUAL_BUY/
+        # MANUAL_SELL - see manual_touch_active and manual_touch_
+        # pause_seconds.
+        self.manual_touch_at: dict[str, float] = {}
         self.stock_cursor = 0
         # The real number of symbols trade_stocks actually fetched
         # quotes for last cycle - can be several STOCK_BATCH_SIZE
@@ -1766,6 +1792,8 @@ class AutoTrader:
         counts_toward_idle_cash_ramp: bool = True,
     ) -> None:
         submitted_at = time.monotonic()
+        if action in ("MANUAL_BUY", "MANUAL_SELL") and key.startswith("STOCK:"):
+            self.manual_touch_at[key.split(":", 1)[1]] = submitted_at
         self.last_trade[key] = submitted_at
         self.submitted_order_ids_today.add(order_id)
         if action in ("PROFIT", "STOP", "MANUAL_SELL"):
@@ -2180,6 +2208,10 @@ class AutoTrader:
             symbol = key.split(":", 1)[1]
             if symbol in self.stop_loss_escalated:
                 continue
+            # By request: "when i touch a stock stop doing anything
+            # with it while i am there."
+            if _manual_touch_active(self, symbol):
+                continue
             if (
                 self.strategy.is_volatility_scalp_eligible(symbol)
                 or symbol in self.volatility_scalp_positions
@@ -2308,6 +2340,10 @@ class AutoTrader:
                 continue
             symbol = key.split(":", 1)[1]
             if symbol in self.stop_loss_escalated:
+                continue
+            # By request: "when i touch a stock stop doing anything
+            # with it while i am there."
+            if _manual_touch_active(self, symbol):
                 continue
             # Also keeps repricing an already-adopted cohort position
             # even if it's no longer live-eligible this exact cycle -
@@ -2471,6 +2507,10 @@ class AutoTrader:
                 continue
             key = f"STOCK:{symbol}"
             if key in keys_with_orders or symbol in self.pending_stock_exits:
+                continue
+            # By request: "when i touch a stock stop doing anything
+            # with it while i am there."
+            if _manual_touch_active(self, symbol):
                 continue
             candidates.append(symbol)
         if not candidates:
@@ -2641,6 +2681,10 @@ class AutoTrader:
             if order.get("cancel_requested_at") is not None:
                 continue
             symbol = key.split(":", 1)[1]
+            # By request: "when i touch a stock stop doing anything
+            # with it while i am there."
+            if _manual_touch_active(self, symbol):
+                continue
             # Also keeps repricing an already-adopted cohort position's
             # resting BUY (e.g. an averaging-down order) even if it's no
             # longer live-eligible this exact cycle - same reasoning as
@@ -2771,6 +2815,10 @@ class AutoTrader:
                 self.strategy.is_volatility_scalp_eligible(symbol)
                 or symbol in self.volatility_scalp_positions
             ):
+                continue
+            # By request: "when i touch a stock stop doing anything
+            # with it while i am there."
+            if _manual_touch_active(self, symbol):
                 continue
             quantity = order.get("quantity")
             if not quantity or quantity <= 0:
@@ -3774,6 +3822,10 @@ class AutoTrader:
                 continue
             if now - submitted_at < threshold:
                 continue
+            # By request: "when i touch a stock stop doing anything
+            # with it while i am there."
+            if _manual_touch_active(self, symbol):
+                continue
             order_id = None
             action = None
             with _working_orders_lock(self):
@@ -4630,6 +4682,16 @@ class AutoTrader:
                     self.volatility_scalp_recently_eligible.add(symbol)
                 else:
                     self.volatility_scalp_recently_eligible.discard(symbol)
+                # By request: "when i touch a stock stop doing anything
+                # with it while i am there." Price/volume tracking above
+                # still runs (keeps the dashboard/PnL accurate and the
+                # strategy's own state warm for when the pause ends),
+                # but every decision/order action below - fresh entries,
+                # averaging down, PROFIT/STOP submission - is skipped
+                # entirely for manual_touch_pause_seconds after a
+                # detected manual buy/sell on this symbol.
+                if _manual_touch_active(self, symbol):
+                    continue
                 if self.analyst_service is not None:
                     self.analyst_service.request(symbol, price)
                 quantity, cost = self.api.stock_position(symbol, positions)
