@@ -6567,7 +6567,27 @@ class AutoTrader:
         # VIXY rides along in the same batched call (real VIX/CGIF index
         # data isn't reachable through the OpenAPI - confirmed live) to
         # track a market-wide volatility regime gate every cycle.
-        underlyings = sorted({contract["underlying_symbol"] for contract in batch})
+        #
+        # By request ("still isn't buying options"): deliberately reads
+        # from self.option_contracts (every discovered contract), NOT
+        # `batch` (this cycle's option-QUOTE rotation, hard-capped at
+        # 20 by Webull's own per-call option-snapshot limit). Live
+        # incident: with 106 contracts discovered (~53 underlyings),
+        # option_direction_signal's EMA(3/8) needs 9 price samples per
+        # underlying, but each underlying was only getting ONE new
+        # sample every ~5 cycles (20 contracts / 2-per-underlying = 10
+        # underlyings covered per rotation) - meaning ~45+ cycles
+        # before ANY underlying could even show a crossover, and that
+        # number only gets worse as discovery finds more contracts.
+        # Stock quotes have a much higher per-call batch limit than
+        # option quotes (stock_quotes_resilient already chunks
+        # internally), so there's no reason to starve direction-signal
+        # history at the option-quote batch's much tighter pace - every
+        # known underlying now gets a fresh sample every single cycle,
+        # completely decoupled from the option-contract quote rotation.
+        underlyings = sorted(
+            {contract["underlying_symbol"] for contract in self.option_contracts}
+        )
         quote_symbols = sorted(set(underlyings) | {OPTION_VIXY_SYMBOL})
         underlying_quote_by_symbol: dict[str, dict] = {}
         current_vixy: Decimal | None = None
