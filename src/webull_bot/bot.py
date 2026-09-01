@@ -348,6 +348,12 @@ class AutoTrader:
         self.option_cursor = 0
         self.option_discovery_cursor = 0
         self.option_discovery_attempted: set[str] = set()
+        # By request: "we want options for more popular stocks only" -
+        # see discover_option_contracts and its own set-site comment in
+        # _resolve_targets_work_body. None means "no curated subset,
+        # fall back to the full stock_symbols" (the STOCK_SYMBOLS=ALL
+        # case).
+        self.option_discovery_universe: list[str] | None = None
         self.discover_all_options = False
         self.option_iv_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=30)
@@ -1139,6 +1145,23 @@ class AutoTrader:
                     for symbol in self.stock_symbols
                     if self.stock_categories.get(symbol) != "US_ETF"
                 ]
+        # By request: "we want options for more popular stocks only
+        # like in snp and dow, and some from nyse." Captured BEFORE the
+        # watchlist-reinstatement block below merges in ~100+ older,
+        # small-cap watchlist symbols (and before pre-market/agent-
+        # predicted gainers get merged in elsewhere in run()) - live
+        # evidence caught discovery picking up ATER/OPRX/FRVO/YMM/ECVT,
+        # none of which are anywhere near the curated STOCK_SYMBOLS
+        # list, because discover_option_contracts was reading the same
+        # self.stock_symbols the general STOCK strategy legitimately
+        # uses (which is SUPPOSED to include those extra sources for
+        # stock scanning). Options discovery gets its own, narrower
+        # candidate list instead - falls back to the full stock_symbols
+        # when STOCK_SYMBOLS=ALL, since there's no curated subset to
+        # restrict to in that mode.
+        self.option_discovery_universe = (
+            list(self.stock_symbols) if requested_stocks != ["ALL"] else None
+        )
         self.stock_symbols, pairs_excluded = self.exclude_pairs_symbols(
             self.stock_symbols
         )
@@ -1247,11 +1270,15 @@ class AutoTrader:
             self._grow_stock_universe(moment)
 
     def discover_option_contracts(self) -> None:
-        if (
-            not self.options_enabled
-            or not self.discover_all_options
-            or not self.stock_symbols
-        ):
+        # By request: "we want options for more popular stocks only
+        # like in snp and dow, and some from nyse" - option_discovery_
+        # universe (the curated STOCK_SYMBOLS list, captured before
+        # pre-market/agent-predicted gainers and watchlist reinstatement
+        # merge into stock_symbols) instead of stock_symbols itself.
+        # Falls back to stock_symbols when there's no curated subset
+        # (STOCK_SYMBOLS=ALL).
+        candidates = self.option_discovery_universe or self.stock_symbols
+        if not self.options_enabled or not self.discover_all_options or not candidates:
             return
         if (
             time.monotonic() - self.last_option_discovery
@@ -1264,12 +1291,12 @@ class AutoTrader:
         examined = 0
         while (
             attempts < self.config.option_discovery_per_cycle
-            and examined < len(self.stock_symbols)
+            and examined < len(candidates)
         ):
-            underlying = self.stock_symbols[self.option_discovery_cursor]
+            underlying = candidates[self.option_discovery_cursor % len(candidates)]
             self.option_discovery_cursor = (
                 self.option_discovery_cursor + 1
-            ) % len(self.stock_symbols)
+            ) % len(candidates)
             examined += 1
             if (
                 underlying in self.option_discovery_attempted
@@ -1291,14 +1318,21 @@ class AutoTrader:
                     underlying,
                     ",".join(contract["symbol"] for contract in contracts),
                     len(self.option_discovery_attempted),
-                    len(self.stock_symbols),
+                    len(candidates),
                 )
             except Exception as exc:
-                if len(self.option_discovery_attempted) % 100 == 0:
+                # By request, after observing discovery growth stay
+                # slow with no visibility into why: lowered 100 -> 10 -
+                # at the old threshold, a symbol with no listed options
+                # chain (common - not every stock has one) silently
+                # consumed its one attempt with zero log output, making
+                # "genuinely no options available" indistinguishable
+                # from "something is actually broken."
+                if len(self.option_discovery_attempted) % 10 == 0:
                     log.info(
                         "OPTIONS | progress=%s/%s | latest=%s | %s",
                         len(self.option_discovery_attempted),
-                        len(self.stock_symbols),
+                        len(candidates),
                         underlying,
                         exc,
                     )
