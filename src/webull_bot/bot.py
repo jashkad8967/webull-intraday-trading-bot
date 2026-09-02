@@ -2806,9 +2806,19 @@ class AutoTrader:
                 # full quantity, matching the user's own framing that
                 # this is about riding further upside, not softening a
                 # loss exit.
+                #
+                # Live correction (this bug): a plain, never-averaged-
+                # down position (GELS, PPBT) got a partial slice sold
+                # off on its very first profit exit - by explicit
+                # request, partial exits only make sense for a position
+                # that's actually been averaged down (multiple buys at
+                # different costs, so locking in part of the gain while
+                # letting the rest ride against a blended cost basis is
+                # meaningful); a single, un-averaged entry should just
+                # sell in full on profit like it always did.
                 sell_quantity = quantity
                 is_partial = False
-                if is_scalp_cohort:
+                if is_scalp_cohort and self.volatility_scalp_average_down_count[symbol] > 0:
                     partial_quantity = self.strategy.volatility_scalp_partial_exit_quantity(
                         int(quantity),
                         price,
