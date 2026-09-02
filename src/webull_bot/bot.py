@@ -6727,27 +6727,6 @@ class AutoTrader:
         # See stop_loss_guard_active() / trade_stocks - same freqtrade-
         # style frequency-based entry pause, applied here too.
         guard_active = self.stop_loss_guard_active()
-        batch, self.option_cursor = self.strategy.rotating_batch(
-            self.option_contracts,
-            self.option_cursor,
-            self.config.option_batch_size,
-        )
-        try:
-            quotes = self.api.option_quotes(
-                [contract["symbol"] for contract in batch]
-            )
-        except Exception as exc:
-            if isinstance(exc, MarketDataPermissionError):
-                self.options_enabled = False
-                log.warning(
-                    "OPTIONS | disabled | OPRA OpenAPI quotes not subscribed"
-                )
-                return buying_power
-            log.error("OPTIONS | quote batch failed | %s", exc)
-            return buying_power
-        quote_by_symbol = {
-            str(quote.get("symbol", "")).upper(): quote for quote in quotes
-        }
         # A fresh underlying quote per cycle, decoupled from whatever batch
         # the stock-scanning path happens to be covering this cycle - the
         # direction signal must never silently run on stale/absent state.
@@ -6757,20 +6736,20 @@ class AutoTrader:
         #
         # By request ("still isn't buying options"): deliberately reads
         # from self.option_contracts (every discovered contract), NOT
-        # `batch` (this cycle's option-QUOTE rotation, hard-capped at
-        # 20 by Webull's own per-call option-snapshot limit). Live
-        # incident: with 106 contracts discovered (~53 underlyings),
-        # option_direction_signal's EMA(3/8) needs 9 price samples per
-        # underlying, but each underlying was only getting ONE new
-        # sample every ~5 cycles (20 contracts / 2-per-underlying = 10
-        # underlyings covered per rotation) - meaning ~45+ cycles
-        # before ANY underlying could even show a crossover, and that
-        # number only gets worse as discovery finds more contracts.
-        # Stock quotes have a much higher per-call batch limit than
-        # option quotes (stock_quotes_resilient already chunks
-        # internally), so there's no reason to starve direction-signal
-        # history at the option-quote batch's much tighter pace - every
-        # known underlying now gets a fresh sample every single cycle,
+        # the option-QUOTE rotation (hard-capped at 20 by Webull's own
+        # per-call option-snapshot limit). Live incident: with 106
+        # contracts discovered (~53 underlyings), option_direction_
+        # signal's EMA(3/8) needs 9 price samples per underlying, but
+        # each underlying was only getting ONE new sample every ~5
+        # cycles (20 contracts / 2-per-underlying = 10 underlyings
+        # covered per rotation) - meaning ~45+ cycles before ANY
+        # underlying could even show a crossover, and that number only
+        # gets worse as discovery finds more contracts. Stock quotes
+        # have a much higher per-call batch limit than option quotes
+        # (stock_quotes_resilient already chunks internally), so
+        # there's no reason to starve direction-signal history at the
+        # option-quote batch's much tighter pace - every known
+        # underlying now gets a fresh sample every single cycle,
         # completely decoupled from the option-contract quote rotation.
         underlyings = sorted(
             {contract["underlying_symbol"] for contract in self.option_contracts}
@@ -6820,6 +6799,62 @@ class AutoTrader:
             signal_counts.get("PUT", 0),
             signal_counts.get("HOLD", 0),
         )
+        # Live incident (this bug): the fix above made direction signals
+        # fire constantly (CALL/PUT counts logged nonzero repeatedly),
+        # yet option_gate_rejections NEVER recorded a single rejection
+        # past "no direction signal for this underlying" - because the
+        # per-CONTRACT gate-check loop below only ever evaluated a
+        # blind round-robin rotation of option_batch_size (20) out of
+        # the full, continuously-growing option_contracts list (136+
+        # and climbing while discovery is still running). A contract
+        # whose underlying briefly signals CALL/PUT this cycle has no
+        # guarantee of being IN that cycle's 20-wide rotation - by the
+        # time round-robin reaches it again, the fast EMA(3/8) signal
+        # has often already reverted to HOLD. Signals were real; they
+        # just almost never lined up with the narrow gate-check window.
+        # Fix: put every contract whose underlying has a LIVE, matching
+        # signal into this cycle's batch first (capped at option_batch_
+        # size, since option_quotes hard-rejects a request over 20
+        # symbols), then fill any remaining room from the normal
+        # rotating cursor so non-signaling contracts still get their IV
+        # history refreshed and stay in exit-management coverage.
+        priority_contracts = [
+            contract
+            for contract in self.option_contracts
+            if directions.get(contract["underlying_symbol"]) == contract.get(
+                "option_type"
+            )
+        ][: self.config.option_batch_size]
+        fill_size = max(
+            0, self.config.option_batch_size - len(priority_contracts)
+        )
+        rotation, self.option_cursor = self.strategy.rotating_batch(
+            self.option_contracts, self.option_cursor, fill_size
+        )
+        seen_symbols: set[str] = set()
+        batch: list[dict] = []
+        for contract in priority_contracts + rotation:
+            symbol = contract["symbol"]
+            if symbol not in seen_symbols:
+                seen_symbols.add(symbol)
+                batch.append(contract)
+        batch = batch[: self.config.option_batch_size]
+        try:
+            quotes = self.api.option_quotes(
+                [contract["symbol"] for contract in batch]
+            )
+        except Exception as exc:
+            if isinstance(exc, MarketDataPermissionError):
+                self.options_enabled = False
+                log.warning(
+                    "OPTIONS | disabled | OPRA OpenAPI quotes not subscribed"
+                )
+                return buying_power
+            log.error("OPTIONS | quote batch failed | %s", exc)
+            return buying_power
+        quote_by_symbol = {
+            str(quote.get("symbol", "")).upper(): quote for quote in quotes
+        }
         today = date.today()
         for contract in batch:
             option_symbol = contract["symbol"]
