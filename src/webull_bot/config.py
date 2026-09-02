@@ -217,6 +217,28 @@ class Settings(BaseSettings):
     multi_day_momentum_max_decline_month: Decimal = Field(
         default=Decimal("0.50"), gt=0, le=1
     )
+    # Live incident (this bug): MGN was bought as a scalp "dip entry" at
+    # $0.2071 while still ~74% above its prior close of ~$0.1196 - a
+    # pullback off an intraday blow-off-top spike, not a real dip - and
+    # kept falling, hitting the hard stop within ~2 minutes. FAMI hit
+    # the same pattern minutes later (bought at 3x the prior close),
+    # and together they tripped the daily loss circuit breaker. This is
+    # the well-documented "don't chase/buy a stock still extended far
+    # above its prior close" pattern (avoiding gap-and-crap / blow-off-
+    # top setups) - a short-term pullback within a huge, still-elevated
+    # intraday spike is a falling knife continuing to unwind, not a
+    # stable range to mean-revert in. Reuses the same daily_closes[0]
+    # "prior close" data multi_day_momentum_supports_entry already has,
+    # just checking the opposite direction (extension up, not decline
+    # down) - blocks a BUY when price is still more than this fraction
+    # above yesterday's close, even if the immediate few minutes look
+    # like a dip. Deliberately generous (50%) since real breakouts do
+    # legitimately run - this targets the extreme, already-cracking
+    # spike cases like MGN/FAMI (74%-280% above prior close), not
+    # ordinary strength.
+    multi_day_momentum_max_extension_1d: Decimal = Field(
+        default=Decimal("0.50"), gt=0, le=5
+    )
     # Directional short-selling in the main EMA/SMA stock strategy - a
     # fresh bearish EMA cross opens a short instead of just being skipped.
     # Off by default: the account needs margin/short approval, and Webull
@@ -1160,16 +1182,16 @@ class Settings(BaseSettings):
     order_history_reconcile_seconds: int = Field(
         default=1800, ge=60, le=86400
     )
-    # By request, after finding this disabled both by code default and
-    # on the live host: "make the daily circuit breaker real." Research:
-    # a daily drawdown cap in the 3-5% convention is standard practice
-    # for automated trading risk management. Flipped to enabled by
-    # default, and the threshold changed from a flat dollar amount
-    # (which doesn't scale with account size - $50 was 25% of this
-    # account's equity, nowhere near a real daily limit) to a fraction
-    # of account equity - see daily_max_loss_fraction below and
-    # AutoTrader.handle_daily_loss_breaker.
-    daily_loss_circuit_breaker_enabled: bool = True
+    # Was flipped to enabled-by-default earlier this session ("make the
+    # daily circuit breaker real"), and it did trip live - correctly,
+    # by its own math (5% of equity) - the same day the MGN/FAMI spike-
+    # chasing bug (see multi_day_momentum_max_extension_1d) produced
+    # the losses that tripped it. By explicit request afterward ("we do
+    # not want the circuit breaker to stop all trading"): disabled
+    # again. The root-cause fix (the extension guard above) addresses
+    # the actual bad entries directly; this halt-everything-for-the-
+    # rest-of-the-day mechanism was the wrong lever for that problem.
+    daily_loss_circuit_breaker_enabled: bool = False
     # Picked at the upper/more-permissive end of the 3-5% convention
     # given this account's dual purpose (real capital to grow, but also
     # a learning testbed where informative losses have value) - not the

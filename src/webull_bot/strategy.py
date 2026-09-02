@@ -1120,7 +1120,7 @@ class TradingStrategy:
         return momentum >= -threshold
 
     def multi_day_momentum_supports_entry(
-        self, symbol: str, direction: str = "BUY"
+        self, symbol: str, direction: str = "BUY", price: Decimal | None = None
     ) -> bool:
         """By request: "also include not only short term patterns like
         5-10 mins, but also 1 day and 5 day and month." recent_momentum
@@ -1140,6 +1140,19 @@ class TradingStrategy:
         entry gate in this file - each of the three checks is
         evaluated independently, so having only 1-day data (say) still
         lets that one check apply.
+
+        Also blocks the opposite extreme on a BUY (live incident: MGN/
+        FAMI - see multi_day_momentum_max_extension_1d's config
+        comment): a stock whose CURRENT live price is still more than
+        that fraction above YESTERDAY's close (closes[0] - the daily-
+        bar API's most recent bar is always the last fully-closed day,
+        never today's still-forming one) is mid-unwind of an intraday
+        spike, not a stable range - a "dip" a few cents off that kind
+        of high is still a falling knife, not a real mean-reversion
+        setup, no matter how the last few minutes of ticks look on
+        their own. Needs the live price passed in separately from
+        closes for this one check; skipped (fails open) if the caller
+        doesn't have it yet.
         """
         if not self.config.multi_day_momentum_filter_enabled:
             return True
@@ -1159,6 +1172,11 @@ class TradingStrategy:
                 if change >= threshold:
                     return False
             elif change <= -threshold:
+                return False
+        if direction == "BUY" and price is not None and price > 0:
+            prior_close = Decimal(str(closes[0]))
+            extension = (price - prior_close) / prior_close
+            if extension >= self.config.multi_day_momentum_max_extension_1d:
                 return False
         return True
 
