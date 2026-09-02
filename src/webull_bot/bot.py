@@ -5354,7 +5354,7 @@ class AutoTrader:
                     # permissive at longer horizons than the short-term
                     # checks above.
                     and self.strategy.multi_day_momentum_supports_entry(
-                        symbol, "BUY"
+                        symbol, "BUY", price
                     )
                     # THREE independent, OR'd entry triggers - by request,
                     # every extra qualifying signal means MORE trading

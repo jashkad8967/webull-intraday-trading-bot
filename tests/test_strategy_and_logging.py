@@ -4832,15 +4832,16 @@ class BotOvertradingCapTests(unittest.TestCase):
         handle = AutoTrader.handle_daily_loss_breaker.__get__(fake_bot)
         self.assertFalse(handle())
 
-    def test_daily_loss_breaker_is_enabled_by_default(self):
-        """By request, after finding this circuit breaker disabled both
-        by code default and on the live host: it must default to
-        enabled, and the threshold must be a fraction of account
-        equity, not a flat dollar amount that doesn't scale with
-        account size.
+    def test_daily_loss_breaker_is_disabled_by_default(self):
+        """Was briefly enabled by default this session, then reverted
+        by explicit request ("we do not want the circuit breaker to
+        stop all trading") after it tripped live and halted the whole
+        day's trading - see daily_loss_circuit_breaker_enabled's own
+        config.py comment. The threshold field itself is left in place
+        (still a valid fraction) in case it's re-enabled later.
         """
         settings = Settings()
-        self.assertTrue(settings.daily_loss_circuit_breaker_enabled)
+        self.assertFalse(settings.daily_loss_circuit_breaker_enabled)
         self.assertGreater(settings.daily_max_loss_fraction, Decimal("0"))
         self.assertLessEqual(settings.daily_max_loss_fraction, Decimal("1"))
 
@@ -5700,17 +5701,12 @@ class AllocationAndLoggingTests(unittest.TestCase):
         noise/whipsaw, and a real cause of net-losing days even with
         plenty of individual winning trades. 1.8 only needs ~35.7%,
         clearing the researched "most professional traders target at
-        least 1:1.5-1:2 reward:risk" convention. By request, after
-        finding it disabled both by code default and on the live host:
-        the daily-loss circuit breaker is now enabled by default too -
-        this strategy's reward:risk ratio being favorable doesn't mean
-        a genuinely bad day can't still happen.
+        least 1:1.5-1:2 reward:risk" convention.
         """
         config = Settings()
         self.assertEqual(config.stock_target_stop_multiple, Decimal("1.8"))
         breakeven_win_rate = 1 / (1 + config.stock_target_stop_multiple)
         self.assertLess(breakeven_win_rate, Decimal("0.36"))
-        self.assertTrue(config.daily_loss_circuit_breaker_enabled)
 
     def test_default_watchlist_is_parsed_and_deduplicated_by_membership(self):
         config = Settings()
@@ -12159,6 +12155,71 @@ class RateLimitRetryTests(unittest.TestCase):
         with self.assertRaises(Exception):
             _retry_once_on_rate_limit(always_rate_limited, delay=0.01)
         self.assertEqual(calls["n"], 2)
+
+
+class MultiDayMomentumExtensionGuardTests(StrategyConfigMixin, unittest.TestCase):
+    """multi_day_momentum_supports_entry's extension check - live
+    incident: MGN was bought as a scalp dip entry at $0.2071 while
+    still ~74% above its prior close of ~$0.1196 (a pullback mid-
+    unwind of an intraday spike, not a real dip), fell straight
+    through the hard stop within ~2 minutes; FAMI hit the same pattern
+    minutes later. This guards the well-documented "don't chase/buy a
+    stock still extended far above its prior close" pattern.
+    """
+
+    def config(self):
+        cfg = super().config()
+        cfg.multi_day_momentum_filter_enabled = True
+        cfg.multi_day_momentum_max_decline_1d = Decimal("0.15")
+        cfg.multi_day_momentum_max_decline_5d = Decimal("0.30")
+        cfg.multi_day_momentum_max_decline_month = Decimal("0.50")
+        cfg.multi_day_momentum_max_extension_1d = Decimal("0.50")
+        return cfg
+
+    def test_blocks_a_buy_still_extended_far_above_prior_close(self):
+        strategy = TradingStrategy(self.config())
+        strategy.daily_closes["MGN"] = [0.1196, 0.1186, 0.1098, 0.111, 0.109]
+        self.assertFalse(
+            strategy.multi_day_momentum_supports_entry(
+                "MGN", "BUY", Decimal("0.2071")
+            )
+        )
+
+    def test_allows_a_buy_close_to_prior_close(self):
+        strategy = TradingStrategy(self.config())
+        strategy.daily_closes["CALM"] = [1.00, 0.99, 0.98, 1.01, 1.00]
+        self.assertTrue(
+            strategy.multi_day_momentum_supports_entry(
+                "CALM", "BUY", Decimal("1.05")
+            )
+        )
+
+    def test_fails_open_without_a_price(self):
+        strategy = TradingStrategy(self.config())
+        strategy.daily_closes["MGN"] = [0.1196, 0.1186, 0.1098, 0.111, 0.109]
+        self.assertTrue(
+            strategy.multi_day_momentum_supports_entry("MGN", "BUY")
+        )
+
+    def test_fails_open_when_filter_disabled(self):
+        cfg = self.config()
+        cfg.multi_day_momentum_filter_enabled = False
+        strategy = TradingStrategy(cfg)
+        strategy.daily_closes["MGN"] = [0.1196, 0.1186, 0.1098, 0.111, 0.109]
+        self.assertTrue(
+            strategy.multi_day_momentum_supports_entry(
+                "MGN", "BUY", Decimal("0.2071")
+            )
+        )
+
+    def test_extension_check_does_not_apply_to_short_direction(self):
+        strategy = TradingStrategy(self.config())
+        strategy.daily_closes["MGN"] = [0.1196, 0.1186, 0.1098, 0.111, 0.109]
+        self.assertTrue(
+            strategy.multi_day_momentum_supports_entry(
+                "MGN", "SHORT", Decimal("0.2071")
+            )
+        )
 
 
 if __name__ == "__main__":
