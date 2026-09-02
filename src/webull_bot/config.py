@@ -623,12 +623,17 @@ class Settings(BaseSettings):
     volatility_scalp_vwap_band_percent: Decimal = Field(
         default=Decimal("0.05"), ge=0, le=Decimal("0.5")
     )
-    # Raised 0.2% -> 0.5% by request - "too trigger happy to sell...
-    # not capturing the profits when it can." A slightly bigger quick
-    # target keeps more of a real move instead of cashing out at the
-    # first sign of a small bounce.
+    # Raised 0.2% -> 0.5% -> 1.0% by request. The first raise wasn't
+    # enough - live incident: LHAI entered 1.185, averaged down to a
+    # blended cost of ~1.17, and the 0.5% target closed it at 1.18,
+    # barely above cost after fees ("closed too low and early"). 0.5%
+    # of a ~$1 stock is a fraction of a cent in absolute terms - too
+    # small to survive fees plus any real slippage. 1.0% keeps the
+    # "quick" scalp character (still tiny relative to this cohort's
+    # own volatility floor, MIN_HISTORICAL_VOLATILITY_PERCENT >= 3%)
+    # while giving a real move room to actually register as profit.
     volatility_scalp_target_percent: Decimal = Field(
-        default=Decimal("0.005"), gt=0, le=1
+        default=Decimal("0.01"), gt=0, le=1
     )
     # Gates TradingStrategy.volatility_scalp_exit_override's fourth,
     # most-eager exit path (stalling momentum on a profitable position) -
