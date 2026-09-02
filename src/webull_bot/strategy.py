@@ -77,6 +77,11 @@ class TradingStrategy:
         # cleared by the once-daily reset" convention as sma_trend
         # above, but refreshed much more often (minutes, not days).
         self.recent_momentum: dict[str, Decimal] = {}
+        # Real daily-bar closes, newest-first, refreshed by AutoTrader.
+        # refresh_multi_day_momentum - see multi_day_momentum_supports_
+        # entry. Same "not cleared by the once-daily reset" convention
+        # as sma_trend above.
+        self.daily_closes: dict[str, list[float]] = {}
         # Webull's most-active screener, refreshed independently every
         # MARKET_PULSE_REFRESH_SECONDS by AutoTrader.refresh_market_pulse -
         # not tied to clear_market_state's once-daily reset, same as
@@ -744,7 +749,30 @@ class TradingStrategy:
             # a real breakdown, not a normal dip - the actual stop-loss
             # is allowed through instead of being suppressed forever.
             drop = (average_cost - price) / average_cost
-            if drop < self.config.volatility_scalp_hard_stop_percent:
+            # By request: "these commonly seen patterns should also
+            # influence averaging down and stop loss... not just
+            # entries and exits." Never LOOSENS this backstop below
+            # its configured value (still a real catastrophic-loss
+            # floor for a genuinely good setup) - only tightens it when
+            # there's POSITIVE evidence (not just missing data, which
+            # both checks fail open on) that this dip was never a real
+            # statistical extreme in the first place: RSI wasn't
+            # actually oversold when it should be, or the real
+            # multi-day/week/month bars show a genuine sustained
+            # breakdown, not routine chop. A low-quality setup by the
+            # same historically-standard reads a fresh entry needs
+            # doesn't get to ride the full DCA-ladder-sized floor.
+            hard_stop_percent = self.config.volatility_scalp_hard_stop_percent
+            if symbol:
+                rsi = self.relative_strength_index(symbol)
+                rsi_confirms_dip = (
+                    rsi is None or rsi <= self.config.rsi_oversold_threshold
+                )
+                if not rsi_confirms_dip or not self.multi_day_momentum_supports_entry(
+                    symbol
+                ):
+                    hard_stop_percent = hard_stop_percent / Decimal("2")
+            if drop < hard_stop_percent:
                 return Decision(
                     "HOLD",
                     "volatility scalp - averaging down instead of stopping out",
@@ -760,6 +788,14 @@ class TradingStrategy:
             if self.parabolic_sar_exit_signal(symbol, price):
                 return Decision(
                     "PROFIT", "parabolic SAR trend reversal exit", price
+                )
+            # By request: "these commonly seen patterns should also
+            # influence... entries and exits." RSI overbought is the
+            # historically-standard mirror of the oversold entry check
+            # above - a real statistical peak, not just a small bounce.
+            if self.rsi_overbought_exit(symbol):
+                return Decision(
+                    "PROFIT", "RSI overbought - selling into the peak", price
                 )
             min_stall_price = average_cost + (target - average_cost) * (
                 self.config.volatility_scalp_momentum_stall_min_profit_fraction
@@ -1035,6 +1071,49 @@ class TradingStrategy:
             return momentum <= threshold
         return momentum >= -threshold
 
+    def multi_day_momentum_supports_entry(
+        self, symbol: str, direction: str = "BUY"
+    ) -> bool:
+        """By request: "also include not only short term patterns like
+        5-10 mins, but also 1 day and 5 day and month." recent_momentum
+        (10 min) and sma_trend (50-day average) already existed; this
+        fills the explicit 1-day/5-day/~1-month timeframes named
+        directly, using real daily-bar closes (self.daily_closes,
+        newest-first - see AutoTrader.refresh_multi_day_momentum)
+        instead of the tick window or an averaged value.
+
+        Deliberately more permissive at longer horizons - a stock can
+        legitimately be down over a month while still being a good
+        dip-buy today (that's the whole cohort's thesis), so this only
+        blocks a genuinely severe, sustained decline at each horizon
+        (15%/1d, 30%/5d, 50%/month by default), not routine drift.
+        Fails open with the filter disabled or insufficient daily-bar
+        history at a given horizon, same convention as every other
+        entry gate in this file - each of the three checks is
+        evaluated independently, so having only 1-day data (say) still
+        lets that one check apply.
+        """
+        if not self.config.multi_day_momentum_filter_enabled:
+            return True
+        closes = self.daily_closes.get(symbol)
+        if not closes or closes[0] <= 0:
+            return True
+        checks = (
+            (1, self.config.multi_day_momentum_max_decline_1d),
+            (5, self.config.multi_day_momentum_max_decline_5d),
+            (20, self.config.multi_day_momentum_max_decline_month),
+        )
+        for offset, threshold in checks:
+            if len(closes) <= offset or closes[offset] <= 0:
+                continue
+            change = (closes[0] - closes[offset]) / closes[offset]
+            if direction == "SHORT":
+                if change >= threshold:
+                    return False
+            elif change <= -threshold:
+                return False
+        return True
+
     def update_recent_tick_history(
         self, symbol: str, price: Decimal, moment: float
     ) -> None:
@@ -1152,6 +1231,82 @@ class TradingStrategy:
             and wick_ratio >= wick_threshold
             and latest_delta >= volume_threshold
         )
+
+    def relative_strength_index(self, symbol: str) -> Decimal | None:
+        """By request: "find common instances historically of dips...
+        known patterns... use that to also decide on an entry or
+        exit." RSI is the single most widely documented, historically-
+        validated way to identify a statistically overextended dip
+        (oversold, < 30) or peak (overbought, > 70) - standard Wilder-
+        style calculation, reused against the same recent_tick_history
+        (real (timestamp, price) samples, already populated for every
+        scanned symbol) the micro-exhaustion check above uses, rather
+        than adding a new data source.
+
+        Uses whatever samples are available up to RSI_PERIOD (default
+        14, the classic convention) - returns None (fails open,
+        callers already treat that as "no data, don't block") with
+        fewer than 3 price changes to measure, same convention as
+        every other gate in this file.
+        """
+        samples = self.recent_tick_history.get(symbol)
+        if not samples:
+            return None
+        prices = [p for _, p in samples][-(self.config.rsi_period + 1) :]
+        if len(prices) < 3:
+            return None
+        gains = Decimal("0")
+        losses = Decimal("0")
+        count = 0
+        for previous, current in zip(prices, prices[1:]):
+            change = current - previous
+            if change > 0:
+                gains += change
+            elif change < 0:
+                losses += -change
+            count += 1
+        if count == 0:
+            return None
+        avg_gain = gains / count
+        avg_loss = losses / count
+        if avg_loss == 0:
+            return Decimal("100") if avg_gain > 0 else Decimal("50")
+        rs = avg_gain / avg_loss
+        return Decimal("100") - (Decimal("100") / (Decimal("1") + rs))
+
+    def rsi_supports_entry(self, symbol: str) -> bool:
+        """True when RSI confirms a genuine statistical dip (oversold,
+        below RSI_OVERSOLD_THRESHOLD) or there isn't enough data yet -
+        fails open, same "no data -> don't block" convention as every
+        other entry gate. Deliberately an AND alongside volatility_
+        scalp_dip_signal (a local-high pullback %) and volatility_
+        scalp_micro_exhaustion_confirmed, not a replacement - RSI adds
+        the historically-standard "is this dip statistically extreme"
+        read on top of the existing "has price actually pulled back
+        and shown a floor" reads.
+        """
+        if not self.config.rsi_filter_enabled:
+            return True
+        rsi = self.relative_strength_index(symbol)
+        if rsi is None:
+            return True
+        return rsi <= self.config.rsi_oversold_threshold
+
+    def rsi_overbought_exit(self, symbol: str) -> bool:
+        """True when RSI confirms a genuine statistical peak
+        (overbought, above RSI_OVERBOUGHT_THRESHOLD) - an additional,
+        historically-standard "sell into strength" signal alongside
+        the existing momentum-stall and Parabolic SAR reversal exits
+        in volatility_scalp_exit_override. False (never blocks a
+        profitable exit) with the filter disabled or insufficient
+        data.
+        """
+        if not self.config.rsi_filter_enabled:
+            return False
+        rsi = self.relative_strength_index(symbol)
+        if rsi is None:
+            return False
+        return rsi >= self.config.rsi_overbought_threshold
 
     def priority_score(self, symbol: str, assessment: dict | None) -> float:
         score = self.activity.get(symbol, 0.0)

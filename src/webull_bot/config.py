@@ -182,6 +182,41 @@ class Settings(BaseSettings):
     volatility_scalp_micro_exhaustion_volume_ema_alpha: Decimal = Field(
         default=Decimal("0.2"), gt=0, le=1
     )
+    # By request: "find common instances historically of dips... known
+    # patterns... use that to also decide on an entry or exit." RSI
+    # (Wilder's Relative Strength Index) is the single most widely
+    # documented, historically-validated way to flag a statistically
+    # overextended dip or peak - see TradingStrategy.rsi_supports_
+    # entry/rsi_overbought_exit. 14/30/70 are the standard, textbook
+    # RSI convention, not tuned specifically for this cohort.
+    rsi_filter_enabled: bool = True
+    rsi_period: int = Field(default=14, ge=2, le=100)
+    rsi_oversold_threshold: Decimal = Field(default=Decimal("30"), ge=0, le=100)
+    rsi_overbought_threshold: Decimal = Field(default=Decimal("70"), ge=0, le=100)
+    # By request: "also include not only short term patterns like 5-10
+    # mins, but also 1 day and 5 day and month." recent_momentum (10
+    # min) and sma_trend (50-day average) already exist - this fills
+    # the explicit 1-day/5-day/~1-month timeframes named directly,
+    # using real daily-bar closes (AutoTrader.refresh_multi_day_
+    # momentum/WebullAPI.daily_closes), not derived from the tick
+    # window. Same "block only a real, sustained decline, not routine
+    # chop" philosophy as recent_momentum - deliberately more
+    # permissive at longer horizons (a stock can legitimately be down
+    # over a month while still being a good dip-buy today).
+    multi_day_momentum_filter_enabled: bool = True
+    multi_day_momentum_refresh_seconds: int = Field(
+        default=1800, ge=300, le=21600
+    )
+    multi_day_momentum_lookback_days: int = Field(default=25, ge=6, le=90)
+    multi_day_momentum_max_decline_1d: Decimal = Field(
+        default=Decimal("0.15"), gt=0, le=1
+    )
+    multi_day_momentum_max_decline_5d: Decimal = Field(
+        default=Decimal("0.30"), gt=0, le=1
+    )
+    multi_day_momentum_max_decline_month: Decimal = Field(
+        default=Decimal("0.50"), gt=0, le=1
+    )
     # Directional short-selling in the main EMA/SMA stock strategy - a
     # fresh bearish EMA cross opens a short instead of just being skipped.
     # Off by default: the account needs margin/short approval, and Webull
