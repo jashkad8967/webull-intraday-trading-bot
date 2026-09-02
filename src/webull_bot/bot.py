@@ -281,6 +281,12 @@ class AutoTrader:
         # See post_stop_reentry_ready - keyed by bare symbol (not the
         # "STOCK:SYMBOL" key), stamped only on a STOP-type record_trade.
         self.last_volatility_stop_loss_at: dict[str, float] = {}
+        # See volatility_scalp_partial_exit_quantity - keyed by bare
+        # symbol, the price of the most recent partial-exit sale on an
+        # open position, so the ladder only fires again after another
+        # VOLATILITY_SCALP_PARTIAL_EXIT_REPRICE_PERCENT move ("sell 5
+        # every 5 cents it goes up"), not on every 0.25s cycle.
+        self.volatility_scalp_last_partial_exit_price: dict[str, Decimal] = {}
         self.trade_times: dict[str, deque] = defaultdict(deque)
         self.status = StatusWriter(
             self.config.status_file,
@@ -1897,6 +1903,31 @@ class AutoTrader:
             self.manual_touch_at[key.split(":", 1)[1]] = submitted_at
         self.last_trade[key] = submitted_at
         self.submitted_order_ids_today.add(order_id)
+        if action == "PARTIAL_PROFIT":
+            # By request: "sell 5 every 5 cents it goes up... keep the
+            # rest for later profit" - a partial exit closes SOME of a
+            # held position, not all of it. Unlike PROFIT/STOP/MANUAL_
+            # SELL below, this must NOT clear position_opened_at or
+            # last_exit_at (the position is still open) and must
+            # DECREMENT, not zero, the matching cached_positions entry -
+            # zeroing here would make the fast loop's PROFIT/LOSS
+            # evaluator think the whole position closed and stop
+            # protecting the shares that are still held.
+            if key.startswith("STOCK:") and quantity is not None:
+                exited_symbol = key.split(":", 1)[1]
+                for item in getattr(self, "cached_positions", None) or []:
+                    if (
+                        item.get("instrument_type") == "EQUITY"
+                        and str(item.get("symbol", "")).upper() == exited_symbol
+                    ):
+                        try:
+                            remaining = Decimal(str(item.get("quantity", "0"))) - quantity
+                        except Exception:
+                            remaining = None
+                        if remaining is not None:
+                            item["quantity"] = str(max(remaining, Decimal("0")))
+            if pnl is not None:
+                self.symbol_pnl_history[key].append((submitted_at, pnl))
         if action in ("PROFIT", "STOP", "MANUAL_SELL"):
             self.last_exit_at[key] = submitted_at
             self.position_opened_at.pop(key, None)
@@ -2755,19 +2786,48 @@ class AutoTrader:
                     return
                 if not self.price_sanity_ok(symbol, price, limit_price):
                     return
+                # By request: "buy 20 shares, then sell 5 every 5 cents
+                # it goes up... sell 10 and keep the rest for later
+                # profit." Scoped to the volatility-scalp cohort's
+                # PROFIT branch only - the slow loop's PROFIT path and
+                # every LOSS/STOP path everywhere else always sells the
+                # full quantity, matching the user's own framing that
+                # this is about riding further upside, not softening a
+                # loss exit.
+                sell_quantity = quantity
+                is_partial = False
+                if is_scalp_cohort:
+                    partial_quantity = self.strategy.volatility_scalp_partial_exit_quantity(
+                        int(quantity),
+                        price,
+                        self.volatility_scalp_last_partial_exit_price.get(symbol),
+                    )
+                    if partial_quantity <= 0:
+                        return
+                    if partial_quantity < quantity:
+                        sell_quantity = Decimal(partial_quantity)
+                        is_partial = True
                 order_id = self.api.place_stock(
-                    symbol, "SELL", quantity, limit_price=limit_price
+                    symbol, "SELL", sell_quantity, limit_price=limit_price
                 )
                 self.pending_stock_exits.add(symbol)
                 self.stop_exit_submitted[symbol] = time.monotonic()
-                pnl = self.record_realized_exit(cost, limit_price, quantity)
+                pnl = self.record_realized_exit(cost, limit_price, sell_quantity)
                 self.record_trade(
-                    key, order_id, "PROFIT", limit_price, pnl=pnl,
-                    entry_price=cost, quantity=quantity,
+                    key, order_id, "PARTIAL_PROFIT" if is_partial else "PROFIT",
+                    limit_price, pnl=pnl,
+                    entry_price=cost, quantity=sell_quantity,
                 )
+                if is_partial:
+                    self.volatility_scalp_last_partial_exit_price[symbol] = price
+                    self.pending_stock_exits.discard(symbol)
+                else:
+                    self.volatility_scalp_last_partial_exit_price.pop(symbol, None)
                 log.info(
-                    "REPRICE| %-8s | PROFIT (fast) | limit=%s | id=%s",
+                    "REPRICE| %-8s | %s (fast) | qty=%s | limit=%s | id=%s",
                     symbol,
+                    "PARTIAL_PROFIT" if is_partial else "PROFIT",
+                    sell_quantity,
                     limit_price,
                     order_id,
                 )

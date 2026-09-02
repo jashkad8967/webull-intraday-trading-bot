@@ -882,6 +882,54 @@ class TradingStrategy:
         capacity = max(0, total_buys_affordable - 1)
         return min(capacity, max_averaging_buys)
 
+    def volatility_scalp_partial_exit_quantity(
+        self,
+        total_quantity: int,
+        price: Decimal,
+        last_partial_exit_price: Decimal | None,
+    ) -> int:
+        """By request: "when buying multiple shares, if needed be able
+        to sell them in parts as the value shifts, to maximize
+        profits... buy 20, sell 5 every 5 cents it goes up." Returns
+        how many shares to sell on THIS profit exit - a shrinking
+        ladder of partial slices instead of one all-or-nothing sale.
+
+        Returns total_quantity unchanged (a full, ordinary exit) when:
+        partial exits are disabled; there's no prior partial-exit price
+        yet AND the computed slice would be too small to leave a
+        meaningful remainder; or the remainder after this slice would
+        drop to/below the configured floor (VOLATILITY_SCALP_PARTIAL_
+        EXIT_MIN_REMAINDER_SHARES) - ends the ladder with one final
+        clean sale instead of grinding into odd-lot slivers.
+
+        Returns 0 (sell nothing THIS cycle, decision-caller must treat
+        that as "wait, don't submit an order") when a prior partial
+        exit already happened and price hasn't moved another
+        VOLATILITY_SCALP_PARTIAL_EXIT_REPRICE_PERCENT beyond it yet -
+        this is what actually implements "every 5 cents it goes up"
+        instead of firing again on the very next 0.25s cycle at
+        essentially the same price (the quick target itself doesn't
+        move once a position is partially closed, only the held
+        quantity shrinks).
+        """
+        if not self.config.volatility_scalp_partial_exit_enabled or total_quantity <= 0:
+            return total_quantity
+        if last_partial_exit_price is not None and last_partial_exit_price > 0:
+            moved = (price - last_partial_exit_price) / last_partial_exit_price
+            if moved < self.config.volatility_scalp_partial_exit_reprice_percent:
+                return 0
+        partial = int(
+            (
+                Decimal(total_quantity)
+                * self.config.volatility_scalp_partial_exit_fraction
+            ).to_integral_value(rounding=ROUND_DOWN)
+        )
+        remainder = total_quantity - partial
+        min_remainder = self.config.volatility_scalp_partial_exit_min_remainder_shares
+        if partial <= 0 or remainder <= min_remainder:
+            return total_quantity
+        return partial
+
     def volatility_scalp_share_count(
         self,
         price: Decimal,
