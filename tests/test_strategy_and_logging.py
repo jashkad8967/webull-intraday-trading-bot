@@ -72,6 +72,8 @@ class StrategyConfigMixin:
             stock_entry_max_extension_percent=Decimal("0.01"),
             stock_core_session_position_fraction=Decimal("0.10"),
             sma_trend_filter_enabled=False,
+            rsi_filter_enabled=False,
+            multi_day_momentum_filter_enabled=False,
             short_selling_enabled=False,
             opening_grace_spread_multiplier=Decimal("2"),
             opening_grace_extension_multiplier=Decimal("2"),

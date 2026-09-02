@@ -407,6 +407,7 @@ class AutoTrader:
         self.last_held_exit_scan = 0.0
         self.last_entry_reprice = 0.0
         self.last_recent_momentum_refresh = 0.0
+        self.last_multi_day_momentum_refresh = 0.0
         self.last_stall_boost = 0.0
         # See idle_cash_ramp_progress()/record_trade() - tracks how long
         # cash has sat above MIN_CASH_RESERVE_DOLLARS with nothing bought,
@@ -726,6 +727,47 @@ class AutoTrader:
             updated,
             len(symbols),
             self.config.recent_momentum_lookback_minutes,
+        )
+
+    def refresh_multi_day_momentum(self, symbols: list[str]) -> None:
+        """By request: "also include not only short term patterns like
+        5-10 mins, but also 1 day and 5 day and month." Real daily-bar
+        closes (WebullAPI.daily_closes), refreshed on its own cadence
+        (MULTI_DAY_MOMENTUM_REFRESH_SECONDS, default 30 min - far less
+        volatile than the 10-minute momentum read, doesn't need to
+        chase every scan cycle). Same "merge into the existing cache,
+        degrade gracefully on a partial/failed refresh" convention as
+        refresh_sma_trend/refresh_recent_momentum.
+        """
+        if not self.config.multi_day_momentum_filter_enabled or not symbols:
+            return
+        now = time.monotonic()
+        if (
+            now - self.last_multi_day_momentum_refresh
+            < float(self.config.multi_day_momentum_refresh_seconds)
+        ):
+            return
+        self.last_multi_day_momentum_refresh = now
+        try:
+            closes_by_symbol = self.api.daily_closes(
+                symbols, self.config.multi_day_momentum_lookback_days
+            )
+        except Exception as exc:
+            log.warning("MOMENTUM| multi-day refresh failed | %s", exc)
+            return
+        if not closes_by_symbol:
+            log.warning(
+                "MOMENTUM| no multi-day coverage this cycle | keeping prior "
+                "values"
+            )
+            return
+        self.strategy.daily_closes.update(closes_by_symbol)
+        log.info(
+            "MOMENTUM| multi-day momentum refreshed | %s/%s symbols | "
+            "lookback=%sd",
+            len(closes_by_symbol),
+            len(symbols),
+            self.config.multi_day_momentum_lookback_days,
         )
 
     def filter_with_popular_reinstated(self, candidates: list[str]) -> list[str]:
@@ -4571,6 +4613,7 @@ class AutoTrader:
         # would be real, avoidable API load for symbols that aren't even
         # being evaluated for entries this cycle.
         self.refresh_recent_momentum(list(batch))
+        self.refresh_multi_day_momentum(list(batch))
         bucket_remaining = {
             bucket: buying_power * fraction
             for bucket, fraction in self.config.stock_capital_fractions().items()
@@ -5242,6 +5285,17 @@ class AutoTrader:
                     and self.strategy.recent_momentum_supports_entry(
                         symbol, "BUY"
                     )
+                    # By request: "also include not only short term
+                    # patterns like 5-10 mins, but also 1 day and 5 day
+                    # and month." Completes the timeframe chain with
+                    # real daily-bar-derived 1-day/5-day/~month checks
+                    # - see multi_day_momentum_supports_entry's own
+                    # docstring for why it's deliberately more
+                    # permissive at longer horizons than the short-term
+                    # checks above.
+                    and self.strategy.multi_day_momentum_supports_entry(
+                        symbol, "BUY"
+                    )
                     # THREE independent, OR'd entry triggers - by request,
                     # every extra qualifying signal means MORE trading
                     # opportunities, not a stricter combined bar: the
@@ -5412,6 +5466,10 @@ class AutoTrader:
                                 symbol, price
                             ),
                         ),
+                        (
+                            "scalp avgdown - not statistically oversold (RSI)",
+                            self.strategy.rsi_supports_entry(symbol),
+                        ),
                     ):
                         if not ok:
                             self.avgdown_gate_rejections[reason] += 1
@@ -5504,6 +5562,15 @@ class AutoTrader:
                     and self.strategy.volatility_scalp_momentum_stalled_or_rising(
                         symbol, price
                     )
+                    # By request: "these commonly seen patterns should
+                    # also influence averaging down and stop loss...
+                    # not just entries and exits." Same RSI oversold
+                    # check fresh entries already require - don't add
+                    # to a losing position just because price ticked
+                    # lower, only when that lower price is ALSO a
+                    # genuine statistical extreme, same historically-
+                    # standard bar a fresh entry has to clear.
+                    and self.strategy.rsi_supports_entry(symbol)
                 ):
                     average_down_quantity = self.strategy.volatility_scalp_share_count(
                         price,

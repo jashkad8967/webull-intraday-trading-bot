@@ -820,6 +820,49 @@ class WebullAPI:
                 results[symbol] = sma
         return results
 
+    def daily_closes(self, symbols: list[str], days: int) -> dict[str, list[float]]:
+        """Real daily-bar closes per symbol, newest-first (same
+        convention as _average_close's own bars[:days] slicing) - by
+        request: "include not only short term patterns like 5-10 mins,
+        but also 1 day and 5 day and month." sma_trend above only ever
+        returns the averaged value; this returns the raw close series
+        itself so a caller can compute point-to-point returns (1-day,
+        5-day, ~20-trading-day/month) instead of just a moving average.
+        Same resilient batching/parsing structure as sma_trend/
+        historical_volatility.
+        """
+        from webull.data.common.category import Category
+        from webull.data.common.timespan import Timespan
+
+        results: dict[str, list[float]] = {}
+        unique = list(dict.fromkeys(symbol.upper() for symbol in symbols))
+        count = str(max(days, 6))
+        for page in self._history_bars_chunks_concurrently(
+            unique, Category.US_STOCK.name, Timespan.D.name, count
+        ):
+            for entry in page or []:
+                if not isinstance(entry, dict):
+                    continue
+                symbol = str(entry.get("symbol", "")).upper()
+                if not symbol:
+                    continue
+                bars = self._extract_bars(entry)
+                if not bars:
+                    continue
+                closes: list[float] = []
+                for bar in bars[:days]:
+                    if not isinstance(bar, dict):
+                        continue
+                    try:
+                        close = float(bar.get("close"))
+                    except (TypeError, ValueError):
+                        continue
+                    if close > 0:
+                        closes.append(close)
+                if closes:
+                    results[symbol] = closes
+        return results
+
     @classmethod
     def _parse_closes(cls, page, days: int) -> dict[str, float]:
         closes: dict[str, float] = {}
