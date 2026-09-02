@@ -12222,5 +12222,118 @@ class MultiDayMomentumExtensionGuardTests(StrategyConfigMixin, unittest.TestCase
         )
 
 
+class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
+    """WebullAPI.select_atm_options's affordability shortlist - by
+    request: "look for cheaper options to buy in to." Always picking
+    the single nearest-to-ATM strike is right for delta but often
+    unaffordable outright on a small account (option_order_quantity
+    then silently rounds to 0 contracts). When max_contract_cost is
+    given, this should quote a shortlist of near-the-money strikes and
+    pick the closest-to-ATM one that still fits, rather than always
+    the true ATM strike regardless of premium.
+    """
+
+    @staticmethod
+    def _contract(symbol, strike, expiration, option_type="CALL"):
+        return {
+            "symbol": symbol,
+            "strike_price": str(strike),
+            "expiration_date": expiration,
+            "option_type": option_type,
+            "tradable_status": "OC",
+        }
+
+    def _fake_api(self, contracts, quotes_by_symbol, shortlist_size=6):
+        from datetime import date, timedelta
+
+        from webull_bot.webull_api import WebullAPI
+
+        expiration = (date.today() + timedelta(days=20)).isoformat()
+        contract_list = [
+            self._contract(symbol, strike, expiration)
+            for symbol, strike in contracts
+        ]
+        fake_api = SimpleNamespace(
+            config=SimpleNamespace(
+                option_min_dte=7,
+                option_max_dte=45,
+                option_type="CALL",
+                option_affordability_shortlist_size=shortlist_size,
+            ),
+            option_contracts=lambda underlying: contract_list,
+            option_quotes=lambda symbols: [
+                {"symbol": s, "ask": str(quotes_by_symbol[s])}
+                for s in symbols
+                if s in quotes_by_symbol
+            ],
+            quote_price=WebullAPI.quote_price,
+        )
+        return WebullAPI.select_atm_options.__get__(fake_api)
+
+    def test_falls_back_to_pure_atm_pick_without_a_cost_cap(self):
+        select = self._fake_api(
+            contracts=[("XYZ260101C00095000", 95), ("XYZ260101C00100000", 100)],
+            quotes_by_symbol={},
+        )
+        result = select("XYZ", Decimal("100"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00100000")
+
+    def test_picks_the_nearest_affordable_strike_when_atm_is_too_expensive(self):
+        # ATM (strike 100) premium is $8.00 -> $800/contract, unaffordable
+        # on a ~$110 account. The next-nearest strike (105) is cheaper
+        # ($1.00 -> $100/contract) and should be picked instead.
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00105000", 105),
+                ("XYZ260101C00110000", 110),
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "8.00",
+                "XYZ260101C00105000": "1.00",
+                "XYZ260101C00110000": "0.20",
+            },
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00105000")
+
+    def test_picks_the_cheapest_quoted_strike_when_nothing_fits(self):
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00105000", 105),
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "8.00",
+                "XYZ260101C00105000": "5.00",
+            },
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00105000")
+
+    def test_falls_back_to_atm_pick_when_the_quote_batch_fails(self):
+        from datetime import date, timedelta
+
+        expiration = (date.today() + timedelta(days=20)).isoformat()
+        fake_api = SimpleNamespace(
+            config=SimpleNamespace(
+                option_min_dte=7,
+                option_max_dte=45,
+                option_type="CALL",
+                option_affordability_shortlist_size=6,
+            ),
+            option_contracts=lambda underlying: [
+                self._contract("XYZ260101C00100000", 100, expiration),
+                self._contract("XYZ260101C00105000", 105, expiration),
+            ],
+            option_quotes=unittest.mock.Mock(side_effect=RuntimeError("boom")),
+        )
+        from webull_bot.webull_api import WebullAPI
+
+        select = WebullAPI.select_atm_options.__get__(fake_api)
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00100000")
+
+
 if __name__ == "__main__":
     unittest.main()

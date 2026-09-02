@@ -1380,9 +1380,21 @@ class AutoTrader:
             self.option_discovery_attempted.add(underlying)
             attempts += 1
             try:
+                # By request: "look for cheaper options to buy in to" -
+                # pass the same risk-cap math option_order_quantity
+                # uses at entry time (buying_power * OPTION_CAPITAL_
+                # FRACTION) so discovery can prefer a strike that will
+                # actually be affordable, instead of always locking in
+                # the single nearest-to-ATM one regardless of premium.
+                max_contract_cost = (
+                    self.cached_buying_power * self.config.option_capital_fraction
+                    if self.cached_buying_power
+                    else None
+                )
                 contracts = self.api.select_atm_options(
                     underlying,
                     self.strategy.prices[underlying],
+                    max_contract_cost=max_contract_cost,
                 )
                 self.option_contracts.extend(contracts)
                 discovered.add(underlying)

@@ -1054,7 +1054,23 @@ class WebullAPI:
         self,
         underlying: str,
         stock_price: Decimal | None = None,
+        max_contract_cost: Decimal | None = None,
     ) -> list[dict]:
+        """By request: "look for cheaper options to buy in to." Always
+        picking the single nearest-to-the-money strike is right for
+        delta, but on a small account that strike's premium is often
+        outright unaffordable (option_order_quantity then silently
+        rounds down to 0 contracts - a real, but real trade). When
+        max_contract_cost is given, quotes the OPTION_AFFORDABILITY_
+        SHORTLIST_SIZE nearest-to-ATM candidates per expiration/type
+        and picks the closest-to-the-money one whose premium*100 still
+        fits - or, if none of them fit, the cheapest one quoted (better
+        than falling through to an unaffordable ATM pick that never
+        actually trades). Falls back to the plain nearest-to-ATM
+        behavior (no extra quote calls) when max_contract_cost is None
+        or a quote batch fails, same "degrade to the old behavior on
+        any trouble" convention as the rest of this file.
+        """
         if stock_price is None:
             stock_price = self.quote_price(self.stock_quote(underlying))
         minimum = date.today() + timedelta(days=self.config.option_min_dte)
@@ -1089,17 +1105,54 @@ class WebullAPI:
                 and minimum <= expiration <= maximum
             ):
                 candidates[item["option_type"]].append(item)
-        selected = [
-            min(
-                candidates[kind],
-                key=lambda item: (
-                    date.fromisoformat(item["expiration_date"]),
-                    abs(Decimal(str(item["strike_price"])) - stock_price),
-                ),
+        def _sort_key(item: dict):
+            return (
+                date.fromisoformat(item["expiration_date"]),
+                abs(Decimal(str(item["strike_price"])) - stock_price),
             )
-            for kind in option_types
-            if candidates[kind]
-        ]
+
+        selected: list[dict] = []
+        for kind in option_types:
+            pool = candidates[kind]
+            if not pool:
+                continue
+            pool_sorted = sorted(pool, key=_sort_key)
+            if max_contract_cost is None or len(pool_sorted) == 1:
+                selected.append(pool_sorted[0])
+                continue
+            shortlist = pool_sorted[
+                : self.config.option_affordability_shortlist_size
+            ]
+            try:
+                quotes = self.option_quotes(
+                    [item["symbol"] for item in shortlist]
+                )
+            except Exception:
+                selected.append(pool_sorted[0])
+                continue
+            quote_by_symbol = {
+                str(q.get("symbol")): q for q in quotes if isinstance(q, dict)
+            }
+            # shortlist is already ordered nearest-to-ATM first, and
+            # this loop preserves that order - so the first affordable
+            # entry found is the closest-to-the-money one that fits.
+            priced: list[tuple[dict, Decimal]] = []
+            for item in shortlist:
+                quote = quote_by_symbol.get(item["symbol"])
+                if not quote:
+                    continue
+                try:
+                    premium = self.quote_price(quote)
+                except Exception:
+                    continue
+                priced.append((item, premium * 100))
+            affordable = [pair for pair in priced if pair[1] <= max_contract_cost]
+            if affordable:
+                selected.append(affordable[0][0])
+            elif priced:
+                selected.append(min(priced, key=lambda pair: pair[1])[0])
+            else:
+                selected.append(pool_sorted[0])
         if not selected:
             raise RuntimeError(f"No matching options found for {underlying}")
         return selected
