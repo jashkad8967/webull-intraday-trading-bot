@@ -6939,22 +6939,21 @@ class AutoTrader:
                             "no direction signal for this underlying"
                         ] += 1
                         continue
-                    tick_score = self.strategy.tick_direction_score(
-                        f"OPTU:{underlying}"
-                    )
-                    underlying_quote = underlying_quote_by_symbol.get(underlying)
-                    obi_score = (
-                        self.obi_score_for(underlying, "US_STOCK", underlying_quote)
-                        if underlying_quote is not None
-                        else None
-                    )
-                    if not self.strategy.option_entry_confirmed(
-                        direction, tick_score, obi_score
-                    ):
-                        self.option_gate_rejections[
-                            "tick/order-flow confirmation failed"
-                        ] += 1
-                        continue
+                    # Live incident (this bug, found right after the
+                    # option-batch-priority fix started actually
+                    # letting real signals reach this loop): tick/
+                    # order-flow confirmation was the dominant remaining
+                    # blocker (1-5 rejections every cycle) - it re-
+                    # checked the SAME "OPTU:" price series option_
+                    # direction_signal's EMA cross just fired on, but
+                    # only advances one sample per ~2-minute cycle, so
+                    # its 10-sample window spans ~20 minutes and could
+                    # easily disagree with a signal that just flipped
+                    # THIS cycle. By explicit request: removed for
+                    # options - trust the EMA direction signal on its
+                    # own, same as the stock side already effectively
+                    # does once tick_direction_ok's own separate check
+                    # passes.
                     if not self.strategy.option_delta_ok(
                         self.api.option_delta(quote)
                     ):
