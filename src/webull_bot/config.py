@@ -566,6 +566,24 @@ class Settings(BaseSettings):
         ge=0,
         le=Decimal("0.20"),
     )
+    # By request: "days high only matters when it is a straight jump
+    # pattern, once it stabilizes it is fine." entry_extension_ok used
+    # to unconditionally require price sit stock_entry_max_extension_
+    # percent below today's high (1% by default) before allowing a
+    # fresh entry - live evidence this was a top-3 gate rejection
+    # reason on nearly half of scanned candidates every cycle, blocking
+    # plenty of real momentum that simply sits close to the high
+    # without still actively racing toward it. Now only enforced while
+    # the stock is genuinely still jumping - recent_momentum (the same
+    # RECENT_MOMENTUM_LOOKBACK_MINUTES-window signal used elsewhere)
+    # over this fraction counts as "still a straight jump"; once that
+    # cools below it, price sitting near the high is a stabilized
+    # level, not chasing a spike, so the buffer is skipped entirely.
+    # Same scale as RECENT_MOMENTUM_MAX_DECLINE_PERCENT (5%) - a
+    # genuinely fast move, not routine chop.
+    entry_extension_jump_momentum_percent: Decimal = Field(
+        default=Decimal("0.03"), gt=0, le=1
+    )
     # Volatility-scalp: a parallel, much faster entry/exit path for
     # symbols whose own realized short-window volatility clears
     # volatility_scalp_min_stdev_percent - buy a small dip, sell a small
