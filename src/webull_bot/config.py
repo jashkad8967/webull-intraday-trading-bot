@@ -1144,6 +1144,17 @@ class Settings(BaseSettings):
     # entry - a defined-risk-per-trade cap layered on top of (not instead
     # of) OPTION_QUANTITY and MAX_ORDER_NOTIONAL.
     option_capital_fraction: Decimal = Field(default=Decimal("0.05"), gt=0, le=1)
+    # By request: "look for cheaper options to buy in to." select_atm_
+    # options always picked the single strike nearest the money -
+    # correct for delta, but on a small account often unaffordable
+    # outright (option_order_quantity silently rounds to 0 contracts
+    # when a single contract's premium*100 exceeds what the risk cap
+    # allows, quietly producing zero real option trades). This is how
+    # many of the NEAREST-to-ATM candidate strikes (per expiration/
+    # type) get quoted at discovery time so a cheaper, still-reasonably
+    # -close strike can be picked instead when the true ATM one doesn't
+    # fit - see WebullAPI.select_atm_options's own docstring.
+    option_affordability_shortlist_size: int = Field(default=6, ge=1, le=20)
     stop_loss_escalate_seconds: int = Field(default=15, ge=5, le=120)
     # Live incident: CTRM resubmitted the same never-fillable PROFIT limit
     # order for 3+ hours (40+ attempts) - escalate_stalled_stop_losses is
