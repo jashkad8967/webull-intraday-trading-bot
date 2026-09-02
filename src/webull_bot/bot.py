@@ -147,6 +147,25 @@ def _manual_touch_active(bot, symbol: str) -> bool:
     return time.monotonic() - touched_at < pause_seconds
 
 
+def _broker_conflict(bot, symbol: str) -> bool:
+    """True once a broker-side "position reverse" conflict has been
+    flagged for symbol (see is_symbol_broker_conflict/CONFLICT log
+    lines) - broker_conflict_symbols is documented (see its __init__
+    comment) as skipping a symbol's exit management entirely, not just
+    entries, but the fast-loop functions added today (evaluate_held_
+    stock_exits, reprice_resting_exits, reprice_volatility_scalp_exits,
+    escalate_stalled_stop_losses) never checked it - only the slow
+    loop did. Live incident: PETZ got flagged CONFLICT at 11:40:06,
+    then the fast loop kept trying to act on it anyway a minute later,
+    hitting OPENAPI_NEW_NO_POSITION...CAN_NOT_SELL_SHORT three times in
+    a row. Module-level, not a self-method, for the same test-fixture-
+    compatibility reason as _manual_touch_active above - getattr
+    defaults to "no conflict" (False) when a fixture never set
+    broker_conflict_symbols at all.
+    """
+    return symbol in getattr(bot, "broker_conflict_symbols", set())
+
+
 def _is_rate_limited(exc: Exception) -> bool:
     """True for Webull's 429 TOO_MANY_REQUESTS rejection - live evidence
     this session: CLOSE (fractional pre-close sweep) and RECON (order
@@ -2267,6 +2286,9 @@ class AutoTrader:
             # with it while i am there."
             if _manual_touch_active(self, symbol):
                 continue
+            # Live incident (PETZ): see _broker_conflict's docstring.
+            if _broker_conflict(self, symbol):
+                continue
             if (
                 self.strategy.is_volatility_scalp_eligible(symbol)
                 or symbol in self.volatility_scalp_positions
@@ -2399,6 +2421,9 @@ class AutoTrader:
             # By request: "when i touch a stock stop doing anything
             # with it while i am there."
             if _manual_touch_active(self, symbol):
+                continue
+            # Live incident (PETZ): see _broker_conflict's docstring.
+            if _broker_conflict(self, symbol):
                 continue
             # Also keeps repricing an already-adopted cohort position
             # even if it's no longer live-eligible this exact cycle -
@@ -2566,6 +2591,11 @@ class AutoTrader:
             # By request: "when i touch a stock stop doing anything
             # with it while i am there."
             if _manual_touch_active(self, symbol):
+                continue
+            # Live incident (PETZ): broker_conflict_symbols is meant to
+            # pause a symbol's exit management entirely, not just
+            # entries - see _broker_conflict's own docstring.
+            if _broker_conflict(self, symbol):
                 continue
             candidates.append(symbol)
         if not candidates:
@@ -2740,6 +2770,9 @@ class AutoTrader:
             # with it while i am there."
             if _manual_touch_active(self, symbol):
                 continue
+            # Live incident (PETZ): see _broker_conflict's docstring.
+            if _broker_conflict(self, symbol):
+                continue
             # Also keeps repricing an already-adopted cohort position's
             # resting BUY (e.g. an averaging-down order) even if it's no
             # longer live-eligible this exact cycle - same reasoning as
@@ -2874,6 +2907,9 @@ class AutoTrader:
             # By request: "when i touch a stock stop doing anything
             # with it while i am there."
             if _manual_touch_active(self, symbol):
+                continue
+            # Live incident (PETZ): see _broker_conflict's docstring.
+            if _broker_conflict(self, symbol):
                 continue
             quantity = order.get("quantity")
             if not quantity or quantity <= 0:
@@ -3880,6 +3916,9 @@ class AutoTrader:
             # By request: "when i touch a stock stop doing anything
             # with it while i am there."
             if _manual_touch_active(self, symbol):
+                continue
+            # Live incident (PETZ): see _broker_conflict's docstring.
+            if _broker_conflict(self, symbol):
                 continue
             order_id = None
             action = None
