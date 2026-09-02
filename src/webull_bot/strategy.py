@@ -2278,7 +2278,8 @@ class TradingStrategy:
         idle_relaxation_multiplier: Decimal = Decimal("1"),
     ) -> bool:
         """Block chasing a name that's already sitting at today's high (or,
-        for a short, today's low).
+        for a short, today's low) WHILE it's still actively jumping toward
+        it.
 
         A crossover that only confirms once price is already at the peak
         of a fast spike is buying the top, not the move - require some
@@ -2290,6 +2291,16 @@ class TradingStrategy:
         of dropping the check entirely. idle_relaxation_multiplier does the
         same shrink for the opposite reason - cash sitting idle too long,
         not the opening print.
+
+        By request: "days high only matters when it is a straight jump
+        pattern, once it stabilizes it is fine." Only enforced while
+        recent_momentum shows the stock is still genuinely racing toward
+        that high/low (see entry_extension_jump_momentum_percent) - once
+        that recent momentum has cooled, price sitting near the high is a
+        stabilized level, not a spike being chased, so the buffer is
+        skipped entirely. Fails open (no buffer required) with no recent-
+        momentum reading yet, same "no data -> don't block" convention as
+        every other gate in this file.
         """
         reference = self.metrics.get(symbol, {}).get(
             "low" if direction == "SHORT" else "high"
@@ -2301,6 +2312,15 @@ class TradingStrategy:
         except Exception:
             return True
         if reference_decimal <= 0:
+            return True
+        momentum = self.recent_momentum.get(symbol)
+        jump_threshold = self.config.entry_extension_jump_momentum_percent
+        still_jumping = momentum is not None and (
+            momentum <= -jump_threshold
+            if direction == "SHORT"
+            else momentum >= jump_threshold
+        )
+        if not still_jumping:
             return True
         extension_percent = self.config.stock_entry_max_extension_percent
         multiplier = idle_relaxation_multiplier

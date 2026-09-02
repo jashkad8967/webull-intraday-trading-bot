@@ -70,6 +70,7 @@ class StrategyConfigMixin:
             stock_price_sanity_percent=Decimal("0.15"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
+            entry_extension_jump_momentum_percent=Decimal("0.03"),
             stock_core_session_position_fraction=Decimal("0.10"),
             sma_trend_filter_enabled=False,
             rsi_filter_enabled=False,
@@ -2839,6 +2840,13 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_extension_gate_short_direction_blocks_chasing_todays_low(self):
         strategy = TradingStrategy(self.config())
         strategy.metrics["DIPPED"] = {"low": 50.0}
+        # By request ("days high only matters when it is a straight jump
+        # pattern, once it stabilizes it is fine"): the buffer is only
+        # enforced while recent_momentum shows the stock still actively
+        # racing toward that low - set it here so this test still
+        # exercises the buffer itself, not the new "stabilized" bypass
+        # (covered separately below).
+        strategy.recent_momentum["DIPPED"] = Decimal("-0.10")
         self.assertFalse(
             strategy.entry_extension_ok("DIPPED", Decimal("50.2"), direction="SHORT")
         )
@@ -2974,6 +2982,7 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_extension_gate_blocks_entry_right_at_todays_high(self):
         strategy = TradingStrategy(self.config())
         strategy.metrics["SPIKED"] = {"high": 100.0}
+        strategy.recent_momentum["SPIKED"] = Decimal("0.10")
         self.assertFalse(strategy.entry_extension_ok("SPIKED", Decimal("99.5")))
         self.assertTrue(strategy.entry_extension_ok("SPIKED", Decimal("98.0")))
 
@@ -2981,9 +2990,23 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         strategy = TradingStrategy(self.config())
         self.assertTrue(strategy.entry_extension_ok("UNSEEN", Decimal("50")))
 
+    def test_extension_gate_does_not_block_a_stabilized_high(self):
+        """By request: "days high only matters when it is a straight
+        jump pattern, once it stabilizes it is fine." Same price/high
+        pair test_extension_gate_blocks_entry_right_at_todays_high
+        rejects, but WITHOUT the recent-momentum "still jumping"
+        evidence - price sitting near the high here is a stabilized
+        level, not a spike being chased.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["SPIKED"] = {"high": 100.0}
+        strategy.recent_momentum["SPIKED"] = Decimal("0.01")
+        self.assertTrue(strategy.entry_extension_ok("SPIKED", Decimal("99.5")))
+
     def test_opening_grace_widens_extension_gate(self):
         strategy = TradingStrategy(self.config())
         strategy.metrics["SPIKED"] = {"high": 100.0}
+        strategy.recent_momentum["SPIKED"] = Decimal("0.10")
         # Same price/high pair the plain gate rejects above - the grace
         # multiplier (2x -> 2% room instead of 1%) should let it through.
         self.assertFalse(strategy.entry_extension_ok("SPIKED", Decimal("99.5")))
@@ -3001,6 +3024,7 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
     def test_idle_cash_relaxation_widens_extension_gate(self):
         strategy = TradingStrategy(self.config())
         strategy.metrics["SPIKED"] = {"high": 100.0}
+        strategy.recent_momentum["SPIKED"] = Decimal("0.10")
         self.assertFalse(strategy.entry_extension_ok("SPIKED", Decimal("99.5")))
         self.assertTrue(
             strategy.entry_extension_ok(
