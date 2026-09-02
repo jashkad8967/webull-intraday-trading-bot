@@ -256,12 +256,25 @@ class WebullAPI:
 
     @staticmethod
     def _payload_too_large(message: str) -> bool:
+        # Live incident: once options discovery grew past 100
+        # underlyings, trade_options' direction-signal quote fetch
+        # started failing every single cycle with "Webull stock
+        # snapshots accept at most 100 symbols" - stock_quotes' own
+        # local pre-check (STOCK_SNAPSHOT_MAX_SYMBOLS), raised BEFORE
+        # ever reaching the real API, not a server-reported 413. This
+        # wasn't recognized as "oversized" here, so stock_quotes_
+        # resilient's existing recursive-split path (already built and
+        # working for genuine server-side oversized-payload errors)
+        # never engaged, and the whole batch was simply lost every
+        # cycle instead of being split - direction signals for every
+        # underlying past the first ~100 just silently stopped updating.
         lowered = message.lower()
         return (
             "payload too large" in lowered
             or "request entity too large" in lowered
             or "content too large" in lowered
             or re.search(r"\b413\b", lowered) is not None
+            or "accept at most" in lowered
         )
 
     @staticmethod

@@ -6136,6 +6136,47 @@ class PayloadSizingTests(unittest.TestCase):
         self.assertTrue(WebullAPI._payload_too_large("Payload Too Large"))
         self.assertFalse(WebullAPI._payload_too_large("INVALID_SYMBOL"))
 
+    def test_local_snapshot_size_guard_is_treated_as_oversized(self):
+        """Live incident: once options discovery grew past 100
+        underlyings, trade_options' direction-signal quote fetch
+        started failing every cycle with stock_quotes' own local
+        pre-check message ("Webull stock snapshots accept at most 100
+        symbols") - raised locally, before ever reaching the real API,
+        not a server-reported 413. This must be recognized as
+        "oversized" too so stock_quotes_resilient's existing recursive
+        split actually engages instead of losing the whole batch.
+        """
+        self.assertTrue(
+            WebullAPI._payload_too_large(
+                "Webull stock snapshots accept at most 100 symbols"
+            )
+        )
+
+    def test_local_snapshot_size_guard_triggers_a_real_bisect(self):
+        api = WebullAPI.__new__(WebullAPI)
+        calls = []
+
+        def stock_quotes(symbols, category):
+            calls.append(list(symbols))
+            if len(symbols) > 2:
+                raise ValueError(
+                    "Webull stock snapshots accept at most 2 symbols"
+                )
+            return [{"symbol": symbol} for symbol in symbols]
+
+        api.stock_quotes = stock_quotes
+        quotes, invalid = api.stock_quotes_resilient(
+            ["A", "B", "C", "D", "E"],
+            "US_STOCK",
+        )
+
+        self.assertEqual(
+            [item["symbol"] for item in quotes],
+            ["A", "B", "C", "D", "E"],
+        )
+        self.assertEqual(invalid, set())
+        self.assertGreater(len(calls), 1)
+
     def test_oversized_stock_snapshot_is_bisected(self):
         api = WebullAPI.__new__(WebullAPI)
         calls = []
