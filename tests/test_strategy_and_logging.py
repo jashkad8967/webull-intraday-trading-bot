@@ -12359,5 +12359,94 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
         self.assertEqual(result[0]["symbol"], "XYZ260101C00100000")
 
 
+class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):
+    """AutoTrader.refresh_multi_day_momentum - live incident: VIOT was
+    bought ~74% above its prior close 10 minutes after a restart. The
+    old single GLOBAL throttle meant only whichever symbols happened
+    to be in the very first post-restart scan batch ever got their
+    daily_closes populated; a symbol scanned later sat with no data
+    (and multi_day_momentum_supports_entry's extension guard fails
+    open with no data) for up to the full 30-minute refresh window.
+    Symbols with no cached entry yet must always be fetched
+    immediately, bypassing the throttle - which only limits how often
+    an ALREADY-cached symbol gets re-fetched.
+    """
+
+    def _fake_bot(self, daily_closes=None, last_refresh=0.0, fetch_calls=None):
+        from webull_bot.bot import AutoTrader
+        from webull_bot.strategy import TradingStrategy
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                multi_day_momentum_filter_enabled=True,
+                multi_day_momentum_lookback_days=25,
+                multi_day_momentum_refresh_seconds=1800,
+            ),
+            strategy=SimpleNamespace(daily_closes=daily_closes or {}),
+            last_multi_day_momentum_refresh=last_refresh,
+            api=SimpleNamespace(
+                daily_closes=lambda symbols, days: {
+                    symbol: [1.0, 0.99, 0.98] for symbol in symbols
+                }
+            ),
+        )
+        if fetch_calls is not None:
+            original = fake_bot.api.daily_closes
+
+            def _tracking(symbols, days):
+                fetch_calls.append(list(symbols))
+                return original(symbols, days)
+
+            fake_bot.api.daily_closes = _tracking
+        return AutoTrader.refresh_multi_day_momentum.__get__(fake_bot), fake_bot
+
+    def test_fetches_an_uncached_symbol_even_within_the_throttle_window(self):
+        refresh, fake_bot = self._fake_bot(
+            daily_closes={}, last_refresh=time.monotonic()
+        )
+        refresh(["VIOT"])
+        self.assertIn("VIOT", fake_bot.strategy.daily_closes)
+
+    def test_does_not_re_fetch_an_already_cached_symbol_within_the_throttle(self):
+        calls = []
+        refresh, fake_bot = self._fake_bot(
+            daily_closes={"AAPL": [1.0, 0.99]},
+            last_refresh=time.monotonic(),
+            fetch_calls=calls,
+        )
+        refresh(["AAPL"])
+        self.assertEqual(calls, [])
+
+    def test_fetches_only_the_uncached_symbols_when_batch_is_mixed(self):
+        calls = []
+        refresh, fake_bot = self._fake_bot(
+            daily_closes={"AAPL": [1.0, 0.99]},
+            last_refresh=time.monotonic(),
+            fetch_calls=calls,
+        )
+        refresh(["AAPL", "VIOT"])
+        self.assertEqual(calls, [["VIOT"]])
+        self.assertIn("VIOT", fake_bot.strategy.daily_closes)
+
+    def test_refetches_everything_once_the_throttle_window_elapses(self):
+        # time.monotonic() is relative to an arbitrary reference point
+        # (often process/system start) - on a freshly-booted CI
+        # container it can itself be a small number, so a hardcoded
+        # last_refresh=0.0 doesn't reliably simulate "the throttle
+        # window has elapsed" the way it does on a long-uptime dev
+        # machine (live incident: this exact test failed in CI for
+        # that reason). A large negative value keeps now - last_refresh
+        # far past the throttle window regardless of what time.
+        # monotonic() itself happens to read on any given machine.
+        calls = []
+        refresh, fake_bot = self._fake_bot(
+            daily_closes={"AAPL": [1.0, 0.99]},
+            last_refresh=-1_000_000.0,
+            fetch_calls=calls,
+        )
+        refresh(["AAPL"])
+        self.assertEqual(calls, [["AAPL"]])
+
+
 if __name__ == "__main__":
     unittest.main()
