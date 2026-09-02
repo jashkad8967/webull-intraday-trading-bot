@@ -1404,15 +1404,25 @@ class AutoTrader:
             attempts += 1
             try:
                 # By request: "look for cheaper options to buy in to" -
-                # pass the same risk-cap math option_order_quantity
-                # uses at entry time (buying_power * OPTION_CAPITAL_
-                # FRACTION) so discovery can prefer a strike that will
-                # actually be affordable, instead of always locking in
-                # the single nearest-to-ATM one regardless of premium.
+                # then clarified: "options do not have to necessarily
+                # be cheap anymore, but just within buying power." The
+                # first version used buying_power * OPTION_CAPITAL_
+                # FRACTION (the much smaller RISK-per-trade cap
+                # option_order_quantity applies at actual sizing time)
+                # as the affordability ceiling here too - meaning even
+                # once the account's real buying power grew, strike
+                # selection was still capped at a tiny fraction of it,
+                # biasing toward far-OTM/cheap contracts long after
+                # that was necessary. select_atm_options already prefers
+                # the CLOSEST-TO-ATM affordable strike, not the
+                # cheapest one available - so raising this ceiling to
+                # the real buying power (not the risk fraction) lets it
+                # pick a strike as close to the money as the account can
+                # actually afford, while option_order_quantity's own
+                # risk_cap still separately bounds how much of that
+                # buying power any one trade is allowed to risk.
                 max_contract_cost = (
-                    self.cached_buying_power * self.config.option_capital_fraction
-                    if self.cached_buying_power
-                    else None
+                    self.cached_buying_power if self.cached_buying_power else None
                 )
                 contracts = self.api.select_atm_options(
                     underlying,
