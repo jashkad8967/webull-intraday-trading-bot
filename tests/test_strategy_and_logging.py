@@ -12429,10 +12429,19 @@ class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):
         self.assertIn("VIOT", fake_bot.strategy.daily_closes)
 
     def test_refetches_everything_once_the_throttle_window_elapses(self):
+        # time.monotonic() is relative to an arbitrary reference point
+        # (often process/system start) - on a freshly-booted CI
+        # container it can itself be a small number, so a hardcoded
+        # last_refresh=0.0 doesn't reliably simulate "the throttle
+        # window has elapsed" the way it does on a long-uptime dev
+        # machine (live incident: this exact test failed in CI for
+        # that reason). A large negative value keeps now - last_refresh
+        # far past the throttle window regardless of what time.
+        # monotonic() itself happens to read on any given machine.
         calls = []
         refresh, fake_bot = self._fake_bot(
             daily_closes={"AAPL": [1.0, 0.99]},
-            last_refresh=0.0,
+            last_refresh=-1_000_000.0,
             fetch_calls=calls,
         )
         refresh(["AAPL"])
