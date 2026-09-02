@@ -670,6 +670,41 @@ class Settings(BaseSettings):
     volatility_scalp_target_percent: Decimal = Field(
         default=Decimal("0.01"), gt=0, le=1
     )
+    # By request: "when buying multiple shares, if needed be able to
+    # sell them in parts as the value shifts, to maximize profits, or
+    # minimize loss... buy 20, sell 5 every 5 cents it goes up... buy
+    # 10, average down 10, and if it goes up a little sell 10 and keep
+    # the rest for later." Scoped to PROFIT only - a stop-loss always
+    # sells the full remaining quantity (real capital protection, no
+    # partial on the downside, matching "minimize loss" specifically).
+    # See TradingStrategy.volatility_scalp_partial_exit_quantity/
+    # AutoTrader.evaluate_held_stock_exits.
+    volatility_scalp_partial_exit_enabled: bool = True
+    # Fraction of the CURRENTLY HELD quantity sold on each partial
+    # exit (0.5 = sell half, keep half riding). Applied repeatedly as
+    # price keeps climbing, so a held position naturally scales out in
+    # a shrinking ladder rather than one all-or-nothing sale.
+    volatility_scalp_partial_exit_fraction: Decimal = Field(
+        default=Decimal("0.5"), gt=0, lt=1
+    )
+    # Required price move, from the price at the LAST partial exit,
+    # before another one can fire - without this, the very next 0.25s
+    # cycle would immediately sell again at essentially the same price
+    # (the quick target itself doesn't move once a position is
+    # partially closed, only the held quantity shrinks). This is what
+    # actually implements "sell some more every N cents/percent it
+    # keeps climbing" instead of dumping the whole position at once.
+    volatility_scalp_partial_exit_reprice_percent: Decimal = Field(
+        default=Decimal("0.01"), gt=0, le=1
+    )
+    # Once the remaining quantity after a partial sale would drop to
+    # or below this many shares, sell the FULL remainder instead of
+    # another partial - keeps the tail end of a ladder from grinding
+    # down into odd-lot slivers too small to matter (or, for a sub-$1
+    # stock, below Webull's own 100-share minimum order size).
+    volatility_scalp_partial_exit_min_remainder_shares: int = Field(
+        default=10, ge=1, le=1000
+    )
     # Gates TradingStrategy.volatility_scalp_exit_override's fourth,
     # most-eager exit path (stalling momentum on a profitable position) -
     # by request: "too trigger happy to sell... not capturing the
