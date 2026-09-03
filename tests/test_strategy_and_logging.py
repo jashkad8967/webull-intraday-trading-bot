@@ -12550,5 +12550,69 @@ class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):
         self.assertEqual(calls, [["AAPL"]])
 
 
+class OptionPriceTickSizeTests(unittest.TestCase):
+    """WebullAPI.option_price_tick_size / option_limit_price - live
+    incident: a real order attempt at $7.47 (AAPL, premium >= $3) was
+    rejected outright with OPENAPI_OPTION_PRICE_STEP_GTE ("Orders
+    placed with a premium of $3 or more must be in increments of
+    0.05"). option_limit_price used to always round to a flat $0.01
+    regardless of premium level.
+    """
+
+    def test_tick_is_a_penny_under_three_dollars(self):
+        self.assertEqual(
+            WebullAPI.option_price_tick_size(Decimal("2.99")), Decimal("0.01")
+        )
+
+    def test_tick_is_a_nickel_at_or_above_three_dollars(self):
+        self.assertEqual(
+            WebullAPI.option_price_tick_size(Decimal("3.00")), Decimal("0.05")
+        )
+        self.assertEqual(
+            WebullAPI.option_price_tick_size(Decimal("7.47")), Decimal("0.05")
+        )
+
+    def test_buy_limit_price_rounds_down_to_the_nearest_nickel_above_three(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            option_limit_offset=Decimal("0.01"),
+            quote_price_sanity_percent=Decimal("0.08"),
+        )
+        # Live incident's exact numbers: bid=7.35/ask=7.59 averages to
+        # 7.47, which is NOT a multiple of 0.05 and was rejected live.
+        price = api.option_limit_price(
+            {"bid": "7.35", "ask": "7.59"}, "BUY"
+        )
+        self.assertEqual(price, Decimal("7.45"))
+        self.assertEqual(price % Decimal("0.05"), Decimal("0"))
+
+    def test_buy_limit_price_stays_penny_precise_under_three_dollars(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            option_limit_offset=Decimal("0.01"),
+            quote_price_sanity_percent=Decimal("0.08"),
+        )
+        price = api.option_limit_price(
+            {"bid": "1.20", "ask": "1.23"}, "BUY"
+        )
+        self.assertEqual(price, Decimal("1.21"))
+
+    def test_sell_limit_price_rounds_up_to_the_nearest_nickel_above_three(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            option_limit_offset=Decimal("0.01"),
+            quote_price_sanity_percent=Decimal("0.08"),
+        )
+        price = api.option_limit_price(
+            {"bid": "5.51", "price": "5.51"}, "SELL"
+        )
+        # base (5.51) * (1 - 1% offset) = 5.4549, rounded UP to the
+        # nearest nickel = 5.50 - the offset deliberately prices a
+        # touch below base for an aggressive sell crossing, so this
+        # only checks tick alignment, not a floor at base itself.
+        self.assertEqual(price, Decimal("5.50"))
+        self.assertEqual(price % Decimal("0.05"), Decimal("0"))
+
+
 if __name__ == "__main__":
     unittest.main()
