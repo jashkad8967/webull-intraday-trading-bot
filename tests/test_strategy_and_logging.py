@@ -2815,10 +2815,16 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
             strategy.trend_signal(key, Decimal(str(price)))
         # 10.4 still confirms the ongoing uptrend (reenter_on_trend fires
         # here per the shared fixture's reenter_confirmation_polls=2,
-        # unrelated to shorting) - the fresh bearish cross only fires once
-        # the EMA spread actually flips negative, at 10.3.
+        # unrelated to shorting). By request, after live evidence
+        # (6 of 7 open positions underwater, entered right as a fresh
+        # cross fired): a fresh cross no longer fires the same tick it
+        # happens - it needs one more confirming tick in the same
+        # direction first (reenter_confirmation_polls=2), same delay
+        # the continuation case already used. 10.3 is the fresh cross
+        # itself (HOLD, not yet confirmed); 10.2 confirms it (SHORT).
         self.assertEqual(strategy.trend_signal(key, Decimal("10.4")), "BUY")
-        self.assertEqual(strategy.trend_signal(key, Decimal("10.3")), "SHORT")
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.3")), "HOLD")
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.2")), "SHORT")
 
     def test_vwap_gate_short_direction_blocks_price_above_vwap(self):
         strategy = TradingStrategy(self.config())
@@ -2876,7 +2882,10 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         for price in uptrend:
             strategy.stock_decision(key, Decimal(str(price)), 0, Decimal("0"))
         strategy.stock_decision(key, Decimal("10.4"), 0, Decimal("0"))
-        decision = strategy.stock_decision(key, Decimal("10.3"), 0, Decimal("0"))
+        # Fresh cross (10.3) needs one more confirming tick (10.2) before
+        # firing - see trend_signal's own comment on this.
+        strategy.stock_decision(key, Decimal("10.3"), 0, Decimal("0"))
+        decision = strategy.stock_decision(key, Decimal("10.2"), 0, Decimal("0"))
         self.assertEqual(decision.action, "SHORT")
 
     def test_stock_decision_short_signal_is_a_noop_when_disabled(self):
@@ -3139,12 +3148,15 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         # directions (see test_reentry_requires_confirmation_polls_for_a_
         # continuing_downtrend_too for a dedicated check of that).
         self.assertEqual(strategy.trend_signal(key, Decimal("9.6")), "SHORT")
-        self.assertEqual(strategy.trend_signal(key, Decimal("9.7")), "BUY")
-        # A fresh crossover fires instantly, but the very next poll of a
-        # still-forming uptrend should not immediately re-fire.
-        self.assertEqual(strategy.trend_signal(key, Decimal("9.9")), "HOLD")
+        # By request, after live evidence (6 of 7 open positions
+        # underwater, entered right as a fresh cross fired): a fresh
+        # crossover no longer fires the same tick it happens - it needs
+        # one more confirming tick in the same direction first, same as
+        # the continuation case already required.
+        self.assertEqual(strategy.trend_signal(key, Decimal("9.7")), "HOLD")
+        self.assertEqual(strategy.trend_signal(key, Decimal("9.9")), "BUY")
         # Once the uptrend has held for the configured confirmation polls,
-        # re-entry is allowed again.
+        # it keeps firing on every subsequent tick.
         self.assertEqual(strategy.trend_signal(key, Decimal("10.2")), "BUY")
 
     def test_reentry_requires_confirmation_polls_for_a_continuing_downtrend_too(self):
@@ -3162,12 +3174,14 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
             strategy.trend_signal(key, Decimal(str(price)))
 
         self.assertEqual(strategy.trend_signal(key, Decimal("10.4")), "BUY")
-        self.assertEqual(strategy.trend_signal(key, Decimal("10.3")), "SHORT")
-        # A fresh crossover fires instantly, but the very next poll of a
-        # still-forming downtrend should not immediately re-fire.
-        self.assertEqual(strategy.trend_signal(key, Decimal("10.1")), "HOLD")
+        # By request, after live evidence (6 of 7 open positions
+        # underwater, entered right as a fresh cross fired): a fresh
+        # crossover no longer fires the same tick it happens - it needs
+        # one more confirming tick in the same direction first.
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.3")), "HOLD")
+        self.assertEqual(strategy.trend_signal(key, Decimal("10.1")), "SHORT")
         # Once the downtrend has held for the configured confirmation
-        # polls, re-entry is allowed again.
+        # polls, it keeps firing on every subsequent tick.
         self.assertEqual(strategy.trend_signal(key, Decimal("9.8")), "SHORT")
 
     def test_tick_direction_score_ranges_from_all_downticks_to_all_upticks(self):
@@ -3197,8 +3211,14 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         for price in downtrend:
             strategy.trend_signal(key, Decimal(str(price)))
         strategy.trend_signal(key, Decimal("9.6"))
+        # By request, after live evidence: a fresh crossover now needs
+        # one more confirming tick before trend_signal itself fires -
+        # 9.7 is that unconfirmed fresh cross (HOLD); 9.9 is what
+        # actually confirms it into a real "BUY" trend read, which is
+        # the point this test's tick-direction veto needs to intercept.
+        strategy.trend_signal(key, Decimal("9.7"))
 
-        decision = strategy.stock_decision(key, Decimal("9.7"), 0, Decimal("0"), None)
+        decision = strategy.stock_decision(key, Decimal("9.9"), 0, Decimal("0"), None)
         self.assertEqual(decision.action, "HOLD")
         self.assertIn("recent ticks", decision.reason)
 
@@ -3211,8 +3231,12 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         for price in downtrend:
             strategy.trend_signal(key, Decimal(str(price)))
         strategy.trend_signal(key, Decimal("9.6"))
+        # See test_tick_direction_veto_blocks_an_otherwise_qualifying_
+        # ema_entry's own comment - 9.7 is the unconfirmed fresh cross,
+        # 9.9 is what confirms it into a real "BUY" trend read.
+        strategy.trend_signal(key, Decimal("9.7"))
 
-        decision = strategy.stock_decision(key, Decimal("9.7"), 0, Decimal("0"), None)
+        decision = strategy.stock_decision(key, Decimal("9.9"), 0, Decimal("0"), None)
         self.assertEqual(decision.action, "BUY")
 
     def test_recurring_crossovers_boost_priority_score(self):

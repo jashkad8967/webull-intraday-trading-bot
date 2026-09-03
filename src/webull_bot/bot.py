@@ -8330,6 +8330,20 @@ class AutoTrader:
                 if not circuit_active:
                     circuit_active = self.handle_daily_loss_breaker()
                 if not circuit_active:
+                    # By explicit request: "I want priority to option
+                    # trades, so make sure you buy options first."
+                    # Options and stocks draw from completely separate
+                    # buying-power pools (see account_state/
+                    # cached_option_buying_power's own comment), so
+                    # this reordering doesn't take capital away from
+                    # stocks - it just means an option candidate gets
+                    # first crack at this cycle's evaluation instead of
+                    # being evaluated after (and therefore effectively
+                    # de-prioritized behind) the general/scalp stock
+                    # paths every single cycle.
+                    if option_open <= moment < option_closeout:
+                        self.discover_option_contracts()
+                        buying_power = self.trade_options(positions, buying_power)
                     buying_power = self.trade_pairs(positions, buying_power)
                     buying_power = self.trade_stocks(
                         positions,
@@ -8337,9 +8351,6 @@ class AutoTrader:
                         opening_grace_active,
                         core_session_active,
                     )
-                    if option_open <= moment < option_closeout:
-                        self.discover_option_contracts()
-                        buying_power = self.trade_options(positions, buying_power)
                     self.boost_stalled_positions(
                         positions,
                         option_open <= moment < option_closeout,

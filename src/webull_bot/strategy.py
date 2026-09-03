@@ -1692,7 +1692,18 @@ class TradingStrategy:
             # directions share the one counter.
             if old_spread > 0:
                 self.trend_streak[key] = 0
-                return "SHORT"
+                # By request, after live evidence: 6 of 7 open general-
+                # path positions were underwater at once, entered right
+                # as a fresh cross fired - the exact instant a real
+                # reversal and a false-signal whipsaw look identical.
+                # Firing the SAME tick the cross happens means "buying
+                # right when the dip starts," not after it's actually
+                # confirmed. reenter_on_trend=False is the one case
+                # that still fires immediately here (its whole "fires
+                # once per fresh cross" design already has no
+                # continuation mechanism to delay into).
+                if not self.config.reenter_on_trend:
+                    return "SHORT"
             current_streak = self.trend_streak.get(key, 0)
             self.trend_streak[key] = current_streak - 1 if current_streak <= 0 else -1
             if (
@@ -1703,7 +1714,10 @@ class TradingStrategy:
             return "HOLD"
         if old_spread <= 0:
             self.trend_streak[key] = 0
-            return "BUY"
+            # Same one-extra-tick confirmation delay as the SHORT branch
+            # above, for the same reason - see its comment.
+            if not self.config.reenter_on_trend:
+                return "BUY"
         self.trend_streak[key] = self.trend_streak.get(key, 0) + 1
         if (
             self.config.reenter_on_trend
