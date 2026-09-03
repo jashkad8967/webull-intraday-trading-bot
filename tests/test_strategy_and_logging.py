@@ -3333,6 +3333,77 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(decision.action, "PROFIT")
 
+    def test_profit_target_waits_for_momentum_to_stall_before_taking_profit(self):
+        """By explicit request: "when you buy and there is momentum
+        up, only sell when the momentum shifts to down, or when the
+        profit is decreasing... sell during that initial momentum run
+        itself after the buy." Reaching the target price used to take
+        profit immediately, even mid-run, capping every winner at the
+        same fixed size. Whole-share only.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:RUN"
+        symbol = "RUN"
+        for price in [100, 100.3, 100.6, 100.9, 101.2, 101.5]:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+        decision = strategy.stock_decision(
+            key, Decimal("101.5"), 10, Decimal("95"), None
+        )
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_profit_target_fires_once_momentum_stalls(self):
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:RUN2"
+        symbol = "RUN2"
+        for price in [100, 100.3, 100.6, 100.9, 101.2, 101.5]:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+        strategy.stock_decision(key, Decimal("101.5"), 10, Decimal("95"), None)
+        # Two consecutive ticks failing to make a fresh high - a real
+        # plateau, not single-tick noise.
+        for price in [101.4, 101.3]:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+        decision = strategy.stock_decision(
+            key, Decimal("101.3"), 10, Decimal("95"), None
+        )
+        self.assertEqual(decision.action, "PROFIT")
+
+    def test_profit_target_fires_immediately_without_momentum_data(self):
+        """With no volatility_price_history at all for this symbol,
+        the momentum-stall gate must fail open (fire immediately) -
+        the default action here is "take the profit," and withholding
+        it needs positive evidence of still-running momentum, not the
+        absence of data.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:NODATA"
+        decision = strategy.stock_decision(
+            key, Decimal("101.5"), 10, Decimal("95"), None
+        )
+        self.assertEqual(decision.action, "PROFIT")
+
+    def test_profit_target_ignores_momentum_stall_for_a_fractional_position(self):
+        strategy = TradingStrategy(self.config())
+        key = "STOCK:RUN3"
+        symbol = "RUN3"
+        for price in [100, 100.3, 100.6, 100.9, 101.2, 101.5]:
+            strategy.update_stock_snapshot(
+                {"symbol": symbol, "volume": "1000", "price": str(price)},
+                Decimal(str(price)),
+            )
+        decision = strategy.stock_decision(
+            key, Decimal("101.5"), Decimal("0.5"), Decimal("95"), None
+        )
+        self.assertEqual(decision.action, "PROFIT")
+
     def test_option_decision_cuts_loss_before_it_reaches_zero(self):
         strategy = TradingStrategy(self.config())
         decision = strategy.option_decision(

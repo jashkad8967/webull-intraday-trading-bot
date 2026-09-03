@@ -492,6 +492,29 @@ class TradingStrategy:
             return False
         return price <= previous <= before_that
 
+    def volatility_scalp_momentum_stalling_short(
+        self, symbol: str, price: Decimal
+    ) -> bool:
+        """Mirror of volatility_scalp_momentum_stalling for a SHORT
+        position: a short profits as price falls, so "still running"
+        means still making fresh LOWS - stalling means two consecutive
+        ticks failing to make a fresh low, the exact opposite direction
+        of the long-side check.
+        """
+        window = self.volatility_price_history.get(symbol)
+        if not window:
+            return False
+        samples = list(window)
+        if samples and Decimal(str(samples[-1])) == price:
+            samples = samples[:-1]
+        if len(samples) < 2:
+            return False
+        previous = Decimal(str(samples[-1]))
+        before_that = Decimal(str(samples[-2]))
+        if previous <= 0 or before_that <= 0:
+            return False
+        return price >= previous >= before_that
+
     def _synthetic_bars(self, symbol: str) -> list[dict]:
         """Buckets the rolling tick-price window (volatility_price_history)
         into fixed-size synthetic OHLC bars, HEIKIN_ASHI_BAR_SAMPLES ticks
@@ -2099,12 +2122,46 @@ class TradingStrategy:
                     + fee_per_share,
                 )
             if average_cost > 0 and price >= target:
-                reason = (
-                    "agent runner target reached"
-                    if target > base_target
-                    else "percentage profit reached"
-                )
-                return Decision("PROFIT", reason, target)
+                # By explicit request: "when you buy and there is
+                # momentum up, only sell when the momentum shifts to
+                # down, or when the profit is decreasing... sell during
+                # that initial momentum run itself after the buy" - was
+                # taking profit the instant price crossed the target,
+                # even mid-run, capping every winner at the same fixed
+                # size regardless of how much further it kept climbing.
+                # Reuses the exact same momentum-stall confirmation
+                # already built and tuned for the volatility-scalp
+                # cohort's own profit exit (two consecutive ticks
+                # failing to make a fresh high - a real plateau, not
+                # single-tick noise) - only the BASE target-reached path
+                # waits for it; the agent-runner/de-risk overrides below
+                # are deliberate, distinct mechanisms and stay immediate.
+                # Whole-share only - a fractional position is deliberately
+                # designed to cycle capital fast (many trades/hour, see
+                # its own target-sizing comment above), and waiting for a
+                # momentum stall would work directly against that intent.
+                # volatility_scalp_momentum_stalling itself fails CLOSED
+                # (False) with no/insufficient price history, which is
+                # right for its ORIGINAL caller (an override that should
+                # only act on positive evidence) but wrong here, where
+                # the default action is "take the profit" and withholding
+                # it needs to be the exceptional case - with no real
+                # momentum data at all, this must still fire immediately,
+                # not hold forever waiting for data that isn't coming.
+                price_history = self.volatility_price_history.get(symbol)
+                has_momentum_data = price_history and len(price_history) >= 2
+                if (
+                    target > base_target
+                    or is_fractional
+                    or not has_momentum_data
+                    or self.volatility_scalp_momentum_stalling(symbol, price)
+                ):
+                    reason = (
+                        "agent runner target reached"
+                        if target > base_target
+                        else "percentage profit reached"
+                    )
+                    return Decision("PROFIT", reason, target)
             if (
                 self.config.agent_exit_influence_enabled
                 and average_cost > 0
@@ -2172,12 +2229,24 @@ class TradingStrategy:
                     - fee_per_share,
                 )
             if average_cost > 0 and price <= target:
-                reason = (
-                    "agent runner target reached (short)"
-                    if target < base_target
-                    else "percentage profit reached (short)"
-                )
-                return Decision("PROFIT", reason, target)
+                # Mirror of the long-side momentum-stall gate above - a
+                # short profits as price falls, so "momentum still
+                # running" here means still making fresh LOWS, not
+                # highs. Same "no data -> fire immediately, don't hold
+                # forever" fallback as the long side.
+                price_history = self.volatility_price_history.get(symbol)
+                has_momentum_data = price_history and len(price_history) >= 2
+                if (
+                    target < base_target
+                    or not has_momentum_data
+                    or self.volatility_scalp_momentum_stalling_short(symbol, price)
+                ):
+                    reason = (
+                        "agent runner target reached (short)"
+                        if target < base_target
+                        else "percentage profit reached (short)"
+                    )
+                    return Decision("PROFIT", reason, target)
             if (
                 self.config.agent_exit_influence_enabled
                 and average_cost > 0
