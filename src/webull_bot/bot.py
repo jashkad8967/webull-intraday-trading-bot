@@ -441,6 +441,9 @@ class AutoTrader:
         # window regardless of how long the symbol was previously held.
         self.position_opened_at: dict[str, float] = {}
         self.cached_buying_power = Decimal("0")
+        # See account_state - option sizing/affordability must use
+        # this, never cached_buying_power (a separate, stock-only pool).
+        self.cached_option_buying_power = Decimal("0")
         self.cached_raw_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
         # Read by _position_protection_loop's background thread - see
@@ -1438,8 +1441,15 @@ class AutoTrader:
                 # actually afford, while option_order_quantity's own
                 # risk_cap still separately bounds how much of that
                 # buying power any one trade is allowed to risk.
+                # Live incident: option buying power is a separate pool
+                # from stock buying power (see account_state) - using
+                # the stock-side figure here meant strike selection
+                # could pick a contract the account's real option
+                # buying power could never actually afford.
                 max_contract_cost = (
-                    self.cached_buying_power if self.cached_buying_power else None
+                    self.cached_option_buying_power
+                    if self.cached_option_buying_power
+                    else None
                 )
                 contracts = self.api.select_atm_options(
                     underlying,
@@ -3200,6 +3210,16 @@ class AutoTrader:
             self.cached_buying_power = max(
                 Decimal("0"),
                 self.cached_raw_buying_power - self.config.min_cash_reserve_dollars,
+            )
+            # Live incident: Webull tracks option buying power as a
+            # COMPLETELY SEPARATE pool from stock buying power (a real
+            # order attempt with plenty of stock buying power available
+            # still failed with OPENAPI_DAY_BUYING_POWER_INSUFFICIENT,
+            # because option_buying_power on the same balance() read
+            # was $0) - option sizing must never use the stock-side
+            # cached_buying_power above.
+            self.cached_option_buying_power = self.api.option_buying_power_from_balance(
+                balance
             )
             self.cached_account_day_pnl = self.api.account_day_pnl_from_balance(
                 balance
@@ -7045,7 +7065,7 @@ class AutoTrader:
                     buy_quantity, contract_cost = (
                         self.strategy.option_order_quantity(
                             limit_price,
-                            buying_power,
+                            self.cached_option_buying_power,
                         )
                     )
                     if buy_quantity <= 0:
