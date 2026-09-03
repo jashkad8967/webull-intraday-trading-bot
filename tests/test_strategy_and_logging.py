@@ -10665,6 +10665,8 @@ class ExtendedHoursProfitSweepTests(unittest.TestCase):
             last_extended_hours_profit_sweep=time.monotonic() - 999999,
             pending_stock_exits={"AAPL", "MSFT"},
             wash_sales=SimpleNamespace(block=lambda *a, **k: None),
+            extended_hours_fractional_skip_logged=set(),
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
         )
         quotes = quotes or {}
         fake_bot.api = SimpleNamespace(
@@ -10699,6 +10701,38 @@ class ExtendedHoursProfitSweepTests(unittest.TestCase):
         self.assertEqual(calls["instrument_types"], {"EQUITY"})
         self.assertEqual(calls["exclude_symbols"], {"BABA"})
         self.assertNotIn("MSFT", fake_bot.pending_stock_exits)
+
+    def test_skips_a_fractional_position_instead_of_retrying_a_guaranteed_rejection(self):
+        """Live incident: UBER's extended-hours close order was rejected
+        with OPENAPI_FRACT_ONLT_CORE_TIME (fractional orders are only
+        accepted during core hours) every ~90s cycle for hours straight
+        - this function only ever runs outside core hours, so a
+        fractional-quantity position here will ALWAYS hit this same
+        rejection. It should be skipped outright, not retried.
+        """
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "MSFT", "quantity": "1", "cost_price": "493.23"},
+            {"instrument_type": "EQUITY", "symbol": "UBER", "quantity": "0.5", "cost_price": "70.00"},
+        ]
+        quotes = {"MSFT": "497.33", "UBER": "75.00"}
+        fake_bot = self._fake_bot(positions, quotes)
+        calls = {}
+
+        def fake_close_all_positions(instrument_types, loss_callback=None, exclude_symbols=None):
+            calls["exclude_symbols"] = exclude_symbols
+            return ["order-1"]
+
+        fake_bot.api.close_all_positions = fake_close_all_positions
+        sweep = AutoTrader.close_profitable_positions_during_extended_hours.__get__(fake_bot)
+
+        sweep()
+
+        # UBER never even reaches close_all_positions as a symbol to
+        # close - it's excluded, same as an underwater position would be.
+        self.assertIn("UBER", calls["exclude_symbols"])
+        self.assertIn("UBER", fake_bot.extended_hours_fractional_skip_logged)
 
     def test_noop_when_every_position_is_underwater(self):
         from webull_bot.bot import AutoTrader
