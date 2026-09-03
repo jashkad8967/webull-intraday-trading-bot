@@ -130,6 +130,33 @@ class WebullAPI:
         cash = usd.get("cash_balance")
         return Decimal(str(cash)) if cash not in (None, "") else Decimal("0")
 
+    def option_buying_power(self) -> Decimal:
+        return self.option_buying_power_from_balance(self.balance())
+
+    @staticmethod
+    def option_buying_power_from_balance(balance: dict) -> Decimal:
+        """Live incident: every real option order attempt this session
+        failed with OPENAPI_DAY_BUYING_POWER_INSUFFICIENT regardless of
+        how cheap the contract was - Webull tracks option buying power
+        as a COMPLETELY SEPARATE pool from stock buying power
+        (balance()'s account_currency_assets carries both
+        "day_buying_power" and "option_buying_power" as independent
+        fields), and this codebase's buying_power_from_balance only
+        ever read the stock-side fields. Sizing option orders against
+        stock buying power meant every option entry this session was
+        sized against the wrong number entirely.
+        """
+        usd = next(
+            (
+                item
+                for item in balance.get("account_currency_assets", [])
+                if item.get("currency") == "USD"
+            ),
+            {},
+        )
+        value = usd.get("option_buying_power")
+        return Decimal(str(value)) if value not in (None, "") else Decimal("0")
+
     @staticmethod
     def account_day_pnl_from_balance(balance: dict) -> Decimal | None:
         """Webull's own account-level today's total P&L (realized +

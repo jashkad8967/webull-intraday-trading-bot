@@ -6035,6 +6035,33 @@ class AccountDayPnlExtractionTests(unittest.TestCase):
             WebullAPI.buying_power_from_balance(balance), Decimal("120.00")
         )
 
+    def test_option_buying_power_from_balance_reads_the_separate_pool(self):
+        """Live incident: a real option order attempt failed with
+        OPENAPI_DAY_BUYING_POWER_INSUFFICIENT even though stock buying
+        power (day_buying_power) had plenty available - Webull tracks
+        option_buying_power as a completely separate field/pool.
+        """
+        balance = {
+            "account_currency_assets": [
+                {
+                    "currency": "USD",
+                    "day_buying_power": "202.53",
+                    "option_buying_power": "0.00",
+                }
+            ]
+        }
+        self.assertEqual(
+            WebullAPI.option_buying_power_from_balance(balance), Decimal("0.00")
+        )
+        self.assertEqual(
+            WebullAPI.buying_power_from_balance(balance), Decimal("202.53")
+        )
+
+    def test_option_buying_power_from_balance_defaults_to_zero_when_unreported(self):
+        self.assertEqual(
+            WebullAPI.option_buying_power_from_balance({}), Decimal("0")
+        )
+
 
 class StopExitPricingTests(unittest.TestCase):
     def test_stop_exit_uses_bid_ask_midpoint_not_aggressive_crossing(self):
@@ -8584,6 +8611,7 @@ class AccountStateCashReserveTests(unittest.TestCase):
             api=SimpleNamespace(
                 balance=lambda: {},
                 buying_power_from_balance=lambda balance: Decimal("120.00"),
+                option_buying_power_from_balance=lambda balance: Decimal("0"),
                 account_day_pnl_from_balance=lambda balance: Decimal("-1.50"),
                 account_value_from_balance=lambda balance: Decimal("500.00"),
                 positions=lambda: [{"symbol": "AAPL"}],
@@ -8652,6 +8680,7 @@ class AccountStateCashReserveTests(unittest.TestCase):
             api=SimpleNamespace(
                 balance=lambda: {},
                 buying_power_from_balance=lambda balance: Decimal("3.00"),
+                option_buying_power_from_balance=lambda balance: Decimal("0"),
                 account_day_pnl_from_balance=lambda balance: None,
                 account_value_from_balance=lambda balance: None,
                 positions=lambda: [],
@@ -8689,6 +8718,7 @@ class ShortSellingEquityGateTests(unittest.TestCase):
             api=SimpleNamespace(
                 balance=lambda: {},
                 buying_power_from_balance=lambda balance: Decimal("120.00"),
+                option_buying_power_from_balance=lambda balance: Decimal("0"),
                 account_day_pnl_from_balance=lambda balance: Decimal("0"),
                 account_value_from_balance=lambda balance: account_value,
                 positions=lambda: [],
