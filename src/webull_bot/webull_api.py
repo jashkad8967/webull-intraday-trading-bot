@@ -1444,6 +1444,31 @@ class WebullAPI:
         price = max(Decimal("0.01"), price)
         return price.quantize(self.price_tick_size(price), rounding=ROUND_DOWN)
 
+    @staticmethod
+    def option_price_tick_size(premium: Decimal) -> Decimal:
+        """The real increment an option premium is allowed to be quoted
+        in - live incident: a real order attempt at $7.47 (AAPL, a
+        premium >= $3) was rejected outright with OPENAPI_OPTION_
+        PRICE_STEP_GTE ("Orders placed with a premium of $3 or more
+        must be in increments of 0.05"). option_limit_price used to
+        always round to a flat $0.01 regardless of premium level - this
+        would have blocked every real option order whose premium ever
+        cleared $3, silently until the first live attempt actually hit
+        it (never verified live before this, since nothing had reached
+        order placement yet). Mirrors price_tick_size's own real-tick-
+        size pattern for stocks, just with the threshold/increments
+        this specific Webull error message documents for options.
+        """
+        return Decimal("0.05") if premium >= 3 else Decimal("0.01")
+
+    @classmethod
+    def _quantize_to_option_tick(
+        cls, price: Decimal, rounding: str
+    ) -> Decimal:
+        tick = cls.option_price_tick_size(price)
+        steps = (price / tick).quantize(Decimal("1"), rounding=rounding)
+        return (steps * tick).quantize(Decimal("0.01"))
+
     def option_limit_price(self, quote: dict, side: str) -> Decimal:
         offset = self.config.option_limit_offset
         if side == "BUY":
@@ -1454,9 +1479,8 @@ class WebullAPI:
                     "option quote has no valid bid/ask spread for a buy"
                 )
             price = (bid + ask) / 2
-            return max(Decimal("0.01"), price).quantize(
-                Decimal("0.01"),
-                rounding=ROUND_DOWN,
+            return self._quantize_to_option_tick(
+                max(Decimal("0.01"), price), ROUND_DOWN
             )
         else:
             base = (
@@ -1465,7 +1489,9 @@ class WebullAPI:
                 or self._sane_bid_or_ask(quote, "ask")
             )
             price = base * (Decimal("1") - offset)
-        return max(Decimal("0.01"), price).quantize(Decimal("0.01"), rounding=ROUND_UP)
+        return self._quantize_to_option_tick(
+            max(Decimal("0.01"), price), ROUND_UP
+        )
 
     @staticmethod
     def _quote_decimal(quote: dict, field: str) -> Decimal | None:
