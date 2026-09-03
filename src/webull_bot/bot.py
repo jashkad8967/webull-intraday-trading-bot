@@ -276,6 +276,11 @@ class AutoTrader:
         )
         self.wash_skip_logged: set[str] = set()
         self.unmanaged_held_logged: set[str] = set()
+        # See close_profitable_positions_during_extended_hours - dedupes
+        # its "skipping a fractional position outside core hours" log so
+        # it fires once per symbol per occurrence, not every ~90s cycle
+        # for the whole pre-market/after-hours window.
+        self.extended_hours_fractional_skip_logged: set[str] = set()
         self.last_trade: dict[str, float] = {}
         self.last_exit_at: dict[str, float] = {}
         # See post_stop_reentry_ready - keyed by bare symbol (not the
@@ -5854,18 +5859,20 @@ class AutoTrader:
                         ] += 1
                         continue
                     bucket = self.strategy.selection_bucket(symbol)
-                    # By request, after pre-market losses: "only trading
-                    # established stocks with more volume and popularity
-                    # in extended hours." Outside core hours, a fresh
-                    # long entry only fires for the POPULAR bucket
-                    # (already gated on popular_stock_min_volume/
-                    # popular_stock_symbols - see TradingStrategy.
-                    # select_stock_symbols) - PENNY and DISCOVERY names
-                    # wait for core hours. Core hours are unaffected.
-                    if not effective_core_session_active and bucket != "POPULAR":
+                    # By explicit request: "stop trading extended hours
+                    # unless it is for closing out positions." Used to
+                    # allow a fresh entry outside core hours for the
+                    # POPULAR bucket only ("only trading established
+                    # stocks... in extended hours") - now a hard block
+                    # on every fresh entry outside core hours,
+                    # regardless of bucket. Every exit path (profit
+                    # target, stop-loss, EOD closeout, the extended-
+                    # hours profit sweep) is completely unaffected -
+                    # only opening a brand-new position is blocked here.
+                    if not effective_core_session_active:
                         self.gate_rejections[
-                            "extended hours - only established/popular "
-                            "symbols trade outside core hours"
+                            "extended hours - fresh entries disabled, "
+                            "exits only"
                         ] += 1
                         continue
                     if fresh_entry_blackout_active:
@@ -7679,6 +7686,26 @@ class AutoTrader:
             symbol = str(item.get("symbol", "")).upper()
             cost = Decimal(str(item.get("cost_price") or "0"))
             if cost <= 0:
+                continue
+            # Live incident: UBER's extended-hours close order was
+            # rejected with OPENAPI_FRACT_ONLT_CORE_TIME (fractional
+            # orders are only accepted during core hours) EVERY cycle
+            # for hours straight - this function only ever runs
+            # outside core hours (see its own docstring), so a
+            # fractional-quantity position here will ALWAYS hit this
+            # same rejection, never just occasionally. Skip it outright
+            # instead of retrying a guaranteed failure every cycle;
+            # close_fractional_positions_before_core_close already
+            # handles fractional exits once core hours actually start.
+            quantity = Decimal(str(item.get("quantity", "0")))
+            if self.is_fractional_quantity(quantity):
+                if symbol not in self.extended_hours_fractional_skip_logged:
+                    self.extended_hours_fractional_skip_logged.add(symbol)
+                    log.info(
+                        "CLOSE  | extended-hours profit sweep | %-8s | "
+                        "fractional position, deferring to core hours",
+                        symbol,
+                    )
                 continue
             try:
                 price = self.api.quote_price(self.api.stock_quote(symbol))
