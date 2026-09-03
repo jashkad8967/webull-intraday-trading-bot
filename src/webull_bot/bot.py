@@ -5229,7 +5229,7 @@ class AutoTrader:
                             ),
                         ),
                         (
-                            "scalp - no dip/breakout/reversal trigger",
+                            "scalp - no dip/reversal trigger",
                             (
                                 (
                                     self.strategy.volatility_scalp_dip_signal(
@@ -5238,9 +5238,6 @@ class AutoTrader:
                                     and self.strategy.volatility_scalp_micro_exhaustion_confirmed(
                                         symbol, price, batch_moment
                                     )
-                                )
-                                or self.strategy.dual_thrust_breakout_signal(
-                                    symbol, price
                                 )
                                 or self.strategy.heikin_ashi_bullish_reversal_signal(
                                     symbol
@@ -5448,23 +5445,27 @@ class AutoTrader:
                     and self.strategy.multi_day_momentum_supports_entry(
                         symbol, "BUY", price
                     )
-                    # THREE independent, OR'd entry triggers - by request,
-                    # every extra qualifying signal means MORE trading
-                    # opportunities, not a stricter combined bar: the
-                    # original dip-buy signal, a Dual-Thrust-style
-                    # opening-range breakout (the mirror case - a fresh
-                    # push to a new high instead of a pullback), and a
-                    # Heikin-Ashi confirmed bullish reversal candle.
+                    # TWO independent, OR'd entry triggers: the dip-buy
+                    # signal (gated behind micro-exhaustion confirmation
+                    # below) and a Heikin-Ashi confirmed bullish reversal
+                    # candle.
                     #
-                    # By request: a 4th confirmation gate sits ONLY
-                    # behind the dip-signal branch specifically - "when
-                    # the flat percentage-off-local-high fires True, it
-                    # runs this... validation." Breakout and reversal
-                    # are independent setups (a fresh push to a new
-                    # high, or a confirmed reversal candle) that don't
-                    # need liquidity-exhaustion proof the same way a
-                    # raw "X% off a local high" dip does - see
-                    # volatility_scalp_micro_exhaustion_confirmed.
+                    # Live incident (this bug): the Dual-Thrust-style
+                    # opening-range breakout trigger that used to sit
+                    # here as a third OR'd path had NO follow-through
+                    # confirmation at all - unlike dip-signal (gated
+                    # behind volatility_scalp_micro_exhaustion_confirmed
+                    # below), it fired the INSTANT price crossed the
+                    # breakout level, with no check that the breakout
+                    # actually held. ORBS: bought at $0.9589, one tick
+                    # before the local peak ($0.9594), then fell ~4.2%
+                    # from there - a textbook failed breakout, buying
+                    # right at the top of a run-up that immediately
+                    # reversed. By explicit request, after confirming
+                    # this: removed entirely rather than adding a
+                    # confirmation gate - dip-signal (with its real
+                    # exhaustion confirmation) and reversal already
+                    # cover this cohort's real setups.
                     and (
                         (
                             self.strategy.volatility_scalp_dip_signal(symbol, price)
@@ -5472,7 +5473,6 @@ class AutoTrader:
                                 symbol, price, batch_moment
                             )
                         )
-                        or self.strategy.dual_thrust_breakout_signal(symbol, price)
                         or self.strategy.heikin_ashi_bullish_reversal_signal(symbol)
                     )
                     # By request: "we don't want to buy when there is
