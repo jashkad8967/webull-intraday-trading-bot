@@ -391,11 +391,6 @@ class AutoTrader:
         # minute window (at the current 5000-symbol universe size)
         # doesn't kick off a second, redundant thread every cycle.
         self._resolve_targets_in_progress_for = None
-        # See discover_option_contracts - guards against stacking a
-        # second discovery thread while one from an earlier cycle is
-        # still running (each discovery attempt costs real API latency,
-        # so a run can easily outlast OPTION_DISCOVERY_SECONDS).
-        self._option_discovery_thread_active = False
         # Live incident (VVOS): the day's very first volatility-scalp
         # dip entries can fire before _resolve_targets_work_body's bulk
         # seed_volatility_windows call (also gated behind resolve_
@@ -1356,44 +1351,18 @@ class AutoTrader:
             self._grow_stock_universe(moment)
 
     def discover_option_contracts(self) -> None:
-        """Kicks off a batch of option-contract discovery on a
-        background thread and returns immediately - never blocks the
-        caller. Live incident (this bug): each discovery attempt costs
-        several real seconds of API latency (a per-underlying contract-
-        chain lookup, no batching available the way quotes have), and
-        this used to run synchronously inline in the main trading loop
-        - raising OPTION_DISCOVERY_PER_CYCLE from 10 to 30 to "scan
-        options faster" instead stalled the ENTIRE bot (all stock
-        trading, not just options) for most of a 14-minute window: only
-        1 SCAN log line and 1 (manual, not bot-driven) stock order in
-        that whole stretch. Same non-blocking-dispatch shape as
-        resolve_targets - see its own docstring for the original
-        version of this exact class of bug (universe/VOLFILT refresh
-        blocking position protection).
-        """
-        if self._option_discovery_thread_active:
-            return
-        if (
-            time.monotonic() - self.last_option_discovery
-            < float(self.config.option_discovery_seconds)
-        ):
-            return
-        self.last_option_discovery = time.monotonic()
-        self._option_discovery_thread_active = True
-        threading.Thread(
-            target=self._discover_option_contracts_work,
-            daemon=True,
-        ).start()
-
-    def _discover_option_contracts_work(self) -> None:
-        try:
-            self._discover_option_contracts_work_body()
-        except Exception as exc:
-            log.error("OPTIONS | discovery thread failed | %s", exc)
-        finally:
-            self._option_discovery_thread_active = False
-
-    def _discover_option_contracts_work_body(self) -> None:
+        # Live incident: dispatching this onto its own background
+        # thread (tried this session, immediately reverted) produced
+        # zero discovery output at all for 12+ minutes straight - no
+        # progress/found/error logs, while stock trading kept working
+        # fine on the main thread. Strong signal of a thread-safety
+        # issue with the shared API client under concurrent use
+        # (main-loop trade_options calls + this new thread's own calls
+        # hitting the same client at once), not safely diagnosable live
+        # against real capital. Reverted to synchronous - the real fix
+        # for "don't block the main loop for too long" is keeping
+        # OPTION_DISCOVERY_PER_CYCLE modest (this file's own comment on
+        # that field has the full story), not threading this call.
         # By request: "we want options for more popular stocks only
         # like in snp and dow, and some from nyse." Computed fresh from
         # config here (not read off self.stock_symbols) - self.
