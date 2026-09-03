@@ -3360,7 +3360,13 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         downtrend = [10, 9.9, 9.8, 9.7, 9.6, 9.5, 9.4, 9.3, 9.2]
         for price in downtrend:
             strategy.option_direction_signal(key, Decimal(str(price)))
-        self.assertEqual(strategy.option_direction_signal(key, Decimal("9.6")), "HOLD")
+        # 9.6 still confirms the ongoing downtrend (reenter_on_trend fires
+        # here per the shared fixture's reenter_confirmation_polls=2 - by
+        # request, "re-fire on a continued trend, not just the fresh
+        # cross," same mechanism trend_signal already uses) - the fresh
+        # bullish cross only fires once the EMA spread actually flips
+        # positive, at 9.7.
+        self.assertEqual(strategy.option_direction_signal(key, Decimal("9.6")), "PUT")
         self.assertEqual(strategy.option_direction_signal(key, Decimal("9.7")), "CALL")
 
     def test_option_direction_signal_fires_put_on_a_fresh_bearish_cross(self):
@@ -3369,8 +3375,29 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         uptrend = [10, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8]
         for price in uptrend:
             strategy.option_direction_signal(key, Decimal(str(price)))
-        self.assertEqual(strategy.option_direction_signal(key, Decimal("10.4")), "HOLD")
+        # Same reenter_on_trend continuation as the CALL case above, mirror
+        # image: 10.4 still confirms the ongoing uptrend.
+        self.assertEqual(strategy.option_direction_signal(key, Decimal("10.4")), "CALL")
         self.assertEqual(strategy.option_direction_signal(key, Decimal("10.3")), "PUT")
+
+    def test_option_direction_signal_reenters_on_a_continued_trend(self):
+        """By explicit request ("screw the direction signal... re-fire
+        on a continued trend, not just the fresh cross"): unlike the
+        old behavior (fire once on the fresh cross, then go quiet even
+        if the trend keeps going), this should keep re-firing every
+        REENTER_CONFIRMATION_POLLS cycles the trend continues - a real
+        signal landing on a cycle whose contract never reaches the
+        gate-check loop is no longer a permanently missed opportunity.
+        """
+        strategy = TradingStrategy(self.config())
+        key = "OPTU:CONTINUE"
+        uptrend = [10, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8]
+        for price in uptrend:
+            strategy.option_direction_signal(key, Decimal(str(price)))
+        # The fresh cross already fired once during the loop above; by
+        # 10.9 the streak has held long enough (reenter_confirmation_
+        # polls=2) to re-fire CALL again on the still-continuing trend.
+        self.assertEqual(strategy.option_direction_signal(key, Decimal("10.9")), "CALL")
 
     def test_option_entry_confirmed_requires_direction(self):
         strategy = TradingStrategy(self.config())

@@ -1716,10 +1716,22 @@ class TradingStrategy:
         """Dual-sided sibling of trend_signal for options: a stock strategy
         only ever needs a bullish entry, but a call needs the same fresh
         bullish EMA cross while a put needs the mirror-image fresh bearish
-        cross. Deliberately skips trend_signal's reenter_on_trend/streak
-        re-entry logic - theta already punishes waiting on an option, so
-        this fires once per fresh cross and goes quiet, rather than
-        re-firing on a continued trend.
+        cross.
+
+        By explicit request ("screw the direction signal, i feel maybe
+        there are too many barriers"), then clarified as "re-fire on a
+        continued trend, not just the fresh cross": this used to go
+        quiet the instant the fresh-cross cycle passed, even if the
+        underlying kept trending - given how the option-contract quote
+        rotation and the outer loop's own cadence both compete for the
+        same cycle, a real fresh cross could easily land on a cycle
+        that never actually reaches the gate-check loop for that
+        contract, and then never fire again until the NEXT fresh cross.
+        Now mirrors trend_signal's own reenter_on_trend/trend_streak
+        continuation exactly (same config, same "OPTU:"-namespaced key
+        so it shares no state with the stock side's "STOCK:" keys) -
+        a signal keeps re-firing every cycle the trend continues, once
+        it's held for REENTER_CONFIRMATION_POLLS cycles.
         """
         values = self.history[key]
         values.append(float(price))
@@ -1727,6 +1739,7 @@ class TradingStrategy:
         slow = self.config.ema_slow_period
         fast = self.config.ema_fast_period
         if len(values) < slow + 1:
+            self.trend_streak[key] = 0
             return "HOLD"
         series = list(values)
         previous = series[:-1]
@@ -1738,10 +1751,27 @@ class TradingStrategy:
             series[-slow:],
             slow,
         )
-        if new_spread > 0 and old_spread <= 0:
+        if new_spread <= 0:
+            if old_spread > 0:
+                self.trend_streak[key] = 0
+                return "PUT"
+            current_streak = self.trend_streak.get(key, 0)
+            self.trend_streak[key] = current_streak - 1 if current_streak <= 0 else -1
+            if (
+                self.config.reenter_on_trend
+                and -self.trend_streak[key] >= self.config.reenter_confirmation_polls
+            ):
+                return "PUT"
+            return "HOLD"
+        if old_spread <= 0:
+            self.trend_streak[key] = 0
             return "CALL"
-        if new_spread < 0 and old_spread >= 0:
-            return "PUT"
+        self.trend_streak[key] = self.trend_streak.get(key, 0) + 1
+        if (
+            self.config.reenter_on_trend
+            and self.trend_streak[key] >= self.config.reenter_confirmation_polls
+        ):
+            return "CALL"
         return "HOLD"
 
     def option_entry_confirmed(
