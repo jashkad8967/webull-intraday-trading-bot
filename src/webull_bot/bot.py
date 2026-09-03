@@ -391,6 +391,11 @@ class AutoTrader:
         # minute window (at the current 5000-symbol universe size)
         # doesn't kick off a second, redundant thread every cycle.
         self._resolve_targets_in_progress_for = None
+        # See discover_option_contracts - guards against stacking a
+        # second discovery thread while one from an earlier cycle is
+        # still running (each discovery attempt costs real API latency,
+        # so a run can easily outlast OPTION_DISCOVERY_SECONDS).
+        self._option_discovery_thread_active = False
         # Live incident (VVOS): the day's very first volatility-scalp
         # dip entries can fire before _resolve_targets_work_body's bulk
         # seed_volatility_windows call (also gated behind resolve_
@@ -1351,6 +1356,44 @@ class AutoTrader:
             self._grow_stock_universe(moment)
 
     def discover_option_contracts(self) -> None:
+        """Kicks off a batch of option-contract discovery on a
+        background thread and returns immediately - never blocks the
+        caller. Live incident (this bug): each discovery attempt costs
+        several real seconds of API latency (a per-underlying contract-
+        chain lookup, no batching available the way quotes have), and
+        this used to run synchronously inline in the main trading loop
+        - raising OPTION_DISCOVERY_PER_CYCLE from 10 to 30 to "scan
+        options faster" instead stalled the ENTIRE bot (all stock
+        trading, not just options) for most of a 14-minute window: only
+        1 SCAN log line and 1 (manual, not bot-driven) stock order in
+        that whole stretch. Same non-blocking-dispatch shape as
+        resolve_targets - see its own docstring for the original
+        version of this exact class of bug (universe/VOLFILT refresh
+        blocking position protection).
+        """
+        if self._option_discovery_thread_active:
+            return
+        if (
+            time.monotonic() - self.last_option_discovery
+            < float(self.config.option_discovery_seconds)
+        ):
+            return
+        self.last_option_discovery = time.monotonic()
+        self._option_discovery_thread_active = True
+        threading.Thread(
+            target=self._discover_option_contracts_work,
+            daemon=True,
+        ).start()
+
+    def _discover_option_contracts_work(self) -> None:
+        try:
+            self._discover_option_contracts_work_body()
+        except Exception as exc:
+            log.error("OPTIONS | discovery thread failed | %s", exc)
+        finally:
+            self._option_discovery_thread_active = False
+
+    def _discover_option_contracts_work_body(self) -> None:
         # By request: "we want options for more popular stocks only
         # like in snp and dow, and some from nyse." Computed fresh from
         # config here (not read off self.stock_symbols) - self.
@@ -6948,70 +6991,87 @@ class AutoTrader:
                     underlying = contract["underlying_symbol"]
                     direction = directions.get(underlying, "HOLD")
                     contract_type = contract.get("option_type")
-                    if not (
-                        (contract_type == "CALL" and direction == "CALL")
-                        or (contract_type == "PUT" and direction == "PUT")
-                    ):
-                        self.option_gate_rejections[
-                            "no direction signal for this underlying"
-                        ] += 1
-                        continue
-                    # Live incident (this bug, found right after the
-                    # option-batch-priority fix started actually
-                    # letting real signals reach this loop): tick/
-                    # order-flow confirmation was the dominant remaining
-                    # blocker (1-5 rejections every cycle) - it re-
-                    # checked the SAME "OPTU:" price series option_
-                    # direction_signal's EMA cross just fired on, but
-                    # only advances one sample per ~2-minute cycle, so
-                    # its 10-sample window spans ~20 minutes and could
-                    # easily disagree with a signal that just flipped
-                    # THIS cycle. By explicit request: removed for
-                    # options - trust the EMA direction signal on its
-                    # own, same as the stock side already effectively
-                    # does once tick_direction_ok's own separate check
-                    # passes.
-                    if not self.strategy.option_delta_ok(
-                        self.api.option_delta(quote)
-                    ):
-                        self.option_gate_rejections["delta out of range"] += 1
-                        continue
-                    if not self.strategy.option_iv_percentile_ok(
-                        self.option_iv_history[option_symbol], current_iv
-                    ):
-                        self.option_gate_rejections["IV percentile failed"] += 1
-                        continue
-                    if not self.strategy.option_market_regime_ok(
-                        self.vixy_history, current_vixy
-                    ):
-                        self.option_gate_rejections[
-                            "market regime (VIXY) gate active"
-                        ] += 1
-                        continue
-                    blocked_until = self.wash_sales.blocked_until(underlying)
-                    if blocked_until:
-                        self.option_gate_rejections["wash-sale blocked"] += 1
-                        if underlying not in self.wash_skip_logged:
-                            self.wash_skip_logged.add(underlying)
-                            log.info(
-                                "WASH   | %-8s | option entry blocked until %s",
-                                underlying,
-                                blocked_until.strftime("%Y-%m-%d"),
-                            )
-                        continue
-                    self.wash_skip_logged.discard(underlying)
-                    if guard_active:
-                        self.gate_rejections[
-                            "stop-loss guard active - too many recent stops"
-                        ] += 1
-                        self.option_gate_rejections["stop-loss guard active"] += 1
-                        continue
-                    if self.symbol_quarantined(key):
-                        self.gate_rejections[
-                            "symbol quarantined - recent net losses on this symbol"
-                        ] += 1
-                        self.option_gate_rejections["symbol quarantined"] += 1
-                        continue
+                    # By explicit request, for a one-off diagnostic
+                    # ("make sure it fires... no barrier, quickly sell
+                    # it, and then change the option strategy again"):
+                    # option_smoke_test_mode skips every entry-QUALITY
+                    # gate below (direction signal, delta, IV
+                    # percentile, market regime, wash-sale, stop-loss
+                    # guard, quarantine) - structural checks (DTE,
+                    # affordability/sizing, cooldown, rate cap, max
+                    # open positions) still apply below, so this can't
+                    # spam unlimited orders. Off by default; meant to
+                    # be turned back off (and OPTION_TAKE_PROFIT_
+                    # PERCENT restored) once a real end-to-end trade is
+                    # confirmed.
+                    if not self.config.option_smoke_test_mode:
+                        if not (
+                            (contract_type == "CALL" and direction == "CALL")
+                            or (contract_type == "PUT" and direction == "PUT")
+                        ):
+                            self.option_gate_rejections[
+                                "no direction signal for this underlying"
+                            ] += 1
+                            continue
+                        # Live incident (this bug, found right after the
+                        # option-batch-priority fix started actually
+                        # letting real signals reach this loop): tick/
+                        # order-flow confirmation was the dominant remaining
+                        # blocker (1-5 rejections every cycle) - it re-
+                        # checked the SAME "OPTU:" price series option_
+                        # direction_signal's EMA cross just fired on, but
+                        # only advances one sample per ~2-minute cycle, so
+                        # its 10-sample window spans ~20 minutes and could
+                        # easily disagree with a signal that just flipped
+                        # THIS cycle. By explicit request: removed for
+                        # options - trust the EMA direction signal on its
+                        # own, same as the stock side already effectively
+                        # does once tick_direction_ok's own separate check
+                        # passes.
+                        if not self.strategy.option_delta_ok(
+                            self.api.option_delta(quote)
+                        ):
+                            self.option_gate_rejections["delta out of range"] += 1
+                            continue
+                        if not self.strategy.option_iv_percentile_ok(
+                            self.option_iv_history[option_symbol], current_iv
+                        ):
+                            self.option_gate_rejections["IV percentile failed"] += 1
+                            continue
+                        if not self.strategy.option_market_regime_ok(
+                            self.vixy_history, current_vixy
+                        ):
+                            self.option_gate_rejections[
+                                "market regime (VIXY) gate active"
+                            ] += 1
+                            continue
+                        blocked_until = self.wash_sales.blocked_until(underlying)
+                        if blocked_until:
+                            self.option_gate_rejections["wash-sale blocked"] += 1
+                            if underlying not in self.wash_skip_logged:
+                                self.wash_skip_logged.add(underlying)
+                                log.info(
+                                    "WASH   | %-8s | option entry blocked until %s",
+                                    underlying,
+                                    blocked_until.strftime("%Y-%m-%d"),
+                                )
+                            continue
+                        self.wash_skip_logged.discard(underlying)
+                        if guard_active:
+                            self.gate_rejections[
+                                "stop-loss guard active - too many recent stops"
+                            ] += 1
+                            self.option_gate_rejections[
+                                "stop-loss guard active"
+                            ] += 1
+                            continue
+                        if self.symbol_quarantined(key):
+                            self.gate_rejections[
+                                "symbol quarantined - recent net losses on "
+                                "this symbol"
+                            ] += 1
+                            self.option_gate_rejections["symbol quarantined"] += 1
+                            continue
                     limit_price = self.api.option_limit_price(quote, "BUY")
                     buy_quantity, contract_cost = (
                         self.strategy.option_order_quantity(

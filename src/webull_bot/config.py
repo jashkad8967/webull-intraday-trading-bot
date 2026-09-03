@@ -1165,6 +1165,21 @@ class Settings(BaseSettings):
     )
     option_take_profit_percent: Decimal = Field(default=Decimal("0.75"), gt=0)
     option_stop_loss_percent: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    # By explicit request, for a one-off diagnostic: "make sure it
+    # fires... no barrier, quickly sell it, and then change the option
+    # strategy again." Off by default (real gates always apply) - when
+    # explicitly turned on, trade_options skips the direction signal,
+    # delta, IV percentile, market-regime, wash-sale, stop-loss-guard,
+    # and quarantine checks for entries (structural checks - DTE,
+    # affordability/sizing, cooldown, rate cap, max open positions -
+    # still apply, so this can't spam unlimited orders), and
+    # option_take_profit_percent is meant to be turned down alongside
+    # it (live .env only, not this default) so the position closes
+    # again almost immediately via the normal exit path instead of
+    # being held. This is a temporary smoke-test switch to prove the
+    # order-placement pipeline works end to end on a real contract -
+    # not a permanent strategy change.
+    option_smoke_test_mode: bool = False
     # Forced exit once a held contract is this many days or fewer from
     # expiration, regardless of target/stop - theta/gamma accelerate sharply
     # in the final days and holding through that stops being a directional
