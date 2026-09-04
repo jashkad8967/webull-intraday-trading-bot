@@ -44,6 +44,7 @@ from webull_bot.strategy import (
 )
 from webull_bot.trade_events import TradeEventStreamService
 from webull_bot.trading.broker_conflict_check import _broker_conflict
+from webull_bot.trading.broker_conflict_handler import handle_broker_conflict
 from webull_bot.trading.clock import is_trading_day, now, session_moment
 from webull_bot.trading.concurrent_dispatch import (
     _POSITION_PROTECTION_MAX_WORKERS,
@@ -55,11 +56,26 @@ from webull_bot.trading.cooldowns import (
     rate_capped,
     reentry_cooldown_ready,
 )
+from webull_bot.trading.force_market_exit import should_force_market_exit
+from webull_bot.trading.fractional_ticker_handler import (
+    handle_fractional_ticker_unsupported,
+)
+from webull_bot.trading.fractional_trading_handler import (
+    handle_fractional_trading_not_enabled,
+)
 from webull_bot.trading.locks import _rekey_working_order, _working_orders_lock
 from webull_bot.trading.manual_touch import _manual_touch_active
 from webull_bot.trading.rate_limit_retry import (
     _is_rate_limited,
     _retry_once_on_rate_limit,
+)
+from webull_bot.trading.short_selling_handler import handle_short_selling_unsupported
+from webull_bot.trading.stop_loss_confirmation import (
+    stop_loss_confirmed,
+    stop_ready_to_submit,
+)
+from webull_bot.trading.symbol_restriction_handler import (
+    handle_symbol_restricted_to_closing_only,
 )
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import (
@@ -161,6 +177,16 @@ class AutoTrader:
     reentry_cooldown_ready = reentry_cooldown_ready
     rate_capped = rate_capped
     has_pending_buy_order = has_pending_buy_order
+    # Broker-error handlers, each paired with its errors/ classifier -
+    # moved out to trading/*_handler.py.
+    handle_broker_conflict = handle_broker_conflict
+    handle_fractional_trading_not_enabled = handle_fractional_trading_not_enabled
+    handle_fractional_ticker_unsupported = handle_fractional_ticker_unsupported
+    handle_short_selling_unsupported = handle_short_selling_unsupported
+    handle_symbol_restricted_to_closing_only = handle_symbol_restricted_to_closing_only
+    should_force_market_exit = should_force_market_exit
+    stop_ready_to_submit = stop_ready_to_submit
+    stop_loss_confirmed = stop_loss_confirmed
 
     def __init__(self):
         self.config = settings()
@@ -1517,140 +1543,6 @@ class AutoTrader:
             total += quantity * cost_price
         cap = account_value * self.config.volatility_scalp_max_total_exposure_fraction
         return total <= cap
-
-    def stop_ready_to_submit(self, key: str, symbol: str) -> bool:
-        """An escalated stop must resubmit immediately after its cancel, not
-        wait out the normal trade cooldown - that cooldown was timed from
-        the original (now-cancelled) submission, so honoring it here would
-        leave the position with no working stop order for several more
-        seconds while price keeps moving against it.
-        """
-        if symbol in self.pending_stock_exits:
-            return False
-        return symbol in self.stop_loss_escalated or self.cooldown_ready(key)
-
-    def stop_loss_confirmed(self, symbol: str) -> bool:
-        """True once price has sat continuously at/below the stop level for
-        STOP_LOSS_CONFIRMATION_SECONDS - see stop_condition_since. An
-        escalated stop (already submitted, just resubmitting at a more
-        aggressive price after sitting unfilled) skips this: the breach
-        was already confirmed once, and escalation is itself a response to
-        elapsed time, not a fresh signal that could be a single bad tick.
-
-        Also skips it for the volatility-scalp cohort. Live incident:
-        MYND sat well past its stop level (11%+ underwater against a
-        ~1.5% max stop) for many minutes without ever stopping out -
-        "GATES | stop breach not yet confirmed" kept firing intermittently,
-        meaning price ticked back above the stop line often enough that
-        the 2s confirmation window never completed. That grace exists to
-        filter a single-tick wick; for a symbol whose entire selection
-        criterion IS being unusually choppy, the same real, sustained
-        loss can cross the stop/un-cross it fast enough to never confirm
-        at all, indefinitely deferring real protection on exactly the
-        positions most likely to need it fast.
-        """
-        if (
-            not self.config.stop_loss_confirmation_enabled
-            or symbol in self.stop_loss_escalated
-            or self.strategy.is_volatility_scalp_eligible(symbol)
-        ):
-            return True
-        since = self.stop_condition_since.get(symbol)
-        if since is None:
-            return False
-        return (
-            time.monotonic() - since
-            >= float(self.config.stop_loss_confirmation_seconds)
-        )
-
-    def should_force_market_exit(
-        self, symbol: str, exit_is_fractional: bool, core_session_active: bool
-    ) -> bool:
-        """True once a symbol's exit has failed to fill
-        CONSECUTIVE_EXIT_FAILURE_MARKET_THRESHOLD times in a row (see
-        consecutive_exit_failures) - the next attempt should use a
-        genuine MARKET order instead of another limit, guaranteed to
-        fill and end the loop. Same MARKET-order eligibility constraints
-        as a manual sell: whole-share, core hours, account supports it.
-        """
-        return (
-            self.consecutive_exit_failures.get(symbol, 0)
-            >= self.config.consecutive_exit_failure_market_threshold
-            and core_session_active
-            and not exit_is_fractional
-            and self.fractional_trading_enabled
-        )
-
-    def handle_broker_conflict(self, symbol: str, exc: Exception) -> None:
-        self.broker_conflict_symbols.add(symbol)
-        self.pending_stock_exits.discard(symbol)
-        self.pending_option_exits.discard(symbol)
-        self.stop_exit_submitted.pop(symbol, None)
-        self.stop_loss_escalated.discard(symbol)
-        self.stop_condition_since.pop(symbol, None)
-        log.error(
-            "CONFLICT | %-8s | broker rejected order as a position reverse "
-            "- our view of this position doesn't match the account. Pausing "
-            "automated action on it for the rest of the day; check the "
-            "Webull app for a stuck order or unexpected position on %s. | %s",
-            symbol,
-            symbol,
-            exc,
-        )
-
-    def handle_fractional_trading_not_enabled(self, exc: Exception) -> None:
-        if not self.fractional_trading_enabled:
-            return
-        self.fractional_trading_enabled = False
-        log.error(
-            "FRACT  | fractional orders rejected - this Webull account "
-            "hasn't agreed to fractional trading yet. Falling back to "
-            "whole-share sizing for the rest of this run; open the "
-            "agreement link below in the Webull app/website once, then "
-            "restart the bot to re-enable dollar-sized core-session "
-            "entries and the fractional-shares fallback. | %s",
-            exc,
-        )
-
-    def handle_fractional_ticker_unsupported(self, symbol: str, exc: Exception) -> None:
-        if symbol in self.fractional_unsupported_symbols:
-            return
-        self.fractional_unsupported_symbols.add(symbol)
-        log.warning(
-            "FRACT  | %-8s | this security doesn't support fractional "
-            "trading - falling back to whole-share sizing for %s for the "
-            "rest of this run | %s",
-            symbol,
-            symbol,
-            exc,
-        )
-
-    def handle_short_selling_unsupported(self, exc: Exception) -> None:
-        if not self.short_selling_supported:
-            return
-        self.short_selling_supported = False
-        log.error(
-            "SHORT  | short selling rejected - this account is under "
-            "Webull's $2,000 equity minimum for short selling. Disabling "
-            "new short entries for the rest of this run; restart the bot "
-            "once equity clears that minimum to re-enable them. | %s",
-            exc,
-        )
-
-    def handle_symbol_restricted_to_closing_only(
-        self, symbol: str, exc: Exception
-    ) -> None:
-        if symbol in self.entry_restricted_symbols:
-            return
-        self.entry_restricted_symbols.add(symbol)
-        log.warning(
-            "GUARD  | %-8s | restricted to closing orders only by the "
-            "broker - blocking new entries for %s for the rest of the "
-            "day (existing positions still exit normally) | %s",
-            symbol,
-            symbol,
-            exc,
-        )
 
     def record_trade(
         self,
