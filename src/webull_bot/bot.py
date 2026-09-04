@@ -64,6 +64,21 @@ from webull_bot.trading.handlers.short_selling_handler import (
 from webull_bot.trading.handlers.symbol_restriction_handler import (
     handle_symbol_restricted_to_closing_only,
 )
+from webull_bot.trading.momentum.historical_volatility_filter import (
+    filter_by_historical_volatility,
+)
+from webull_bot.trading.momentum.multi_day_momentum_refresh import (
+    refresh_multi_day_momentum,
+)
+from webull_bot.trading.momentum.recent_momentum_refresh import (
+    refresh_recent_momentum,
+)
+from webull_bot.trading.momentum.scalp_cohort_selection import (
+    select_volatility_scalp_symbols,
+)
+from webull_bot.trading.momentum.volatility_window_seeding import (
+    seed_volatility_windows,
+)
 from webull_bot.trading.orders.close_instruments import close_instruments
 from webull_bot.trading.orders.exit_failure_tracking import _note_exit_failure
 from webull_bot.trading.orders.force_market_exit import should_force_market_exit
@@ -307,6 +322,14 @@ class AutoTrader:
     _download_and_filter_universe = _download_and_filter_universe
     _grow_stock_universe = _grow_stock_universe
     _resolve_targets_work_body = _resolve_targets_work_body
+    # Momentum/volatility scanning: historical-volatility filtering,
+    # recent/multi-day momentum refresh, volatility-window bar seeding,
+    # and volatility-scalp cohort selection - moved out to trading/momentum/.
+    filter_by_historical_volatility = filter_by_historical_volatility
+    refresh_recent_momentum = refresh_recent_momentum
+    refresh_multi_day_momentum = refresh_multi_day_momentum
+    seed_volatility_windows = seed_volatility_windows
+    select_volatility_scalp_symbols = select_volatility_scalp_symbols
 
     def __init__(self):
         self.config = settings()
@@ -668,170 +691,6 @@ class AutoTrader:
         self.pairs = PairsStrategy()
         self.pairs_positions: dict[tuple[str, str], dict] = {}
         self.last_pairs_sample = 0.0
-
-    def filter_by_historical_volatility(self, symbols: list[str]) -> list[str]:
-        if (
-            not self.config.historical_volatility_filter_enabled
-            or not symbols
-        ):
-            return symbols
-        floor = float(self.config.min_historical_volatility_percent)
-        log.info(
-            "VOLFILT | scoring %s symbols | lookback=%sd | floor=%.2f%%",
-            len(symbols),
-            self.config.historical_volatility_days,
-            floor,
-        )
-        try:
-            scores = self.api.historical_volatility(
-                symbols,
-                self.config.historical_volatility_days,
-            )
-        except Exception as exc:
-            log.warning("VOLFILT | disabled this cycle | %s", exc)
-            return symbols
-        covered = [symbol for symbol in symbols if symbol in scores]
-        if len(covered) < max(1, len(symbols) // 2):
-            log.warning(
-                "VOLFILT | insufficient coverage (%s/%s) | keeping full universe",
-                len(covered),
-                len(symbols),
-            )
-            return symbols
-        qualifying = [symbol for symbol in covered if scores[symbol] >= floor]
-        if not qualifying:
-            log.warning(
-                "VOLFILT | no symbols cleared floor | keeping full universe"
-            )
-            return symbols
-        ordered = sorted(
-            qualifying,
-            key=lambda symbol: scores[symbol],
-            reverse=True,
-        )
-        log.info(
-            "VOLFILT | kept %s of %s | top=%s",
-            len(ordered),
-            len(symbols),
-            ",".join(
-                f"{symbol}:{scores[symbol]:.1f}%" for symbol in ordered[:5]
-            ),
-        )
-        return ordered
-
-    def refresh_recent_momentum(self, symbols: list[str]) -> None:
-        """By request: "look at tickers in the last 10 mins for
-        momentum... to analyze the upcoming trend." Real 1-minute bar
-        closes (same source recent_minute_closes/seed_volatility_windows
-        already use), NOT the blended live-tick volatility_price_history
-        window - that window's sample spacing tracks scan cadence, not
-        wall-clock time, so it can't reliably represent a genuine "last
-        10 minutes." Own throttle (RECENT_MOMENTUM_REFRESH_SECONDS, much
-        more frequent than the once-daily SMA refresh, since a 10-minute
-        signal goes stale fast) - see its call site in run(). Merges
-        into the existing cache rather than replacing it outright, same
-        "a partial/failed refresh degrades gracefully" convention as
-        refresh_sma_trend.
-        """
-        if not self.config.recent_momentum_filter_enabled or not symbols:
-            return
-        now = time.monotonic()
-        if (
-            now - self.last_recent_momentum_refresh
-            < float(self.config.recent_momentum_refresh_seconds)
-        ):
-            return
-        self.last_recent_momentum_refresh = now
-        try:
-            closes_by_symbol = self.api.recent_minute_closes(
-                symbols,
-                "US_STOCK",
-                self.config.recent_momentum_lookback_minutes,
-            )
-        except Exception as exc:
-            log.warning("MOMENTUM| recent refresh failed this cycle | %s", exc)
-            return
-        if not closes_by_symbol:
-            log.warning("MOMENTUM| no coverage this cycle | keeping prior values")
-            return
-        updated = 0
-        for symbol, closes in closes_by_symbol.items():
-            if len(closes) < 2 or closes[0] <= 0:
-                continue
-            self.strategy.recent_momentum[symbol] = Decimal(
-                str((closes[-1] - closes[0]) / closes[0])
-            )
-            updated += 1
-        log.info(
-            "MOMENTUM| recent momentum refreshed | %s/%s symbols | lookback=%sm",
-            updated,
-            len(symbols),
-            self.config.recent_momentum_lookback_minutes,
-        )
-
-    def refresh_multi_day_momentum(self, symbols: list[str]) -> None:
-        """By request: "also include not only short term patterns like
-        5-10 mins, but also 1 day and 5 day and month." Real daily-bar
-        closes (WebullAPI.daily_closes), refreshed on its own cadence
-        (MULTI_DAY_MOMENTUM_REFRESH_SECONDS, default 30 min - far less
-        volatile than the 10-minute momentum read, doesn't need to
-        chase every scan cycle). Same "merge into the existing cache,
-        degrade gracefully on a partial/failed refresh" convention as
-        refresh_sma_trend/refresh_recent_momentum.
-
-        Live incident (this bug): the throttle used to be a single
-        GLOBAL timestamp gating the whole call, including for symbols
-        with NO cached data at all - so after every restart (this
-        session redeployed often), only whichever symbols happened to
-        be in the very first post-restart scan batch ever got their
-        daily_closes populated; everything scanned afterward sat with
-        no data for up to the full 30-minute window, during which
-        multi_day_momentum_supports_entry's extension guard (see its
-        own docstring - built specifically to stop buying a "dip" that's
-        still mid-unwind of a huge intraday spike) fails OPEN with no
-        data and can't do anything. VIOT was bought ~74% above its
-        prior close 10 minutes after a restart, in exactly this gap.
-        Now symbols with no cached entry yet are ALWAYS fetched
-        immediately regardless of the throttle (closing the cold-start
-        gap); the throttle only limits how often an ALREADY-cached
-        symbol gets re-fetched (daily bars barely change intra-session,
-        so that part still doesn't need to chase every cycle).
-        """
-        if not self.config.multi_day_momentum_filter_enabled or not symbols:
-            return
-        now = time.monotonic()
-        uncached = [
-            symbol for symbol in symbols if symbol not in self.strategy.daily_closes
-        ]
-        if (
-            not uncached
-            and now - self.last_multi_day_momentum_refresh
-            < float(self.config.multi_day_momentum_refresh_seconds)
-        ):
-            return
-        to_fetch = uncached if uncached else symbols
-        self.last_multi_day_momentum_refresh = now
-        try:
-            closes_by_symbol = self.api.daily_closes(
-                to_fetch, self.config.multi_day_momentum_lookback_days
-            )
-        except Exception as exc:
-            log.warning("MOMENTUM| multi-day refresh failed | %s", exc)
-            return
-        if not closes_by_symbol:
-            log.warning(
-                "MOMENTUM| no multi-day coverage this cycle | keeping prior "
-                "values"
-            )
-            return
-        self.strategy.daily_closes.update(closes_by_symbol)
-        log.info(
-            "MOMENTUM| multi-day momentum refreshed | %s/%s symbols | "
-            "lookback=%sd",
-            len(closes_by_symbol),
-            len(to_fetch),
-            self.config.multi_day_momentum_lookback_days,
-        )
 
     def discover_option_contracts(self) -> None:
         # Live incident: dispatching this onto its own background
@@ -2961,100 +2820,6 @@ class AutoTrader:
                     order.get("filled_quantity"),
                     client_order_id,
                 )
-
-    def seed_volatility_windows(self, symbols: list[str]) -> None:
-        """Warm-starts each not-yet-seen symbol's volatility-scalp window
-        from real M1 bar closes in one batched call per category, instead
-        of leaving it to build up one live snapshot poll at a time. Fully
-        self-limiting: TradingStrategy.seed_volatility_window is a no-op
-        for any symbol whose window already has data (from a prior seed
-        or from live polling), so the candidate list naturally shrinks to
-        nothing as the watchlist gets covered.
-        """
-        unseeded = [
-            symbol
-            for symbol in symbols
-            if not self.strategy.volatility_price_history.get(symbol)
-        ]
-        if not unseeded:
-            return
-        grouped: dict[str, list[str]] = defaultdict(list)
-        for symbol in unseeded:
-            grouped[self.stock_categories.get(symbol, "US_STOCK")].append(symbol)
-        for category, category_symbols in grouped.items():
-            try:
-                closes_by_symbol = self.api.recent_minute_closes(
-                    category_symbols,
-                    category,
-                    self.config.volatility_scalp_lookback_samples,
-                )
-            except Exception as exc:
-                log.warning("SCALP  | bar seed fetch failed | %s | %s", category, exc)
-                continue
-            for symbol, closes in closes_by_symbol.items():
-                self.strategy.seed_volatility_window(symbol, closes)
-                # select_volatility_scalp_symbols candidates come from
-                # self.strategy.prices, which otherwise only gets
-                # populated by a live quote scan (update_stock_snapshot)
-                # - without this, bar-seeding the volatility window alone
-                # still wouldn't make a symbol visible to cohort
-                # selection until it was actually scanned. Never
-                # overwrites an already-live price with a stale bar
-                # close.
-                if closes and symbol not in self.strategy.prices:
-                    self.strategy.prices[symbol] = Decimal(str(closes[-1]))
-
-    def select_volatility_scalp_symbols(self) -> None:
-        """Re-ranks the curated volatility-scalp cohort from data already
-        being collected during normal scanning (self.strategy.prices/
-        volatility_price_history) - no extra API calls needed. Picks the
-        top VOLATILITY_SCALP_SYMBOL_COUNT symbols, by realized short-
-        window volatility, among those priced at or under
-        VOLATILITY_SCALP_MAX_PRICE with enough samples to have a real
-        reading. Re-run periodically (VOLATILITY_SCALP_RESELECT_SECONDS),
-        so a symbol that's cooled off drops out and a newly-hot one
-        (from anywhere in the scanned universe, not just today's
-        starting picks) can take its place - "keep looking for volatile
-        stocks to add to the group."
-        """
-        if not self.config.volatility_scalp_enabled:
-            return
-        now = time.monotonic()
-        if (
-            now - self.last_volatility_symbol_selection
-            < float(self.config.volatility_scalp_reselect_seconds)
-        ):
-            return
-        candidates: list[tuple[Decimal, str]] = []
-        for symbol, price in self.strategy.prices.items():
-            if price <= 0 or price > self.config.volatility_scalp_max_price:
-                continue
-            stdev = self.strategy.realized_volatility_percent(symbol)
-            if stdev is None:
-                continue
-            candidates.append((stdev, symbol))
-        if not candidates:
-            # Don't stamp the throttle yet - this call ran before any
-            # symbol had accumulated a real volatility reading (always
-            # true for the very first call or two right after startup,
-            # since self.strategy.prices is still empty then). Stamping
-            # here anyway would "spend" the throttle on a result with no
-            # real data behind it and leave the cohort empty for the
-            # full VOLATILITY_SCALP_RESELECT_SECONDS (default 30 min)
-            # before ever trying again.
-            return
-        self.last_volatility_symbol_selection = now
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        selected = {
-            symbol
-            for _, symbol in candidates[: self.config.volatility_scalp_symbol_count]
-        }
-        if selected != self.volatility_scalp_symbols:
-            log.info(
-                "SCALP  | daily cohort | %s",
-                ", ".join(sorted(selected)) if selected else "(none eligible yet)",
-            )
-        self.volatility_scalp_symbols = selected
 
     def trade_stocks(
         self,
