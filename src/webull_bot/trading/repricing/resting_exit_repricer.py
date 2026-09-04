@@ -160,7 +160,15 @@ def reprice_resting_exits(
                 new_order_id,
             )
         except Exception as exc:
-            log.error("REPRICE| %s | %s", symbol, exc)
+            if self.is_order_not_cancelable(exc):
+                log.warning(
+                    "REPRICE| %s | reprice skipped | order already "
+                    "resolving | %s",
+                    symbol,
+                    exc,
+                )
+            else:
+                log.error("REPRICE| %s | %s", symbol, exc)
 
     # By request: "do not wait for the response to fire another
     # request" - fires every candidate's cancel+place concurrently
