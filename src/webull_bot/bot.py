@@ -14,6 +14,12 @@ from webull_bot.analyst_data import AnalystDataService
 from webull_bot.commands import CommandQueue
 from webull_bot.config import settings
 from webull_bot.daily_pnl import DailyPnlTracker
+from webull_bot.errors.broker_conflict import is_broker_position_conflict
+from webull_bot.errors.fractional_ticker import is_fractional_ticker_unsupported
+from webull_bot.errors.fractional_trading import is_fractional_trading_not_enabled
+from webull_bot.errors.order_cancellation import is_order_not_cancelable
+from webull_bot.errors.short_selling import is_short_selling_unsupported
+from webull_bot.errors.symbol_restrictions import is_symbol_restricted_to_closing_only
 from webull_bot.invalid_symbols import InvalidSymbolTracker
 from webull_bot.market_agent import MarketResearchAgent
 from webull_bot.pairs import (
@@ -22,6 +28,7 @@ from webull_bot.pairs import (
     PAIRS_MAX_CONCURRENT,
     PairsStrategy,
 )
+from webull_bot.sizing.fractional_quantity import is_fractional_quantity
 from webull_bot.status import StatusWriter
 from webull_bot.strategy import (
     OBI_DEPTH_LEVELS,
@@ -238,6 +245,22 @@ def _dispatch_concurrently(items: list, worker) -> None:
 
 
 class AutoTrader:
+    # Pure Webull-error classifiers and the fractional-quantity check -
+    # moved out to their own single-purpose files under errors/ and
+    # sizing/ (see each file's own docstring for what live incident it
+    # traces back to), bound here as staticmethods so every existing
+    # self.is_x_y(...) call site elsewhere in this class keeps working
+    # unchanged.
+    is_broker_position_conflict = staticmethod(is_broker_position_conflict)
+    is_fractional_quantity = staticmethod(is_fractional_quantity)
+    is_fractional_ticker_unsupported = staticmethod(is_fractional_ticker_unsupported)
+    is_fractional_trading_not_enabled = staticmethod(is_fractional_trading_not_enabled)
+    is_order_not_cancelable = staticmethod(is_order_not_cancelable)
+    is_short_selling_unsupported = staticmethod(is_short_selling_unsupported)
+    is_symbol_restricted_to_closing_only = staticmethod(
+        is_symbol_restricted_to_closing_only
+    )
+
     def __init__(self):
         self.config = settings()
         self.config.validate_runtime()
@@ -1703,28 +1726,6 @@ class AutoTrader:
             and self.fractional_trading_enabled
         )
 
-    @staticmethod
-    def is_fractional_trading_not_enabled(exc: Exception) -> bool:
-        """True for Webull's OAUTH_OPENAPI_OPENAPI_FRACT_VERSION2_ACCOUNT_
-        NOT_TRADE rejection - the account itself hasn't agreed to Webull's
-        fractional-trading terms (a one-time click-through at a URL Webull
-        includes in the error), so every fractional order will keep failing
-        identically until that happens. Retrying changes nothing here.
-        """
-        return "FRACT_VERSION2_ACCOUNT_NOT_TRADE" in str(exc).upper()
-
-    @staticmethod
-    def is_broker_position_conflict(exc: Exception) -> bool:
-        """True for Webull's "this order would reverse an existing
-        position" rejection - a sign our local view of the position is out
-        of sync with the broker's (a stale quantity, a partially-filled
-        order, or account state from outside the bot). No amount of
-        retrying with the same (wrong) assumption will fix this - it needs
-        the account state to actually resolve, so the caller should stop
-        hammering the symbol instead of just backing off and trying again.
-        """
-        return "REVERSE" in str(exc).upper()
-
     def handle_broker_conflict(self, symbol: str, exc: Exception) -> None:
         self.broker_conflict_symbols.add(symbol)
         self.pending_stock_exits.discard(symbol)
@@ -1755,17 +1756,6 @@ class AutoTrader:
             "entries and the fractional-shares fallback. | %s",
             exc,
         )
-
-    @staticmethod
-    def is_fractional_ticker_unsupported(exc: Exception) -> bool:
-        """True for Webull's OAUTH_OPENAPI_FRACT_TICKER_DONT_SUPPORT_TRADE
-        rejection - unlike FRACT_VERSION2_ACCOUNT_NOT_TRADE (an account-
-        wide agreement gate), this is a per-security restriction: some
-        tickers just aren't fractional-eligible on Webull regardless of
-        account status, and every other symbol is unaffected. Retrying
-        the same symbol changes nothing; retrying a different one is fine.
-        """
-        return "FRACT_TICKER_DONT_SUPPORT_TRADE" in str(exc).upper()
 
     def handle_fractional_ticker_unsupported(self, symbol: str, exc: Exception) -> None:
         if symbol in self.fractional_unsupported_symbols:
@@ -1880,31 +1870,6 @@ class AutoTrader:
             cap = min(buying_power, min_notional_floor)
         return cap
 
-    @staticmethod
-    def is_order_not_cancelable(exc: Exception) -> bool:
-        """True for Webull's OPENAPI_ORDER_CAN_NOT_CANCEL rejection - a
-        benign race, not a fault: the order is already filling or has
-        just filled by the time a repricer/escalator tries to cancel
-        it. The working order will resolve itself (fill and drop out
-        of open_ids, or genuinely still be cancelable) on the next
-        monitor_working_orders poll, so this is a WARNING, same
-        "expected, not a fault" convention as QuoteUnavailableError -
-        not an ERROR needing investigation.
-        """
-        return "ORDER_CAN_NOT_CANCEL" in str(exc).upper()
-
-    @staticmethod
-    def is_short_selling_unsupported(exc: Exception) -> bool:
-        """True for Webull's OAUTH_OPENAPI_NEW_NO_POSITION_MARGIN_ACCOUNT_
-        CAN_NOT_SELL_SHORT_FOR_LT_2K rejection - short selling requires at
-        least $2,000 in account equity (a standard margin-account
-        minimum, not something specific to one security), so every short
-        attempt keeps failing identically until equity grows past that
-        threshold. Retrying changes nothing here, same reasoning as
-        is_fractional_trading_not_enabled.
-        """
-        return "CAN_NOT_SELL_SHORT_FOR_LT_2K" in str(exc).upper()
-
     def handle_short_selling_unsupported(self, exc: Exception) -> None:
         if not self.short_selling_supported:
             return
@@ -1916,23 +1881,6 @@ class AutoTrader:
             "once equity clears that minimum to re-enable them. | %s",
             exc,
         )
-
-    @staticmethod
-    def is_symbol_restricted_to_closing_only(exc: Exception) -> bool:
-        """True for Webull's OAUTH_OPENAPI_CAN_NOT_CREATE_A_OPEN_ORDER
-        rejection ("This symbol is restricted to closing orders only") -
-        a per-security, broker-side restriction (e.g. a halt, an
-        emergency SSR-style curb, being pulled from tradability) that
-        deterministically rejects every single opening order for this
-        symbol, exactly the same way, for as long as it's in effect.
-        Live incident: RFAI. Retrying changes nothing, same reasoning as
-        is_short_selling_unsupported/is_fractional_ticker_unsupported -
-        letting it accumulate toward the generic order-error-rate
-        blacklist (5 errors in a shared, cross-symbol window) wastes
-        several futile attempts and API calls first, and risks that
-        window tripping on account of an unrelated symbol instead.
-        """
-        return "CAN_NOT_CREATE_A_OPEN_ORDER" in str(exc).upper()
 
     def handle_symbol_restricted_to_closing_only(
         self, symbol: str, exc: Exception
@@ -3761,10 +3709,6 @@ class AutoTrader:
                 Decimal("0"), self.daily_realized_loss - (-pnl)
             )
         self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
-
-    @staticmethod
-    def is_fractional_quantity(quantity: Decimal) -> bool:
-        return quantity != quantity.to_integral_value()
 
     @staticmethod
     def max_fractional_position_slots(
