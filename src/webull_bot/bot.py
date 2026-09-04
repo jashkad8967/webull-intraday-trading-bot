@@ -28,7 +28,14 @@ from webull_bot.pairs import (
     PAIRS_MAX_CONCURRENT,
     PairsStrategy,
 )
+from webull_bot.risk.entry_blackout import fresh_entry_blackout_active
+from webull_bot.risk.profit_target_multiplier import profit_target_multiplier
+from webull_bot.risk.stop_tighten_multiplier import stop_tighten_multiplier
+from webull_bot.sizing.diversification_budget import (
+    diversification_capped_entry_budget,
+)
 from webull_bot.sizing.fractional_quantity import is_fractional_quantity
+from webull_bot.sizing.fractional_slots import max_fractional_position_slots
 from webull_bot.status import StatusWriter
 from webull_bot.strategy import (
     OBI_DEPTH_LEVELS,
@@ -260,6 +267,15 @@ class AutoTrader:
     is_symbol_restricted_to_closing_only = staticmethod(
         is_symbol_restricted_to_closing_only
     )
+    # Same pattern, moved out to risk/ and sizing/ - pure sizing/risk
+    # multiplier math, no shared instance state.
+    diversification_capped_entry_budget = staticmethod(
+        diversification_capped_entry_budget
+    )
+    fresh_entry_blackout_active = staticmethod(fresh_entry_blackout_active)
+    max_fractional_position_slots = staticmethod(max_fractional_position_slots)
+    profit_target_multiplier = staticmethod(profit_target_multiplier)
+    stop_tighten_multiplier = staticmethod(stop_tighten_multiplier)
 
     def __init__(self):
         self.config = settings()
@@ -1769,106 +1785,6 @@ class AutoTrader:
             symbol,
             exc,
         )
-
-    @staticmethod
-    def profit_target_multiplier(
-        daily_realized_pnl: Decimal,
-        account_value: Decimal | None,
-        threshold_fraction: Decimal,
-        widen_multiplier: Decimal,
-    ) -> Decimal:
-        """By request: "we basically just want to be able to stay in a
-        significant profit until eod" -> "let winners run further
-        before taking profit." Once today's realized pnl reaches
-        threshold_fraction of account_value, returns widen_multiplier
-        (applied to the general path's stop-scaled profit target in
-        stock_decision) instead of 1 (no change). Fails safe (returns
-        1) with an unknown/non-positive account value - never widens
-        based on a stale or missing read.
-        """
-        if account_value is None or account_value <= 0:
-            return Decimal("1")
-        if daily_realized_pnl >= account_value * threshold_fraction:
-            return widen_multiplier
-        return Decimal("1")
-
-    @staticmethod
-    def stop_tighten_multiplier(
-        daily_realized_pnl: Decimal,
-        account_value: Decimal | None,
-        threshold_fraction: Decimal,
-        tighten_multiplier: Decimal,
-    ) -> Decimal:
-        """By request: "when we have a certain profit we should also
-        not allow stops to be too low" - the same "significantly
-        ahead for the day" trigger as profit_target_multiplier above,
-        but tightens the general path's stop distance (< 1, e.g. 0.7 =
-        30% tighter) instead of widening the target - once the account
-        is already ahead, a reversal shouldn't be allowed to give back
-        as much of that lead as a normal-conditions stop would permit.
-        Same fail-safe behavior (returns 1, no change) with an
-        unknown/non-positive account value.
-        """
-        if account_value is None or account_value <= 0:
-            return Decimal("1")
-        if daily_realized_pnl >= account_value * threshold_fraction:
-            return tighten_multiplier
-        return Decimal("1")
-
-    @staticmethod
-    def fresh_entry_blackout_active(
-        minutes_until_close: float,
-        blackout_minutes: float,
-        core_session_active: bool,
-    ) -> bool:
-        """By request, after live evidence (WNW/WKHS stopping out
-        shortly after core hours ended): true once fewer than
-        blackout_minutes remain in the core session - blocks FRESH
-        entries only (not averaging down, not any exit), since a
-        brand-new position opened this close to the bell has almost no
-        runway to reach its target before conditions change. Always
-        False once core_session_active is already False - the existing
-        "only established/popular symbols trade outside core hours"
-        gate already covers that case, and a negative minutes_until_
-        close (core hours already ended) shouldn't itself trigger this
-        for a symbol that gate already lets through.
-        """
-        return (
-            core_session_active
-            and 0 <= minutes_until_close < blackout_minutes
-        )
-
-    @staticmethod
-    def diversification_capped_entry_budget(
-        buying_power: Decimal,
-        max_position_fraction: Decimal,
-        min_notional_floor: Decimal,
-    ) -> Decimal:
-        """By request: "out of 7500 stocks it should easily be able to
-        find enough stocks to invest everything" - a real per-position
-        diversification cap (max_position_fraction of the CURRENT,
-        already cycle-shrinking buying_power - see
-        stock_max_position_fraction_of_buying_power), so one candidate
-        can't absorb most of a bucket's whole allocation the way a
-        live FDX entry did (~43% of the whole account in one trade).
-
-        Live evidence this needed a floor: with buying_power already
-        down to ~$45 later in the same cycle, 15% of that is ~$6.75 -
-        well under fractional_shares_min_notional ($25 default) - a
-        rigid fraction alone would have STARVED further deployment
-        entirely below that floor (a cap that can never be satisfied
-        isn't diversification, it's accidentally stranding capital),
-        directly contradicting "100% of buying power should be used."
-        Once the fraction alone would fall under min_notional_floor,
-        allows up to the smaller of (the floor) or (everything that's
-        actually left) instead - still meaningfully smaller than the
-        full remaining balance on anything but the very last sliver of
-        it, but never zeroed out by the cap alone.
-        """
-        cap = buying_power * max_position_fraction
-        if cap < min_notional_floor:
-            cap = min(buying_power, min_notional_floor)
-        return cap
 
     def handle_short_selling_unsupported(self, exc: Exception) -> None:
         if not self.short_selling_supported:
@@ -3709,28 +3625,6 @@ class AutoTrader:
                 Decimal("0"), self.daily_realized_loss - (-pnl)
             )
         self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
-
-    @staticmethod
-    def max_fractional_position_slots(
-        max_open_positions: int,
-        fractional_fraction: Decimal,
-        whole_share_fraction: Decimal,
-    ) -> int:
-        """Caps how many concurrently-open fractional-quantity stock
-        positions there can be, reserved in the same proportion as
-        fractional's capital share. A fractional position can't be exited
-        outside core hours (Webull constraint - see is_fractional_quantity
-        gating in trade_stocks), so letting fractional entries alone fill
-        every MAX_OPEN_POSITIONS slot during core hours would strand the
-        account with an unexitable, maxed-out position count for the rest
-        of the day - no new entries of any style until the next core
-        session. At least 1 slot is always reserved when fractional
-        capital is allocated at all.
-        """
-        capital_split = fractional_fraction + whole_share_fraction
-        if capital_split <= 0:
-            return max_open_positions
-        return max(1, int(max_open_positions * fractional_fraction / capital_split))
 
     def price_sanity_ok(self, symbol: str, last_price: Decimal, limit_price: Decimal) -> bool:
         """Fat-finger guard: reject a limit price that's implausibly far
