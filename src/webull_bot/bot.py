@@ -119,12 +119,23 @@ from webull_bot.trading.universe.pairs_symbol_exclusion import exclude_pairs_sym
 from webull_bot.trading.universe.popular_reinstatement import (
     filter_with_popular_reinstated,
 )
+from webull_bot.trading.universe.resolve_targets import (
+    _resolve_targets_work,
+    resolve_targets,
+)
 from webull_bot.trading.universe.sma_trend_refresh import refresh_sma_trend
 from webull_bot.trading.universe.snapshot_batch_capping import (
     cap_batch_to_snapshot_limit,
 )
 from webull_bot.trading.universe.symbol_universe_backfill import (
     backfill_stock_symbols,
+)
+from webull_bot.trading.universe.universe_download import (
+    _download_and_filter_universe,
+)
+from webull_bot.trading.universe.universe_growth import _grow_stock_universe
+from webull_bot.trading.universe.universe_resolution_body import (
+    _resolve_targets_work_body,
 )
 from webull_bot.trading.util.clock import is_trading_day, now, session_moment
 from webull_bot.trading.util.compact_number import _compact_number
@@ -288,6 +299,14 @@ class AutoTrader:
     close_instruments = close_instruments
     _manual_cancel_order = _manual_cancel_order
     process_ui_commands = process_ui_commands
+    # Daily universe-resolution pipeline (non-blocking dispatch, download/
+    # filter, background growth, and the full-day-reset work body) - moved
+    # out to trading/universe/*.py.
+    resolve_targets = resolve_targets
+    _resolve_targets_work = _resolve_targets_work
+    _download_and_filter_universe = _download_and_filter_universe
+    _grow_stock_universe = _grow_stock_universe
+    _resolve_targets_work_body = _resolve_targets_work_body
 
     def __init__(self):
         self.config = settings()
@@ -813,321 +832,6 @@ class AutoTrader:
             len(to_fetch),
             self.config.multi_day_momentum_lookback_days,
         )
-
-    def resolve_targets(self, moment: datetime) -> None:
-        """Kicks off the once-daily universe/VOLFILT/SMA refresh on a
-        background thread and returns immediately - never blocks the
-        caller. Live incident: this used to run synchronously inline in
-        the main loop, meaning EVERY protective mechanism (stop-loss
-        checks, order-fill monitoring, repricing) was unavailable for
-        however long the whole sequence took - under a minute at the
-        old 500-symbol universe, but 15-20 minutes at today's 5000-
-        symbol universe. Confirmed live: real open positions (down as
-        much as -7.6%) sat completely unmonitored through that entire
-        window on every restart. See _resolve_targets_work for the
-        actual (unchanged) slow work; this wrapper only adds the
-        non-blocking dispatch.
-        """
-        if self.resolved_date == moment.date():
-            return
-        if self._resolve_targets_in_progress_for == moment.date():
-            return
-        self._resolve_targets_in_progress_for = moment.date()
-        threading.Thread(
-            target=self._resolve_targets_work,
-            args=(moment,),
-            daemon=True,
-        ).start()
-
-    def _resolve_targets_work(self, moment: datetime) -> None:
-        try:
-            self._resolve_targets_work_body(moment)
-        except Exception as exc:
-            log.error("LOAD   | resolve_targets failed | %s", exc)
-        finally:
-            # Cleared on both success and failure - a failure retries
-            # on the very next cycle instead of being permanently
-            # stuck for the rest of the day (resolved_date is only
-            # ever set on success, at the end of the body below).
-            self._resolve_targets_in_progress_for = None
-
-    def _download_and_filter_universe(
-        self, limit: int, pool: int
-    ) -> tuple[dict[str, str], list[str], list[str]]:
-        """The "STOCK_SYMBOLS=ALL" universe download+filter pipeline,
-        extracted as a pure(ish) helper (reads self.invalid_symbols/
-        self.config only, never mutates self.stock_symbols/
-        self.stock_categories itself) so it can run more than once per
-        day at different sizes - see _resolve_targets_work_body (the
-        fast initial pass) and _grow_stock_universe (the background
-        continuation toward the full universe). Returns (categories,
-        stock_symbols, reserve_symbols).
-        """
-        log.info(
-            "LOAD   | downloading stocks and ETFs | limit=%s | pool=%s",
-            limit,
-            pool,
-        )
-        categories = self.api.stock_universe(
-            lambda category, count, category_limit: log.info(
-                "LOAD   | %-8s | %s/%s",
-                category,
-                count,
-                category_limit or "ALL",
-            ),
-            limit=pool,
-        )
-        preferred = self.config.popular_stocks()
-        preferred_categories = self.api.stock_categories(preferred)
-        added = 0
-        for symbol in preferred:
-            if symbol not in categories and symbol in preferred_categories:
-                categories[symbol] = preferred_categories[symbol]
-                added += 1
-        if added:
-            log.info(
-                "LOAD   | added %s popular symbols outside directory cap",
-                added,
-            )
-        if self.config.top_gainers_limit > 0:
-            gainers = self.safe_top_gainers(
-                self.config.top_gainers_limit,
-                self.config.stock_universe_page_size,
-            )
-            gainers_added = 0
-            for symbol in gainers:
-                if symbol not in categories:
-                    categories[symbol] = "US_STOCK"
-                    gainers_added += 1
-            if gainers_added:
-                log.info(
-                    "LOAD   | added %s top-gainer symbols outside directory cap",
-                    gainers_added,
-                )
-        if self.config.exclude_etfs:
-            etfs = [
-                symbol
-                for symbol, category in categories.items()
-                if category == "US_ETF"
-            ]
-            for symbol in etfs:
-                categories.pop(symbol, None)
-            if etfs:
-                log.info("LOAD   | excluded %s ETFs", len(etfs))
-        for symbol in self.invalid_symbols.symbols:
-            categories.pop(symbol, None)
-        eligible = [
-            symbol for symbol in categories if symbol not in self.invalid_symbols
-        ]
-        eligible = self.filter_with_popular_reinstated(eligible)
-        return categories, eligible[:limit], eligible[limit:]
-
-    def _grow_stock_universe(self, moment: datetime) -> None:
-        """Continues growing today's universe toward the full
-        MAX_SYMBOLS in the background, after _resolve_targets_work_body's
-        fast initial pass has already unblocked trading. By request,
-        after live evidence: at a large MAX_SYMBOLS, downloading and
-        VOLFILT-scoring the WHOLE universe before AutoTrader.stock_
-        symbols was populated at all took 15-20 minutes - position
-        protection never blocked on this (see resolve_targets), but no
-        NEW entry could fire the entire time either, since trade_stocks
-        had nothing to scan. Only ever called once per day, right after
-        the initial pass, from the same background thread - never blocks
-        the main loop either, same as resolve_targets itself.
-
-        Re-downloads at a progressively larger limit each step (simpler
-        and safer than trying to resume Webull's own pagination cursor
-        across separate calls) and MERGES newly-discovered symbols into
-        the already-active self.stock_symbols/self.stock_categories -
-        never replaces or resets what's already scanning, only adds to
-        it. Stops once the configured MAX_SYMBOLS is reached, or the
-        universe genuinely has no more symbols to add.
-        """
-        full_limit = self.config.stock_universe_limit()
-        initial_limit = min(full_limit, self.config.stock_universe_initial_limit)
-        if full_limit <= initial_limit:
-            return
-        pool = self.config.stock_universe_pool()
-        current_limit = initial_limit
-        batch = self.config.stock_universe_growth_batch_size
-        interval = self.config.stock_universe_growth_interval_seconds
-        while current_limit < full_limit and self.resolved_date == moment.date():
-            time.sleep(interval)
-            current_limit = min(full_limit, current_limit + batch)
-            try:
-                categories, symbols, reserve = self._download_and_filter_universe(
-                    current_limit, pool
-                )
-            except Exception as exc:
-                log.error("LOAD   | universe growth step failed | %s", exc)
-                continue
-            if self.resolved_date != moment.date():
-                # A new trading day started (or a fresh resolve_targets
-                # kicked off) while this growth step was in flight -
-                # abandon it rather than merge stale-day data into a
-                # new day's universe.
-                return
-            existing = set(self.stock_symbols)
-            new_symbols = [s for s in symbols if s not in existing]
-            if new_symbols:
-                self.stock_categories.update(categories)
-                self.stock_symbols = self.stock_symbols + new_symbols
-                self.reserve_symbols = reserve
-                log.info(
-                    "LOAD   | universe grown | +%s symbols | total=%s/%s",
-                    len(new_symbols),
-                    len(self.stock_symbols),
-                    full_limit,
-                )
-            if current_limit >= full_limit or len(symbols) < current_limit:
-                # Reached the configured cap, or the real universe is
-                # simply smaller than the cap - nothing more to grow.
-                return
-
-    def _resolve_targets_work_body(self, moment: datetime) -> None:
-        requested_stocks = self.config.stocks()
-        if requested_stocks == ["ALL"]:
-            full_limit = self.config.stock_universe_limit()
-            pool = self.config.stock_universe_pool()
-            # By request: start with a small, fast initial universe so
-            # trading can begin almost immediately, then grow toward
-            # the full MAX_SYMBOLS in the background (see
-            # _grow_stock_universe, kicked off at the end of this
-            # function) instead of blocking every new entry on
-            # downloading and VOLFILT-scoring the whole universe first.
-            limit = min(full_limit, self.config.stock_universe_initial_limit)
-            initial_pool = min(pool, max(limit, self.config.stock_universe_page_size))
-            self.stock_categories, self.stock_symbols, self.reserve_symbols = (
-                self._download_and_filter_universe(limit, initial_pool)
-            )
-        else:
-            log.info("LOAD   | resolving %s configured symbols", len(requested_stocks))
-            requested_stocks = [
-                symbol
-                for symbol in requested_stocks
-                if symbol not in self.invalid_symbols
-            ]
-            self.stock_symbols = (
-                requested_stocks
-                if self.config.max_symbols == 0
-                else requested_stocks[: self.config.max_symbols]
-            )
-            self.reserve_symbols = []
-            self.stock_categories = self.api.stock_categories(self.stock_symbols)
-            for symbol in self.stock_symbols:
-                self.stock_categories.setdefault(symbol, "US_STOCK")
-            if self.config.exclude_etfs:
-                self.stock_symbols = [
-                    symbol
-                    for symbol in self.stock_symbols
-                    if self.stock_categories.get(symbol) != "US_ETF"
-                ]
-        self.stock_symbols, pairs_excluded = self.exclude_pairs_symbols(
-            self.stock_symbols
-        )
-        self.reserve_symbols, _ = self.exclude_pairs_symbols(self.reserve_symbols)
-        if pairs_excluded:
-            log.info(
-                "LOAD   | excluded %s pairs-strategy symbols from the main "
-                "universe scan (managed separately) | %s",
-                len(pairs_excluded),
-                ",".join(pairs_excluded),
-            )
-        missing_watchlist = [
-            symbol for symbol in self.user_watchlist if symbol not in self.stock_symbols
-        ]
-        if missing_watchlist:
-            uncategorized = [
-                symbol
-                for symbol in missing_watchlist
-                if symbol not in self.stock_categories
-            ]
-            if uncategorized:
-                # A single batched lookup (stock_categories chunks internally)
-                # instead of one throttled call per symbol - this list can be
-                # 100+ symbols long (the default watchlist alone), and that
-                # throttle is ~3.3s/call, so doing it one at a time would
-                # stall startup for minutes.
-                try:
-                    categories = self.api.stock_categories(uncategorized)
-                except Exception as exc:
-                    log.error(
-                        "LOAD   | watchlist category lookup failed | %s",
-                        exc,
-                    )
-                    categories = {}
-                for symbol in uncategorized:
-                    self.stock_categories[symbol] = categories.get(symbol, "US_STOCK")
-            self.stock_symbols.extend(missing_watchlist)
-            log.info(
-                "LOAD   | reinstated %s user-watchlist symbols | %s",
-                len(missing_watchlist),
-                ",".join(missing_watchlist),
-            )
-        self.refresh_sma_trend(self.stock_symbols)
-        self.option_contracts = self.api.resolve_options()
-        self.discover_all_options = "ALL" in self.config.option_roots()
-        self.strategy.clear_market_state()
-        self.volatility_scalp_recently_eligible.clear()
-        if (
-            self.config.volatility_scalp_enabled
-            and self.config.volatility_scalp_bar_seed_enabled
-        ):
-            # By request: pick the volatility-scalp cohort very early in
-            # the day, not whenever organic scanning happens to reach
-            # enough symbols - left to the normal per-batch seeding
-            # alone, the first cohort selection would only ever see
-            # whichever ~100 of 300+ symbols happened to be scanned
-            # first (a rotating batch, not the whole universe), biasing
-            # it toward scan order instead of genuine volatility. Bar-
-            # seeding the WHOLE day's candidate pool once, right here,
-            # means the very first select_volatility_scalp_symbols()
-            # call (right after this function returns) already has full
-            # visibility across every symbol, not a scan-order-biased
-            # slice of it.
-            log.info(
-                "SCALP  | seeding volatility windows for %s symbols ahead "
-                "of the day's first cohort selection",
-                len(self.stock_symbols),
-            )
-            self.seed_volatility_windows(self.stock_symbols)
-        self.volatility_windows_seeded_date = moment.date()
-        self.stock_cursor = 0
-        self.option_cursor = 0
-        self.option_discovery_cursor = 0
-        self.option_discovery_attempted.clear()
-        self.invalid_stock_symbols.clear()
-        self.resolved_date = moment.date()
-        available = set(self.stock_symbols)
-        self.seed_popular_symbols = set(self.config.popular_stocks()) & available
-        self.agent_popular_symbols.clear()
-        self.daily_realized_loss = Decimal("0")
-        self.daily_realized_pnl = Decimal("0")
-        self.daily_pnl.reset()
-        self.daily_loss_breaker_triggered = False
-        self.submitted_order_ids_today.clear()
-        self.reconciliation_flagged_order_ids.clear()
-        if self.broker_conflict_symbols:
-            log.info(
-                "CONFLICT | daily reset | resuming automated action on | %s",
-                ",".join(sorted(self.broker_conflict_symbols)),
-            )
-        self.broker_conflict_symbols.clear()
-        log.info(
-            "READY  | stocks=%s | popular seeds=%s | options=%s | option scan=%s",
-            len(self.stock_symbols),
-            len(self.seed_popular_symbols),
-            len(self.option_contracts),
-            "ON" if self.discover_all_options else "OFF",
-        )
-        # Trading is already unblocked at this point (stock_symbols is
-        # populated, resolved_date is set) - continue growing toward
-        # the full universe on this same background thread, still
-        # never blocking the main loop. No-ops immediately if
-        # STOCK_SYMBOLS isn't "ALL" or the initial pass already covered
-        # the full configured size.
-        if requested_stocks == ["ALL"]:
-            self._grow_stock_universe(moment)
 
     def discover_option_contracts(self) -> None:
         # Live incident: dispatching this onto its own background
