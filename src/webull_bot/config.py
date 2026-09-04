@@ -530,6 +530,23 @@ class Settings(BaseSettings):
     stock_entry_blackout_minutes_before_close: int = Field(
         default=15, ge=0, le=120
     )
+    # By request: "keep it separate, all the bp should be for option,
+    # then at 9am cst whatever is remaining can be used for stocks."
+    # Options and stocks draw from separate Webull buying-power pools
+    # (see account_state), but a fresh stock entry still consumes
+    # margin/equity that reduces the account's real option buying
+    # power for the rest of the day - opening stock positions in the
+    # first minutes of the session, before options have had a chance
+    # to claim anything, works against giving options first priority.
+    # Blocks FRESH stock entries only (general BUY/SHORT and
+    # volatility-scalp, same scope as stock_entry_blackout_minutes_
+    # before_close - averaging down and every exit path are
+    # unaffected) for this many minutes after OPTION_MARKET_OPEN_TIME.
+    # Default 30 = 9:30am ET option open + 30min = 10:00am ET = 9:00am
+    # CT.
+    stock_entry_options_priority_minutes: int = Field(
+        default=30, ge=0, le=120
+    )
     # By request: "start transitioning away from core hours strategy
     # around 30 minutes before end of core hours." Softer/earlier than
     # stock_entry_blackout_minutes_before_close above (a hard block on

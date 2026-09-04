@@ -1168,6 +1168,60 @@ class FreshEntryBlackoutActiveTests(unittest.TestCase):
         )
 
 
+class OptionsPriorityWindowActiveTests(unittest.TestCase):
+    """options_priority_window_active - by request: "keep it separate,
+    all the bp should be for option, then at 9am cst whatever is
+    remaining can be used for stocks." Blocks fresh stock entries only
+    for the first priority_minutes of the session, so options get
+    first claim on the account's buying power.
+    """
+
+    def test_active_right_after_open(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertTrue(
+            AutoTrader.options_priority_window_active(
+                5, 30, core_session_active=True
+            )
+        )
+
+    def test_inactive_once_the_window_has_passed(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.options_priority_window_active(
+                45, 30, core_session_active=True
+            )
+        )
+
+    def test_inactive_right_at_the_boundary(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.options_priority_window_active(
+                30, 30, core_session_active=True
+            )
+        )
+
+    def test_inactive_outside_core_hours_even_with_negative_minutes(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.options_priority_window_active(
+                -5, 30, core_session_active=False
+            )
+        )
+
+    def test_inactive_when_core_session_is_not_active_regardless_of_minutes(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.options_priority_window_active(
+                5, 30, core_session_active=False
+            )
+        )
+
+
 class DiversificationCappedEntryBudgetTests(unittest.TestCase):
     """diversification_capped_entry_budget - by request: "out of 7500
     stocks it should easily be able to find enough stocks to invest
@@ -10596,6 +10650,13 @@ class EntrySizingSplitTests(unittest.TestCase):
 
 class OvernightHoldTests(unittest.TestCase):
     def test_overnight_hold_symbols_excludes_intraday_only_buckets(self):
+        # By request: overnight hold is disabled by default now ("sell
+        # all before eod" - see OVERNIGHT_HOLD_ENABLED's own comment),
+        # but the bucket-filtering logic underneath is still there and
+        # still worth covering - temporarily re-enable it, same pattern
+        # test_overnight_hold_disabled_returns_empty_set already uses
+        # for the opposite direction.
+        import webull_bot.trading.universe.overnight_hold as overnight_hold_module
         from webull_bot.bot import AutoTrader
 
         fake_bot = SimpleNamespace(
@@ -10607,17 +10668,28 @@ class OvernightHoldTests(unittest.TestCase):
             },
             short_symbols=set(),
         )
-        held = AutoTrader.overnight_hold_symbols.__get__(fake_bot)()
+        original = overnight_hold_module.OVERNIGHT_HOLD_ENABLED
+        overnight_hold_module.OVERNIGHT_HOLD_ENABLED = True
+        try:
+            held = AutoTrader.overnight_hold_symbols.__get__(fake_bot)()
+        finally:
+            overnight_hold_module.OVERNIGHT_HOLD_ENABLED = original
         self.assertEqual(held, {"AAPL", "GME"})
 
     def test_overnight_hold_symbols_excludes_main_strategy_shorts(self):
+        import webull_bot.trading.universe.overnight_hold as overnight_hold_module
         from webull_bot.bot import AutoTrader
 
         fake_bot = SimpleNamespace(
             position_buckets={"AAPL": "popular", "GME": "popular"},
             short_symbols={"GME"},
         )
-        held = AutoTrader.overnight_hold_symbols.__get__(fake_bot)()
+        original = overnight_hold_module.OVERNIGHT_HOLD_ENABLED
+        overnight_hold_module.OVERNIGHT_HOLD_ENABLED = True
+        try:
+            held = AutoTrader.overnight_hold_symbols.__get__(fake_bot)()
+        finally:
+            overnight_hold_module.OVERNIGHT_HOLD_ENABLED = original
         self.assertEqual(held, {"AAPL"})
 
     def test_overnight_hold_disabled_returns_empty_set(self):
