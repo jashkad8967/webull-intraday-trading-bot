@@ -10621,18 +10621,18 @@ class OvernightHoldTests(unittest.TestCase):
         self.assertEqual(held, {"AAPL"})
 
     def test_overnight_hold_disabled_returns_empty_set(self):
-        import webull_bot.bot as bot_module
+        import webull_bot.trading.overnight_hold as overnight_hold_module
         from webull_bot.bot import AutoTrader
 
         fake_bot = SimpleNamespace(
             position_buckets={"AAPL": "popular"}, short_symbols=set()
         )
-        original = bot_module.OVERNIGHT_HOLD_ENABLED
-        bot_module.OVERNIGHT_HOLD_ENABLED = False
+        original = overnight_hold_module.OVERNIGHT_HOLD_ENABLED
+        overnight_hold_module.OVERNIGHT_HOLD_ENABLED = False
         try:
             held = AutoTrader.overnight_hold_symbols.__get__(fake_bot)()
         finally:
-            bot_module.OVERNIGHT_HOLD_ENABLED = original
+            overnight_hold_module.OVERNIGHT_HOLD_ENABLED = original
         self.assertEqual(held, set())
 
     def test_exclude_pairs_symbols_removes_pairs_tickers(self):

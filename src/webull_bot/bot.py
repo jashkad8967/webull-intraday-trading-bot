@@ -43,6 +43,8 @@ from webull_bot.strategy import (
     TradingStrategy,
 )
 from webull_bot.trade_events import TradeEventStreamService
+from webull_bot.trading.agent_assessment_stub import agent_assessment
+from webull_bot.trading.agent_discoveries import refresh_agent_discoveries
 from webull_bot.trading.broker_conflict_check import _broker_conflict
 from webull_bot.trading.broker_conflict_handler import handle_broker_conflict
 from webull_bot.trading.clock import is_trading_day, now, session_moment
@@ -57,6 +59,7 @@ from webull_bot.trading.cooldowns import (
     rate_capped,
     reentry_cooldown_ready,
 )
+from webull_bot.trading.day_end_summary import log_day_end_summary
 from webull_bot.trading.force_market_exit import should_force_market_exit
 from webull_bot.trading.fractional_ticker_handler import (
     handle_fractional_ticker_unsupported,
@@ -64,13 +67,22 @@ from webull_bot.trading.fractional_ticker_handler import (
 from webull_bot.trading.fractional_trading_handler import (
     handle_fractional_trading_not_enabled,
 )
+from webull_bot.trading.idle_cash_ramp import idle_cash_ramp_progress
 from webull_bot.trading.locks import _rekey_working_order, _working_orders_lock
 from webull_bot.trading.manual_touch import _manual_touch_active
 from webull_bot.trading.market_pulse_entries import _market_pulse_entries
+from webull_bot.trading.order_book_imbalance import _quote_size, obi_score_for
+from webull_bot.trading.overnight_hold import overnight_hold_symbols
 from webull_bot.trading.pairs_symbol_exclusion import exclude_pairs_symbols
+from webull_bot.trading.post_stop_reentry import post_stop_reentry_ready
+from webull_bot.trading.price_sanity import price_sanity_cooldown_ready, price_sanity_ok
 from webull_bot.trading.rate_limit_retry import (
     _is_rate_limited,
     _retry_once_on_rate_limit,
+)
+from webull_bot.trading.realized_pnl_tracking import (
+    record_realized_exit,
+    reverse_phantom_exit,
 )
 from webull_bot.trading.scalp_entry_price import volatility_scalp_entry_price
 from webull_bot.trading.scalp_position_exposure import (
@@ -83,6 +95,8 @@ from webull_bot.trading.screener_premarket_gainers import safe_premarket_gainers
 from webull_bot.trading.screener_top_gainers import safe_top_gainers
 from webull_bot.trading.screener_top_losers import safe_top_losers
 from webull_bot.trading.short_selling_handler import handle_short_selling_unsupported
+from webull_bot.trading.sma_trend_refresh import refresh_sma_trend
+from webull_bot.trading.snapshot_batch_capping import cap_batch_to_snapshot_limit
 from webull_bot.trading.stop_loss_confirmation import (
     stop_loss_confirmed,
     stop_ready_to_submit,
@@ -90,6 +104,9 @@ from webull_bot.trading.stop_loss_confirmation import (
 from webull_bot.trading.symbol_restriction_handler import (
     handle_symbol_restricted_to_closing_only,
 )
+from webull_bot.trading.symbol_universe_backfill import backfill_stock_symbols
+from webull_bot.trading.trade_event_logging import log_trade_events
+from webull_bot.trading.watchlist import add_to_watchlist
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import (
     MarketDataPermissionError,
@@ -124,7 +141,6 @@ ICEBERG_SLICE_SHARES = 10
 ICEBERG_SLICE_INTERVAL_SECONDS = 3
 
 # Automated risk guardrails.
-PRICE_SANITY_TOLERANCE = Decimal("0.05")
 HARD_ORDER_NOTIONAL_CEILING = Decimal("2000")
 CONSECUTIVE_ORDER_ERROR_LIMIT = 5
 ORDER_ERROR_WINDOW_SECONDS = 60
@@ -135,13 +151,6 @@ ORDER_ERROR_WINDOW_SECONDS = 60
 # live order attempt (and its own share of the "order" rate budget) on
 # a short that's certain to be rejected every single time.
 SHORT_SELLING_MIN_EQUITY = Decimal("2000")
-
-# Hold non-intraday stock positions overnight instead of always flattening
-# at EOD_CLOSE_TIME. Buckets in ALWAYS_FLATTEN_BUCKETS stay same-day-only
-# regardless of this flag, since pairs is an intraday-only strategy by
-# design.
-OVERNIGHT_HOLD_ENABLED = True
-ALWAYS_FLATTEN_BUCKETS = frozenset({"PAIRS_LONG", "PAIRS_SHORT"})
 
 # Deterministic market context (Webull's own gainers/losers/most-active
 # screeners - no LLM involved) refreshed on a slow, fixed cadence
@@ -214,6 +223,28 @@ class AutoTrader:
     safe_market_pulse_active = safe_market_pulse_active
     _market_pulse_entries = staticmethod(_market_pulse_entries)
     _compact_number = staticmethod(_compact_number)
+    # Small standalone helpers (idle-cash ramp, agent stubs/discoveries,
+    # OBI scoring, realized-pnl bookkeeping, price sanity, DAIC post-stop
+    # cooldown, watchlist, day-end/trade-event logging, universe backfill/
+    # overnight-hold/batch-capping) - moved out to trading/*.py, one
+    # function (or a tightly-coupled pair) per file.
+    idle_cash_ramp_progress = idle_cash_ramp_progress
+    agent_assessment = agent_assessment
+    _quote_size = staticmethod(_quote_size)
+    obi_score_for = obi_score_for
+    refresh_agent_discoveries = refresh_agent_discoveries
+    record_realized_exit = record_realized_exit
+    reverse_phantom_exit = reverse_phantom_exit
+    price_sanity_ok = price_sanity_ok
+    price_sanity_cooldown_ready = price_sanity_cooldown_ready
+    post_stop_reentry_ready = post_stop_reentry_ready
+    log_trade_events = log_trade_events
+    backfill_stock_symbols = backfill_stock_symbols
+    overnight_hold_symbols = overnight_hold_symbols
+    add_to_watchlist = add_to_watchlist
+    log_day_end_summary = log_day_end_summary
+    cap_batch_to_snapshot_limit = staticmethod(cap_batch_to_snapshot_limit)
+    refresh_sma_trend = refresh_sma_trend
 
     def __init__(self):
         self.config = settings()
@@ -625,34 +656,6 @@ class AutoTrader:
             ),
         )
         return ordered
-
-    def refresh_sma_trend(self, symbols: list[str]) -> None:
-        """Once-daily higher-timeframe trend reference (see
-        TradingStrategy.sma_trend_supports_entry) - a real daily-bar SMA,
-        not something derivable from the bot's own few-second tick polls.
-        Merges into the existing cache rather than replacing it outright,
-        so a partial/failed refresh degrades to yesterday's (still roughly
-        valid) SMA instead of going empty and disabling the filter.
-        """
-        if not self.config.sma_trend_filter_enabled or not symbols:
-            return
-        try:
-            sma = self.api.sma_trend(symbols, self.config.sma_trend_days)
-        except Exception as exc:
-            log.warning("SMA    | trend refresh failed this cycle | %s", exc)
-            return
-        if not sma:
-            log.warning("SMA    | no coverage this cycle | keeping prior values")
-            return
-        self.strategy.sma_trend.update(
-            {symbol: Decimal(str(value)) for symbol, value in sma.items()}
-        )
-        log.info(
-            "SMA    | trend reference refreshed | %s/%s symbols | lookback=%sd",
-            len(sma),
-            len(symbols),
-            self.config.sma_trend_days,
-        )
 
     def refresh_recent_momentum(self, symbols: list[str]) -> None:
         """By request: "look at tickers in the last 10 mins for
@@ -1364,34 +1367,6 @@ class AutoTrader:
                         underlying,
                         exc,
                     )
-
-    @staticmethod
-    def cap_batch_to_snapshot_limit(
-        batch: list[str],
-        unmanaged_held: list[str],
-        limit: int = WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS,
-    ) -> list[str]:
-        """Caps a scan batch at `limit` (defaults to WebullAPI's own
-        hard 100-symbol snapshot limit for a single quote-fetch call -
-        see trade_stocks, which passes a multiple of that when firing
-        several concurrent quote batches this cycle - see
-        stock_scan_concurrent_batches), always keeping every currently-
-        held position first (a real position losing quote coverage -
-        see the "fell out of the scanned universe" GUARD warning just
-        above this call site - is the more severe failure mode) and
-        only trimming the lower-priority remainder. Without this,
-        force-injecting the curated cohort/eligible-symbol set on top
-        of an already-full batch could push the combined size past
-        what this cycle's quote fetch(es) can cover, losing price data
-        for every symbol past the limit, not just the extra ones.
-        """
-        if len(batch) <= limit:
-            return batch
-        held_set = set(unmanaged_held)
-        prioritized = [symbol for symbol in batch if symbol in held_set]
-        rest = [symbol for symbol in batch if symbol not in held_set]
-        room = max(0, limit - len(prioritized))
-        return prioritized + rest[:room]
 
     def record_trade(
         self,
@@ -2684,73 +2659,6 @@ class AutoTrader:
                 )
         return self.cached_buying_power, [dict(item) for item in self.cached_positions]
 
-    def idle_cash_ramp_progress(self, buying_power: Decimal) -> Decimal:
-        """0..1 - how far along the idle-cash gate-relaxation ramp the bot
-        currently is. Keeping buying_power (already net of
-        MIN_CASH_RESERVE_DOLLARS) deployed outranks entry quality, so the
-        longer it sits unspent, the more entry_spread_ok/entry_extension_ok/
-        vwap_supports_entry/tick_direction_ok loosen - see their
-        idle_relaxation_multiplier parameter. Resets to 0 the moment
-        record_trade() sees a new BUY/SHORT/MANUAL_BUY fill that counts
-        toward this ramp - volatility-scalp fills deliberately don't (see
-        record_trade's counts_toward_idle_cash_ramp), since this ramp
-        only ever loosens the GENERAL strategy's own gates and scalp
-        activity firing every few minutes was otherwise starving it
-        from ever advancing, even while real buying power sat unused
-        for hours.
-        """
-        if not self.config.idle_cash_relaxation_enabled or buying_power <= 0:
-            return Decimal("0")
-        idle_seconds = time.monotonic() - self.last_capital_deployed_at
-        grace = float(self.config.idle_cash_grace_seconds)
-        if idle_seconds <= grace:
-            return Decimal("0")
-        ramp = float(self.config.idle_cash_ramp_seconds)
-        return Decimal(str(min(1.0, (idle_seconds - grace) / ramp)))
-
-    def agent_assessment(self, symbol: str) -> dict | None:
-        """The agent no longer scores individual symbols (see
-        MarketResearchAgent - it now reviews account-wide performance,
-        not per-symbol setups). Kept as an always-None stub so
-        prioritized_stock_batch/stock_decision's existing "no
-        assessment" handling doesn't need to change.
-        """
-        return None
-
-    @staticmethod
-    def _quote_size(quote: dict, *fields: str) -> Decimal | None:
-        for field in fields:
-            value = quote.get(field)
-            if value in (None, ""):
-                continue
-            try:
-                size = Decimal(str(value))
-            except Exception:
-                continue
-            if size.is_finite() and size >= 0:
-                return size
-        return None
-
-    def obi_score_for(self, symbol: str, category: str, quote: dict) -> Decimal | None:
-        """Order-book-imbalance score for a symbol that's otherwise about
-        to fire a BUY. Only ever called for that one symbol right before
-        order placement - fetching L2 depth for every scanned symbol every
-        cycle would badly overrun the "market" request-rate budget (a
-        single depth call per symbol vs. today's one snapshot call per
-        whole batch), so this stays a final, on-demand gate rather than a
-        per-cycle metric like everything else in strategy.metrics.
-        """
-        depth = self.api.stock_depth(symbol, category)
-        score = self.api.depth_imbalance(depth, OBI_DEPTH_LEVELS)
-        if score is not None:
-            return score
-        bid_size = self._quote_size(quote, "bid_size", "bidSize", "bid_volume")
-        ask_size = self._quote_size(quote, "ask_size", "askSize", "ask_volume")
-        if bid_size is None or ask_size is None:
-            return None
-        total = bid_size + ask_size
-        return bid_size / total if total > 0 else None
-
     def size_stock_entry(
         self,
         price: Decimal,
@@ -2850,23 +2758,6 @@ class AutoTrader:
                     # itself already uses.
                     quantity = Decimal("0")
         return quantity, buffered_price, False
-
-    def refresh_agent_discoveries(self) -> None:
-        """Sourced from the deterministic market_pulse screener data, not
-        the research agent - this keeps working (and keeps priority
-        scanning pointed at today's actual movers) even if AGENT_ENABLED
-        is false or a Groq request fails.
-        """
-        self.refresh_market_pulse()
-        available = set(self.stock_symbols)
-        pulse_symbols = {
-            entry["symbol"]
-            for bucket in self.market_pulse_cache.values()
-            for entry in bucket
-        }
-        self.agent_popular_symbols = {
-            symbol for symbol in pulse_symbols if symbol in available
-        }
 
     def submit_strategy_review(
         self,
@@ -3135,145 +3026,6 @@ class AutoTrader:
         self.daily_loss_breaker_triggered = True
         self.last_account_refresh = 0.0
         return True
-
-    def record_realized_exit(
-        self,
-        average_cost: Decimal,
-        exit_price: Decimal,
-        quantity: Decimal,
-        multiplier: int = 1,
-    ) -> Decimal:
-        """Track today's realized P&L from a submitted exit's limit price.
-
-        This is an estimate (actual fill price can differ slightly), which
-        is fine for a dashboard total and the daily-loss circuit breaker -
-        both care about the running picture, not cent-perfect accounting.
-        Returns the estimated pnl so callers can show it on the trade log.
-        """
-        pnl = (exit_price - average_cost) * quantity * multiplier - self.config.sell_fee_dollars
-        self.daily_realized_pnl += pnl
-        if pnl < 0:
-            self.daily_realized_loss += -pnl
-        self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
-        return pnl
-
-    def reverse_phantom_exit(
-        self, pnl: Decimal | None, order_id: str | None = None
-    ) -> None:
-        """Undo a realized-exit pnl that was recorded at order SUBMISSION
-        time (see record_realized_exit) once it's confirmed the order
-        never actually filled - either it was cancelled/failed outright,
-        or it was deliberately abandoned mid-flight (escalation cancels
-        the gentle order and lets a fresh one fire its own pnl next
-        cycle). Without this, an exit that never fills still permanently
-        inflates the daily realized total as if it had.
-
-        Also discards the matching entry from the dashboard's trade log
-        (see StatusWriter.discard_trade) - record_trade wrote it
-        optimistically at the same submission time as the phantom pnl, so
-        without this a cancelled order stays visible on Recent Trades
-        forever, labeled as a completed profit that never happened.
-        """
-        if order_id:
-            self.status.discard_trade(order_id)
-        if not pnl:
-            return
-        self.daily_realized_pnl -= pnl
-        if pnl < 0:
-            self.daily_realized_loss = max(
-                Decimal("0"), self.daily_realized_loss - (-pnl)
-            )
-        self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
-
-    def price_sanity_ok(self, symbol: str, last_price: Decimal, limit_price: Decimal) -> bool:
-        """Fat-finger guard: reject a limit price that's implausibly far
-        from the last observed trade price instead of trusting sizing/
-        pricing math blindly. Catches a stale or corrupted quote producing
-        a wildly wrong limit before it ever reaches the broker - hardcoded,
-        not config, since this is a sanity backstop, not a tuning knob.
-
-        Records the rejection in price_sanity_rejected_at - see
-        price_sanity_cooldown_ready. Live incident: one illiquid
-        symbol's bid/ask sat consistently ~9-10% off its own last-trade
-        price (a real market condition on a thin quote, not a bad
-        broker read - past _sane_bid_or_ask's own, looser 8% tolerance,
-        but still past this stricter 5% one), rejecting an entry attempt
-        on essentially every single scan cycle for hours with no
-        backoff between attempts and no symbol in the log line to even
-        identify which stock it was.
-        """
-        if last_price <= 0:
-            return True
-        deviation = abs(limit_price - last_price) / last_price
-        if deviation > PRICE_SANITY_TOLERANCE:
-            self.price_sanity_rejected_at[symbol] = time.monotonic()
-            log.error(
-                "GUARD  | %-8s | price sanity check failed | last=%.4f limit=%.4f "
-                "deviation=%.1f%% (max %.0f%%) | order skipped",
-                symbol,
-                last_price,
-                limit_price,
-                deviation * 100,
-                PRICE_SANITY_TOLERANCE * 100,
-            )
-            return False
-        return True
-
-    def price_sanity_cooldown_ready(self, symbol: str) -> bool:
-        """False while symbol is still within PRICE_SANITY_COOLDOWN_SECONDS
-        of its last price_sanity_ok rejection - without this, a symbol
-        whose quote sits just past the sanity tolerance gets retried
-        (and re-rejected) on literally every scan cycle forever, wasting
-        a batch slot another, viable candidate could have used instead.
-
-        Live incident (this bug): originally entry-only (the docstring
-        used to claim "unlike the exit side's stalled-order backstops,
-        this only ever backs off" - that assumption was wrong in
-        practice). BMEA's profit-take order re-escalated and resubmitted
-        every ~15-20s continuously for over 5 HOURS, hitting this exact
-        price-sanity rejection ~570 times with zero backoff, because
-        place_stock_scaled itself never checked this cooldown - only the
-        entry code paths checked it themselves, before ever calling
-        place_stock_scaled. Now enforced directly inside
-        place_stock_scaled, so it applies uniformly to every order this
-        function submits - entries AND exits alike - not just whichever
-        callers happened to remember to check it first.
-        """
-        rejected_at = self.price_sanity_rejected_at.get(symbol)
-        if rejected_at is None:
-            return True
-        return (
-            time.monotonic() - rejected_at
-            >= float(self.config.price_sanity_cooldown_seconds)
-        )
-
-    def post_stop_reentry_ready(self, symbol: str) -> bool:
-        """False while symbol is still within
-        volatility_scalp_post_stop_cooldown_seconds of its last STOP-loss
-        exit. By request, after the DAIC incident: 3 stop-losses in
-        ~9 minutes on one symbol during a fast decline, erasing the
-        day's gains, because nothing throttled re-entry into the exact
-        same falling knife right after being stopped out of it - the
-        volatility-scalp cohort's re-entry cooldown is deliberately
-        zeroed for everything else ("orders can be made as frequently
-        as possible"), and this cohort explicitly bypasses quarantine/
-        the stop-loss guard/wash-sale blocks by request ("keep trading
-        through losses"). This is a narrow, deliberate exception to
-        that: it only pauses the ONE symbol that just stopped out, for
-        a few minutes, not the strategy - compatible with "keep trading
-        through losses" (the other 7 concurrent slots and every other
-        symbol are completely unaffected) while closing the specific
-        gap DAIC exposed. Fails open (True) for a symbol with no
-        recorded stop-loss yet, same convention as every other cooldown
-        gate in this file.
-        """
-        stopped_at = self.last_volatility_stop_loss_at.get(symbol)
-        if stopped_at is None:
-            return True
-        return (
-            time.monotonic() - stopped_at
-            >= float(self.config.volatility_scalp_post_stop_cooldown_seconds)
-        )
 
     def record_order_error(self, symbol: str, exc: Exception) -> None:
         """Order-error guard: distinct from the existing P&L-based circuit
@@ -3751,37 +3503,6 @@ class AutoTrader:
                     order.get("filled_quantity"),
                     client_order_id,
                 )
-
-    def log_trade_events(self) -> None:
-        """Phase 0 of the polling-to-streaming migration (see the plan):
-        drains and logs whatever TradeEventStreamService received since
-        the last cycle. Purely observational - no trading state is
-        touched here. The goal is to document the real payload schema
-        from live traffic (the SDK source only confirms one field,
-        request_id) before any later phase parses these events for
-        anything that matters.
-        """
-        if self.trade_event_service is None:
-            return
-        for event_type, subscribe_type, payload in self.trade_event_service.drain():
-            log.info(
-                "EVENTS | event_type=%s | subscribe_type=%s | %s",
-                event_type,
-                subscribe_type,
-                payload,
-            )
-
-    def backfill_stock_symbols(self, count: int) -> int:
-        active = set(self.stock_symbols)
-        added = 0
-        while added < count and self.reserve_symbols:
-            candidate = self.reserve_symbols.pop(0)
-            if candidate in active or candidate in self.invalid_symbols:
-                continue
-            self.stock_symbols.append(candidate)
-            active.add(candidate)
-            added += 1
-        return added
 
     def seed_volatility_windows(self, symbols: list[str]) -> None:
         """Warm-starts each not-yet-seen symbol's volatility-scalp window
@@ -6161,34 +5882,6 @@ class AutoTrader:
             )
         return buying_power
 
-    def log_day_end_summary(self, moment: datetime) -> None:
-        if self.last_day_end_log_date == moment.date():
-            return
-        self.last_day_end_log_date = moment.date()
-        try:
-            buying_power = self.api.buying_power()
-            positions = [
-                item
-                for item in self.api.positions()
-                if Decimal(str(item.get("quantity", "0"))) != 0
-            ]
-            log.info(
-                "DAYEND | date=%s | buying_power=$%.2f | positions=%s | working_orders=%s | popular_research=%s",
-                moment.date().isoformat(),
-                buying_power,
-                len(positions),
-                len(self.working_orders),
-                ",".join(
-                    sorted(
-                        self.seed_popular_symbols
-                        | self.agent_popular_symbols
-                    )
-                )
-                or "NONE",
-            )
-        except Exception as exc:
-            log.error("DAYEND | date=%s | summary failed | %s", moment.date(), exc)
-
     def trade_options(
         self,
         positions: list[dict],
@@ -6999,22 +6692,6 @@ class AutoTrader:
             pending_orders=pending_order_rows,
         )
 
-    def overnight_hold_symbols(self) -> set[str]:
-        """Symbols whose bucket is eligible to carry a position past
-        EOD_CLOSE_TIME instead of always flattening. Pairs positions are
-        excluded - that strategy is intraday-only by design - so only the
-        core EMA/OBI stock strategy's own positions (plus manual buys)
-        ever ride overnight.
-        """
-        if not OVERNIGHT_HOLD_ENABLED:
-            return set()
-        return {
-            symbol
-            for symbol, bucket in self.position_buckets.items()
-            if bucket not in ALWAYS_FLATTEN_BUCKETS
-            and symbol not in self.short_symbols
-        }
-
     def close_fractional_positions_before_core_close(self) -> None:
         """Fractional orders only work during core hours - once core
         session ends, a fractional position can't be bought, sold,
@@ -7547,27 +7224,6 @@ class AutoTrader:
             buy_quantity,
         )
         return max(Decimal("0"), buying_power - buffered_price * buy_quantity)
-
-    def add_to_watchlist(self, symbol: str) -> None:
-        symbol = str(symbol).upper().strip()
-        if not symbol:
-            return
-        self.user_watchlist.add(symbol)
-        if symbol not in self.stock_categories:
-            try:
-                categories = self.api.stock_categories([symbol])
-            except Exception as exc:
-                log.error(
-                    "CMD    | watchlist category lookup failed | %-8s | %s",
-                    symbol,
-                    exc,
-                )
-                categories = {}
-            self.stock_categories[symbol] = categories.get(symbol, "US_STOCK")
-        if symbol not in self.stock_symbols:
-            self.stock_symbols.append(symbol)
-        self.priority_scan_symbols.add(symbol)
-        log.warning("CMD    | added %-8s to watchlist from dashboard", symbol)
 
     def _position_protection_loop(self) -> None:
         """Runs fill/cancel detection, exit repricing, and stop-loss
