@@ -69,6 +69,12 @@ from webull_bot.trading.rate_limit_retry import (
     _is_rate_limited,
     _retry_once_on_rate_limit,
 )
+from webull_bot.trading.scalp_entry_price import volatility_scalp_entry_price
+from webull_bot.trading.scalp_position_exposure import (
+    volatility_scalp_position_value_ok,
+)
+from webull_bot.trading.scalp_reentry import volatility_scalp_reentry_ready
+from webull_bot.trading.scalp_total_exposure import volatility_scalp_total_exposure_ok
 from webull_bot.trading.short_selling_handler import handle_short_selling_unsupported
 from webull_bot.trading.stop_loss_confirmation import (
     stop_loss_confirmed,
@@ -187,6 +193,11 @@ class AutoTrader:
     should_force_market_exit = should_force_market_exit
     stop_ready_to_submit = stop_ready_to_submit
     stop_loss_confirmed = stop_loss_confirmed
+    # Volatility-scalp cohort small helpers - moved out to trading/scalp_*.py.
+    volatility_scalp_entry_price = volatility_scalp_entry_price
+    volatility_scalp_reentry_ready = volatility_scalp_reentry_ready
+    volatility_scalp_position_value_ok = volatility_scalp_position_value_ok
+    volatility_scalp_total_exposure_ok = volatility_scalp_total_exposure_ok
 
     def __init__(self):
         self.config = settings()
@@ -1443,106 +1454,6 @@ class AutoTrader:
         rest = [symbol for symbol in batch if symbol not in held_set]
         room = max(0, limit - len(prioritized))
         return prioritized + rest[:room]
-
-    def volatility_scalp_entry_price(self, quote: dict) -> Decimal | None:
-        """Aggressive, cross-the-spread BUY price for the volatility-
-        scalp cohort - by request: "a lot of the orders are being
-        cancelled... ensure the initial order itself is likely to be
-        filled." The general stock_limit_price(quote, "BUY") used
-        everywhere else prices passively at the bid/ask midpoint - fine
-        for the normal strategy's slower entries, but for a strategy
-        whose whole point is fast, repeated round trips, a passive mid
-        that the market has to fall back down to before it ever fills
-        just sits for the full ORDER_TIMEOUT_SECONDS (120s) and gets
-        cancelled without ever entering the position (live incident:
-        several BUY orders cancelled "unfilled after 120s" in a row).
-        Crosses at the ask instead - a real cost (paying the spread
-        instead of resting inside it), but guarantees the order can
-        actually fill immediately in virtually all cases, which is the
-        whole point of a high-frequency strategy that depends on
-        actually being in the position to catch the next move.
-        reprice_volatility_scalp_entries still lowers this toward a
-        falling market afterward, same as before.
-        """
-        ask = self.api.quote_ask(quote)
-        if ask is None:
-            return None
-        return ask.quantize(self.api.price_tick_size(ask), rounding=ROUND_UP)
-
-    def volatility_scalp_reentry_ready(self, key: str) -> bool:
-        """A much shorter reentry cooldown than the normal trend-entry
-        path's (STOCK_REENTRY_COOLDOWN_SECONDS, 180s default) - the whole
-        point of volatility-scalp is cycling the same volatile symbol's
-        capital back in as soon as it dips again, not waiting out a
-        cooldown sized for a slower, trend-following re-entry.
-        """
-        elapsed = time.monotonic() - self.last_exit_at.get(key, float("-inf"))
-        return elapsed >= float(self.config.volatility_scalp_reentry_cooldown_seconds)
-
-    def volatility_scalp_position_value_ok(
-        self,
-        current_quantity,
-        additional_quantity,
-        price: Decimal,
-    ) -> bool:
-        """True as long as a cohort symbol's total position value
-        (existing + a prospective new buy, fresh entry or averaging-
-        down) would stay within VOLATILITY_SCALP_MAX_POSITION_FRACTION
-        of total account value. Live incident: GAUZ alone grew to ~66%
-        of a small account's total value - averaging is still allowed
-        up to the separate VOLATILITY_SCALP_MAX_AVERAGING_BUYS cap, but
-        never to the point of concentrating most of the account in one
-        name. Fails open (True) if account value isn't known yet - a
-        missing/stale account-value read should never itself block
-        trading.
-        """
-        account_value = self.cached_account_value
-        if account_value is None or account_value <= 0:
-            return True
-        projected_value = (
-            Decimal(str(current_quantity)) + Decimal(str(additional_quantity))
-        ) * price
-        cap = account_value * self.config.volatility_scalp_max_position_fraction
-        return projected_value <= cap
-
-    def volatility_scalp_total_exposure_ok(
-        self,
-        positions: list[dict],
-        additional_value: Decimal,
-    ) -> bool:
-        """True as long as the WHOLE cohort's total position value
-        (every currently-held volatility-scalp symbol combined, plus a
-        prospective new buy) would stay within
-        VOLATILITY_SCALP_MAX_TOTAL_EXPOSURE_FRACTION of account value.
-
-        volatility_scalp_position_value_ok only bounds one symbol at a
-        time - up to VOLATILITY_SCALP_MAX_CONCURRENT_POSITIONS symbols
-        could each independently satisfy that cap while the account as a
-        whole is almost entirely concentrated in this cohort during a
-        correlated selloff (these are explicitly the most volatile names,
-        selected together, so correlation during a broad move is likely
-        rather than a tail case). Fails open (True) if account value
-        isn't known yet, same as the per-symbol check.
-        """
-        account_value = self.cached_account_value
-        if account_value is None or account_value <= 0:
-            return True
-        total = additional_value
-        for position in positions:
-            symbol = str(position.get("symbol", "")).upper()
-            # self.volatility_scalp_positions (every symbol this
-            # strategy has an in-process-tracked open position in), not
-            # the narrower curated self.volatility_scalp_symbols cohort
-            # list - entries now open for any eligible symbol, not just
-            # the curated top handful, so exposure has to be summed
-            # against the same broadened set.
-            if symbol not in self.volatility_scalp_positions:
-                continue
-            quantity = Decimal(str(position.get("quantity", "0") or "0"))
-            cost_price = Decimal(str(position.get("cost_price") or "0"))
-            total += quantity * cost_price
-        cap = account_value * self.config.volatility_scalp_max_total_exposure_fraction
-        return total <= cap
 
     def record_trade(
         self,
