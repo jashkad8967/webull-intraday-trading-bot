@@ -92,7 +92,9 @@ from webull_bot.trading.orders.close_instruments import close_instruments
 from webull_bot.trading.orders.exit_failure_tracking import _note_exit_failure
 from webull_bot.trading.orders.force_market_exit import should_force_market_exit
 from webull_bot.trading.orders.locks import _rekey_working_order, _working_orders_lock
+from webull_bot.trading.orders.manual_buy import _manual_buy
 from webull_bot.trading.orders.manual_cancel_order import _manual_cancel_order
+from webull_bot.trading.orders.manual_sell import _manual_sell
 from webull_bot.trading.orders.manual_touch import _manual_touch_active
 from webull_bot.trading.orders.pending_order_release import _release_pending_order
 from webull_bot.trading.orders.phantom_exit_confirmation import (
@@ -357,6 +359,10 @@ class AutoTrader:
     reprice_resting_entries = reprice_resting_entries
     reprice_volatility_scalp_exits = reprice_volatility_scalp_exits
     reprice_resting_exits = reprice_resting_exits
+    # Manual dashboard buy/sell command execution - moved out to
+    # trading/orders/.
+    _manual_sell = _manual_sell
+    _manual_buy = _manual_buy
 
     def __init__(self):
         self.config = settings()
@@ -5378,251 +5384,6 @@ class AutoTrader:
             len(submitted),
             ",".join(sorted(profitable_symbols)),
         )
-
-    def _manual_sell(
-        self,
-        command: dict,
-        positions: list[dict],
-        core_session_active: bool = False,
-    ) -> None:
-        symbol = str(command.get("symbol", "")).upper()
-        instrument_type = command.get("instrument_type", "EQUITY")
-        if not symbol:
-            return
-        position = next(
-            (
-                item
-                for item in positions
-                if item.get("instrument_type") == instrument_type
-                and str(item.get("symbol", "")).upper() == symbol
-            ),
-            None,
-        )
-        if not position:
-            log.info(
-                "CMD    | manual sell skipped | %-8s | no matching open position",
-                symbol,
-            )
-            return
-        quantity = Decimal(str(position.get("quantity", "0")))
-        cost = Decimal(str(position.get("cost_price", "0")))
-        if quantity <= 0:
-            return
-        if instrument_type == "EQUITY":
-            if symbol in self.pending_stock_exits:
-                log.info(
-                    "CMD    | manual sell skipped | %-8s | exit already pending",
-                    symbol,
-                )
-                return
-            is_fractional = self.is_fractional_quantity(quantity)
-            if is_fractional and not core_session_active:
-                log.info(
-                    "CMD    | manual sell skipped | %-8s | fractional "
-                    "position, Webull only allows an order on it during "
-                    "core hours",
-                    symbol,
-                )
-                return
-            quote = self.api.stock_quote(symbol)
-            # A manual sell is an urgent "get me out" click, not a patient
-            # resting order - the old below-bid crossing price
-            # (stock_limit_price's SELL side) shaved off an extra
-            # STOCK_LIMIT_OFFSET on top of the spread, which could tip an
-            # otherwise-flat or barely-profitable exit into a recorded
-            # loss for no real reason. Price it at the ask (top of the
-            # spread) instead, and place a genuine MARKET order whenever
-            # one is actually usable (whole shares, core hours, account
-            # allows fractional/MARKET orders) so it's not left resting
-            # unfilled either.
-            sell_price = self.api.quote_ask(quote) or self.api.stock_limit_price(
-                quote, "SELL"
-            )
-            use_market = (
-                core_session_active
-                and not is_fractional
-                and self.fractional_trading_enabled
-            )
-            order_id = self.api.place_stock(
-                symbol,
-                "SELL",
-                quantity,
-                limit_price=None if use_market else sell_price,
-                fractional=is_fractional,
-                market=use_market,
-            )
-            self.pending_stock_exits.add(symbol)
-            pnl = self.record_realized_exit(cost, sell_price, quantity)
-            self.record_trade(
-                f"STOCK:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl,
-                entry_price=cost, quantity=quantity,
-            )
-            if pnl < 0:
-                self.wash_sales.block(symbol, "manual sell at a loss")
-        elif instrument_type == "OPTION":
-            if symbol in self.pending_option_exits:
-                log.info(
-                    "CMD    | manual sell skipped | %-8s | exit already pending",
-                    symbol,
-                )
-                return
-            contract = self.api.contract_from_position(position)
-            if not contract:
-                log.error(
-                    "CMD    | manual sell failed | %-8s | could not resolve option contract",
-                    symbol,
-                )
-                return
-            quote = self.api.option_quote(contract["symbol"])
-            sell_price = self.api.quote_ask(quote) or self.api.option_limit_price(
-                quote, "SELL"
-            )
-            order_id = self.api.place_option(
-                contract,
-                "SELL",
-                quantity,
-                sell_price,
-                "SELL_TO_CLOSE",
-            )
-            self.pending_option_exits.add(symbol)
-            pnl = self.record_realized_exit(cost, sell_price, quantity, multiplier=100)
-            self.record_trade(
-                f"OPTION:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl,
-                entry_price=cost, quantity=quantity,
-            )
-            if pnl < 0:
-                self.wash_sales.block(
-                    contract["underlying_symbol"],
-                    "manual option sell at a loss",
-                )
-        else:
-            return
-        log.warning(
-            "CMD    | manual sell executed | %-8s (%s) | qty=%s",
-            symbol,
-            instrument_type,
-            quantity,
-        )
-
-    def _manual_buy(
-        self,
-        command: dict,
-        positions: list[dict],
-        buying_power: Decimal,
-        core_session_active: bool = False,
-    ) -> Decimal:
-        """Stocks only for now, mirroring the same entry sizing/pricing the
-        automatic strategy uses (dollar-sized during core hours, fixed
-        STOCK_QUANTITY sizing otherwise) rather than a separate ad-hoc
-        path, so a manual buy still respects the account's normal risk
-        limits (MAX_ORDER_NOTIONAL, the $0.10-$0.999 lot rule, etc).
-        """
-        symbol = str(command.get("symbol", "")).upper()
-        if not symbol:
-            return buying_power
-        if symbol in self.broker_conflict_symbols:
-            log.info(
-                "CMD    | manual buy skipped | %-8s | broker conflict blacklisted",
-                symbol,
-            )
-            return buying_power
-        quantity, _cost = self.api.stock_position(symbol, positions)
-        if quantity > 0:
-            log.info(
-                "CMD    | manual buy skipped | %-8s | already holding a position",
-                symbol,
-            )
-            return buying_power
-        blocked_until = self.wash_sales.blocked_until(symbol)
-        if blocked_until:
-            log.info(
-                "CMD    | manual buy skipped | %-8s | wash-sale blocked until %s",
-                symbol,
-                blocked_until.strftime("%Y-%m-%d"),
-            )
-            return buying_power
-        if self.strategy.open_position_count(positions) >= self.config.max_open_positions:
-            log.info(
-                "CMD    | manual buy skipped | %-8s | at MAX_OPEN_POSITIONS",
-                symbol,
-            )
-            return buying_power
-        try:
-            quote = self.api.stock_quote(symbol)
-            price = self.api.quote_price(quote)
-        except Exception as exc:
-            log.error("CMD    | manual buy failed | %-8s | %s", symbol, exc)
-            return buying_power
-        self.strategy.update_stock_snapshot(quote, price)
-        fractional = False
-        if (
-            core_session_active
-            and self.fractional_trading_enabled
-            and self.config.stock_core_session_position_fraction > 0
-        ):
-            target_notional = min(
-                buying_power * self.config.stock_core_session_position_fraction,
-                buying_power,
-                self.config.max_order_notional,
-            )
-            buy_quantity, buffered_price = self.strategy.dollar_stock_quantity(
-                price, target_notional
-            )
-            fractional = buy_quantity > 0
-        else:
-            buy_quantity, buffered_price = self.strategy.stock_order_quantity(
-                price, buying_power
-            )
-            if (
-                buy_quantity == 0
-                and self.config.fractional_shares_enabled
-                and core_session_active
-                and self.fractional_trading_enabled
-            ):
-                fractional_quantity = self.strategy.fractional_stock_quantity(
-                    price, buying_power
-                )
-                if fractional_quantity > 0:
-                    buy_quantity = fractional_quantity
-                    buffered_price = price * Decimal("1.03")
-                    fractional = True
-        if buy_quantity <= 0:
-            log.info(
-                "CMD    | manual buy skipped | %-8s | no affordable quantity",
-                symbol,
-            )
-            return buying_power
-        entry_price = self.api.stock_limit_price(quote, "BUY")
-        try:
-            order_id = self.api.place_stock(
-                symbol,
-                "BUY",
-                buy_quantity,
-                limit_price=entry_price,
-                fractional=fractional,
-            )
-        except Exception as exc:
-            if self.is_fractional_trading_not_enabled(exc):
-                self.handle_fractional_trading_not_enabled(exc)
-            elif self.is_fractional_ticker_unsupported(exc):
-                self.handle_fractional_ticker_unsupported(symbol, exc)
-            else:
-                log.error("CMD    | manual buy failed | %-8s | %s", symbol, exc)
-            return buying_power
-        self.record_trade(
-            f"STOCK:{symbol}",
-            order_id,
-            "MANUAL_BUY",
-            entry_price=entry_price,
-            quantity=buy_quantity,
-        )
-        self.position_buckets[symbol] = "MANUAL"
-        log.warning(
-            "CMD    | manual buy executed | %-8s | qty=%s",
-            symbol,
-            buy_quantity,
-        )
-        return max(Decimal("0"), buying_power - buffered_price * buy_quantity)
 
     def _position_protection_loop(self) -> None:
         """Runs fill/cancel detection, exit repricing, and stop-loss
