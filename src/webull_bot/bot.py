@@ -153,6 +153,12 @@ from webull_bot.trading.screeners.screener_premarket_gainers import (
 )
 from webull_bot.trading.screeners.screener_top_gainers import safe_top_gainers
 from webull_bot.trading.screeners.screener_top_losers import safe_top_losers
+from webull_bot.trading.sweeps.extended_hours_profit_sweep import (
+    close_profitable_positions_during_extended_hours,
+)
+from webull_bot.trading.sweeps.fractional_pre_close_sweep import (
+    close_fractional_positions_before_core_close,
+)
 from webull_bot.trading.universe.overnight_hold import overnight_hold_symbols
 from webull_bot.trading.universe.pairs_symbol_exclusion import exclude_pairs_symbols
 from webull_bot.trading.universe.popular_reinstatement import (
@@ -371,6 +377,14 @@ class AutoTrader:
     _batched_quotes = _batched_quotes
     _stall_equity_quotes = _stall_equity_quotes
     _stall_exit_price = _stall_exit_price
+    # Profitable-position closing sweeps (fractional pre-core-close,
+    # extended-hours) - moved out to trading/sweeps/.
+    close_fractional_positions_before_core_close = (
+        close_fractional_positions_before_core_close
+    )
+    close_profitable_positions_during_extended_hours = (
+        close_profitable_positions_during_extended_hours
+    )
 
     def __init__(self):
         self.config = settings()
@@ -5023,177 +5037,6 @@ class AutoTrader:
             account_value=self.cached_account_value,
             user_watchlist=sorted(self.user_watchlist),
             pending_orders=pending_order_rows,
-        )
-
-    def close_fractional_positions_before_core_close(self) -> None:
-        """Fractional orders only work during core hours - once core
-        session ends, a fractional position can't be bought, sold,
-        stopped out, or profit-taken at all until the next session opens.
-        Unlike a whole-share position (which OVERNIGHT_HOLD_ENABLED lets
-        ride deliberately, still exitable pre/after-hours if needed), a
-        fractional position caught past this boundary has zero downside
-        protection for the rest of the day/overnight - overnight_hold_
-        symbols() doesn't know about quantity at all, so a fractional
-        position in an otherwise overnight-eligible bucket (POPULAR/
-        PENNY/DISCOVERY) would silently ride along with no way to defend
-        it.
-
-        Only closes the ones currently sitting at a profit - locking in a
-        gain before it becomes undefendable is the whole point, but a
-        loser isn't forced out just because the window is closing (it's
-        already undefendable either way, and forcing a realized loss here
-        isn't necessary the way capturing a gain is). Called from the same
-        option_closeout-to-option_close window the option EOD closeout
-        already uses.
-        """
-        now = time.monotonic()
-        if now - self.last_fractional_sweep < self.config.eod_retry_seconds:
-            return
-        self.last_fractional_sweep = now
-        try:
-            positions = self.api.positions()
-        except Exception as exc:
-            log.error("CLOSE  | fractional pre-close sweep failed | %s", exc)
-            return
-        fractional_positions = [
-            item
-            for item in positions
-            if item.get("instrument_type") == "EQUITY"
-            and self.is_fractional_quantity(Decimal(str(item.get("quantity", "0"))))
-        ]
-        if not fractional_positions:
-            return
-        profitable_symbols: set[str] = set()
-        for item in fractional_positions:
-            symbol = str(item.get("symbol", "")).upper()
-            cost = Decimal(str(item.get("cost_price") or "0"))
-            if cost <= 0:
-                continue
-            try:
-                price = self.api.quote_price(self.api.stock_quote(symbol))
-            except Exception as exc:
-                log.warning(
-                    "CLOSE  | fractional pre-close sweep | %-8s | quote "
-                    "failed, skipping this cycle | %s",
-                    symbol,
-                    exc,
-                )
-                continue
-            if price > cost:
-                profitable_symbols.add(symbol)
-        if not profitable_symbols:
-            return
-        exclude_symbols = {
-            str(item.get("symbol", "")).upper()
-            for item in positions
-            if item.get("instrument_type") == "EQUITY"
-        } - profitable_symbols
-        try:
-            submitted = self.api.close_all_positions(
-                {"EQUITY"},
-                loss_callback=self.wash_sales.block,
-                exclude_symbols=exclude_symbols,
-            )
-        except Exception as exc:
-            log.error("CLOSE  | fractional pre-close sweep failed | %s", exc)
-            return
-        self.pending_stock_exits -= profitable_symbols
-        log.info(
-            "CLOSE  | fractional pre-core-close sweep | submitted=%s | %s",
-            len(submitted),
-            ",".join(sorted(profitable_symbols)),
-        )
-
-    def close_profitable_positions_during_extended_hours(self) -> None:
-        """By request, after pre-market losses: "capturing any profits
-        to close out the day as much as possible" outside core hours -
-        proactively closes any equity position currently sitting at a
-        profit during extended hours (pre-market or after-hours),
-        instead of waiting for its normal PROFIT target or letting it
-        ride toward an overnight hold. Only ever fires outside core
-        hours (see the call site's core_session_active check) and only
-        ever closes a confirmed GAIN - same reasoning as
-        close_fractional_positions_before_core_close: locking in a
-        profit before the session gets even thinner is the point,
-        forcing a realized loss isn't.
-        """
-        now = time.monotonic()
-        if (
-            now - self.last_extended_hours_profit_sweep
-            < float(self.config.extended_hours_profit_sweep_seconds)
-        ):
-            return
-        self.last_extended_hours_profit_sweep = now
-        try:
-            positions = self.api.positions()
-        except Exception as exc:
-            log.error("CLOSE  | extended-hours profit sweep failed | %s", exc)
-            return
-        equity_positions = [
-            item
-            for item in positions
-            if item.get("instrument_type") == "EQUITY"
-            and Decimal(str(item.get("quantity", "0"))) != 0
-        ]
-        if not equity_positions:
-            return
-        profitable_symbols: set[str] = set()
-        for item in equity_positions:
-            symbol = str(item.get("symbol", "")).upper()
-            cost = Decimal(str(item.get("cost_price") or "0"))
-            if cost <= 0:
-                continue
-            # Live incident: UBER's extended-hours close order was
-            # rejected with OPENAPI_FRACT_ONLT_CORE_TIME (fractional
-            # orders are only accepted during core hours) EVERY cycle
-            # for hours straight - this function only ever runs
-            # outside core hours (see its own docstring), so a
-            # fractional-quantity position here will ALWAYS hit this
-            # same rejection, never just occasionally. Skip it outright
-            # instead of retrying a guaranteed failure every cycle;
-            # close_fractional_positions_before_core_close already
-            # handles fractional exits once core hours actually start.
-            quantity = Decimal(str(item.get("quantity", "0")))
-            if self.is_fractional_quantity(quantity):
-                if symbol not in self.extended_hours_fractional_skip_logged:
-                    self.extended_hours_fractional_skip_logged.add(symbol)
-                    log.info(
-                        "CLOSE  | extended-hours profit sweep | %-8s | "
-                        "fractional position, deferring to core hours",
-                        symbol,
-                    )
-                continue
-            try:
-                price = self.api.quote_price(self.api.stock_quote(symbol))
-            except Exception as exc:
-                log.warning(
-                    "CLOSE  | extended-hours profit sweep | %-8s | quote "
-                    "failed, skipping this cycle | %s",
-                    symbol,
-                    exc,
-                )
-                continue
-            if price > cost:
-                profitable_symbols.add(symbol)
-        if not profitable_symbols:
-            return
-        exclude_symbols = {
-            str(item.get("symbol", "")).upper() for item in equity_positions
-        } - profitable_symbols
-        try:
-            submitted = self.api.close_all_positions(
-                {"EQUITY"},
-                loss_callback=self.wash_sales.block,
-                exclude_symbols=exclude_symbols,
-            )
-        except Exception as exc:
-            log.error("CLOSE  | extended-hours profit sweep failed | %s", exc)
-            return
-        self.pending_stock_exits -= profitable_symbols
-        log.info(
-            "CLOSE  | extended-hours profit sweep | submitted=%s | %s",
-            len(submitted),
-            ",".join(sorted(profitable_symbols)),
         )
 
     def _position_protection_loop(self) -> None:
