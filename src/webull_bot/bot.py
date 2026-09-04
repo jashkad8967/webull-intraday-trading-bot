@@ -114,6 +114,9 @@ from webull_bot.trading.orders.stop_loss_confirmation import (
 )
 from webull_bot.trading.orders.ui_command_dispatch import process_ui_commands
 from webull_bot.trading.orders.watchlist import add_to_watchlist
+from webull_bot.trading.quoting.batched_quotes import _batched_quotes
+from webull_bot.trading.quoting.stall_equity_quotes import _stall_equity_quotes
+from webull_bot.trading.quoting.stall_exit_price import _stall_exit_price
 from webull_bot.trading.repricing.resting_entry_repricer import (
     reprice_resting_entries,
 )
@@ -363,6 +366,11 @@ class AutoTrader:
     # trading/orders/.
     _manual_sell = _manual_sell
     _manual_buy = _manual_buy
+    # Batched-quote helpers used across repricers and stall detection -
+    # moved out to trading/quoting/.
+    _batched_quotes = _batched_quotes
+    _stall_equity_quotes = _stall_equity_quotes
+    _stall_exit_price = _stall_exit_price
 
     def __init__(self):
         self.config = settings()
@@ -1163,50 +1171,6 @@ class AutoTrader:
                     )
                 else:
                     log.error("CANCEL | id=%s | %s", order_id, exc)
-
-    def _batched_quotes(self, symbols: list[str]) -> dict[str, dict]:
-        """One (or a few, split by category) batched snapshot call for
-        multiple symbols, instead of a caller looping and calling
-        self.api.stock_quote(symbol) once per symbol. Each individual
-        call is a full separate network round-trip - with several
-        repricers/sweeps each doing this once per open position or
-        working order, every single main-loop cycle, this was a real
-        contributor to cycles taking far longer than poll_seconds (live
-        evidence: ~40s between scan cycles despite a 0.25s poll target).
-
-        Grouped by category (stock_quotes requires one category per
-        call) and capped at WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS per
-        group. A group's failure only drops that group's symbols from
-        the result - callers already treat a missing symbol as "no
-        quote yet, try again next cycle," the same as any other quote
-        failure.
-        """
-        unique_symbols = list(dict.fromkeys(symbols))
-        if not unique_symbols:
-            return {}
-        by_category: dict[str, list[str]] = defaultdict(list)
-        for symbol in unique_symbols:
-            by_category[self.stock_categories.get(symbol, "US_STOCK")].append(symbol)
-        quotes: dict[str, dict] = {}
-        for category, group in by_category.items():
-            for start in range(0, len(group), WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS):
-                chunk = group[start : start + WebullAPI.STOCK_SNAPSHOT_MAX_SYMBOLS]
-                try:
-                    fetched, _invalid = self.api.stock_quotes_resilient(
-                        chunk, category
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "REPRICE| batched quote fetch failed | %s | %s",
-                        ",".join(chunk),
-                        exc,
-                    )
-                    continue
-                for quote in fetched:
-                    symbol = str(quote.get("symbol", "")).upper()
-                    if symbol:
-                        quotes[symbol] = quote
-        return quotes
 
     def evaluate_held_stock_exits(self) -> None:
         """By request: "we want entry and profit to be quicker." Detects
@@ -4798,159 +4762,6 @@ class AutoTrader:
                     continue
                 log.error("OPTION | %s | %s", option_symbol, exc)
         return buying_power
-
-    def _stall_equity_quotes(
-        self,
-        positions: list[dict],
-        core_session_active: bool,
-        stall_seconds: float,
-        now: float,
-    ) -> dict[str, dict]:
-        """Batch-fetches quotes for every EQUITY position that clears the
-        cheap stall-eligibility checks, instead of boost_stalled_positions
-        calling api.stock_quote(symbol) one at a time inside its loop.
-        stock_quote() with no category does its OWN per-symbol category
-        lookup plus its own single-symbol quote fetch - two API calls
-        each - so a held-position count in the teens meant dozens of
-        sequential, individually rate-limited round trips blocking this
-        entire single-threaded loop for minutes at a stretch, right when
-        the per-symbol stall check (see boost_stalled_positions) started
-        actually reaching this code instead of bailing out early.
-        """
-        candidates = []
-        for position in positions:
-            if position.get("instrument_type") != "EQUITY":
-                continue
-            quantity = Decimal(str(position.get("quantity", "0")))
-            if quantity <= 0:
-                continue
-            if Decimal(str(position.get("cost_price") or "0")) <= 0:
-                continue
-            symbol = str(position.get("symbol", "")).upper()
-            if symbol in self.pending_stock_exits:
-                continue
-            key = f"STOCK:{symbol}"
-            if not self.cooldown_ready(key):
-                continue
-            if now - self.last_trade.get(key, 0.0) < stall_seconds:
-                continue
-            if self.is_fractional_quantity(quantity) and not core_session_active:
-                continue
-            candidates.append(symbol)
-        if not candidates:
-            return {}
-        by_category: dict[str, list[str]] = defaultdict(list)
-        for symbol in candidates:
-            by_category[self.stock_categories.get(symbol, "US_STOCK")].append(symbol)
-        quote_by_symbol: dict[str, dict] = {}
-        for category, symbols in by_category.items():
-            try:
-                quotes, _ = self.api.stock_quotes_resilient(symbols, category)
-            except Exception as exc:
-                log.error(
-                    "STALL  | batch quote fetch failed | %s | %s",
-                    category,
-                    exc,
-                )
-                continue
-            for quote in quotes:
-                quote_by_symbol[str(quote.get("symbol", "")).upper()] = quote
-        return quote_by_symbol
-
-    def _stall_exit_price(
-        self,
-        quote: dict,
-        average_cost: Decimal,
-        min_profit: Decimal,
-        fee_per_share: Decimal,
-        max_spread_percent: Decimal | None = None,
-    ) -> Decimal | None:
-        """Pick the best available green exit price for a stalled position.
-
-        Prefers the bid (fills immediately) whenever it alone clears cost +
-        min_profit + fee. If the bid doesn't clear but the ask (top of the
-        spread) does, rest a passive limit there instead of giving up - a
-        stalled position sitting inside the spread shouldn't be abandoned
-        just because the aggressive/immediate price isn't green yet. Never
-        prices below cost + min_profit + fee on either side, so this can
-        only ever produce a genuinely profitable exit or no exit at all.
-
-        max_spread_percent defaults to stock_entry_max_spread_percent (the
-        stall-breaker's own long-standing bound, tuned for a quote-glitch
-        on an otherwise normal, liquid stock - see the TBB incident
-        below). Callers whose positions are deliberately choppy/wide-
-        spread by their own selection criterion (the volatility-scalp
-        cohort) should pass a wider bound explicitly - live incident:
-        GAUZ routinely quoted 2-7% spreads (its normal character, not a
-        glitch), so the 0.50% default meant the ask-fallback almost
-        never fired, exits depended entirely on the bid alone clearing
-        cost, and the strategy kept averaging into new dip-buys (a much
-        looser bar) far faster than it could ever exit.
-        """
-        if max_spread_percent is None:
-            max_spread_percent = self.config.stock_entry_max_spread_percent
-        floor = average_cost + min_profit + fee_per_share
-        bid = self.api.quote_bid(quote)
-        if bid is not None:
-            # By request: these smaller/cheaper stocks have real
-            # sub-penny precision (a live quote showed bid=0.4592) -
-            # quantizing to a flat cent throws away real value on
-            # exactly the stocks where a cent is a meaningful fraction
-            # of the price. See WebullAPI.price_tick_size.
-            sell_price = bid.quantize(
-                self.api.price_tick_size(bid), rounding=ROUND_DOWN
-            )
-            if sell_price >= floor:
-                return sell_price
-        ask = self.api.quote_ask(quote)
-        if ask is not None:
-            # A resting limit at the ask only has a realistic chance of
-            # filling if the spread itself is reasonably tight - the same
-            # bound entries are already held to (entry_spread_ok). On a
-            # thin/illiquid name with an artificially wide quoted spread,
-            # the ask can sit far above where the stock is actually
-            # trading (live incident: TBB quoted bid=19.39/ask=19.89 while
-            # prints were at 19.41) - resting there submits an order that
-            # can never fill, times out, and gets resubmitted at the
-            # identical unreachable price every stall cycle, forever.
-            # Skip the fallback entirely in that case and wait for the
-            # spread to normalize instead of spinning on a doomed order.
-            if bid is not None and bid > 0:
-                spread_percent = (ask - bid) / bid * 100
-                if spread_percent > max_spread_percent:
-                    return None
-            sell_price = ask.quantize(
-                self.api.price_tick_size(ask), rounding=ROUND_DOWN
-            )
-            # By request: "you cannot always go to the top of the spread
-            # when it is big, you must ask a reasonable price, not too
-            # far from the last [trade]." Even within max_spread_percent,
-            # the raw ask can still sit meaningfully far from where the
-            # stock is actually trading on a genuinely wide (not just
-            # glitchy) spread - the exact TBB pattern above, just not
-            # extreme enough to trip the spread-sanity skip entirely.
-            # Caps the fallback at half the allowed spread's distance
-            # above the last print instead of the literal ask, so a big
-            # spread means "rest closer to reality," not "chase the far
-            # edge of the book."
-            try:
-                last_price = self.api.quote_price(quote)
-            except Exception:
-                last_price = None
-            if last_price and last_price > 0:
-                reasonable_cap = last_price * (
-                    Decimal("1") + max_spread_percent / Decimal("200")
-                )
-                sell_price = min(
-                    sell_price,
-                    reasonable_cap.quantize(
-                        self.api.price_tick_size(reasonable_cap),
-                        rounding=ROUND_DOWN,
-                    ),
-                )
-            if sell_price >= floor:
-                return sell_price
-        return None
 
     def boost_stalled_positions(
         self,
