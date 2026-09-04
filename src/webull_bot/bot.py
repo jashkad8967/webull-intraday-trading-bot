@@ -46,6 +46,7 @@ from webull_bot.trade_events import TradeEventStreamService
 from webull_bot.trading.broker_conflict_check import _broker_conflict
 from webull_bot.trading.broker_conflict_handler import handle_broker_conflict
 from webull_bot.trading.clock import is_trading_day, now, session_moment
+from webull_bot.trading.compact_number import _compact_number
 from webull_bot.trading.concurrent_dispatch import (
     _POSITION_PROTECTION_MAX_WORKERS,
     _dispatch_concurrently,
@@ -65,6 +66,8 @@ from webull_bot.trading.fractional_trading_handler import (
 )
 from webull_bot.trading.locks import _rekey_working_order, _working_orders_lock
 from webull_bot.trading.manual_touch import _manual_touch_active
+from webull_bot.trading.market_pulse_entries import _market_pulse_entries
+from webull_bot.trading.pairs_symbol_exclusion import exclude_pairs_symbols
 from webull_bot.trading.rate_limit_retry import (
     _is_rate_limited,
     _retry_once_on_rate_limit,
@@ -75,6 +78,10 @@ from webull_bot.trading.scalp_position_exposure import (
 )
 from webull_bot.trading.scalp_reentry import volatility_scalp_reentry_ready
 from webull_bot.trading.scalp_total_exposure import volatility_scalp_total_exposure_ok
+from webull_bot.trading.screener_market_pulse_active import safe_market_pulse_active
+from webull_bot.trading.screener_premarket_gainers import safe_premarket_gainers
+from webull_bot.trading.screener_top_gainers import safe_top_gainers
+from webull_bot.trading.screener_top_losers import safe_top_losers
 from webull_bot.trading.short_selling_handler import handle_short_selling_unsupported
 from webull_bot.trading.stop_loss_confirmation import (
     stop_loss_confirmed,
@@ -198,6 +205,15 @@ class AutoTrader:
     volatility_scalp_reentry_ready = volatility_scalp_reentry_ready
     volatility_scalp_position_value_ok = volatility_scalp_position_value_ok
     volatility_scalp_total_exposure_ok = volatility_scalp_total_exposure_ok
+    # Pairs-symbol exclusion, screener safety wrappers, and small number/
+    # formatting helpers - moved out to trading/*.py, one function per file.
+    exclude_pairs_symbols = staticmethod(exclude_pairs_symbols)
+    safe_top_gainers = safe_top_gainers
+    safe_premarket_gainers = safe_premarket_gainers
+    safe_top_losers = safe_top_losers
+    safe_market_pulse_active = safe_market_pulse_active
+    _market_pulse_entries = staticmethod(_market_pulse_entries)
+    _compact_number = staticmethod(_compact_number)
 
     def __init__(self):
         self.config = settings()
@@ -774,84 +790,6 @@ class AutoTrader:
             )
             filtered = list(dict.fromkeys(reinstated + filtered))
         return filtered
-
-    @staticmethod
-    def exclude_pairs_symbols(symbols: list[str]) -> tuple[list[str], list[str]]:
-        """A pairs leg can be short (a negative broker-reported quantity),
-        and stock_decision treats any non-positive quantity as "flat,
-        eligible to BUY" - left in the main scan, the EMA/OBI strategy would
-        try to buy into a position trade_pairs is deliberately holding
-        short.
-        """
-        pairs_symbols = {symbol for pair in PAIRS for symbol in pair}
-        if not pairs_symbols:
-            return symbols, []
-        excluded = [symbol for symbol in symbols if symbol in pairs_symbols]
-        if not excluded:
-            return symbols, []
-        remaining = [symbol for symbol in symbols if symbol not in pairs_symbols]
-        return remaining, excluded
-
-    def safe_top_gainers(self, limit: int, page_size: int) -> dict[str, dict]:
-        """top_gainers() hits a live Webull endpoint during the once-daily
-        universe rebuild; a screener hiccup here must never be allowed to
-        crash the whole trading loop, so failures are logged and treated as
-        "no gainers this cycle" instead of propagating.
-        """
-        try:
-            return self.api.top_gainers(limit, page_size)
-        except Exception as exc:
-            log.warning("LOAD   | top-gainers screener failed this cycle | %s", exc)
-            return {}
-
-    def safe_premarket_gainers(self, limit: int, page_size: int) -> dict[str, dict]:
-        """Same screener as safe_top_gainers, but Webull's own
-        rank_type="PRE_MARKET" (today's biggest movers in the
-        pre-market session specifically) instead of the default
-        DAY_1/regular-session ranking safe_top_gainers already feeds
-        into the daily universe rebuild - see refresh_premarket_
-        gainers. A screener hiccup here must never crash the trading
-        loop either.
-        """
-        try:
-            return self.api.top_gainers(limit, page_size, rank_type="PRE_MARKET")
-        except Exception as exc:
-            log.warning(
-                "LOAD   | pre-market gainers screener failed | %s", exc
-            )
-            return {}
-
-    def safe_top_losers(self, limit: int, page_size: int) -> dict[str, dict]:
-        try:
-            return self.api.top_losers(limit, page_size)
-        except Exception as exc:
-            log.warning("LOAD   | top-losers screener failed this cycle | %s", exc)
-            return {}
-
-    def safe_market_pulse_active(self, limit: int, page_size: int) -> dict[str, dict]:
-        """Distinct from safe_top_active_stocks: that method's failure
-        fallback is the prior day's whole trading universe (right for a
-        once-daily universe rebuild), which would blow up market_pulse's
-        small-fixed-size guarantee. This falls back to empty instead.
-        """
-        try:
-            return self.api.top_active_stocks(limit, page_size)
-        except Exception as exc:
-            log.warning("LOAD   | most-active screener failed this cycle | %s", exc)
-            return {}
-
-    @staticmethod
-    def _market_pulse_entries(data: dict[str, dict]) -> list[dict]:
-        return [
-            {
-                "symbol": symbol,
-                "chg": AutoTrader._compact_number(
-                    item.get("change_ratio", 0) * 100, 2
-                ),
-                "vol": AutoTrader._compact_number(item.get("volume", 0)),
-            }
-            for symbol, item in data.items()
-        ]
 
     def refresh_market_pulse(self) -> None:
         """Small, fixed-size, fully deterministic market context (Webull's
@@ -2997,17 +2935,6 @@ class AutoTrader:
             },
             force=force,
         )
-
-    @staticmethod
-    def _compact_number(value, digits: int | None = None):
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return 0
-        if digits is None:
-            return int(number) if number == int(number) else round(number, 4)
-        rounded = round(number, digits)
-        return int(rounded) if digits == 0 else rounded
 
     def stop_loss_guard_active(self) -> bool:
         """freqtrade-style StoplossGuard: pause NEW entries (stock and
