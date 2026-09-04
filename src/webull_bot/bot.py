@@ -43,6 +43,15 @@ from webull_bot.strategy import (
     TradingStrategy,
 )
 from webull_bot.trade_events import TradeEventStreamService
+from webull_bot.trading.guards.daily_loss_breaker import handle_daily_loss_breaker
+from webull_bot.trading.guards.order_error_guard import (
+    CONSECUTIVE_ORDER_ERROR_LIMIT,
+    ORDER_ERROR_WINDOW_SECONDS,
+    record_order_error,
+)
+from webull_bot.trading.guards.portfolio_circuit_breaker import (
+    handle_portfolio_circuit_breaker,
+)
 from webull_bot.trading.guards.post_stop_reentry import post_stop_reentry_ready
 from webull_bot.trading.guards.price_sanity import (
     price_sanity_cooldown_ready,
@@ -203,8 +212,6 @@ ICEBERG_SLICE_INTERVAL_SECONDS = 3
 
 # Automated risk guardrails.
 HARD_ORDER_NOTIONAL_CEILING = Decimal("2000")
-CONSECUTIVE_ORDER_ERROR_LIMIT = 5
-ORDER_ERROR_WINDOW_SECONDS = 60
 # Webull's own hard minimum account equity for short selling
 # (OAUTH_OPENAPI_NEW_NO_POSITION_MARGIN_ACCOUNT_CAN_NOT_SELL_SHORT_FOR_LT_2K)
 # - see AutoTrader.account_state's proactive check, which disables short
@@ -330,6 +337,10 @@ class AutoTrader:
     refresh_multi_day_momentum = refresh_multi_day_momentum
     seed_volatility_windows = seed_volatility_windows
     select_volatility_scalp_symbols = select_volatility_scalp_symbols
+    # Circuit-breaker guards - moved out to trading/guards/.
+    handle_portfolio_circuit_breaker = handle_portfolio_circuit_breaker
+    handle_daily_loss_breaker = handle_daily_loss_breaker
+    record_order_error = record_order_error
 
     def __init__(self):
         self.config = settings()
@@ -2217,181 +2228,6 @@ class AutoTrader:
             },
             force=force,
         )
-
-    def handle_portfolio_circuit_breaker(
-        self,
-        positions: list[dict],
-        buying_power: Decimal,
-    ) -> bool:
-        if not self.config.loss_circuit_breaker_enabled:
-            return False
-
-        now = time.monotonic()
-        if self.entries_paused:
-            old_enough = (
-                now - self.circuit_breaker_time
-                >= self.config.loss_reevaluation_seconds
-            )
-            if old_enough:
-                self.entries_paused = False
-                log.warning(
-                    "CIRCUIT | resumed after %ss reevaluation pause",
-                    self.config.loss_reevaluation_seconds,
-                )
-                return False
-            if (
-                self.market_agent
-                and now - self.last_circuit_research
-                >= self.config.loss_reevaluation_seconds
-            ):
-                self.last_circuit_research = now
-                self.submit_strategy_review(
-                    positions,
-                    buying_power,
-                    force=True,
-                    event="POST_LIQUIDATION_REEVALUATION",
-                )
-            return True
-
-        states = []
-        for position in positions:
-            if Decimal(str(position.get("quantity", "0"))) == 0:
-                continue
-            symbol = str(position.get("symbol", "")).upper()
-            states.append(
-                {
-                    "symbol": symbol,
-                    "unrealized_pnl": self.strategy.position_unrealized_pnl(
-                        position
-                    ),
-                }
-            )
-        decision = self.strategy.portfolio_decision(
-            states,
-            self.config.loss_spree_position_count,
-            self.config.loss_spree_total_dollars,
-        )
-        if decision.action != "LIQUIDATE":
-            return False
-
-        log.critical(
-            "CIRCUIT | LIQUIDATE | losers=%s | loss=$%.2f | %s",
-            decision.losing_positions,
-            decision.total_loss,
-            decision.reason,
-        )
-        submitted = self.api.close_all_positions(
-            loss_callback=self.wash_sales.block,
-        )
-        log.warning("CIRCUIT | close orders submitted=%s | entries paused", len(submitted))
-        self.entries_paused = True
-        self.circuit_breaker_time = now
-        self.last_circuit_research = now
-        self.last_account_refresh = 0.0
-        self.submit_strategy_review(
-            positions,
-            buying_power,
-            force=True,
-            event="LOSS_CIRCUIT_BREAKER_LIQUIDATION",
-        )
-        return True
-
-    def handle_daily_loss_breaker(self) -> bool:
-        """Halt entries for the rest of the day once realized stop-loss
-        exits alone (not counting the expected EOD closeout) add up past
-        daily_max_loss_fraction of account equity. The per-position stop
-        already bounds any single loss; this bounds how many of those a
-        bad day can rack up before the bot stops opening new positions.
-
-        By request, after finding this circuit breaker disabled both by
-        code default and on the live host: enabled by default now, and
-        the threshold is a fraction of account equity (the researched
-        3-5% daily-drawdown convention) instead of a flat dollar amount
-        that doesn't scale with account size - $50 used to be 25% of
-        this account's equity, nowhere near a real daily limit. Falls
-        back to daily_realized_loss never tripping (rather than raising)
-        if account value isn't cached yet - same "no data -> don't
-        block" convention as every other gate, applied to a circuit
-        breaker's own inputs.
-        """
-        if not self.config.daily_loss_circuit_breaker_enabled:
-            return False
-        if self.daily_loss_breaker_triggered:
-            return True
-        if not self.cached_account_value or self.cached_account_value <= 0:
-            return False
-        max_loss_dollars = (
-            self.cached_account_value * self.config.daily_max_loss_fraction
-        )
-        if self.daily_realized_loss < max_loss_dollars:
-            return False
-        log.critical(
-            "CIRCUIT | DAILY LOSS LIMIT | realized=$%.2f >= limit=$%.2f "
-            "(%.0f%% of $%.2f equity) | halting new entries for the "
-            "rest of the trading day",
-            self.daily_realized_loss,
-            max_loss_dollars,
-            self.config.daily_max_loss_fraction * 100,
-            self.cached_account_value,
-        )
-        submitted = self.api.close_all_positions(loss_callback=self.wash_sales.block)
-        log.warning(
-            "CIRCUIT | close orders submitted=%s | entries halted until "
-            "tomorrow's session",
-            len(submitted),
-        )
-        self.daily_loss_breaker_triggered = True
-        self.last_account_refresh = 0.0
-        return True
-
-    def record_order_error(self, symbol: str, exc: Exception) -> None:
-        """Order-error guard: distinct from the existing P&L-based circuit
-        breakers (daily-loss, loss-spree) because it fires on *error
-        rate*, not realized loss - the guard against a rogue loop or a
-        systematically broken order path (bad auth, malformed payload,
-        API outage) spinning through the whole symbol universe before any
-        single trade even fills.
-
-        Blacklists only the offending symbol (reusing
-        broker_conflict_symbols - every entry path already skips symbols
-        in that set), not the whole account. This used to trip a global
-        kill switch that halted every symbol's entries AND exits until
-        the process was restarted - in production, a single symbol stuck
-        in a broker-side rejection (e.g. Webull's $0.10-$0.999 lot-size
-        rule) repeatedly tripped this and froze the entire bot for the
-        rest of the session over a problem confined to one symbol. The
-        error-rate counter itself stays global (still the right signal
-        for "something is systematically broken," e.g. bad auth spamming
-        errors across many different symbols), but the consequence is now
-        scoped to whichever symbol actually caused it.
-        """
-        now = time.monotonic()
-        self.order_error_times.append(now)
-        while (
-            self.order_error_times
-            and now - self.order_error_times[0] > ORDER_ERROR_WINDOW_SECONDS
-        ):
-            self.order_error_times.popleft()
-        if len(self.order_error_times) >= CONSECUTIVE_ORDER_ERROR_LIMIT:
-            self.order_error_times.clear()
-            already_blacklisted = symbol in self.broker_conflict_symbols
-            self.broker_conflict_symbols.add(symbol)
-            self.pending_stock_exits.discard(symbol)
-            self.pending_option_exits.discard(symbol)
-            self.stop_exit_submitted.pop(symbol, None)
-            self.stop_loss_escalated.discard(symbol)
-            self.stop_condition_since.pop(symbol, None)
-            if not already_blacklisted:
-                log.critical(
-                    "GUARD  | %s order errors in %ss (last: %s | %s) | "
-                    "blacklisting %s from further automated action for "
-                    "the rest of the day - other symbols are unaffected",
-                    CONSECUTIVE_ORDER_ERROR_LIMIT,
-                    ORDER_ERROR_WINDOW_SECONDS,
-                    symbol,
-                    exc,
-                    symbol,
-                )
 
     def place_stock_scaled(
         self,
