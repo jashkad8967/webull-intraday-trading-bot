@@ -10621,7 +10621,7 @@ class OvernightHoldTests(unittest.TestCase):
         self.assertEqual(held, {"AAPL"})
 
     def test_overnight_hold_disabled_returns_empty_set(self):
-        import webull_bot.trading.overnight_hold as overnight_hold_module
+        import webull_bot.trading.universe.overnight_hold as overnight_hold_module
         from webull_bot.bot import AutoTrader
 
         fake_bot = SimpleNamespace(
