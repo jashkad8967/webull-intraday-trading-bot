@@ -28,6 +28,7 @@ from webull_bot.pairs import (
     PairsStrategy,
 )
 from webull_bot.risk.entry_blackout import fresh_entry_blackout_active
+from webull_bot.risk.options_priority_window import options_priority_window_active
 from webull_bot.risk.profit_target_multiplier import profit_target_multiplier
 from webull_bot.risk.stop_tighten_multiplier import stop_tighten_multiplier
 from webull_bot.sizing.diversification_budget import (
@@ -271,6 +272,7 @@ class AutoTrader:
         diversification_capped_entry_budget
     )
     fresh_entry_blackout_active = staticmethod(fresh_entry_blackout_active)
+    options_priority_window_active = staticmethod(options_priority_window_active)
     max_fractional_position_slots = staticmethod(max_fractional_position_slots)
     profit_target_multiplier = staticmethod(profit_target_multiplier)
     stop_tighten_multiplier = staticmethod(stop_tighten_multiplier)
@@ -1328,6 +1330,27 @@ class AutoTrader:
             minutes_until_close,
             float(self.config.stock_entry_blackout_minutes_before_close),
             core_session_active,
+        )
+        # By request: "keep it separate, all the bp should be for
+        # option, then at 9am cst whatever is remaining can be used
+        # for stocks." Same fresh-entries-only scope as the blackout
+        # above (reuses the same fresh_entry_blackout_active gate at
+        # every one of its existing call sites below) - blocks new
+        # stock positions from claiming equity/margin during the
+        # first stock_entry_options_priority_minutes of the session,
+        # so options get first crack at the account's buying power
+        # before stocks start consuming any of it.
+        option_open_moment = self.session_moment(
+            moment, self.config.option_market_open_time
+        )
+        minutes_since_open = (moment - option_open_moment).total_seconds() / 60
+        fresh_entry_blackout_active = (
+            fresh_entry_blackout_active
+            or self.options_priority_window_active(
+                minutes_since_open,
+                float(self.config.stock_entry_options_priority_minutes),
+                core_session_active,
+            )
         )
         # By request: "start transitioning away from core hours
         # strategy around 30 minutes before end of core hours." Softer

@@ -1,7 +1,12 @@
-# Symbols carry a position past EOD_CLOSE_TIME instead of always
-# flattening, unless their bucket is in ALWAYS_FLATTEN_BUCKETS (pairs
-# legs - that strategy is intraday-only by design).
-OVERNIGHT_HOLD_ENABLED = True
+# By request: "before eod sell all and make sure for tuesday there is
+# enough option bp, keep it separate, in fact all the bp should be for
+# option." Every stock position (not just pairs legs) now always
+# flattens at EOD_CLOSE_TIME instead of certain buckets riding
+# overnight - closing everything out maximizes the account's free
+# equity (and therefore next session's real option buying power,
+# which is net equity minus margin held for open positions - see
+# account_state) going into the next trading day.
+OVERNIGHT_HOLD_ENABLED = False
 ALWAYS_FLATTEN_BUCKETS = frozenset({"PAIRS_LONG", "PAIRS_SHORT"})
 
 
