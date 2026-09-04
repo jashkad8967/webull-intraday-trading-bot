@@ -3,7 +3,6 @@ import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from zoneinfo import ZoneInfo
@@ -44,6 +43,24 @@ from webull_bot.strategy import (
     TradingStrategy,
 )
 from webull_bot.trade_events import TradeEventStreamService
+from webull_bot.trading.broker_conflict_check import _broker_conflict
+from webull_bot.trading.clock import is_trading_day, now, session_moment
+from webull_bot.trading.concurrent_dispatch import (
+    _POSITION_PROTECTION_MAX_WORKERS,
+    _dispatch_concurrently,
+)
+from webull_bot.trading.cooldowns import (
+    cooldown_ready,
+    has_pending_buy_order,
+    rate_capped,
+    reentry_cooldown_ready,
+)
+from webull_bot.trading.locks import _rekey_working_order, _working_orders_lock
+from webull_bot.trading.manual_touch import _manual_touch_active
+from webull_bot.trading.rate_limit_retry import (
+    _is_rate_limited,
+    _retry_once_on_rate_limit,
+)
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import (
     MarketDataPermissionError,
@@ -106,151 +123,6 @@ ALWAYS_FLATTEN_BUCKETS = frozenset({"PAIRS_LONG", "PAIRS_SHORT"})
 MARKET_PULSE_REFRESH_SECONDS = 120
 
 
-def _working_orders_lock(bot) -> object:
-    """getattr fallback (module-level, not a self-method - see below)
-    so working_orders touches can be locked without breaking the many
-    existing unit tests that bind an AutoTrader method directly onto a
-    bare SimpleNamespace fixture (AutoTrader.foo.__get__(fake_bot)).
-    A self-method here would itself need to be looked up as
-    self._working_orders_lock, which fails on a fixture that never
-    bound it - a plain module-level function taking bot as an argument
-    has no such requirement. Falls back to a no-op context manager
-    when bot has no working_orders_lock attribute at all (every
-    existing test fixture), so those tests run unchanged, single-
-    threaded, with no behavior change - only the real AutoTrader
-    (which sets a real threading.Lock in __init__) actually
-    serializes against the position-protection thread (see
-    AutoTrader._position_protection_loop).
-    """
-    lock = getattr(bot, "working_orders_lock", None)
-    return lock if lock is not None else nullcontext()
-
-
-def _rekey_working_order(bot, old_order_id: str, new_order_id: str, entry: dict) -> None:
-    """Swaps a cancel-and-replace repricer's working_orders entry
-    atomically under the lock - every repricer (reprice_resting_
-    exits/entries, reprice_volatility_scalp_exits/entries) does this
-    exact pop-old/set-new pair, and each one needs it locked now that
-    the position-protection thread runs concurrently with record_trade
-    on the main thread. Module-level for the same test-fixture-
-    compatibility reason as _working_orders_lock above.
-    """
-    with _working_orders_lock(bot):
-        bot.working_orders.pop(old_order_id, None)
-        bot.working_orders[new_order_id] = entry
-
-
-def _manual_touch_active(bot, symbol: str) -> bool:
-    """By request: "when i touch a stock stop doing anything with it
-    while i am there." Module-level, not a self-method, for the same
-    test-fixture-compatibility reason as _working_orders_lock above -
-    every repricer/escalation call site calls this on `bot`, which in
-    many existing tests is a bare SimpleNamespace with only one method
-    bound via .__get__, not a real AutoTrader. getattr defaults to "no
-    touch recorded" (False) when the fixture never set manual_touch_at
-    at all, so every existing test keeps its original behavior
-    unchanged - only a real AutoTrader (which does set manual_touch_at
-    in __init__ and stamps it in record_trade) actually pauses.
-    """
-    touched_at = getattr(bot, "manual_touch_at", {}).get(symbol)
-    if touched_at is None:
-        return False
-    pause_seconds = float(
-        getattr(bot.config, "manual_touch_pause_seconds", 300)
-    )
-    return time.monotonic() - touched_at < pause_seconds
-
-
-def _broker_conflict(bot, symbol: str) -> bool:
-    """True once a broker-side "position reverse" conflict has been
-    flagged for symbol (see is_symbol_broker_conflict/CONFLICT log
-    lines) - broker_conflict_symbols is documented (see its __init__
-    comment) as skipping a symbol's exit management entirely, not just
-    entries, but the fast-loop functions added today (evaluate_held_
-    stock_exits, reprice_resting_exits, reprice_volatility_scalp_exits,
-    escalate_stalled_stop_losses) never checked it - only the slow
-    loop did. Live incident: PETZ got flagged CONFLICT at 11:40:06,
-    then the fast loop kept trying to act on it anyway a minute later,
-    hitting OPENAPI_NEW_NO_POSITION...CAN_NOT_SELL_SHORT three times in
-    a row. Module-level, not a self-method, for the same test-fixture-
-    compatibility reason as _manual_touch_active above - getattr
-    defaults to "no conflict" (False) when a fixture never set
-    broker_conflict_symbols at all.
-    """
-    return symbol in getattr(bot, "broker_conflict_symbols", set())
-
-
-def _is_rate_limited(exc: Exception) -> bool:
-    """True for Webull's 429 TOO_MANY_REQUESTS rejection - live evidence
-    this session: CLOSE (fractional pre-close sweep) and RECON (order
-    history reconciliation) both hit it right after a restart's initial
-    burst of setup calls.
-    """
-    text = str(exc).upper()
-    return "429" in text or "TOO_MANY_REQUESTS" in text
-
-
-def _retry_once_on_rate_limit(fn, *args, delay: float = 0.3, **kwargs):
-    """By request: "if there is any 429, make sure to refire that order
-    asap" - a single quick retry (not an unbounded loop, which would
-    itself contribute to the rate limit it's trying to recover from)
-    after a brief pause, specifically for the order-placement/
-    cancellation calls in the position-protection loop where a missed
-    action costs real money/opportunity (unlike a quote/position
-    lookup, which already fails soft and just retries next cycle
-    regardless). Re-raises whatever the second attempt raises (a non-
-    429 exception immediately, or the 429 again after the one retry) -
-    callers keep their own existing try/except handling unchanged.
-    """
-    try:
-        return fn(*args, **kwargs)
-    except Exception as exc:
-        if not _is_rate_limited(exc):
-            raise
-        time.sleep(delay)
-        return fn(*args, **kwargs)
-
-
-# By request: "do not wait for the response to fire another request" -
-# scoped to the position-protection loop only (not the universe scan,
-# which already hit live 429 TOO_MANY_REQUESTS rate-limit errors - see
-# the CLOSE/RECON incidents this same session). Each repricer's per-
-# candidate cancel+place (and stock_position lookup) previously ran
-# ONE order at a time, each waiting out a full network round-trip
-# before the next candidate's requests even started - with N stale
-# orders needing action in the same cycle, that's N sequential round-
-# trips instead of ~1. Bounded worker count (not unbounded) so a cycle
-# with many candidates still can't multiply the account's real request
-# rate past what a human clicking through the same N actions by hand
-# would generate.
-_POSITION_PROTECTION_MAX_WORKERS = 4
-
-
-def _dispatch_concurrently(items: list, worker) -> None:
-    """Runs worker(item) for every item without waiting for one to
-    finish before starting the next (bounded by
-    _POSITION_PROTECTION_MAX_WORKERS) - worker is expected to handle
-    its own exceptions internally (every caller's per-candidate body
-    already does, via its own try/except), same as the sequential
-    for-loop this replaces. A single item's exception here would
-    otherwise only surface (and stop the whole batch) when its future
-    is collected - re-raising defeats "one bad candidate shouldn't
-    block the rest," so any exception a worker doesn't catch itself is
-    logged and swallowed here instead.
-    """
-    if not items:
-        return
-    with ThreadPoolExecutor(
-        max_workers=min(_POSITION_PROTECTION_MAX_WORKERS, len(items))
-    ) as pool:
-        futures = [pool.submit(worker, item) for item in items]
-        for future in futures:
-            try:
-                future.result()
-            except Exception as exc:  # pragma: no cover - workers self-handle
-                log.error("PROTECT| concurrent dispatch worker failed | %s", exc)
-
-
 class AutoTrader:
     # Pure Webull-error classifiers and the fractional-quantity check -
     # moved out to their own single-purpose files under errors/ and
@@ -276,6 +148,19 @@ class AutoTrader:
     max_fractional_position_slots = staticmethod(max_fractional_position_slots)
     profit_target_multiplier = staticmethod(profit_target_multiplier)
     stop_tighten_multiplier = staticmethod(stop_tighten_multiplier)
+    # These take self (they read config/instance state), so they're
+    # assigned directly - not staticmethod-wrapped - which is enough
+    # for Python's normal descriptor protocol to bind them as regular
+    # instance methods, same as if they'd been defined in the class
+    # body directly. Moved out to trading/ (see each file's own
+    # docstring).
+    now = now
+    is_trading_day = is_trading_day
+    session_moment = session_moment
+    cooldown_ready = cooldown_ready
+    reentry_cooldown_ready = reentry_cooldown_ready
+    rate_capped = rate_capped
+    has_pending_buy_order = has_pending_buy_order
 
     def __init__(self):
         self.config = settings()
@@ -637,22 +522,6 @@ class AutoTrader:
         self.pairs = PairsStrategy()
         self.pairs_positions: dict[tuple[str, str], dict] = {}
         self.last_pairs_sample = 0.0
-
-    def now(self) -> datetime:
-        return datetime.now(self.timezone)
-
-    def is_trading_day(self, moment: datetime) -> bool:
-        return (
-            moment.weekday() < 5
-            and moment.date().isoformat() not in self.config.holidays()
-        )
-
-    def session_moment(self, moment: datetime, value: str) -> datetime:
-        return datetime.combine(
-            moment.date(),
-            self.config.session_time(value),
-            tzinfo=self.timezone,
-        )
 
     def filter_by_historical_volatility(self, symbols: list[str]) -> list[str]:
         if (
@@ -1521,10 +1390,6 @@ class AutoTrader:
                         exc,
                     )
 
-    def cooldown_ready(self, key: str) -> bool:
-        elapsed = time.monotonic() - self.last_trade.get(key, float("-inf"))
-        return elapsed >= float(self.config.trade_cooldown_seconds)
-
     @staticmethod
     def cap_batch_to_snapshot_limit(
         batch: list[str],
@@ -1553,28 +1418,6 @@ class AutoTrader:
         room = max(0, limit - len(prioritized))
         return prioritized + rest[:room]
 
-    def has_pending_buy_order(self, key: str) -> bool:
-        """True while an uncancelled BUY order for this key is still
-        resting in self.working_orders - independent of the account's
-        own (up to ACCOUNT_REFRESH_SECONDS-stale) position snapshot,
-        which still reads "flat" (quantity 0) the entire time a BUY
-        order hasn't filled yet. Live incident: without this, the
-        volatility-scalp fresh-entry gate's only guard against
-        double-buying (self.volatility_scalp_positions) was being wiped
-        every single cycle by the quantity == 0 cleanup while a resting
-        order was still live, stacking repeated duplicate BUY orders
-        for the same symbol (MTNB: 5 orders in ~70s, same price, no
-        fill or cancel in between) with no cooldown left to stop it.
-        """
-        with _working_orders_lock(self):
-            orders = list(self.working_orders.values())
-        return any(
-            order.get("key") == key
-            and order.get("action") == "BUY"
-            and order.get("cancel_requested_at") is None
-            for order in orders
-        )
-
     def volatility_scalp_entry_price(self, quote: dict) -> Decimal | None:
         """Aggressive, cross-the-spread BUY price for the volatility-
         scalp cohort - by request: "a lot of the orders are being
@@ -1599,10 +1442,6 @@ class AutoTrader:
         if ask is None:
             return None
         return ask.quantize(self.api.price_tick_size(ask), rounding=ROUND_UP)
-
-    def reentry_cooldown_ready(self, key: str) -> bool:
-        elapsed = time.monotonic() - self.last_exit_at.get(key, float("-inf"))
-        return elapsed >= float(self.config.stock_reentry_cooldown_seconds)
 
     def volatility_scalp_reentry_ready(self, key: str) -> bool:
         """A much shorter reentry cooldown than the normal trend-entry
@@ -1812,16 +1651,6 @@ class AutoTrader:
             symbol,
             exc,
         )
-
-    def rate_capped(self, key: str) -> bool:
-        limit = self.config.stock_max_trades_per_hour
-        if limit <= 0:
-            return False
-        now = time.monotonic()
-        times = self.trade_times[key]
-        while times and now - times[0] > 3600.0:
-            times.popleft()
-        return len(times) >= limit
 
     def record_trade(
         self,
