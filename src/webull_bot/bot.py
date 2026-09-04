@@ -43,70 +43,105 @@ from webull_bot.strategy import (
     TradingStrategy,
 )
 from webull_bot.trade_events import TradeEventStreamService
-from webull_bot.trading.agent_assessment_stub import agent_assessment
-from webull_bot.trading.agent_discoveries import refresh_agent_discoveries
-from webull_bot.trading.broker_conflict_check import _broker_conflict
-from webull_bot.trading.broker_conflict_handler import handle_broker_conflict
-from webull_bot.trading.clock import is_trading_day, now, session_moment
-from webull_bot.trading.compact_number import _compact_number
-from webull_bot.trading.concurrent_dispatch import (
+from webull_bot.trading.guards.post_stop_reentry import post_stop_reentry_ready
+from webull_bot.trading.guards.price_sanity import (
+    price_sanity_cooldown_ready,
+    price_sanity_ok,
+)
+from webull_bot.trading.guards.stop_loss_guard import stop_loss_guard_active
+from webull_bot.trading.guards.symbol_quarantine import symbol_quarantined
+from webull_bot.trading.handlers.broker_conflict_check import _broker_conflict
+from webull_bot.trading.handlers.broker_conflict_handler import handle_broker_conflict
+from webull_bot.trading.handlers.fractional_ticker_handler import (
+    handle_fractional_ticker_unsupported,
+)
+from webull_bot.trading.handlers.fractional_trading_handler import (
+    handle_fractional_trading_not_enabled,
+)
+from webull_bot.trading.handlers.short_selling_handler import (
+    handle_short_selling_unsupported,
+)
+from webull_bot.trading.handlers.symbol_restriction_handler import (
+    handle_symbol_restricted_to_closing_only,
+)
+from webull_bot.trading.orders.close_instruments import close_instruments
+from webull_bot.trading.orders.exit_failure_tracking import _note_exit_failure
+from webull_bot.trading.orders.force_market_exit import should_force_market_exit
+from webull_bot.trading.orders.locks import _rekey_working_order, _working_orders_lock
+from webull_bot.trading.orders.manual_cancel_order import _manual_cancel_order
+from webull_bot.trading.orders.manual_touch import _manual_touch_active
+from webull_bot.trading.orders.pending_order_release import _release_pending_order
+from webull_bot.trading.orders.phantom_exit_confirmation import (
+    _reverse_if_never_filled,
+)
+from webull_bot.trading.orders.rate_limit_retry import (
+    _is_rate_limited,
+    _retry_once_on_rate_limit,
+)
+from webull_bot.trading.orders.realized_pnl_tracking import (
+    record_realized_exit,
+    reverse_phantom_exit,
+)
+from webull_bot.trading.orders.stop_loss_confirmation import (
+    stop_loss_confirmed,
+    stop_ready_to_submit,
+)
+from webull_bot.trading.orders.ui_command_dispatch import process_ui_commands
+from webull_bot.trading.orders.watchlist import add_to_watchlist
+from webull_bot.trading.scalp.scalp_entry_price import volatility_scalp_entry_price
+from webull_bot.trading.scalp.scalp_position_exposure import (
+    volatility_scalp_position_value_ok,
+)
+from webull_bot.trading.scalp.scalp_reentry import volatility_scalp_reentry_ready
+from webull_bot.trading.scalp.scalp_total_exposure import (
+    volatility_scalp_total_exposure_ok,
+)
+from webull_bot.trading.screeners.agent_assessment_stub import agent_assessment
+from webull_bot.trading.screeners.agent_discoveries import refresh_agent_discoveries
+from webull_bot.trading.screeners.agent_predicted_gainers_refresh import (
+    refresh_agent_predicted_gainers,
+)
+from webull_bot.trading.screeners.market_pulse_entries import _market_pulse_entries
+from webull_bot.trading.screeners.market_pulse_refresh import refresh_market_pulse
+from webull_bot.trading.screeners.premarket_gainers_refresh import (
+    refresh_premarket_gainers,
+)
+from webull_bot.trading.screeners.screener_market_pulse_active import (
+    safe_market_pulse_active,
+)
+from webull_bot.trading.screeners.screener_premarket_gainers import (
+    safe_premarket_gainers,
+)
+from webull_bot.trading.screeners.screener_top_gainers import safe_top_gainers
+from webull_bot.trading.screeners.screener_top_losers import safe_top_losers
+from webull_bot.trading.universe.overnight_hold import overnight_hold_symbols
+from webull_bot.trading.universe.pairs_symbol_exclusion import exclude_pairs_symbols
+from webull_bot.trading.universe.popular_reinstatement import (
+    filter_with_popular_reinstated,
+)
+from webull_bot.trading.universe.sma_trend_refresh import refresh_sma_trend
+from webull_bot.trading.universe.snapshot_batch_capping import (
+    cap_batch_to_snapshot_limit,
+)
+from webull_bot.trading.universe.symbol_universe_backfill import (
+    backfill_stock_symbols,
+)
+from webull_bot.trading.util.clock import is_trading_day, now, session_moment
+from webull_bot.trading.util.compact_number import _compact_number
+from webull_bot.trading.util.concurrent_dispatch import (
     _POSITION_PROTECTION_MAX_WORKERS,
     _dispatch_concurrently,
 )
-from webull_bot.trading.cooldowns import (
+from webull_bot.trading.util.cooldowns import (
     cooldown_ready,
     has_pending_buy_order,
     rate_capped,
     reentry_cooldown_ready,
 )
-from webull_bot.trading.day_end_summary import log_day_end_summary
-from webull_bot.trading.force_market_exit import should_force_market_exit
-from webull_bot.trading.fractional_ticker_handler import (
-    handle_fractional_ticker_unsupported,
-)
-from webull_bot.trading.fractional_trading_handler import (
-    handle_fractional_trading_not_enabled,
-)
-from webull_bot.trading.idle_cash_ramp import idle_cash_ramp_progress
-from webull_bot.trading.locks import _rekey_working_order, _working_orders_lock
-from webull_bot.trading.manual_touch import _manual_touch_active
-from webull_bot.trading.market_pulse_entries import _market_pulse_entries
-from webull_bot.trading.order_book_imbalance import _quote_size, obi_score_for
-from webull_bot.trading.overnight_hold import overnight_hold_symbols
-from webull_bot.trading.pairs_symbol_exclusion import exclude_pairs_symbols
-from webull_bot.trading.post_stop_reentry import post_stop_reentry_ready
-from webull_bot.trading.price_sanity import price_sanity_cooldown_ready, price_sanity_ok
-from webull_bot.trading.rate_limit_retry import (
-    _is_rate_limited,
-    _retry_once_on_rate_limit,
-)
-from webull_bot.trading.realized_pnl_tracking import (
-    record_realized_exit,
-    reverse_phantom_exit,
-)
-from webull_bot.trading.scalp_entry_price import volatility_scalp_entry_price
-from webull_bot.trading.scalp_position_exposure import (
-    volatility_scalp_position_value_ok,
-)
-from webull_bot.trading.scalp_reentry import volatility_scalp_reentry_ready
-from webull_bot.trading.scalp_total_exposure import volatility_scalp_total_exposure_ok
-from webull_bot.trading.screener_market_pulse_active import safe_market_pulse_active
-from webull_bot.trading.screener_premarket_gainers import safe_premarket_gainers
-from webull_bot.trading.screener_top_gainers import safe_top_gainers
-from webull_bot.trading.screener_top_losers import safe_top_losers
-from webull_bot.trading.short_selling_handler import handle_short_selling_unsupported
-from webull_bot.trading.sma_trend_refresh import refresh_sma_trend
-from webull_bot.trading.snapshot_batch_capping import cap_batch_to_snapshot_limit
-from webull_bot.trading.stop_loss_confirmation import (
-    stop_loss_confirmed,
-    stop_ready_to_submit,
-)
-from webull_bot.trading.symbol_restriction_handler import (
-    handle_symbol_restricted_to_closing_only,
-)
-from webull_bot.trading.symbol_universe_backfill import backfill_stock_symbols
-from webull_bot.trading.trade_event_logging import log_trade_events
-from webull_bot.trading.watchlist import add_to_watchlist
+from webull_bot.trading.util.day_end_summary import log_day_end_summary
+from webull_bot.trading.util.idle_cash_ramp import idle_cash_ramp_progress
+from webull_bot.trading.util.order_book_imbalance import _quote_size, obi_score_for
+from webull_bot.trading.util.trade_event_logging import log_trade_events
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import (
     MarketDataPermissionError,
@@ -151,14 +186,6 @@ ORDER_ERROR_WINDOW_SECONDS = 60
 # live order attempt (and its own share of the "order" rate budget) on
 # a short that's certain to be rejected every single time.
 SHORT_SELLING_MIN_EQUITY = Decimal("2000")
-
-# Deterministic market context (Webull's own gainers/losers/most-active
-# screeners - no LLM involved) refreshed on a slow, fixed cadence
-# independent of the ~4x/second poll loop. Feeds the research agent's
-# STATE as fixed-size context instead of asking it to discover movers via
-# open-ended web search, and feeds agent_popular_symbols directly so that
-# signal keeps working even if the agent is disabled or a request fails.
-MARKET_PULSE_REFRESH_SECONDS = 120
 
 
 class AutoTrader:
@@ -245,6 +272,22 @@ class AutoTrader:
     log_day_end_summary = log_day_end_summary
     cap_batch_to_snapshot_limit = staticmethod(cap_batch_to_snapshot_limit)
     refresh_sma_trend = refresh_sma_trend
+    # Order-exit bookkeeping, popular-symbol reinstatement, market/agent
+    # screener refreshers, account-wide and per-symbol trading guards, and
+    # dashboard/manual command handling - moved out to trading/orders,
+    # trading/universe, trading/screeners, and trading/guards.
+    _release_pending_order = _release_pending_order
+    _note_exit_failure = _note_exit_failure
+    _reverse_if_never_filled = _reverse_if_never_filled
+    filter_with_popular_reinstated = filter_with_popular_reinstated
+    refresh_market_pulse = refresh_market_pulse
+    refresh_premarket_gainers = refresh_premarket_gainers
+    refresh_agent_predicted_gainers = refresh_agent_predicted_gainers
+    stop_loss_guard_active = stop_loss_guard_active
+    symbol_quarantined = symbol_quarantined
+    close_instruments = close_instruments
+    _manual_cancel_order = _manual_cancel_order
+    process_ui_commands = process_ui_commands
 
     def __init__(self):
         self.config = settings()
@@ -769,159 +812,6 @@ class AutoTrader:
             len(closes_by_symbol),
             len(to_fetch),
             self.config.multi_day_momentum_lookback_days,
-        )
-
-    def filter_with_popular_reinstated(self, candidates: list[str]) -> list[str]:
-        """Volatility-filter candidates, then re-add any configured popular
-        symbol the filter cut - so well-known names aren't silently dropped
-        just because their historical amplitude sits under the floor.
-        """
-        filtered = self.filter_by_historical_volatility(candidates)
-        available = set(candidates)
-        kept = set(filtered)
-        reinstated = [
-            symbol
-            for symbol in self.config.popular_stocks()
-            if symbol in available and symbol not in kept
-        ]
-        if reinstated:
-            log.info(
-                "LOAD   | reinstated %s popular symbols the volatility filter "
-                "would have dropped | %s",
-                len(reinstated),
-                ",".join(reinstated),
-            )
-            filtered = list(dict.fromkeys(reinstated + filtered))
-        return filtered
-
-    def refresh_market_pulse(self) -> None:
-        """Small, fixed-size, fully deterministic market context (Webull's
-        own gainers/losers/most-active screeners) refreshed on a slow,
-        fixed cadence independent of the poll loop - this replaces asking
-        the research agent to discover movers via open-ended web search,
-        which was the actual source of unpredictable request size (and the
-        occasional Groq 413). Each of the three lists is capped at
-        AGENT_MARKET_PULSE_SYMBOLS, so the payload this feeds downstream
-        never grows with market conditions. Uses its own small-list
-        fallback (empty, not the prior universe) on a screener failure -
-        this is market color, not the trading universe.
-        """
-        now = time.monotonic()
-        if now - self.last_market_pulse_refresh < MARKET_PULSE_REFRESH_SECONDS:
-            return
-        self.last_market_pulse_refresh = now
-        limit = self.config.agent_market_pulse_symbols
-        gainers = self.safe_top_gainers(limit, limit)
-        losers = self.safe_top_losers(limit, limit)
-        most_active = self.safe_market_pulse_active(limit, limit)
-        self.market_pulse_cache = {
-            "gainers": self._market_pulse_entries(gainers),
-            "losers": self._market_pulse_entries(losers),
-            "most_active": self._market_pulse_entries(most_active),
-        }
-        # Feeds a direct priority_score bonus (see
-        # TradingStrategy.most_active_priority_bonus) - distinct from
-        # agent_popular_symbols below, which just marks a symbol eligible
-        # for the POPULAR bucket without weighting most-active names any
-        # higher than a gainer/loser inside it.
-        self.strategy.most_active_symbols = {
-            str(symbol).upper() for symbol in most_active
-        }
-
-    def refresh_premarket_gainers(self, moment: datetime) -> None:
-        """By request: "get the top gainers before the day starts and
-        look to invest in that for quick profit." Distinct from
-        safe_top_gainers (Webull's default DAY_1/regular-session
-        ranking, already folded anonymously into the once-daily full
-        universe download) - this uses Webull's own rank_type=
-        "PRE_MARKET" screener, fetched once per day as early as this
-        method gets called (well before market_open in practice, since
-        run() calls it before its own market_open gate below), so
-        today's actual pre-market movers get a head start instead of
-        competing for attention with the other several thousand
-        symbols in the general scan rotation.
-
-        Feeds seed_popular_symbols (POPULAR-bucket eligible, so these
-        can trade in extended hours too - see the "only established/
-        popular symbols trade outside core hours" gate in trade_
-        stocks) and gets merged into stock_symbols/stock_categories
-        directly (a symbol might not already be in the fast initial
-        universe load) so trade_stocks' own force_scan mechanism
-        (already used for the volatility-scalp cohort) can pick it up
-        below.
-        """
-        if self.premarket_gainers_date == moment.date():
-            return
-        if self.config.premarket_gainers_limit <= 0:
-            self.premarket_gainers_date = moment.date()
-            return
-        gainers = self.safe_premarket_gainers(
-            self.config.premarket_gainers_limit,
-            self.config.stock_universe_page_size,
-        )
-        self.premarket_gainers_date = moment.date()
-        if not gainers:
-            return
-        self.premarket_gainers = {str(symbol).upper() for symbol in gainers}
-        self.seed_popular_symbols |= self.premarket_gainers
-        new_to_universe = [
-            symbol
-            for symbol in self.premarket_gainers
-            if symbol not in self.stock_categories
-        ]
-        for symbol in new_to_universe:
-            self.stock_categories[symbol] = "US_STOCK"
-        if new_to_universe:
-            self.stock_symbols = self.stock_symbols + new_to_universe
-        log.info(
-            "LOAD   | pre-market gainers | %s symbols (%s new to the "
-            "universe) | %s",
-            len(self.premarket_gainers),
-            len(new_to_universe),
-            ",".join(sorted(self.premarket_gainers)[:10]),
-        )
-
-    def refresh_agent_predicted_gainers(self, moment: datetime) -> None:
-        """By request: "pre trading should not be too intense, and it
-        should just set up the main gainers for the day, in fact have
-        the research agent return stocks likely to be top gainers
-        before core hours start, then put those stocks in some sort of
-        priority list to also look at." Complementary to refresh_
-        premarket_gainers (Webull's own real PRE_MARKET screener data)
-        - this is the research agent's own speculative pick list, once
-        per day, same "priority list" mechanism (seed_popular_symbols +
-        merged into stock_symbols/stock_categories so trade_stocks'
-        force_scan can pick it up).
-        """
-        if self.agent_predicted_gainers_date == moment.date():
-            return
-        self.agent_predicted_gainers_date = moment.date()
-        if self.market_agent is None:
-            return
-        try:
-            symbols = self.market_agent.predict_likely_gainers()
-        except Exception as exc:
-            log.warning("LOAD   | agent gainer prediction failed | %s", exc)
-            return
-        if not symbols:
-            return
-        self.agent_predicted_gainers = {str(symbol).upper() for symbol in symbols}
-        self.seed_popular_symbols |= self.agent_predicted_gainers
-        new_to_universe = [
-            symbol
-            for symbol in self.agent_predicted_gainers
-            if symbol not in self.stock_categories
-        ]
-        for symbol in new_to_universe:
-            self.stock_categories[symbol] = "US_STOCK"
-        if new_to_universe:
-            self.stock_symbols = self.stock_symbols + new_to_universe
-        log.info(
-            "LOAD   | agent-predicted gainers | %s symbols (%s new to "
-            "the universe) | %s",
-            len(self.agent_predicted_gainers),
-            len(new_to_universe),
-            ",".join(sorted(self.agent_predicted_gainers)),
         )
 
     def resolve_targets(self, moment: datetime) -> None:
@@ -1529,68 +1419,6 @@ class AutoTrader:
             limit_text,
             order_id,
         )
-
-    def _release_pending_order(self, order: dict) -> None:
-        key = str(order.get("key") or "")
-        action = str(order.get("action") or "")
-        if action not in {"PROFIT", "STOP"} or ":" not in key:
-            return
-        instrument_type, symbol = key.split(":", 1)
-        if instrument_type == "STOCK":
-            self.pending_stock_exits.discard(symbol)
-        elif instrument_type == "OPTION":
-            self.pending_option_exits.discard(symbol)
-
-    def _note_exit_failure(self, key: str) -> None:
-        """Tracks a confirmed never-filled exit attempt - see
-        consecutive_exit_failures and CONSECUTIVE_EXIT_FAILURE_MARKET_
-        THRESHOLD. Stock-only: this class of endless-retry loop was seen
-        for stocks specifically, and options' own defined-risk sizing
-        already bounds the exposure a stuck options exit represents
-        differently enough that folding it into the same counter isn't
-        clearly right without its own evidence.
-        """
-        if not key.startswith("STOCK:"):
-            return
-        symbol = key.split(":", 1)[1]
-        if symbol:
-            self.consecutive_exit_failures[symbol] += 1
-
-    def _reverse_if_never_filled(
-        self, order_id: str, order: dict, pnl: Decimal
-    ) -> None:
-        """An exit order that dropped out of the open-orders list is
-        usually a fill, but it can also be a cancel/reject the broker
-        processed on its own (e.g. a fat-finger price, a stale quote) -
-        record_realized_exit already counted its pnl as if it filled, at
-        submission time. Confirm via order_detail before trusting that;
-        only reverse on an explicit CANCELLED/FAILED status, and fail
-        open (assume filled, leave the pnl as-is) on any fetch error or
-        an unrecognized/missing status field, since the field name isn't
-        confirmed against a live payload yet - a false reversal would be
-        worse than an occasional unconfirmed phantom.
-        """
-        try:
-            detail = self.api.order_detail(order_id)
-            status = self.api.order_status(detail)
-        except Exception as exc:
-            log.error(
-                "ORDER  | could not confirm fill status | id=%s | %s",
-                order_id,
-                exc,
-            )
-            return
-        if status in ("CANCELLED", "FAILED"):
-            self.reverse_phantom_exit(pnl, order_id)
-            self._note_exit_failure(order.get("key", ""))
-            log.warning(
-                "ORDER  | %s | never filled (%s) - reversing $%s phantom "
-                "realized pnl | id=%s",
-                order.get("key", ""),
-                status,
-                pnl,
-                order_id,
-            )
 
     def monitor_working_orders(self) -> None:
         now = time.monotonic()
@@ -2826,80 +2654,6 @@ class AutoTrader:
             },
             force=force,
         )
-
-    def stop_loss_guard_active(self) -> bool:
-        """freqtrade-style StoplossGuard: pause NEW entries (stock and
-        short, see trade_stocks) if STOP_LOSS_GUARD_TRADE_LIMIT or more
-        stop-losses have fired within the trailing STOP_LOSS_GUARD_
-        LOOKBACK_SECONDS window - a frequency-based signal that the
-        strategy is currently whipsawing in a bad regime, distinct from
-        the dollar/equity-based breakers in handle_portfolio_circuit_
-        breaker/handle_daily_loss_breaker (which can take much longer to
-        trip, and which liquidate everything when they do). This never
-        liquidates anything - existing positions keep being managed
-        normally; it just declines to add new risk until the recent stop
-        rate cools off, then resumes on its own (no restart needed).
-        """
-        if not self.config.stop_loss_guard_enabled:
-            return False
-        now = time.monotonic()
-        if now < self.stop_loss_guard_until:
-            return True
-        lookback = float(self.config.stop_loss_guard_lookback_seconds)
-        while self.recent_stop_losses and now - self.recent_stop_losses[0] > lookback:
-            self.recent_stop_losses.popleft()
-        if len(self.recent_stop_losses) < self.config.stop_loss_guard_trade_limit:
-            return False
-        self.stop_loss_guard_until = now + float(
-            self.config.stop_loss_guard_cooldown_seconds
-        )
-        log.warning(
-            "GUARD  | stop-loss guard tripped | %s stops in the last %ss | "
-            "pausing new entries for %ss",
-            len(self.recent_stop_losses),
-            self.config.stop_loss_guard_lookback_seconds,
-            self.config.stop_loss_guard_cooldown_seconds,
-        )
-        return True
-
-    def symbol_quarantined(self, key: str) -> bool:
-        """freqtrade-style LowProfitPairs: same shape as stop_loss_guard_
-        active but scoped to one symbol's own recent realized P&L instead
-        of an account-wide stop count. A symbol that's been a net loser
-        lately pauses new entries on just that symbol - via
-        symbol_pnl_history, fed by record_trade on every PROFIT/STOP/
-        MANUAL_SELL exit - while every other symbol keeps trading
-        normally. Never liquidates the symbol's existing position, if any.
-        """
-        if not self.config.symbol_quarantine_enabled:
-            return False
-        now = time.monotonic()
-        if now < self.symbol_quarantine_until.get(key, 0.0):
-            return True
-        history = self.symbol_pnl_history.get(key)
-        if not history:
-            return False
-        lookback = float(self.config.symbol_quarantine_lookback_seconds)
-        while history and now - history[0][0] > lookback:
-            history.popleft()
-        if len(history) < self.config.symbol_quarantine_min_trades:
-            return False
-        total_pnl = sum((pnl for _, pnl in history), Decimal("0"))
-        if total_pnl > -self.config.symbol_quarantine_loss_dollars:
-            return False
-        self.symbol_quarantine_until[key] = now + float(
-            self.config.symbol_quarantine_cooldown_seconds
-        )
-        log.warning(
-            "GUARD  | symbol quarantined | %s | net $%s over %s trades in "
-            "the last %ss | pausing entries for %ss",
-            key,
-            total_pnl,
-            len(history),
-            self.config.symbol_quarantine_lookback_seconds,
-            self.config.symbol_quarantine_cooldown_seconds,
-        )
-        return True
 
     def handle_portfolio_circuit_breaker(
         self,
@@ -6861,123 +6615,6 @@ class AutoTrader:
             "CLOSE  | extended-hours profit sweep | submitted=%s | %s",
             len(submitted),
             ",".join(sorted(profitable_symbols)),
-        )
-
-    def close_instruments(
-        self,
-        instrument_types: set[str],
-        apply_overnight_hold: bool = False,
-    ) -> bool:
-        now = time.monotonic()
-        if now - self.last_close_attempt < self.config.eod_retry_seconds:
-            return False
-        self.last_close_attempt = now
-        held_overnight = (
-            self.overnight_hold_symbols() if apply_overnight_hold else set()
-        )
-        try:
-            submitted = self.api.close_all_positions(
-                instrument_types,
-                loss_callback=self.wash_sales.block,
-                exclude_symbols=held_overnight,
-            )
-            self.pending_stock_exits.clear()
-            self.pending_option_exits.clear()
-            remaining = [
-                item
-                for item in self.api.positions()
-                if item.get("instrument_type") in instrument_types
-                if Decimal(str(item.get("quantity", "0"))) != 0
-                if str(item.get("symbol", "")).upper() not in held_overnight
-            ]
-            log.info(
-                "CLOSE  | submitted=%s | remaining=%s%s",
-                len(submitted),
-                len(remaining),
-                f" | held overnight={len(held_overnight)}" if held_overnight else "",
-            )
-            return not remaining
-        except Exception as exc:
-            log.error("CLOSE  | failed | %s", exc)
-            return False
-
-    def process_ui_commands(
-        self,
-        positions: list[dict],
-        buying_power: Decimal = Decimal("0"),
-        core_session_active: bool = False,
-    ) -> Decimal:
-        """Executes dashboard-initiated actions (close all, sell one
-        position, buy one symbol, cancel one pending order, add a watchlist
-        symbol). The dashboard has no Webull credentials or API access of
-        its own - it can only enqueue a request, which is executed here
-        through the same order-placement, wash-sale, and position-tracking
-        code every other entry/exit uses. Runs before the circuit-breaker
-        gate so a manual risk-reducing action (Sell, Cancel, Close All) is
-        never blocked by a paused/halted state - a manual Buy still is,
-        naturally, since handle_portfolio_circuit_breaker/handle_daily_loss_
-        breaker only gate the automatic entry paths that run after this.
-        """
-        try:
-            commands = self.commands.pop_all()
-        except Exception as exc:
-            log.error("CMD    | queue read failed | %s", exc)
-            return buying_power
-        for command in commands:
-            command_type = command.get("type")
-            try:
-                if command_type == "close_all":
-                    self.close_instruments({"EQUITY", "OPTION"})
-                    log.warning("CMD    | manual close-all executed from dashboard")
-                elif command_type == "sell":
-                    self._manual_sell(command, positions, core_session_active)
-                elif command_type == "buy":
-                    buying_power = self._manual_buy(
-                        command, positions, buying_power, core_session_active
-                    )
-                elif command_type == "watchlist_add":
-                    self.add_to_watchlist(command.get("symbol", ""))
-                elif command_type == "cancel_order":
-                    self._manual_cancel_order(command)
-                else:
-                    log.warning("CMD    | unknown command type=%s", command_type)
-            except Exception as exc:
-                log.error("CMD    | %s failed | %s", command_type, exc)
-        return buying_power
-
-    def _manual_cancel_order(self, command: dict) -> None:
-        order_id = str(command.get("order_id", "")).strip()
-        if not order_id:
-            return
-        order = self.working_orders.get(order_id)
-        if not order:
-            log.info(
-                "CMD    | cancel skipped | id=%s | no longer a tracked working order",
-                order_id,
-            )
-            return
-        if order.get("cancel_requested_at") is not None:
-            log.info(
-                "CMD    | cancel skipped | id=%s | already cancel-requested",
-                order_id,
-            )
-            return
-        try:
-            self.api.cancel(order_id)
-        except Exception as exc:
-            log.error("CMD    | cancel failed | id=%s | %s", order_id, exc)
-            return
-        order["cancel_requested_at"] = time.monotonic()
-        # Reconciliation (releasing pending_stock_exits/pending_option_exits
-        # for a cancelled STOP/PROFIT, dropping it from working_orders) is
-        # handled the next time monitor_working_orders sees the order has
-        # actually disappeared from the broker's open-order list - the same
-        # path an automatic timeout cancel already goes through, so a
-        # manual cancel doesn't need its own separate cleanup logic.
-        log.warning(
-            "CMD    | manual cancel requested from dashboard | %s | id=%s",
-            order.get("key", "?"),
-            order_id,
         )
 
     def _manual_sell(

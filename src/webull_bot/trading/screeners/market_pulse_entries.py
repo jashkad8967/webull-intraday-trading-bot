@@ -1,4 +1,4 @@
-from webull_bot.trading.compact_number import _compact_number
+from webull_bot.trading.util.compact_number import _compact_number
 
 
 def _market_pulse_entries(data: dict[str, dict]) -> list[dict]:

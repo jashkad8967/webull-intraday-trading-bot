@@ -1,6 +1,6 @@
 import time
 
-from webull_bot.trading.locks import _working_orders_lock
+from webull_bot.trading.orders.locks import _working_orders_lock
 
 
 def cooldown_ready(self, key: str) -> bool:
