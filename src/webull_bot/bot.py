@@ -35,6 +35,7 @@ from webull_bot.sizing.diversification_budget import (
 )
 from webull_bot.sizing.fractional_quantity import is_fractional_quantity
 from webull_bot.sizing.fractional_slots import max_fractional_position_slots
+from webull_bot.sizing.stock_entry_sizing import size_stock_entry
 from webull_bot.status import StatusWriter
 from webull_bot.strategy import (
     OBI_DEPTH_LEVELS,
@@ -153,6 +154,13 @@ from webull_bot.trading.screeners.screener_premarket_gainers import (
 )
 from webull_bot.trading.screeners.screener_top_gainers import safe_top_gainers
 from webull_bot.trading.screeners.screener_top_losers import safe_top_losers
+from webull_bot.trading.screeners.strategy_review import submit_strategy_review
+from webull_bot.trading.sweeps.extended_hours_profit_sweep import (
+    close_profitable_positions_during_extended_hours,
+)
+from webull_bot.trading.sweeps.fractional_pre_close_sweep import (
+    close_fractional_positions_before_core_close,
+)
 from webull_bot.trading.universe.overnight_hold import overnight_hold_symbols
 from webull_bot.trading.universe.pairs_symbol_exclusion import exclude_pairs_symbols
 from webull_bot.trading.universe.popular_reinstatement import (
@@ -176,6 +184,7 @@ from webull_bot.trading.universe.universe_growth import _grow_stock_universe
 from webull_bot.trading.universe.universe_resolution_body import (
     _resolve_targets_work_body,
 )
+from webull_bot.trading.util.account_state import account_state
 from webull_bot.trading.util.clock import is_trading_day, now, session_moment
 from webull_bot.trading.util.compact_number import _compact_number
 from webull_bot.trading.util.concurrent_dispatch import (
@@ -227,13 +236,6 @@ ICEBERG_SLICE_INTERVAL_SECONDS = 3
 
 # Automated risk guardrails.
 HARD_ORDER_NOTIONAL_CEILING = Decimal("2000")
-# Webull's own hard minimum account equity for short selling
-# (OAUTH_OPENAPI_NEW_NO_POSITION_MARGIN_ACCOUNT_CAN_NOT_SELL_SHORT_FOR_LT_2K)
-# - see AutoTrader.account_state's proactive check, which disables short
-# entries the moment equity is seen below this, instead of spending a
-# live order attempt (and its own share of the "order" rate budget) on
-# a short that's certain to be rejected every single time.
-SHORT_SELLING_MIN_EQUITY = Decimal("2000")
 
 
 class AutoTrader:
@@ -371,6 +373,20 @@ class AutoTrader:
     _batched_quotes = _batched_quotes
     _stall_equity_quotes = _stall_equity_quotes
     _stall_exit_price = _stall_exit_price
+    # Profitable-position closing sweeps (fractional pre-core-close,
+    # extended-hours) - moved out to trading/sweeps/.
+    close_fractional_positions_before_core_close = (
+        close_fractional_positions_before_core_close
+    )
+    close_profitable_positions_during_extended_hours = (
+        close_profitable_positions_during_extended_hours
+    )
+    # Account-state refresh, stock entry sizing, and agent strategy
+    # review - moved out to trading/util/, sizing/, and trading/screeners/
+    # respectively.
+    account_state = account_state
+    size_stock_entry = size_stock_entry
+    submit_strategy_review = submit_strategy_review
 
     def __init__(self):
         self.config = settings()
@@ -1421,240 +1437,6 @@ class AutoTrader:
                 )
 
         _dispatch_concurrently(candidates, _evaluate_one)
-
-    def account_state(self) -> tuple[Decimal, list[dict]]:
-        now = time.monotonic()
-        if (
-            now - self.last_account_refresh
-            >= float(self.config.account_refresh_seconds)
-        ):
-            # MIN_CASH_RESERVE_DOLLARS is subtracted right here, once, at
-            # the fresh broker read - not at every call site that reads
-            # cached_buying_power. This value stays cached (and this
-            # already-reduced) for ACCOUNT_REFRESH_SECONDS; subtracting
-            # the reserve again on every cache hit within that window
-            # would compound each cycle and drive spendable capital to
-            # zero almost immediately.
-            balance = self.api.balance()
-            # Raw, before MIN_CASH_RESERVE_DOLLARS - the dashboard should
-            # show the account's real buying power (what Webull's own app
-            # shows), not the internally-reserved figure trading logic
-            # actually sizes against below. The reserve is a real safety
-            # margin for order sizing, not something the display should
-            # silently subtract and show as a gap against Webull's app.
-            self.cached_raw_buying_power = self.api.buying_power_from_balance(
-                balance
-            )
-            self.cached_buying_power = max(
-                Decimal("0"),
-                self.cached_raw_buying_power - self.config.min_cash_reserve_dollars,
-            )
-            # Live incident: Webull tracks option buying power as a
-            # COMPLETELY SEPARATE pool from stock buying power (a real
-            # order attempt with plenty of stock buying power available
-            # still failed with OPENAPI_DAY_BUYING_POWER_INSUFFICIENT,
-            # because option_buying_power on the same balance() read
-            # was $0) - option sizing must never use the stock-side
-            # cached_buying_power above.
-            self.cached_option_buying_power = self.api.option_buying_power_from_balance(
-                balance
-            )
-            self.cached_account_day_pnl = self.api.account_day_pnl_from_balance(
-                balance
-            )
-            self.cached_account_value = self.api.account_value_from_balance(balance)
-            self.cached_positions = self.api.positions()
-            self.last_account_refresh = now
-            if (
-                self.short_selling_supported
-                and self.cached_account_value is not None
-                and self.cached_account_value < SHORT_SELLING_MIN_EQUITY
-            ):
-                # Same threshold Webull's own rejection enforces - catch
-                # it here, proactively, instead of spending a live order
-                # attempt (certain to fail) to discover it. Once equity
-                # clears the minimum on a later refresh, no code re-
-                # enables this automatically (matches handle_short_
-                # selling_unsupported's existing "restart to re-enable"
-                # behavior) - intentionally conservative rather than
-                # flapping short-selling on and off around the threshold.
-                self.short_selling_supported = False
-                log.warning(
-                    "SHORT  | account equity ($%s) is under Webull's $%s "
-                    "minimum for short selling - disabling new short "
-                    "entries for the rest of this run",
-                    self.cached_account_value,
-                    SHORT_SELLING_MIN_EQUITY,
-                )
-        return self.cached_buying_power, [dict(item) for item in self.cached_positions]
-
-    def size_stock_entry(
-        self,
-        price: Decimal,
-        entry_budget: Decimal,
-        fractional_remaining: Decimal,
-        whole_share_remaining: Decimal,
-        core_session_active: bool,
-        fractional_slot_available: bool = True,
-        fractional_supported: bool = True,
-        symbol: str = "",
-        buying_power: Decimal | None = None,
-    ) -> tuple[Decimal, Decimal, bool]:
-        """Splits capital between fractional and whole-share entry sizing
-        instead of one style claiming every candidate during core hours.
-
-        fractional_remaining/whole_share_remaining are each computed ONCE
-        per trade_stocks cycle (buying_power * their respective fraction)
-        and decremented by the caller as buys land - passing a live,
-        already-shrinking buying_power in here instead would let fractional
-        sizing succeed for nearly every candidate (its own cap barely
-        shrinks relative to total buying power), leaving whole-share
-        sizing's larger capital slice essentially unreachable during core
-        hours. fractional_slot_available additionally gates fractional
-        sizing on a reserved position-count budget (see trade_stocks) - a
-        fractional position can't be exited outside core hours, so
-        fractional entries alone filling every MAX_OPEN_POSITIONS slot
-        would strand the account with no room for entries of any style for
-        the rest of the day. fractional_supported is False for a specific
-        symbol Webull has already rejected with
-        FRACT_TICKER_DONT_SUPPORT_TRADE (see
-        handle_fractional_ticker_unsupported) - a per-security
-        restriction, distinct from fractional_trading_enabled's
-        account-wide one.
-        Returns (quantity, buffered_price, is_fractional).
-        """
-        if (
-            core_session_active
-            and self.fractional_trading_enabled
-            and fractional_supported
-            and fractional_slot_available
-            and fractional_remaining > 0
-        ):
-            target_notional = min(
-                fractional_remaining,
-                entry_budget,
-                self.config.max_order_notional,
-            )
-            quantity, buffered_price = self.strategy.dollar_stock_quantity(
-                price, target_notional
-            )
-            if quantity > 0:
-                return quantity, buffered_price, True
-        whole_share_budget = (
-            min(entry_budget, whole_share_remaining)
-            if core_session_active
-            else entry_budget
-        )
-        quantity, buffered_price = self.strategy.stock_order_quantity(
-            price, whole_share_budget
-        )
-        # stock_order_quantity is typed -> tuple[int, Decimal] (its own
-        # affordability math is integer-based) - normalize to Decimal
-        # here since every downstream caller of this whole-share
-        # quantity (is_fractional_quantity, record_trade's
-        # working_orders["quantity"], etc.) expects one. Without this,
-        # a plain int leaking into working_orders["quantity"] crashed
-        # a later is_fractional_quantity(quantity) call with "'int'
-        # object has no attribute 'to_integral_value'" - live evidence,
-        # traced to this line.
-        quantity = Decimal(quantity)
-        # By request: risk-based position sizing (the professional 1-2%
-        # rule, adapted for this account's size - see
-        # stock_risk_per_trade_fraction) - an ADDITIONAL cap layered on
-        # top of the affordability/notional caps above, not a
-        # replacement for them. Sizes against the account's real total
-        # buying power (not the bucket-allocated entry_budget slice
-        # above), same as how the professional rule is normally stated
-        # ("risk 1% of the account"), using the stop distance
-        # stock_decision itself will use for this symbol.
-        if quantity > 0 and symbol and buying_power is not None:
-            stop_percent = self.strategy.adaptive_stop_percent(symbol)
-            stop_price = price * (Decimal("1") - stop_percent)
-            risk_cap = self.strategy.risk_based_share_count(
-                price,
-                stop_price,
-                buying_power,
-                self.config.stock_risk_per_trade_fraction,
-            )
-            if risk_cap < quantity:
-                quantity = Decimal(risk_cap)
-                min_lot = self.strategy.minimum_lot_size(price)
-                if 0 < quantity < min_lot:
-                    # The risk cap alone can't afford even the exchange-
-                    # mandated minimum lot for this price band - skip
-                    # rather than place an order the broker would
-                    # reject, same convention stock_order_quantity
-                    # itself already uses.
-                    quantity = Decimal("0")
-        return quantity, buffered_price, False
-
-    def submit_strategy_review(
-        self,
-        positions: list[dict],
-        buying_power: Decimal,
-        force: bool = False,
-        event: str = "ROUTINE_REVIEW",
-    ) -> None:
-        """Sends the agent a compact snapshot of real account performance
-        (holdings, today's pnl, recent trades) - not per-symbol setups -
-        and lets it assess whether the CURRENT strategy is working. See
-        MarketResearchAgent.submit_strategy_review's docstring: this is
-        review-gated, the result is only ever a logged/dashboard
-        suggestion, never applied automatically.
-        """
-        if not self.market_agent or not self.config.strategy_review_enabled:
-            return
-        held = [
-            {
-                "symbol": str(item.get("symbol", "")).upper(),
-                "type": item.get("instrument_type"),
-                "qty": self._compact_number(item.get("quantity")),
-                "cost": self._compact_number(item.get("cost_price"), 2),
-                "unrealized_pnl": self._compact_number(
-                    self.strategy.position_unrealized_pnl(item), 2
-                ),
-                "day_pnl": self._compact_number(
-                    self.strategy.position_day_pnl(item), 2
-                ),
-            }
-            for item in positions
-            if Decimal(str(item.get("quantity", "0"))) != 0
-        ]
-        recent_trades = [
-            {
-                "symbol": trade.get("symbol"),
-                "action": trade.get("action"),
-                "entry": trade.get("entry_price"),
-                "exit": trade.get("limit_price"),
-                "qty": trade.get("quantity"),
-                "pnl": trade.get("pnl"),
-            }
-            for trade in list(self.status.trades)[
-                : self.config.strategy_review_trade_history_limit
-            ]
-        ]
-        self.market_agent.submit_strategy_review(
-            {
-                "event": event,
-                "buying_power": self._compact_number(buying_power, 0),
-                "holdings": held,
-                # Same reconciliation StatusWriter's own dashboard total
-                # uses - Webull's own account_day_pnl when available
-                # (ground truth), not just the bot's local estimate. The
-                # agent should review real performance, not the same
-                # drifting number this session's earlier fixes addressed.
-                "pnl_today": StatusWriter.pnl_today_payload(
-                    self.daily_realized_pnl,
-                    sum(
-                        (Decimal(str(item["day_pnl"])) for item in held),
-                        Decimal("0"),
-                    ),
-                    self.cached_account_day_pnl,
-                ),
-                "recent_trades": recent_trades,
-            },
-            force=force,
-        )
 
     def place_stock_scaled(
         self,
@@ -5023,177 +4805,6 @@ class AutoTrader:
             account_value=self.cached_account_value,
             user_watchlist=sorted(self.user_watchlist),
             pending_orders=pending_order_rows,
-        )
-
-    def close_fractional_positions_before_core_close(self) -> None:
-        """Fractional orders only work during core hours - once core
-        session ends, a fractional position can't be bought, sold,
-        stopped out, or profit-taken at all until the next session opens.
-        Unlike a whole-share position (which OVERNIGHT_HOLD_ENABLED lets
-        ride deliberately, still exitable pre/after-hours if needed), a
-        fractional position caught past this boundary has zero downside
-        protection for the rest of the day/overnight - overnight_hold_
-        symbols() doesn't know about quantity at all, so a fractional
-        position in an otherwise overnight-eligible bucket (POPULAR/
-        PENNY/DISCOVERY) would silently ride along with no way to defend
-        it.
-
-        Only closes the ones currently sitting at a profit - locking in a
-        gain before it becomes undefendable is the whole point, but a
-        loser isn't forced out just because the window is closing (it's
-        already undefendable either way, and forcing a realized loss here
-        isn't necessary the way capturing a gain is). Called from the same
-        option_closeout-to-option_close window the option EOD closeout
-        already uses.
-        """
-        now = time.monotonic()
-        if now - self.last_fractional_sweep < self.config.eod_retry_seconds:
-            return
-        self.last_fractional_sweep = now
-        try:
-            positions = self.api.positions()
-        except Exception as exc:
-            log.error("CLOSE  | fractional pre-close sweep failed | %s", exc)
-            return
-        fractional_positions = [
-            item
-            for item in positions
-            if item.get("instrument_type") == "EQUITY"
-            and self.is_fractional_quantity(Decimal(str(item.get("quantity", "0"))))
-        ]
-        if not fractional_positions:
-            return
-        profitable_symbols: set[str] = set()
-        for item in fractional_positions:
-            symbol = str(item.get("symbol", "")).upper()
-            cost = Decimal(str(item.get("cost_price") or "0"))
-            if cost <= 0:
-                continue
-            try:
-                price = self.api.quote_price(self.api.stock_quote(symbol))
-            except Exception as exc:
-                log.warning(
-                    "CLOSE  | fractional pre-close sweep | %-8s | quote "
-                    "failed, skipping this cycle | %s",
-                    symbol,
-                    exc,
-                )
-                continue
-            if price > cost:
-                profitable_symbols.add(symbol)
-        if not profitable_symbols:
-            return
-        exclude_symbols = {
-            str(item.get("symbol", "")).upper()
-            for item in positions
-            if item.get("instrument_type") == "EQUITY"
-        } - profitable_symbols
-        try:
-            submitted = self.api.close_all_positions(
-                {"EQUITY"},
-                loss_callback=self.wash_sales.block,
-                exclude_symbols=exclude_symbols,
-            )
-        except Exception as exc:
-            log.error("CLOSE  | fractional pre-close sweep failed | %s", exc)
-            return
-        self.pending_stock_exits -= profitable_symbols
-        log.info(
-            "CLOSE  | fractional pre-core-close sweep | submitted=%s | %s",
-            len(submitted),
-            ",".join(sorted(profitable_symbols)),
-        )
-
-    def close_profitable_positions_during_extended_hours(self) -> None:
-        """By request, after pre-market losses: "capturing any profits
-        to close out the day as much as possible" outside core hours -
-        proactively closes any equity position currently sitting at a
-        profit during extended hours (pre-market or after-hours),
-        instead of waiting for its normal PROFIT target or letting it
-        ride toward an overnight hold. Only ever fires outside core
-        hours (see the call site's core_session_active check) and only
-        ever closes a confirmed GAIN - same reasoning as
-        close_fractional_positions_before_core_close: locking in a
-        profit before the session gets even thinner is the point,
-        forcing a realized loss isn't.
-        """
-        now = time.monotonic()
-        if (
-            now - self.last_extended_hours_profit_sweep
-            < float(self.config.extended_hours_profit_sweep_seconds)
-        ):
-            return
-        self.last_extended_hours_profit_sweep = now
-        try:
-            positions = self.api.positions()
-        except Exception as exc:
-            log.error("CLOSE  | extended-hours profit sweep failed | %s", exc)
-            return
-        equity_positions = [
-            item
-            for item in positions
-            if item.get("instrument_type") == "EQUITY"
-            and Decimal(str(item.get("quantity", "0"))) != 0
-        ]
-        if not equity_positions:
-            return
-        profitable_symbols: set[str] = set()
-        for item in equity_positions:
-            symbol = str(item.get("symbol", "")).upper()
-            cost = Decimal(str(item.get("cost_price") or "0"))
-            if cost <= 0:
-                continue
-            # Live incident: UBER's extended-hours close order was
-            # rejected with OPENAPI_FRACT_ONLT_CORE_TIME (fractional
-            # orders are only accepted during core hours) EVERY cycle
-            # for hours straight - this function only ever runs
-            # outside core hours (see its own docstring), so a
-            # fractional-quantity position here will ALWAYS hit this
-            # same rejection, never just occasionally. Skip it outright
-            # instead of retrying a guaranteed failure every cycle;
-            # close_fractional_positions_before_core_close already
-            # handles fractional exits once core hours actually start.
-            quantity = Decimal(str(item.get("quantity", "0")))
-            if self.is_fractional_quantity(quantity):
-                if symbol not in self.extended_hours_fractional_skip_logged:
-                    self.extended_hours_fractional_skip_logged.add(symbol)
-                    log.info(
-                        "CLOSE  | extended-hours profit sweep | %-8s | "
-                        "fractional position, deferring to core hours",
-                        symbol,
-                    )
-                continue
-            try:
-                price = self.api.quote_price(self.api.stock_quote(symbol))
-            except Exception as exc:
-                log.warning(
-                    "CLOSE  | extended-hours profit sweep | %-8s | quote "
-                    "failed, skipping this cycle | %s",
-                    symbol,
-                    exc,
-                )
-                continue
-            if price > cost:
-                profitable_symbols.add(symbol)
-        if not profitable_symbols:
-            return
-        exclude_symbols = {
-            str(item.get("symbol", "")).upper() for item in equity_positions
-        } - profitable_symbols
-        try:
-            submitted = self.api.close_all_positions(
-                {"EQUITY"},
-                loss_callback=self.wash_sales.block,
-                exclude_symbols=exclude_symbols,
-            )
-        except Exception as exc:
-            log.error("CLOSE  | extended-hours profit sweep failed | %s", exc)
-            return
-        self.pending_stock_exits -= profitable_symbols
-        log.info(
-            "CLOSE  | extended-hours profit sweep | submitted=%s | %s",
-            len(submitted),
-            ",".join(sorted(profitable_symbols)),
         )
 
     def _position_protection_loop(self) -> None:
