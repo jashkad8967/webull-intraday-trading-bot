@@ -1455,7 +1455,21 @@ class Settings(BaseSettings):
     extended_hours_profit_sweep_seconds: int = Field(
         default=60, ge=5, le=3600
     )
-    market_holidays: str = ""
+    # Live incident: is_trading_day only ever checked weekday (Mon-Fri)
+    # against this list, which defaulted to empty - on Labor Day 2026
+    # (a Monday), the bot spent the whole session repeatedly attempting
+    # doomed orders every ~30s, each one rejected by Webull with
+    # OPENAPI_CAN_NOT_TRADING_FOR_NON_TRADING_HOURS, until manually
+    # fixed live via a MARKET_HOLIDAYS env override. Defaulting to a
+    # real NYSE holiday calendar (rather than leaving new deploys to
+    # rediscover this the same way) closes the gap out of the box;
+    # .env can still override/extend this for a year not covered here.
+    market_holidays: str = (
+        "2026-01-01,2026-01-19,2026-02-16,2026-04-03,2026-05-25,"
+        "2026-06-19,2026-07-03,2026-09-07,2026-11-26,2026-12-25,"
+        "2027-01-01,2027-01-18,2027-02-15,2027-03-26,2027-05-31,"
+        "2027-06-18,2027-07-05,2027-09-06,2027-11-25,2027-12-24"
+    )
     wash_sale_block_days: int = Field(default=31, ge=31, le=365)
     wash_sale_state_file: str = "conf/wash_sale_blocks.json"
     daily_pnl_state_file: str = "conf/daily_pnl.json"
