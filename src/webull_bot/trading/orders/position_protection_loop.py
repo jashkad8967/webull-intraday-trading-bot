@@ -38,6 +38,9 @@ def _position_protection_loop(self) -> None:
             self.reprice_resting_exits(
                 self.cached_positions, self.cached_core_session_active
             )
+            self.reprice_resting_option_exits(
+                self.cached_positions, self.cached_core_session_active
+            )
             self.reprice_volatility_scalp_exits(
                 self.cached_positions, self.cached_core_session_active
             )

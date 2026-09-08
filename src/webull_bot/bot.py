@@ -149,6 +149,9 @@ from webull_bot.trading.repricing.resting_entry_repricer import (
     reprice_resting_entries,
 )
 from webull_bot.trading.repricing.resting_exit_repricer import reprice_resting_exits
+from webull_bot.trading.repricing.resting_option_exit_repricer import (
+    reprice_resting_option_exits,
+)
 from webull_bot.trading.repricing.scalp_entry_repricer import (
     reprice_volatility_scalp_entries,
 )
@@ -386,6 +389,7 @@ class AutoTrader:
     reprice_resting_entries = reprice_resting_entries
     reprice_volatility_scalp_exits = reprice_volatility_scalp_exits
     reprice_resting_exits = reprice_resting_exits
+    reprice_resting_option_exits = reprice_resting_option_exits
     # Manual dashboard buy/sell command execution - moved out to
     # trading/orders/.
     _manual_sell = _manual_sell
@@ -605,6 +609,7 @@ class AutoTrader:
         self.last_account_refresh = 0.0
         self.last_order_monitor = 0.0
         self.last_reprice = 0.0
+        self.last_option_reprice = 0.0
         self.last_volatility_reprice = 0.0
         self.last_volatility_entry_reprice = 0.0
         self.last_held_exit_scan = 0.0
@@ -3835,18 +3840,25 @@ class AutoTrader:
                                 "market regime (VIXY) gate active"
                             ] += 1
                             continue
-                        blocked_until = self.wash_sales.blocked_until(underlying)
+                        # By request: "you can constantly buy puts and
+                        # calls on the same stock as it dips and rises" -
+                        # scoped to underlying+direction (see the
+                        # matching wash_sales.block call above), so a
+                        # stopped-out CALL only blocks a repurchased
+                        # CALL, not a PUT on the same underlying.
+                        wash_key = f"{underlying}:{contract_type}"
+                        blocked_until = self.wash_sales.blocked_until(wash_key)
                         if blocked_until:
                             self.option_gate_rejections["wash-sale blocked"] += 1
-                            if underlying not in self.wash_skip_logged:
-                                self.wash_skip_logged.add(underlying)
+                            if wash_key not in self.wash_skip_logged:
+                                self.wash_skip_logged.add(wash_key)
                                 log.info(
                                     "WASH   | %-8s | option entry blocked until %s",
-                                    underlying,
+                                    wash_key,
                                     blocked_until.strftime("%Y-%m-%d"),
                                 )
                             continue
-                        self.wash_skip_logged.discard(underlying)
+                        self.wash_skip_logged.discard(wash_key)
                         if guard_active:
                             self.gate_rejections[
                                 "stop-loss guard active - too many recent stops"
@@ -3994,8 +4006,19 @@ class AutoTrader:
                         limit_price,
                         "SELL_TO_CLOSE",
                     )
+                    # By request: "you can constantly buy puts and calls
+                    # on the same stock as it dips and rises" - blocking
+                    # the whole underlying after ANY option stop-loss
+                    # (as this used to) would lock out a PUT re-entry
+                    # for WASH_SALE_BLOCK_DAYS just because a CALL on
+                    # the same name stopped out, defeating exactly the
+                    # swing-with-the-price behavior requested. Scoping
+                    # the block to underlying+direction still blocks
+                    # repurchasing the SAME losing side too soon (the
+                    # actual wash-sale concern) while leaving the
+                    # opposite side free.
                     self.wash_sales.block(
-                        contract["underlying_symbol"],
+                        f"{contract['underlying_symbol']}:{contract['option_type']}",
                         "option stop-loss exit submitted",
                     )
                     self.pending_option_exits.add(option_symbol)

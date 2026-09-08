@@ -1173,11 +1173,16 @@ class WebullAPI:
             quote_by_symbol = {
                 str(q.get("symbol")): q for q in quotes if isinstance(q, dict)
             }
-            # shortlist is already ordered nearest-to-ATM first, and
-            # this loop preserves that order - so the first affordable
-            # entry found is the closest-to-the-money one that fits.
-            priced: list[tuple[dict, Decimal]] = []
-            for item in shortlist:
+            # By request: "look at contracts in those stocks with high
+            # volume movement and volatility" - among the AFFORDABLE
+            # candidates, prefer the one with the most contract volume
+            # (liquidity/activity), breaking ties by shortlist order
+            # (nearest-to-ATM first, since shortlist is already sorted
+            # that way). Affordability stays the hard filter; volume
+            # only re-ranks within it, so this never picks a contract
+            # that doesn't fit max_contract_cost.
+            priced: list[tuple[dict, Decimal, Decimal, int]] = []
+            for index, item in enumerate(shortlist):
                 quote = quote_by_symbol.get(item["symbol"])
                 if not quote:
                     continue
@@ -1185,10 +1190,12 @@ class WebullAPI:
                     premium = self.quote_price(quote)
                 except Exception:
                     continue
-                priced.append((item, premium * 100))
+                volume = self.option_volume(quote) or Decimal("0")
+                priced.append((item, premium * 100, volume, index))
             affordable = [pair for pair in priced if pair[1] <= max_contract_cost]
             if affordable:
-                selected.append(affordable[0][0])
+                best = max(affordable, key=lambda pair: (pair[2], -pair[3]))
+                selected.append(best[0])
             elif priced:
                 selected.append(min(priced, key=lambda pair: pair[1])[0])
             else:
@@ -1582,6 +1589,18 @@ class WebullAPI:
     def option_implied_vol(self, quote: dict) -> Decimal | None:
         return self._option_greek_field(
             quote, ("impliedVol", "implied_vol", "iv", "impliedVolatility")
+        )
+
+    def option_volume(self, quote: dict) -> Decimal | None:
+        """Best-effort contract volume extraction, same unconfirmed-field-
+        name situation as option_delta/option_implied_vol above - tries the
+        plausible key names rather than guessing one. By request: "look for
+        contracts in those stocks with high volume movement and volatility"
+        - contract selection previously only weighed DTE/ATM-proximity/
+        affordability, never the contract's own trading activity.
+        """
+        return self._option_greek_field(
+            quote, ("volume", "tradeVolume", "dealNum", "totalShares")
         )
 
     def _option_greek_field(self, quote: dict, fields: tuple[str, ...]) -> Decimal | None:

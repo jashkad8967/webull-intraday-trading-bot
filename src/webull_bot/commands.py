@@ -1,8 +1,16 @@
-import fcntl
 import json
 import time
 import uuid
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    # fcntl is POSIX-only; production always runs in the Linux Docker
+    # image, so this only matters for collecting/running tests on a
+    # native Windows dev machine. No real advisory locking there, but
+    # nothing on Windows shares this file across processes either.
+    fcntl = None
 
 
 class CommandQueue:
@@ -24,7 +32,8 @@ class CommandQueue:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
         with open(self.path, "r+", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(handle, fcntl.LOCK_EX)
             try:
                 raw = handle.read().strip()
                 try:
@@ -40,7 +49,8 @@ class CommandQueue:
                 handle.write(json.dumps({"commands": new_commands}))
                 return result
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
 
     def enqueue(self, command_type: str, **fields) -> str:
         command_id = uuid.uuid4().hex
