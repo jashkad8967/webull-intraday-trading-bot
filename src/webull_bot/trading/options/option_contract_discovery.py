@@ -18,33 +18,24 @@ def discover_option_contracts(self) -> None:
     # OPTION_DISCOVERY_PER_CYCLE modest (this file's own comment on
     # that field has the full story), not threading this call.
     # By request: "we want options for more popular stocks only
-    # like in snp and dow, and some from nyse." Computed fresh from
-    # config here (not read off self.stock_symbols) - self.
-    # stock_symbols is legitimately mutated by MULTIPLE sources for
-    # the general STOCK strategy's own purposes (pre-market gainers,
-    # agent-predicted gainers, reinstated watchlist symbols), and a
-    # background thread (resolve_targets) also reassigns it
-    # concurrently with those. A live incident (this bug, caught
-    # right after an earlier fix attempt): a one-time snapshot of
-    # self.stock_symbols taken inside _resolve_targets_work_body
-    # still leaked AIDX (a pre-market-gainer symbol, nowhere near
-    # the curated list) into discovery, because the main thread's
-    # refresh_premarket_gainers mutation landed in the race window
-    # before the snapshot was taken - a genuine, unsynchronized
-    # cross-thread race, not a logic bug in the filtering itself.
-    # config.stocks() is a pure function of static config (just a
-    # string split) - computing it fresh every call is cheap (at
-    # most ~500 items) and immune to that race entirely, since it
-    # never reads any thread-shared mutable state.
-    requested_stocks = self.config.stocks()
-    if requested_stocks == ["ALL"]:
-        candidates = self.stock_symbols
-    else:
-        candidates = [
-            symbol
-            for symbol in requested_stocks
-            if symbol not in self.invalid_symbols
-        ]
+    # like in snp and dow, and some from nyse" / "make sure the
+    # stocks selected for options are popular like snp500." Draws
+    # from config.option_candidates() - a curated, real, large-cap-
+    # heavy list (see its own comment for why this isn't a literal
+    # S&P 500 enumeration) - instead of self.stock_symbols, which can
+    # be the ENTIRE scanned universe (thousands of symbols, including
+    # penny/micro-cap names, in STOCK_SYMBOLS=ALL mode). Computed
+    # fresh from config here (not cached on self) for the same
+    # cross-thread-race-immunity reason the old self.stock_symbols
+    # read had to be abandoned: config.option_candidates() is a pure
+    # function of static config, never touches any thread-shared
+    # mutable state resolve_targets/refresh_premarket_gainers can
+    # reassign concurrently.
+    candidates = [
+        symbol
+        for symbol in self.config.option_candidates()
+        if symbol not in self.invalid_symbols
+    ]
     if not self.options_enabled or not self.discover_all_options or not candidates:
         return
     if (
@@ -53,6 +44,22 @@ def discover_option_contracts(self) -> None:
     ):
         return
     self.last_option_discovery = time.monotonic()
+    # By request: "we want options with volume and volatility to be
+    # chosen." Re-ranks the (already small, curated) candidate list
+    # by volume + realized volatility every call, using data already
+    # collected during normal scanning (self.strategy.metrics/
+    # volatility_price_history) - no extra API calls, same "free"
+    # convention select_volatility_scalp_symbols already uses for its
+    # own volatility ranking. A symbol with no scan data yet (metrics/
+    # volatility not populated) sorts last, not excluded - it still
+    # gets examined once the cursor reaches it, just without a
+    # priority boost until it's actually been scanned once.
+    def _priority(symbol: str) -> tuple[float, float]:
+        volume = float(self.strategy.metrics.get(symbol, {}).get("volume", 0) or 0)
+        volatility = self.strategy.realized_volatility_percent(symbol)
+        return (volume, float(volatility) if volatility is not None else 0.0)
+
+    candidates = sorted(candidates, key=_priority, reverse=True)
     discovered = {item["underlying_symbol"] for item in self.option_contracts}
     attempts = 0
     examined = 0

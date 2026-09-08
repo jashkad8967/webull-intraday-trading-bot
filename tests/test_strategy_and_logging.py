@@ -12927,5 +12927,113 @@ class OptionPriceTickSizeTests(unittest.TestCase):
         self.assertEqual(price % Decimal("0.05"), Decimal("0"))
 
 
+class DiscoverOptionContractsCandidatePoolTests(unittest.TestCase):
+    """By request: "we want options for more popular stocks only like
+    in snp and dow" / "make sure the stocks selected for options are
+    popular like snp500" / "we want options with volume and
+    volatility to be chosen." discover_option_contracts now draws its
+    candidate pool from config.option_candidates() (a curated large-
+    cap list), not self.stock_symbols (which can be the entire scanned
+    universe), and ranks that pool by volume + realized volatility
+    before examining any of it each cycle.
+    """
+
+    @staticmethod
+    def _fake_bot(candidates, metrics, volatility, discovery_order):
+        from webull_bot.bot import AutoTrader
+
+        def select_atm_options(underlying, price, max_contract_cost=None):
+            discovery_order.append(underlying)
+            return []
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                option_candidates=lambda: candidates,
+                option_discovery_seconds=0,
+                option_discovery_per_cycle=len(candidates),
+            ),
+            invalid_symbols=set(),
+            options_enabled=True,
+            discover_all_options=True,
+            last_option_discovery=0.0,
+            option_discovery_cursor=0,
+            option_discovery_attempted=set(),
+            option_contracts=[],
+            cached_option_buying_power=Decimal("100"),
+            strategy=SimpleNamespace(
+                metrics={
+                    symbol: {"volume": volume}
+                    for symbol, volume in metrics.items()
+                },
+                realized_volatility_percent=lambda symbol: volatility.get(symbol),
+                prices={symbol: Decimal("10") for symbol in candidates},
+            ),
+            api=SimpleNamespace(select_atm_options=select_atm_options),
+        )
+        return AutoTrader.discover_option_contracts.__get__(fake_bot)
+
+    def test_candidates_come_from_option_candidates_not_stock_symbols(self):
+        """A symbol only present in self.stock_symbols (not in the
+        curated option_candidates() list) must never be examined -
+        confirmed by never assigning self.stock_symbols on the fixture
+        at all, so any attempt to read it would raise AttributeError.
+        """
+        discovery_order = []
+        discover = self._fake_bot(
+            candidates=["AAPL", "MSFT"],
+            metrics={"AAPL": 1_000_000, "MSFT": 500_000},
+            volatility={},
+            discovery_order=discovery_order,
+        )
+
+        discover()
+
+        self.assertEqual(set(discovery_order), {"AAPL", "MSFT"})
+
+    def test_higher_volume_is_examined_before_lower_volume(self):
+        discovery_order = []
+        discover = self._fake_bot(
+            candidates=["LOWVOL", "HIGHVOL"],
+            metrics={"LOWVOL": 100, "HIGHVOL": 10_000},
+            volatility={},
+            discovery_order=discovery_order,
+        )
+
+        discover()
+
+        self.assertEqual(discovery_order, ["HIGHVOL", "LOWVOL"])
+
+    def test_higher_volatility_breaks_a_volume_tie(self):
+        discovery_order = []
+        discover = self._fake_bot(
+            candidates=["CALM", "CHOPPY"],
+            metrics={"CALM": 1000, "CHOPPY": 1000},
+            volatility={"CALM": Decimal("0.01"), "CHOPPY": Decimal("0.05")},
+            discovery_order=discovery_order,
+        )
+
+        discover()
+
+        self.assertEqual(discovery_order, ["CHOPPY", "CALM"])
+
+    def test_a_never_scanned_symbol_is_still_examined_just_last(self):
+        """No metrics/volatility yet (never scanned) sorts to the
+        bottom of the priority ranking, but is NOT excluded from
+        discovery entirely - it still gets examined this same cycle
+        since option_discovery_per_cycle covers the whole small list.
+        """
+        discovery_order = []
+        discover = self._fake_bot(
+            candidates=["SCANNED", "UNSCANNED"],
+            metrics={"SCANNED": 500},
+            volatility={},
+            discovery_order=discovery_order,
+        )
+
+        discover()
+
+        self.assertEqual(discovery_order, ["SCANNED", "UNSCANNED"])
+
+
 if __name__ == "__main__":
     unittest.main()
