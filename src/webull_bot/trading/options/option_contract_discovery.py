@@ -19,21 +19,29 @@ def discover_option_contracts(self) -> None:
     # that field has the full story), not threading this call.
     # By request: "we want options for more popular stocks only
     # like in snp and dow, and some from nyse" / "make sure the
-    # stocks selected for options are popular like snp500." Draws
-    # from config.option_candidates() - a curated, real, large-cap-
-    # heavy list (see its own comment for why this isn't a literal
-    # S&P 500 enumeration) - instead of self.stock_symbols, which can
-    # be the ENTIRE scanned universe (thousands of symbols, including
-    # penny/micro-cap names, in STOCK_SYMBOLS=ALL mode). Computed
-    # fresh from config here (not cached on self) for the same
-    # cross-thread-race-immunity reason the old self.stock_symbols
-    # read had to be abandoned: config.option_candidates() is a pure
-    # function of static config, never touches any thread-shared
-    # mutable state resolve_targets/refresh_premarket_gainers can
-    # reassign concurrently.
+    # stocks selected for options are popular like snp500" / "look
+    # at the top gainers, most volatile, similar criteria for
+    # stocks, and then look the popular options contracts from
+    # those." Draws from TWO sources: config.option_candidates() (a
+    # curated, real, large-cap-heavy list - see its own comment for
+    # why this isn't a literal S&P 500 enumeration) union self.
+    # agent_popular_symbols (today's actual top-gainer/most-active
+    # movers - refresh_agent_discoveries already builds this from
+    # the same deterministic market_pulse screeners, so this adds no
+    # new API calls). Neither is self.stock_symbols, which can be
+    # the ENTIRE scanned universe (thousands of symbols, including
+    # penny/micro-cap names, in STOCK_SYMBOLS=ALL mode).
+    # option_candidates() is computed fresh from static config here
+    # (not cached) for the same cross-thread-race-immunity reason
+    # the old self.stock_symbols read had to be abandoned; agent_
+    # popular_symbols is safe to read directly since discover_
+    # option_contracts, like refresh_agent_discoveries, only ever
+    # runs on the main thread (see run()) - never the separate
+    # position-protection thread, so there's no cross-thread race on
+    # it the way there was on self.stock_symbols.
     candidates = [
         symbol
-        for symbol in self.config.option_candidates()
+        for symbol in set(self.config.option_candidates()) | self.agent_popular_symbols
         if symbol not in self.invalid_symbols
     ]
     if not self.options_enabled or not self.discover_all_options or not candidates:
