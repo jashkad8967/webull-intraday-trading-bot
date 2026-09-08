@@ -1115,6 +1115,35 @@ class OrderNotCancelableTests(unittest.TestCase):
         self.assertFalse(AutoTrader.is_order_not_cancelable(Exception("timeout")))
 
 
+class OrderReversesExistingPositionTests(unittest.TestCase):
+    """is_order_reverses_existing_position - live incident:
+    escalate_stalled_stop_losses cancels a stalled exit then
+    immediately submits a fresh aggressive sell on the same cycle;
+    Webull's cancel acknowledgement doesn't guarantee the old order
+    has cleared its own book yet, so the new sell can get rejected
+    with OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION - a benign timing
+    race (despite "OPTION" in the code name, this fires for stock
+    orders too), not a fault.
+    """
+
+    def test_true_for_the_webull_reverse_position_rejection_code(self):
+        from webull_bot.bot import AutoTrader
+
+        exc = Exception(
+            "HTTP Status: 417, Code: OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION, "
+            "Msg: This order cannot be entered because it will reverse an "
+            "existing position."
+        )
+        self.assertTrue(AutoTrader.is_order_reverses_existing_position(exc))
+
+    def test_false_for_an_unrelated_error(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.is_order_reverses_existing_position(Exception("timeout"))
+        )
+
+
 class FreshEntryBlackoutActiveTests(unittest.TestCase):
     """fresh_entry_blackout_active - by request, after live evidence
     (WNW/WKHS stopping out shortly after core hours ended): a fresh
@@ -3731,6 +3760,9 @@ class StopLossEscalationTests(unittest.TestCase):
         )
         fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
         fake_bot._note_exit_failure = AutoTrader._note_exit_failure.__get__(fake_bot)
+        fake_bot.is_order_reverses_existing_position = (
+            AutoTrader.is_order_reverses_existing_position
+        )
         escalate = AutoTrader.escalate_stalled_stop_losses.__get__(fake_bot)
 
         with unittest.mock.patch("time.monotonic", return_value=20.0):
@@ -9500,6 +9532,77 @@ class IdleCashRelaxationTests(unittest.TestCase):
 
         self.assertEqual(fake_bot.last_capital_deployed_at, stale)
 
+    def test_record_trade_marks_a_fresh_option_buy_as_occurred_today(self):
+        """By request: "first we want an option trade to occur, and
+        the stock trading should start later" - see options_priority_
+        window_active, which reads this flag to release the fresh-
+        stock-entry hold as soon as a real option entry lands.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=time.monotonic(),
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            consecutive_exit_failures=defaultdict(int),
+            submitted_order_ids_today=set(),
+            option_entry_occurred_today=False,
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade("OPTION:AAPL", "order-1", "BUY")
+
+        self.assertTrue(fake_bot.option_entry_occurred_today)
+
+    def test_record_trade_does_not_mark_a_stock_buy_as_an_option_entry(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=time.monotonic(),
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            consecutive_exit_failures=defaultdict(int),
+            submitted_order_ids_today=set(),
+            option_entry_occurred_today=False,
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade("STOCK:AAPL", "order-1", "BUY")
+
+        self.assertFalse(fake_bot.option_entry_occurred_today)
+
+    def test_record_trade_does_not_mark_an_option_exit_as_an_entry(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=time.monotonic(),
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            consecutive_exit_failures=defaultdict(int),
+            submitted_order_ids_today=set(),
+            option_entry_occurred_today=False,
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade("OPTION:AAPL", "order-1", "PROFIT")
+
+        self.assertFalse(fake_bot.option_entry_occurred_today)
+
     def test_record_trade_does_not_reset_the_timer_on_an_exit(self):
         from webull_bot.bot import AutoTrader
 
@@ -11512,6 +11615,9 @@ class PhantomExitReversalTests(unittest.TestCase):
         )
         fake_bot.reverse_phantom_exit = AutoTrader.reverse_phantom_exit.__get__(fake_bot)
         fake_bot._note_exit_failure = AutoTrader._note_exit_failure.__get__(fake_bot)
+        fake_bot.is_order_reverses_existing_position = (
+            AutoTrader.is_order_reverses_existing_position
+        )
         escalate = AutoTrader.escalate_stalled_stop_losses.__get__(fake_bot)
 
         with unittest.mock.patch("time.monotonic", return_value=20.0):
@@ -12754,14 +12860,23 @@ class OptionPriceTickSizeTests(unittest.TestCase):
     placed with a premium of $3 or more must be in increments of
     0.05"). option_limit_price used to always round to a flat $0.01
     regardless of premium level.
+
+    Second live incident: OPENAPI_OPTION_PRICE_STEP_LT hit repeatedly
+    on a different underlying (CD) - "Orders placed with a premium of
+    less than $3 must be in increments of 0.05," directly contradicting
+    the $0.01-below-$3 assumption a $3 threshold used to make (that
+    finer grid only applies to Penny Pilot-enrolled underlyings, not
+    every symbol). $0.05 is always valid on the $0.01 grid too, so the
+    tick is now unconditionally $0.05 regardless of premium.
     """
 
-    def test_tick_is_a_penny_under_three_dollars(self):
+    def test_tick_is_always_a_nickel_regardless_of_premium(self):
         self.assertEqual(
-            WebullAPI.option_price_tick_size(Decimal("2.99")), Decimal("0.01")
+            WebullAPI.option_price_tick_size(Decimal("0.50")), Decimal("0.05")
         )
-
-    def test_tick_is_a_nickel_at_or_above_three_dollars(self):
+        self.assertEqual(
+            WebullAPI.option_price_tick_size(Decimal("2.99")), Decimal("0.05")
+        )
         self.assertEqual(
             WebullAPI.option_price_tick_size(Decimal("3.00")), Decimal("0.05")
         )
@@ -12783,7 +12898,7 @@ class OptionPriceTickSizeTests(unittest.TestCase):
         self.assertEqual(price, Decimal("7.45"))
         self.assertEqual(price % Decimal("0.05"), Decimal("0"))
 
-    def test_buy_limit_price_stays_penny_precise_under_three_dollars(self):
+    def test_buy_limit_price_rounds_down_to_the_nearest_nickel_under_three(self):
         api = WebullAPI.__new__(WebullAPI)
         api.config = SimpleNamespace(
             option_limit_offset=Decimal("0.01"),
@@ -12792,7 +12907,8 @@ class OptionPriceTickSizeTests(unittest.TestCase):
         price = api.option_limit_price(
             {"bid": "1.20", "ask": "1.23"}, "BUY"
         )
-        self.assertEqual(price, Decimal("1.21"))
+        self.assertEqual(price, Decimal("1.20"))
+        self.assertEqual(price % Decimal("0.05"), Decimal("0"))
 
     def test_sell_limit_price_rounds_up_to_the_nearest_nickel_above_three(self):
         api = WebullAPI.__new__(WebullAPI)

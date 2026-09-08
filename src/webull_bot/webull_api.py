@@ -1482,11 +1482,22 @@ class WebullAPI:
         would have blocked every real option order whose premium ever
         cleared $3, silently until the first live attempt actually hit
         it (never verified live before this, since nothing had reached
-        order placement yet). Mirrors price_tick_size's own real-tick-
-        size pattern for stocks, just with the threshold/increments
-        this specific Webull error message documents for options.
+        order placement yet).
+
+        Live incident (this fix): a second, distinct rejection -
+        OPENAPI_OPTION_PRICE_STEP_LT ("Orders placed with a premium of
+        less than $3 must be in increments of 0.05") - hit repeatedly
+        on a different underlying (CD), directly contradicting the
+        $0.01-below-$3 assumption this used to make. Standard OCC tick
+        rules only allow $0.01 increments below $3 for "Penny Pilot"
+        underlyings; most names aren't enrolled, and Webull's API gives
+        no cheap way to tell which is which ahead of a real order
+        attempt. $0.05 is always a valid point on the $0.01 grid too,
+        so quoting every premium at $0.05 (not just >= $3) satisfies
+        both rule variants unconditionally, at the cost of the finer
+        penny-level granularity Penny Pilot names could otherwise use.
         """
-        return Decimal("0.05") if premium >= 3 else Decimal("0.01")
+        return Decimal("0.05")
 
     @classmethod
     def _quantize_to_option_tick(

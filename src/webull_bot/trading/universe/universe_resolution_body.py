@@ -126,6 +126,7 @@ def _resolve_targets_work_body(self, moment: datetime) -> None:
     self.daily_realized_pnl = Decimal("0")
     self.daily_pnl.reset()
     self.daily_loss_breaker_triggered = False
+    self.option_entry_occurred_today = False
     self.submitted_order_ids_today.clear()
     self.reconciliation_flagged_order_ids.clear()
     if self.broker_conflict_symbols:

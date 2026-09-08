@@ -17,6 +17,9 @@ from webull_bot.errors.broker_conflict import is_broker_position_conflict
 from webull_bot.errors.fractional_ticker import is_fractional_ticker_unsupported
 from webull_bot.errors.fractional_trading import is_fractional_trading_not_enabled
 from webull_bot.errors.order_cancellation import is_order_not_cancelable
+from webull_bot.errors.order_reverses_position import (
+    is_order_reverses_existing_position,
+)
 from webull_bot.errors.short_selling import is_short_selling_unsupported
 from webull_bot.errors.symbol_restrictions import is_symbol_restricted_to_closing_only
 from webull_bot.invalid_symbols import InvalidSymbolTracker
@@ -262,6 +265,9 @@ class AutoTrader:
     is_fractional_ticker_unsupported = staticmethod(is_fractional_ticker_unsupported)
     is_fractional_trading_not_enabled = staticmethod(is_fractional_trading_not_enabled)
     is_order_not_cancelable = staticmethod(is_order_not_cancelable)
+    is_order_reverses_existing_position = staticmethod(
+        is_order_reverses_existing_position
+    )
     is_short_selling_unsupported = staticmethod(is_short_selling_unsupported)
     is_symbol_restricted_to_closing_only = staticmethod(
         is_symbol_restricted_to_closing_only
@@ -746,6 +752,11 @@ class AutoTrader:
         self.daily_realized_loss = self.daily_pnl.realized_loss
         self.daily_realized_pnl = self.daily_pnl.realized_pnl
         self.daily_loss_breaker_triggered = False
+        # By request: "first we want an option trade to occur, and the
+        # stock trading should start later" - see options_priority_
+        # window_active/record_trade. Reset daily alongside the other
+        # once-per-day counters in _resolve_targets_work_body.
+        self.option_entry_occurred_today = False
         self.commands = CommandQueue(self.config.command_file)
         self.user_watchlist: set[str] = set(self.config.default_watchlist())
         # Symbols a dashboard "add to watchlist" command just added -
@@ -1233,11 +1244,25 @@ class AutoTrader:
                                     symbol,
                                 )
             except Exception as exc:
-                log.error(
-                    "STOP   | %s | immediate post-escalation sell failed | %s",
-                    symbol,
-                    exc,
-                )
+                if self.is_order_reverses_existing_position(exc):
+                    # Live incident: the cancel just above this often
+                    # hasn't fully cleared the broker's own book yet by
+                    # the time this immediate sell fires - see is_order_
+                    # reverses_existing_position's own docstring. The
+                    # symbol falls through to a fresh, uncontested stop
+                    # order on the very next fast-loop cycle either way.
+                    log.warning(
+                        "STOP   | %s | immediate post-escalation sell "
+                        "skipped | prior order still resolving | %s",
+                        symbol,
+                        exc,
+                    )
+                else:
+                    log.error(
+                        "STOP   | %s | immediate post-escalation sell failed | %s",
+                        symbol,
+                        exc,
+                    )
 
     def trade_stocks(
         self,
@@ -1333,23 +1358,31 @@ class AutoTrader:
         )
         # By request: "keep it separate, all the bp should be for
         # option, then at 9am cst whatever is remaining can be used
-        # for stocks." Same fresh-entries-only scope as the blackout
-        # above (reuses the same fresh_entry_blackout_active gate at
-        # every one of its existing call sites below) - blocks new
-        # stock positions from claiming equity/margin during the
-        # first stock_entry_options_priority_minutes of the session,
-        # so options get first crack at the account's buying power
-        # before stocks start consuming any of it.
+        # for stocks" -> refined to "first we want an option trade to
+        # occur, and the stock trading should start later, although
+        # you can sell stocks anytime." Same fresh-entries-only scope
+        # as the blackout above (reuses the same fresh_entry_blackout_
+        # active gate at every one of its existing call sites below;
+        # exits are never affected by any of this) - blocks new stock
+        # positions from claiming equity/margin until EITHER a real
+        # option entry has landed today (self.option_entry_occurred_
+        # today, set by record_trade) OR stock_entry_options_priority_
+        # minutes have passed, whichever comes first. The time fallback
+        # exists so a day with zero qualifying option candidates
+        # doesn't lock fresh stock entries out for the entire session.
         option_open_moment = self.session_moment(
             moment, self.config.option_market_open_time
         )
         minutes_since_open = (moment - option_open_moment).total_seconds() / 60
         fresh_entry_blackout_active = (
             fresh_entry_blackout_active
-            or self.options_priority_window_active(
-                minutes_since_open,
-                float(self.config.stock_entry_options_priority_minutes),
-                core_session_active,
+            or (
+                not self.option_entry_occurred_today
+                and self.options_priority_window_active(
+                    minutes_since_open,
+                    float(self.config.stock_entry_options_priority_minutes),
+                    core_session_active,
+                )
             )
         )
         # By request: "start transitioning away from core hours

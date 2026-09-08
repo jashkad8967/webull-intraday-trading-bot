@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import time
 from collections import deque
 from decimal import Decimal
@@ -26,6 +27,23 @@ class StatusWriter:
         self.balance_history: deque = deque(
             loaded_balance_history, maxlen=balance_history_length
         )
+        # Live incident: record_trade/discard_trade/rekey_trade/
+        # record_balance/write are all reachable from BOTH the main
+        # loop (trade_stocks/trade_options/trade_pairs) and the
+        # separate, fast position-protection thread (evaluate_held_
+        # stock_exits/the repricers/escalate_stalled_stop_losses/
+        # monitor_working_orders) - see AutoTrader._position_protection_
+        # loop. _save_state's fixed-name .tmp file (same name every
+        # call, no lock) let two concurrent callers race: one thread's
+        # rename could consume the other's .tmp before it renamed its
+        # own, surfacing as "FileNotFoundError: .../trade_history.tmp
+        # -> .../trade_history.json" - a real cross-thread race, not a
+        # filesystem fault. One lock around every method that reads or
+        # mutates self.trades/self.balance_history (including write,
+        # which only reads them but from the main thread while the
+        # other thread can be mutating concurrently) makes each call a
+        # single atomic step relative to the other thread.
+        self._lock = threading.Lock()
 
     def _load_state(self) -> tuple[list[dict], list[dict]]:
         if self.state_path is None:
@@ -77,20 +95,25 @@ class StatusWriter:
         entry_price: Decimal | None = None,
         quantity: Decimal | None = None,
     ) -> None:
-        self.trades.appendleft(
-            {
-                "time": time.time(),
-                "instrument_type": instrument_type,
-                "symbol": symbol,
-                "action": action,
-                "limit_price": str(limit_price) if limit_price is not None else None,
-                "order_id": order_id,
-                "pnl": str(pnl) if pnl is not None else None,
-                "entry_price": str(entry_price) if entry_price is not None else None,
-                "quantity": str(quantity) if quantity is not None else None,
-            }
-        )
-        self._save_state()
+        with self._lock:
+            self.trades.appendleft(
+                {
+                    "time": time.time(),
+                    "instrument_type": instrument_type,
+                    "symbol": symbol,
+                    "action": action,
+                    "limit_price": (
+                        str(limit_price) if limit_price is not None else None
+                    ),
+                    "order_id": order_id,
+                    "pnl": str(pnl) if pnl is not None else None,
+                    "entry_price": (
+                        str(entry_price) if entry_price is not None else None
+                    ),
+                    "quantity": str(quantity) if quantity is not None else None,
+                }
+            )
+            self._save_state()
 
     def discard_trade(self, order_id: str) -> None:
         """Removes a trade-log entry that record_trade wrote optimistically
@@ -99,13 +122,14 @@ class StatusWriter:
         cancelled order stays on the dashboard's Recent Trades list
         forever, labeled as a completed profit that never happened.
         """
-        before = len(self.trades)
-        self.trades = deque(
-            (trade for trade in self.trades if trade.get("order_id") != order_id),
-            maxlen=self.trade_history,
-        )
-        if len(self.trades) != before:
-            self._save_state()
+        with self._lock:
+            before = len(self.trades)
+            self.trades = deque(
+                (trade for trade in self.trades if trade.get("order_id") != order_id),
+                maxlen=self.trade_history,
+            )
+            if len(self.trades) != before:
+                self._save_state()
 
     def rekey_trade(self, old_order_id: str, new_order_id: str) -> None:
         """Repoints a trade-log entry's order_id after AutoTrader.
@@ -119,11 +143,12 @@ class StatusWriter:
         - leaving a cancelled order's phantom profit on the dashboard
         forever, same symptom as a missing discard_trade call entirely.
         """
-        for trade in self.trades:
-            if trade.get("order_id") == old_order_id:
-                trade["order_id"] = new_order_id
-                self._save_state()
-                return
+        with self._lock:
+            for trade in self.trades:
+                if trade.get("order_id") == old_order_id:
+                    trade["order_id"] = new_order_id
+                    self._save_state()
+                    return
 
     def record_balance(self, balance: Decimal) -> None:
         """Appends one point to the account-equity history the dashboard
@@ -131,8 +156,9 @@ class StatusWriter:
         (this is called far less often than every status write; a point
         every few seconds is already more than a chart needs).
         """
-        self.balance_history.append({"time": time.time(), "balance": str(balance)})
-        self._save_state()
+        with self._lock:
+            self.balance_history.append({"time": time.time(), "balance": str(balance)})
+            self._save_state()
 
     @staticmethod
     def pnl_today_payload(
@@ -202,33 +228,39 @@ class StatusWriter:
         # (still optimistic, for the exact reasons discard_trade already
         # documents), just filters the DISPLAYED recent-trades list
         # against whatever's currently still pending.
-        pending_ids = {order.get("order_id") for order in pending_orders}
-        recent_trades = [
-            trade for trade in self.trades if trade.get("order_id") not in pending_ids
-        ]
-        payload = {
-            "updated_at": time.time(),
-            "mode": mode,
-            "paused": paused,
-            "buying_power": str(buying_power),
-            # Total net liquidation value (cash + market value of every
-            # held position) - the account's actual full worth, distinct
-            # from buying_power (spendable cash only). None (and shown
-            # as "—") when Webull doesn't report it (e.g. paper mode).
-            "account_value": str(account_value) if account_value is not None else None,
-            "positions": positions,
-            "watchlist": watchlist,
-            "user_watchlist": user_watchlist or [],
-            "agent": agent_summary,
-            "universe": {"stocks": stock_count, "options": option_count},
-            "recent_trades": recent_trades,
-            "pending_orders": pending_orders,
-            "balance_history": list(self.balance_history),
-            "pnl_today": self.pnl_today_payload(
-                realized_pnl_today, open_pnl_total, account_day_pnl_total
-            ),
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, default=str), encoding="utf-8")
-        temporary.replace(self.path)
+        with self._lock:
+            pending_ids = {order.get("order_id") for order in pending_orders}
+            recent_trades = [
+                trade
+                for trade in self.trades
+                if trade.get("order_id") not in pending_ids
+            ]
+            payload = {
+                "updated_at": time.time(),
+                "mode": mode,
+                "paused": paused,
+                "buying_power": str(buying_power),
+                # Total net liquidation value (cash + market value of
+                # every held position) - the account's actual full
+                # worth, distinct from buying_power (spendable cash
+                # only). None (and shown as "—") when Webull doesn't
+                # report it (e.g. paper mode).
+                "account_value": (
+                    str(account_value) if account_value is not None else None
+                ),
+                "positions": positions,
+                "watchlist": watchlist,
+                "user_watchlist": user_watchlist or [],
+                "agent": agent_summary,
+                "universe": {"stocks": stock_count, "options": option_count},
+                "recent_trades": recent_trades,
+                "pending_orders": pending_orders,
+                "balance_history": list(self.balance_history),
+                "pnl_today": self.pnl_today_payload(
+                    realized_pnl_today, open_pnl_total, account_day_pnl_total
+                ),
+            }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, default=str), encoding="utf-8")
+            temporary.replace(self.path)

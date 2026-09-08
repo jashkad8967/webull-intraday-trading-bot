@@ -23,6 +23,14 @@ def record_trade(
         self.manual_touch_at[key.split(":", 1)[1]] = submitted_at
     self.last_trade[key] = submitted_at
     self.submitted_order_ids_today.add(order_id)
+    # By request: "first we want an option trade to occur, and the
+    # stock trading should start later" - see options_priority_window_
+    # active, which reads this to release the fresh-stock-entry hold
+    # the moment a real option entry lands (not just once a fixed
+    # timer expires). A fresh option BUY only - not an exit/PROFIT/
+    # STOP, and not the general strategy's own BUY on a STOCK: key.
+    if action == "BUY" and key.startswith("OPTION:"):
+        self.option_entry_occurred_today = True
     if action == "PARTIAL_PROFIT":
         # By request: "sell 5 every 5 cents it goes up... keep the
         # rest for later profit" - a partial exit closes SOME of a
