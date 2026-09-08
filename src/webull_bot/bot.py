@@ -23,6 +23,7 @@ from webull_bot.errors.order_reverses_position import (
 from webull_bot.errors.short_selling import is_short_selling_unsupported
 from webull_bot.errors.symbol_restrictions import is_symbol_restricted_to_closing_only
 from webull_bot.invalid_symbols import InvalidSymbolTracker
+from webull_bot.option_contracts_state import OptionContractsStateStore
 from webull_bot.market_agent import MarketResearchAgent
 from webull_bot.pairs import (
     PAIRS,
@@ -574,6 +575,18 @@ class AutoTrader:
         self.option_cursor = 0
         self.option_discovery_cursor = 0
         self.option_discovery_attempted: set[str] = set()
+        # By request: "is there a way to save these option contracts" -
+        # restores whatever discover_option_contracts had already found
+        # in a prior session instead of paying the whole discovery
+        # ramp-up cost again on every restart. See
+        # OptionContractsStateStore's docstring.
+        self.option_contracts_state = OptionContractsStateStore(
+            self.config.option_contracts_state_file, log
+        )
+        restored_contracts, restored_attempted = self.option_contracts_state.load()
+        if restored_contracts:
+            self.option_contracts = restored_contracts
+            self.option_discovery_attempted = restored_attempted
         self.discover_all_options = False
         self.option_iv_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=30)

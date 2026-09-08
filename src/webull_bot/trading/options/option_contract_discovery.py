@@ -124,6 +124,13 @@ def discover_option_contracts(self) -> None:
             )
             self.option_contracts.extend(contracts)
             discovered.add(underlying)
+            # By request: "is there a way to save these option
+            # contracts" - persist after every real discovery so a
+            # restart resumes from here instead of an empty list. See
+            # OptionContractsStateStore.
+            self.option_contracts_state.save(
+                self.option_contracts, self.option_discovery_attempted
+            )
             log.info(
                 "OPTIONS | %s | found=%s | progress=%s/%s",
                 underlying,

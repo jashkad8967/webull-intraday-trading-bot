@@ -1526,6 +1526,7 @@ class Settings(BaseSettings):
     daily_pnl_state_file: str = "conf/daily_pnl.json"
     trade_history_state_file: str = "conf/trade_history.json"
     invalid_symbol_state_file: str = "conf/invalid_symbols.json"
+    option_contracts_state_file: str = "conf/option_contracts.json"
     # DISABLED by request, after an independent risk review found fully-
     # automatic live application of model-generated tuning to be the
     # most urgent operational risk in the system - a synthetic test

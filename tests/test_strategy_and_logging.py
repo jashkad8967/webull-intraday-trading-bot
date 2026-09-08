@@ -8707,6 +8707,76 @@ class DashboardCommandTests(unittest.TestCase):
         self.assertIn("TSLA", fake_bot.priority_scan_symbols)
 
 
+class OptionContractsStateStoreTests(unittest.TestCase):
+    """By request: "is there a way to save these option contracts" -
+    discover_option_contracts used to rebuild self.option_contracts
+    from scratch, in memory only, every process start.
+    """
+
+    def _store(self, path):
+        from webull_bot.option_contracts_state import OptionContractsStateStore
+
+        return OptionContractsStateStore(str(path), logging.getLogger("test-opt-state"))
+
+    def test_save_then_load_round_trips_contracts_and_attempted(self):
+        path = Path("tests/.generated_option_state/roundtrip.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            from datetime import date
+
+            store = self._store(path)
+            future = (date.today() + timedelta(days=20)).isoformat()
+            contracts = [
+                {
+                    "symbol": "XYZ260101C00100000",
+                    "underlying_symbol": "XYZ",
+                    "strike_price": "100",
+                    "expiration_date": future,
+                    "option_type": "CALL",
+                }
+            ]
+            store.save(contracts, {"XYZ", "ABC"})
+            loaded_contracts, loaded_attempted = self._store(path).load()
+            self.assertEqual(loaded_contracts, contracts)
+            self.assertEqual(loaded_attempted, {"XYZ", "ABC"})
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_load_drops_already_expired_contracts(self):
+        path = Path("tests/.generated_option_state/expired.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            from datetime import date
+
+            store = self._store(path)
+            past = (date.today() - timedelta(days=1)).isoformat()
+            future = (date.today() + timedelta(days=20)).isoformat()
+            store.save(
+                [
+                    {
+                        "symbol": "OLD",
+                        "expiration_date": past,
+                    },
+                    {
+                        "symbol": "STILL_GOOD",
+                        "expiration_date": future,
+                    },
+                ],
+                set(),
+            )
+            loaded_contracts, _ = self._store(path).load()
+            self.assertEqual([c["symbol"] for c in loaded_contracts], ["STILL_GOOD"])
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_load_with_no_file_yet_returns_empty(self):
+        path = Path("tests/.generated_option_state/missing.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        contracts, attempted = self._store(path).load()
+        self.assertEqual(contracts, [])
+        self.assertEqual(attempted, set())
+
+
 class WashSaleTrackerTests(unittest.TestCase):
     def _tracker(self, path, block_days):
         return WashSaleTracker(str(path), block_days, timezone.utc, logging.getLogger("test-wash"))
@@ -13158,6 +13228,47 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
         select = WebullAPI.select_atm_options.__get__(fake_api)
         result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
         self.assertEqual(result[0]["symbol"], "XYZ260101C00100000")
+
+    def test_searches_further_otm_when_the_whole_near_atm_shortlist_is_unaffordable(
+        self,
+    ):
+        # By request: "these are definitely not the most volatile
+        # contracts, I know TSLA contracts move like crazy" - a high-
+        # priced underlying's near-ATM strikes (100/105/110 here) can
+        # ALL be unaffordable on a small account; the contract must
+        # still be tradable, so this should walk further OTM (120)
+        # instead of giving up on the unaffordable near-ATM cluster.
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00105000", 105),
+                ("XYZ260101C00110000", 110),
+                ("XYZ260101C00120000", 120),
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "8.00",
+                "XYZ260101C00105000": "7.00",
+                "XYZ260101C00110000": "6.00",
+                "XYZ260101C00120000": "1.00",
+            },
+            shortlist_size=3,
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00120000")
+
+    def test_still_falls_back_to_cheapest_near_atm_when_nothing_anywhere_fits(self):
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00105000", 105),
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "80.00",
+                "XYZ260101C00105000": "70.00",
+            },
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("10"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00105000")
 
 
 class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):
