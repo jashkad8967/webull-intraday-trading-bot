@@ -9713,6 +9713,49 @@ class ExecutionGuardrailTests(unittest.TestCase):
         self.assertIn("AAPL", logs.output[0])
         self.assertIn("AAPL", fake_bot.price_sanity_rejected_at)
 
+    def test_option_tolerance_allows_a_wide_but_real_option_spread(self):
+        """By request: "make sure your buy and sell price will
+        actually be executed inside the spread for options, similar
+        to stocks." A 20% deviation is normal for a liquid option
+        (unlike a stock) and must not be rejected under the wider
+        option tolerance, even though it would fail the default 5%
+        stock tolerance.
+        """
+        from webull_bot.bot import AutoTrader
+        from webull_bot.trading.guards.price_sanity import (
+            OPTION_PRICE_SANITY_TOLERANCE,
+        )
+
+        fake_bot = SimpleNamespace(price_sanity_rejected_at={})
+        check = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        self.assertTrue(
+            check(
+                "AAPL260101C00200000",
+                Decimal("1.00"),
+                Decimal("1.20"),
+                tolerance=OPTION_PRICE_SANITY_TOLERANCE,
+            )
+        )
+        self.assertEqual(fake_bot.price_sanity_rejected_at, {})
+
+    def test_option_tolerance_still_rejects_a_truly_stale_quote(self):
+        from webull_bot.bot import AutoTrader
+        from webull_bot.trading.guards.price_sanity import (
+            OPTION_PRICE_SANITY_TOLERANCE,
+        )
+
+        fake_bot = SimpleNamespace(price_sanity_rejected_at={})
+        check = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        with self.assertLogs("webull-bot", level="ERROR"):
+            self.assertFalse(
+                check(
+                    "AAPL260101C00200000",
+                    Decimal("1.00"),
+                    Decimal("2.00"),
+                    tolerance=OPTION_PRICE_SANITY_TOLERANCE,
+                )
+            )
+
     def test_entry_price_sanity_cooldown_blocks_a_recent_rejection(self):
         """Live incident: one illiquid symbol's quote sat just past
         price_sanity_ok's tolerance and got retried (and re-rejected) on

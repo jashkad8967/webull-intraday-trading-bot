@@ -5,14 +5,37 @@ from decimal import Decimal
 log = logging.getLogger("webull-bot")
 
 PRICE_SANITY_TOLERANCE = Decimal("0.05")
+# By request: "make sure your buy and sell price will actually be
+# executed inside the spread for options, similar to stocks" - stocks
+# already ran every order through price_sanity_ok as a fat-finger
+# backstop; options never did at all, a real gap given a stale/corrupt
+# option quote can misprice a limit just as badly as a stock one can.
+# A materially wider bound than the stock tolerance above - options
+# routinely carry much wider REAL relative bid-ask spreads than stocks
+# (a $1.00 contract quoting $0.90/$1.10 is a normal, liquid 20% spread,
+# not a broken quote), so reusing the 5% stock tolerance here would
+# reject a large share of genuinely fine option orders. Still hardcoded,
+# not config, same "sanity backstop, not a tuning knob" reasoning as
+# PRICE_SANITY_TOLERANCE - this catches a truly stale/corrupt quote
+# (deviation far beyond even a wide real spread), not normal option
+# pricing.
+OPTION_PRICE_SANITY_TOLERANCE = Decimal("0.30")
 
 
-def price_sanity_ok(self, symbol: str, last_price: Decimal, limit_price: Decimal) -> bool:
+def price_sanity_ok(
+    self,
+    symbol: str,
+    last_price: Decimal,
+    limit_price: Decimal,
+    tolerance: Decimal = PRICE_SANITY_TOLERANCE,
+) -> bool:
     """Fat-finger guard: reject a limit price that's implausibly far
     from the last observed trade price instead of trusting sizing/
     pricing math blindly. Catches a stale or corrupted quote producing
     a wildly wrong limit before it ever reaches the broker - hardcoded,
     not config, since this is a sanity backstop, not a tuning knob.
+    tolerance defaults to the stock bound (PRICE_SANITY_TOLERANCE) but
+    callers can pass a wider one - see OPTION_PRICE_SANITY_TOLERANCE.
 
     Records the rejection in price_sanity_rejected_at - see
     price_sanity_cooldown_ready. Live incident: one illiquid
@@ -27,7 +50,7 @@ def price_sanity_ok(self, symbol: str, last_price: Decimal, limit_price: Decimal
     if last_price <= 0:
         return True
     deviation = abs(limit_price - last_price) / last_price
-    if deviation > PRICE_SANITY_TOLERANCE:
+    if deviation > tolerance:
         self.price_sanity_rejected_at[symbol] = time.monotonic()
         log.error(
             "GUARD  | %-8s | price sanity check failed | last=%.4f limit=%.4f "
@@ -36,7 +59,7 @@ def price_sanity_ok(self, symbol: str, last_price: Decimal, limit_price: Decimal
             last_price,
             limit_price,
             deviation * 100,
-            PRICE_SANITY_TOLERANCE * 100,
+            tolerance * 100,
         )
         return False
     return True
