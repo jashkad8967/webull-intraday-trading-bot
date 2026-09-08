@@ -117,6 +117,13 @@ def _resolve_targets_work_body(self, moment: datetime) -> None:
     self.option_cursor = 0
     self.option_discovery_cursor = 0
     self.option_discovery_attempted.clear()
+    # Keep the persisted file in sync with this in-memory clear - a
+    # restart between now and the next real discovery pass must not
+    # resurrect yesterday's attempted set from disk. See
+    # OptionContractsStateStore.
+    self.option_contracts_state.save(
+        self.option_contracts, self.option_discovery_attempted
+    )
     self.invalid_stock_symbols.clear()
     self.resolved_date = moment.date()
     available = set(self.stock_symbols)

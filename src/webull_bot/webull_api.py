@@ -1193,6 +1193,58 @@ class WebullAPI:
                 volume = self.option_volume(quote) or Decimal("0")
                 priced.append((item, premium * 100, volume, index))
             affordable = [pair for pair in priced if pair[1] <= max_contract_cost]
+            # By request: "these are definitely not the most volatile
+            # contracts, I know TSLA contracts move like crazy" - a
+            # high-priced underlying's near-ATM strikes can ALL be
+            # unaffordable on a small account (the old fallback below
+            # then just picked the cheapest of that same unaffordable
+            # cluster, which still doesn't fit - buy_quantity ends up
+            # 0 downstream and the underlying silently never trades
+            # despite being "selected" every cycle). Rather than give
+            # up at the near-ATM shortlist, walk further OUT into the
+            # same expiration/type pool (further OTM = cheaper premium,
+            # still a real, tradable contract on that same volatile
+            # underlying) until an affordable one turns up. Bounded to
+            # a few extra quote batches (option_quotes caps at 20/call)
+            # so a single expensive underlying can't blow up this
+            # cycle's request budget.
+            if not affordable:
+                already_quoted = {item["symbol"] for item in shortlist}
+                remaining = [
+                    item for item in pool_sorted if item["symbol"] not in already_quoted
+                ]
+                for start in range(0, min(len(remaining), 60), 20):
+                    chunk = remaining[start : start + 20]
+                    if not chunk:
+                        break
+                    try:
+                        extra_quotes = self.option_quotes(
+                            [item["symbol"] for item in chunk]
+                        )
+                    except Exception:
+                        break
+                    extra_by_symbol = {
+                        str(q.get("symbol")): q
+                        for q in extra_quotes
+                        if isinstance(q, dict)
+                    }
+                    found = False
+                    for item in chunk:
+                        quote = extra_by_symbol.get(item["symbol"])
+                        if not quote:
+                            continue
+                        try:
+                            premium = self.quote_price(quote)
+                        except Exception:
+                            continue
+                        cost = premium * 100
+                        if cost <= max_contract_cost:
+                            affordable.append(
+                                (item, cost, self.option_volume(quote) or Decimal("0"), -1)
+                            )
+                            found = True
+                    if found:
+                        break
             if affordable:
                 best = max(affordable, key=lambda pair: (pair[2], -pair[3]))
                 selected.append(best[0])
