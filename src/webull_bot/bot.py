@@ -544,6 +544,13 @@ class AutoTrader:
         # lower one before averaging down again. Reset the moment the
         # position fully closes.
         self.volatility_scalp_last_buy_price: dict[str, Decimal] = {}
+        # Options analog of the three dicts above - by request: "you can
+        # also use averaging down... for options as well." Same
+        # widening-ladder/strictly-lower-than-last-buy/reset-on-close
+        # shape, keyed by option contract symbol instead of stock symbol.
+        self.option_average_down_count: dict[str, int] = defaultdict(int)
+        self.last_option_average_down: dict[str, float] = {}
+        self.option_last_buy_price: dict[str, Decimal] = {}
         # -inf, not 0.0: time.monotonic() starts near zero at process
         # boot too, so a 0.0 default would silently throttle the very
         # first selection until VOLATILITY_SCALP_RESELECT_SECONDS
@@ -3776,6 +3783,12 @@ class AutoTrader:
                     self.option_iv_history[option_symbol].append(current_iv)
                 if quantity == 0:
                     self.pending_option_exits.discard(option_symbol)
+                    # Reset averaging-down state the moment the position
+                    # fully closes - same convention as the stock-side
+                    # volatility_scalp_average_down_count.pop(...) reset.
+                    self.option_average_down_count.pop(option_symbol, None)
+                    self.last_option_average_down.pop(option_symbol, None)
+                    self.option_last_buy_price.pop(option_symbol, None)
                     # By request ("scan through everything... figure out
                     # what you missed"): live evidence showed real CALL/
                     # PUT signals firing constantly all day (169/186
@@ -3813,8 +3826,25 @@ class AutoTrader:
                     # PERCENT restored) once a real end-to-end trade is
                     # confirmed.
                     if not self.config.option_smoke_test_mode:
+                        # By request: "you can... use call and put
+                        # simultaneously type strategies for options as
+                        # well" - option_straddle_enabled (opt-in, off
+                        # by default) drops the requirement that this
+                        # contract's type match the underlying's single
+                        # directional EMA signal, so a CALL and a PUT on
+                        # the SAME underlying can both qualify for entry
+                        # at once (a straddle bet on movement itself,
+                        # not a specific direction). Every OTHER gate
+                        # below (delta, IV percentile, market regime,
+                        # wash-sale, stop-loss guard, quarantine,
+                        # cooldown, rate cap, affordability) still
+                        # applies unchanged - this only removes the
+                        # single-direction restriction, it doesn't
+                        # bypass quality checks the way smoke-test mode
+                        # does.
                         if not (
-                            (contract_type == "CALL" and direction == "CALL")
+                            self.config.option_straddle_enabled
+                            or (contract_type == "CALL" and direction == "CALL")
                             or (contract_type == "PUT" and direction == "PUT")
                         ):
                             self.option_gate_rejections[
@@ -3967,6 +3997,85 @@ class AutoTrader:
                     cost,
                     days_to_expiration,
                 )
+                # By request: "you can also use averaging down... for
+                # options as well" - only when the position is neither
+                # profiting nor already at its stop (decision == HOLD),
+                # still has genuine room before forced time-decay exit,
+                # and hasn't hit its averaging cap/cooldown/strictly-
+                # lower-price bar. Sized with the same option_order_
+                # quantity risk-cap fresh entries use, against whatever
+                # buying power remains this cycle.
+                if (
+                    decision.action == "HOLD"
+                    and quantity > 0
+                    and option_symbol not in self.pending_option_exits
+                    and days_to_expiration > self.config.option_min_hold_dte
+                    and self.option_average_down_count[option_symbol]
+                    < self.config.option_max_averaging_buys
+                    and (
+                        time.monotonic()
+                        - self.last_option_average_down.get(option_symbol, 0.0)
+                    )
+                    >= float(self.config.option_averaging_reentry_cooldown_seconds)
+                    and self.strategy.option_average_down_signal(
+                        price,
+                        cost,
+                        level=self.option_average_down_count[option_symbol],
+                    )
+                    and (
+                        option_symbol not in self.option_last_buy_price
+                        or price < self.option_last_buy_price[option_symbol]
+                    )
+                ):
+                    average_down_quantity, average_down_contract_cost = (
+                        self.strategy.option_order_quantity(price, buying_power)
+                    )
+                    if average_down_quantity > 0:
+                        try:
+                            average_down_price = self.api.option_limit_price(
+                                quote, "BUY"
+                            )
+                        except QuoteUnavailableError:
+                            average_down_price = None
+                        if average_down_price is not None and self.price_sanity_ok(
+                            option_symbol,
+                            price,
+                            average_down_price,
+                            tolerance=OPTION_PRICE_SANITY_TOLERANCE,
+                        ):
+                            order_id = self.api.place_option(
+                                contract,
+                                "BUY",
+                                average_down_quantity,
+                                average_down_price,
+                                "BUY_TO_OPEN",
+                            )
+                            self.record_trade(
+                                key,
+                                order_id,
+                                "BUY",
+                                entry_price=average_down_price,
+                                quantity=average_down_quantity,
+                                counts_toward_idle_cash_ramp=False,
+                            )
+                            self.option_average_down_count[option_symbol] += 1
+                            self.last_option_average_down[option_symbol] = (
+                                time.monotonic()
+                            )
+                            self.option_last_buy_price[option_symbol] = price
+                            buying_power = max(
+                                Decimal("0"),
+                                buying_power
+                                - average_down_contract_cost * average_down_quantity,
+                            )
+                            log.info(
+                                "OPTIONS| %-8s | average down | qty=%s | price=%s "
+                                "| count=%s",
+                                option_symbol,
+                                average_down_quantity,
+                                average_down_price,
+                                self.option_average_down_count[option_symbol],
+                            )
                 if (
                     decision.action == "PROFIT"
                     and option_symbol not in self.pending_option_exits

@@ -3736,6 +3736,48 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(quantity, 2)
 
+    def test_option_average_down_signal_widens_the_required_drop_per_level(self):
+        # By request: "you can also use averaging down... for options
+        # as well" - same widening-ladder shape as volatility_scalp_
+        # average_down_signal, using the real Settings defaults
+        # (20% base dip, 0.5x step multiplier).
+        from webull_bot.config import Settings
+
+        config = Settings(_env_file=None)
+        strategy = TradingStrategy(config)
+        # Level 0: needs >= 20% drop.
+        self.assertFalse(
+            strategy.option_average_down_signal(
+                Decimal("0.85"), Decimal("1.00"), level=0
+            )
+        )
+        self.assertTrue(
+            strategy.option_average_down_signal(
+                Decimal("0.79"), Decimal("1.00"), level=0
+            )
+        )
+        # Level 1: needs >= 30% drop (20% * (1 + 0.5*1)) - the same 21%
+        # drop that qualified at level 0 must NOT qualify at level 1.
+        self.assertFalse(
+            strategy.option_average_down_signal(
+                Decimal("0.79"), Decimal("1.00"), level=1
+            )
+        )
+        self.assertTrue(
+            strategy.option_average_down_signal(
+                Decimal("0.69"), Decimal("1.00"), level=1
+            )
+        )
+
+    def test_option_average_down_signal_rejects_non_positive_inputs(self):
+        strategy = TradingStrategy(self.config())
+        self.assertFalse(
+            strategy.option_average_down_signal(Decimal("1.00"), Decimal("0"))
+        )
+        self.assertFalse(
+            strategy.option_average_down_signal(Decimal("0"), Decimal("1.00"))
+        )
+
 
 class StopLossEscalationTests(unittest.TestCase):
     def test_escalated_stop_bypasses_cooldown_after_cancel(self):

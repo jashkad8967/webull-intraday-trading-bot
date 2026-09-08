@@ -2675,6 +2675,27 @@ class TradingStrategy:
             contract_cost,
         )
 
+    def option_average_down_signal(
+        self, price: Decimal, average_cost: Decimal, level: int = 0
+    ) -> bool:
+        """Options analog of volatility_scalp_average_down_signal - by
+        request: "you can also use averaging down... for options as
+        well." Same widening-ladder shape (each successive averaging
+        level requires a bigger drop than the last, so a losing
+        position can't refill into noise) - options move far more,
+        percentage-wise, than stocks, so this uses its own, wider dip/
+        step config (option_averaging_down_dip_percent/option_
+        averaging_step_multiplier) rather than reusing the stock-side
+        volatility-scalp knobs.
+        """
+        if average_cost <= 0 or price <= 0:
+            return False
+        drop = (average_cost - price) / average_cost
+        required = self.config.option_averaging_down_dip_percent * (
+            Decimal("1") + self.config.option_averaging_step_multiplier * level
+        )
+        return drop >= required
+
     @staticmethod
     def open_position_count(positions: list[dict]) -> int:
         return sum(
