@@ -17,9 +17,9 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     option quotes.
 
     Returns (open_count, guard_active, directions, batch, quote_by_symbol,
-    today) on success, or None if this cycle's option scan batch could
-    not be built at all - callers should treat None the same as the
-    "return buying_power unchanged" cases it replaces.
+    today, current_vixy) on success, or None if this cycle's option scan
+    batch could not be built at all - callers should treat None the same
+    as the "return buying_power unchanged" cases it replaces.
     """
     open_count = self.strategy.open_position_count(positions)
     # See stop_loss_guard_active() / trade_stocks - same freqtrade-
@@ -154,4 +154,4 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
         str(quote.get("symbol", "")).upper(): quote for quote in quotes
     }
     today = date.today()
-    return open_count, guard_active, directions, batch, quote_by_symbol, today
+    return open_count, guard_active, directions, batch, quote_by_symbol, today, current_vixy
