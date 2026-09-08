@@ -17,7 +17,10 @@ def _prepare_stock_scan_batch(
 ):
     """Builds this cycle's stock scan batch and fetches quotes for it,
     plus every other once-per-cycle (not per-symbol) gate/multiplier
-    trade_stocks' per-symbol loop needs. See trade_stocks for how each
+    trade_stocks' per-symbol loop needs, including volatility_scalp_
+    intensity itself (not just the two limits derived from it) - the
+    per-symbol loop passes it straight through to several
+    volatility_scalp_share_count calls. See trade_stocks for how each
     of these is used.
 
     Returns a tuple of everything the per-symbol loop needs on success,
@@ -545,4 +548,5 @@ def _prepare_stock_scan_batch(
         fractional_position_count,
         volatility_scalp_effective_max_concurrent,
         volatility_scalp_effective_max_averaging,
+        volatility_scalp_intensity,
     )

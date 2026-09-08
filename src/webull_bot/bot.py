@@ -867,6 +867,7 @@ class AutoTrader:
             fractional_position_count,
             volatility_scalp_effective_max_concurrent,
             volatility_scalp_effective_max_averaging,
+            volatility_scalp_intensity,
         ) = prepared
         for symbol in batch:
             if symbol in self.broker_conflict_symbols:
