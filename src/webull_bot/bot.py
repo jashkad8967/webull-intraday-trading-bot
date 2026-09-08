@@ -60,6 +60,7 @@ from webull_bot.trading.guards.portfolio_circuit_breaker import (
 )
 from webull_bot.trading.guards.post_stop_reentry import post_stop_reentry_ready
 from webull_bot.trading.guards.price_sanity import (
+    OPTION_PRICE_SANITY_TOLERANCE,
     price_sanity_cooldown_ready,
     price_sanity_ok,
 )
@@ -3868,6 +3869,21 @@ class AutoTrader:
                             self.cached_option_buying_power,
                         )
                     )
+                    # By request: "make sure your buy and sell price
+                    # will actually be executed inside the spread for
+                    # options, similar to stocks" - stocks already run
+                    # every order through this fat-finger backstop;
+                    # options never did. Computed once (not inline in
+                    # both the diagnostic elif chain below and the real
+                    # gate) since price_sanity_ok has a side effect
+                    # (logs + records the rejection timestamp) that
+                    # would otherwise double-fire.
+                    price_sane = self.price_sanity_ok(
+                        option_symbol,
+                        price,
+                        limit_price,
+                        tolerance=OPTION_PRICE_SANITY_TOLERANCE,
+                    )
                     if buy_quantity <= 0:
                         self.option_gate_rejections[
                             "sizing produced zero contracts (price/buying "
@@ -3883,12 +3899,15 @@ class AutoTrader:
                         self.option_gate_rejections["hourly rate cap"] += 1
                     elif not self.reentry_cooldown_ready(key):
                         self.option_gate_rejections["reentry cooldown"] += 1
+                    elif not price_sane:
+                        self.option_gate_rejections["price sanity check failed"] += 1
                     if (
                         open_count < self.config.max_open_positions
                         and buy_quantity > 0
                         and self.cooldown_ready(key)
                         and not self.rate_capped(key)
                         and self.reentry_cooldown_ready(key)
+                        and price_sane
                     ):
                         order_id = self.api.place_option(
                             contract,
@@ -3935,6 +3954,13 @@ class AutoTrader:
                         target,
                         self.api.option_limit_price(quote, "SELL"),
                     )
+                    if not self.price_sanity_ok(
+                        option_symbol,
+                        price,
+                        limit_price,
+                        tolerance=OPTION_PRICE_SANITY_TOLERANCE,
+                    ):
+                        continue
                     order_id = self.api.place_option(
                         contract,
                         "SELL",
@@ -3954,6 +3980,13 @@ class AutoTrader:
                     and self.cooldown_ready(key)
                 ):
                     limit_price = self.api.option_limit_price(quote, "SELL")
+                    if not self.price_sanity_ok(
+                        option_symbol,
+                        price,
+                        limit_price,
+                        tolerance=OPTION_PRICE_SANITY_TOLERANCE,
+                    ):
+                        continue
                     order_id = self.api.place_option(
                         contract,
                         "SELL",
