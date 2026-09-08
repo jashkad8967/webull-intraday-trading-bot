@@ -2446,7 +2446,7 @@ class AutoTrader:
         prepared = self._prepare_option_scan_batch(positions)
         if prepared is None:
             return buying_power
-        open_count, guard_active, directions, batch, quote_by_symbol, today = prepared
+        open_count, guard_active, directions, batch, quote_by_symbol, today, current_vixy = prepared
         for contract in batch:
             option_symbol = contract["symbol"]
             key = f"OPTION:{option_symbol}"
