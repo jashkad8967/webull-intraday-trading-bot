@@ -355,20 +355,25 @@ class Settings(BaseSettings):
     fractional_shares_enabled: bool = True
     fractional_shares_min_notional: Decimal = Field(default=Decimal("25"), ge=Decimal("5"))
     option_batch_size: int = Field(default=20, ge=1, le=20)
-    # By request ("it is very slow with scanning option"): the outer
-    # loop cycle itself currently runs ~2 minutes (universe rebuild/
-    # VOLFILT/momentum refresh overhead - see the general stock-scan
-    # throughput notes elsewhere in this file), and this cap was
-    # already maxed out at its old ceiling (10) live - meaning
-    # discovery could only ever examine ~5 new underlyings/minute
-    # regardless. Each discovery attempt is a lightweight per-symbol
-    # contract lookup (plus, since the buying-power-affordability fix,
-    # one small quote batch only when a cost cap is actually passed),
-    # not a big batch call - raising both the ceiling and the live
-    # value gives real headroom without changing per-cycle API request
-    # shape.
-    option_discovery_per_cycle: int = Field(default=1, ge=1, le=50)
-    option_discovery_seconds: Decimal = Field(default=Decimal("15"), ge=1, le=3600)
+    # By request ("it is very slow with scanning option" / "are you
+    # sure there is no way to load options more quickly"): discover_
+    # option_contracts only runs once per full run() loop cycle, and
+    # that outer cycle's own pace (universe scan/quote batching/trade_
+    # stocks overhead) is the real bottleneck, not this throttle - live
+    # evidence: with this at (5, 1s), successful discovery bursts
+    # correctly examined ~5 at a time, but the bursts themselves were
+    # 30s-2min+ apart, averaging well under 2 new underlyings/minute.
+    # Raising the throttle interval further wouldn't help (the outer
+    # loop is already calling far less often than once/second) - what
+    # helps is covering MORE of the (now much smaller, curated - see
+    # discover_option_contracts) candidate pool on each of those
+    # infrequent bursts. Each discovery attempt is a lightweight per-
+    # symbol contract lookup (plus, since the buying-power-
+    # affordability fix, one small quote batch only when a cost cap is
+    # actually passed), not a big batch call, so a higher per-cycle
+    # ceiling doesn't meaningfully change per-cycle API request shape.
+    option_discovery_per_cycle: int = Field(default=20, ge=1, le=50)
+    option_discovery_seconds: Decimal = Field(default=Decimal("1"), ge=1, le=3600)
 
     stock_quantity: int = Field(default=1, ge=1)
     option_quantity: int = Field(default=1, ge=1)
