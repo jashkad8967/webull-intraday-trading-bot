@@ -376,7 +376,14 @@ class Settings(BaseSettings):
     option_discovery_seconds: Decimal = Field(default=Decimal("1"), ge=1, le=3600)
 
     stock_quantity: int = Field(default=1, ge=1)
-    option_quantity: int = Field(default=1, ge=1)
+    # By request: "you can buy multiple contracts, it does not have to
+    # be only 1" - this used to default to 1 and, since option_order_
+    # quantity takes the MIN of this against affordability/notional/
+    # risk-cap, it was always the binding constraint regardless of how
+    # much buying power was actually available. Raised to a high
+    # ceiling so those real, buying-power-aware caps do the actual
+    # sizing instead of a flat hardcoded 1.
+    option_quantity: int = Field(default=20, ge=1)
     max_open_positions: int = Field(default=50, ge=1)
     max_order_notional: Decimal = Field(default=Decimal("1000"), gt=0)
 

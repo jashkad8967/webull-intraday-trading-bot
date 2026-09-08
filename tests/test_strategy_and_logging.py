@@ -3716,6 +3716,27 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(quantity, 1)
 
+    def test_real_config_default_lets_the_risk_cap_size_multiple_contracts(self):
+        # By request: "you can buy multiple contracts, it does not have
+        # to be only 1" - option_quantity used to default to 1 and,
+        # since option_order_quantity takes the MIN against it, that
+        # was always the binding cap regardless of buying power. Using
+        # the REAL Config (not the test fixture's hardcoded
+        # option_quantity=1) confirms the risk/notional/affordability
+        # caps now actually get to size more than one contract.
+        from webull_bot.config import Settings
+
+        config = Settings(_env_file=None)
+        strategy = TradingStrategy(config)
+        # $1 premium -> $100/contract. 5% risk cap of $5000 = $250 -> 2
+        # contracts; option_quantity's default ceiling must not clamp
+        # this down to 1.
+        quantity, _ = strategy.option_order_quantity(
+            Decimal("1.00"), Decimal("5000")
+        )
+        self.assertEqual(quantity, 2)
+
+
 class StopLossEscalationTests(unittest.TestCase):
     def test_escalated_stop_bypasses_cooldown_after_cancel(self):
         from webull_bot.bot import AutoTrader
