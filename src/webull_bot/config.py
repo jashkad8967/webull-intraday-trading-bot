@@ -1268,6 +1268,26 @@ class Settings(BaseSettings):
     # -close strike can be picked instead when the true ATM one doesn't
     # fit - see WebullAPI.select_atm_options's own docstring.
     option_affordability_shortlist_size: int = Field(default=6, ge=1, le=20)
+    # By request: "you can also use averaging down... for options as
+    # well" - options analog of the volatility-scalp averaging-down
+    # knobs, but wider, since options routinely move a much larger
+    # percentage than the underlying stock does.
+    option_averaging_down_dip_percent: Decimal = Field(
+        default=Decimal("0.20"), gt=0, le=1
+    )
+    option_averaging_step_multiplier: Decimal = Field(
+        default=Decimal("0.5"), ge=0, le=5
+    )
+    option_max_averaging_buys: int = Field(default=2, ge=0, le=10)
+    option_averaging_reentry_cooldown_seconds: Decimal = Field(
+        default=Decimal("60"), ge=0, le=3600
+    )
+    # By request: "you can... use call and put simultaneously type
+    # strategies for options as well" - off by default (a genuine
+    # straddle risks paying two premiums instead of one when the
+    # underlying doesn't move enough), opt-in via this flag. See its
+    # use in trade_options' direction-match gate.
+    option_straddle_enabled: bool = False
     stop_loss_escalate_seconds: int = Field(default=15, ge=5, le=120)
     # Live incident: CTRM resubmitted the same never-fillable PROFIT limit
     # order for 3+ hours (40+ attempts) - escalate_stalled_stop_losses is
