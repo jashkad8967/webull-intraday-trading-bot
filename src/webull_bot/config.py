@@ -572,6 +572,15 @@ class Settings(BaseSettings):
     stock_entry_options_priority_minutes: int = Field(
         default=30, ge=0, le=120
     )
+    # By request: "do not allow more than 20% in stocks." A hard
+    # portfolio-level ceiling on total stock (EQUITY) exposure as a
+    # fraction of account value - see risk.stock_total_exposure's
+    # stock_total_exposure_at_cap, which reuses the same fresh_entry_
+    # blackout_active gate every fresh stock entry/averaging-down
+    # check already goes through. Never affects exits.
+    stock_max_total_exposure_fraction: Decimal = Field(
+        default=Decimal("0.20"), gt=0, le=1
+    )
     # By request: "start transitioning away from core hours strategy
     # around 30 minutes before end of core hours." Softer/earlier than
     # stock_entry_blackout_minutes_before_close above (a hard block on

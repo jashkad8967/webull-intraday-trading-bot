@@ -33,6 +33,7 @@ from webull_bot.pairs import (
 from webull_bot.risk.entry_blackout import fresh_entry_blackout_active
 from webull_bot.risk.options_priority_window import options_priority_window_active
 from webull_bot.risk.profit_target_multiplier import profit_target_multiplier
+from webull_bot.risk.stock_total_exposure import stock_total_exposure_at_cap
 from webull_bot.risk.stop_tighten_multiplier import stop_tighten_multiplier
 from webull_bot.sizing.diversification_budget import (
     diversification_capped_entry_budget,
@@ -279,6 +280,7 @@ class AutoTrader:
     )
     fresh_entry_blackout_active = staticmethod(fresh_entry_blackout_active)
     options_priority_window_active = staticmethod(options_priority_window_active)
+    stock_total_exposure_at_cap = staticmethod(stock_total_exposure_at_cap)
     max_fractional_position_slots = staticmethod(max_fractional_position_slots)
     profit_target_multiplier = staticmethod(profit_target_multiplier)
     stop_tighten_multiplier = staticmethod(stop_tighten_multiplier)
@@ -1383,6 +1385,19 @@ class AutoTrader:
                     float(self.config.stock_entry_options_priority_minutes),
                     core_session_active,
                 )
+            )
+        )
+        # By request: "do not allow more than 20% in stocks." Same
+        # fresh-entries-only scope as everything else folded into
+        # fresh_entry_blackout_active above - blocks new stock
+        # positions (and averaging down) once total stock exposure
+        # already meets or exceeds the cap; every exit is unaffected.
+        fresh_entry_blackout_active = (
+            fresh_entry_blackout_active
+            or self.stock_total_exposure_at_cap(
+                self.cached_account_value,
+                positions,
+                self.config.stock_max_total_exposure_fraction,
             )
         )
         # By request: "start transitioning away from core hours

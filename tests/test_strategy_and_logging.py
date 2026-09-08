@@ -1251,6 +1251,75 @@ class OptionsPriorityWindowActiveTests(unittest.TestCase):
         )
 
 
+class StockTotalExposureAtCapTests(unittest.TestCase):
+    """stock_total_exposure_at_cap - by request: "do not allow more
+    than 20% in stocks." A hard, checked-before-adding portfolio-level
+    ceiling on total EQUITY position value as a fraction of account
+    value - blocks fresh stock entries/averaging-down only, never any
+    exit.
+    """
+
+    def test_false_when_well_under_the_cap(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "quantity": "10", "cost_price": "5"},
+        ]
+        self.assertFalse(
+            AutoTrader.stock_total_exposure_at_cap(
+                Decimal("1000"), positions, Decimal("0.20")
+            )
+        )
+
+    def test_true_once_at_the_cap(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "quantity": "20", "cost_price": "10"},
+        ]
+        # 20 * 10 = $200 == 20% of $1000 - at the cap, not over it,
+        # but "do not allow MORE than 20%" means no further room.
+        self.assertTrue(
+            AutoTrader.stock_total_exposure_at_cap(
+                Decimal("1000"), positions, Decimal("0.20")
+            )
+        )
+
+    def test_true_once_over_the_cap(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "quantity": "30", "cost_price": "10"},
+        ]
+        self.assertTrue(
+            AutoTrader.stock_total_exposure_at_cap(
+                Decimal("1000"), positions, Decimal("0.20")
+            )
+        )
+
+    def test_ignores_option_positions(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "OPTION", "quantity": "50", "cost_price": "10"},
+        ]
+        self.assertFalse(
+            AutoTrader.stock_total_exposure_at_cap(
+                Decimal("1000"), positions, Decimal("0.20")
+            )
+        )
+
+    def test_false_when_account_value_is_not_cached_yet(self):
+        from webull_bot.bot import AutoTrader
+
+        positions = [
+            {"instrument_type": "EQUITY", "quantity": "999", "cost_price": "999"},
+        ]
+        self.assertFalse(
+            AutoTrader.stock_total_exposure_at_cap(None, positions, Decimal("0.20"))
+        )
+
+
 class DiversificationCappedEntryBudgetTests(unittest.TestCase):
     """diversification_capped_entry_budget - by request: "out of 7500
     stocks it should easily be able to find enough stocks to invest
