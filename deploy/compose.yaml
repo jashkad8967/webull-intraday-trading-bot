@@ -14,6 +14,7 @@ services:
       INVALID_SYMBOL_STATE_FILE: /var/data/conf/invalid_symbols.json
       DAILY_PNL_STATE_FILE: /var/data/conf/daily_pnl.json
       TRADE_HISTORY_STATE_FILE: /var/data/conf/trade_history.json
+      OPTION_CONTRACTS_STATE_FILE: /var/data/conf/option_contracts.json
       STATUS_FILE: /var/data/status.json
       COMMAND_FILE: /var/commands/commands.json
       TZ: America/New_York
