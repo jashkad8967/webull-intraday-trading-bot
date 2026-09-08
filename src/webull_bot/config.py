@@ -269,6 +269,31 @@ class Settings(BaseSettings):
         "RKLB,TSM,MU,JPM,AMD,NOK,BA,RIOT,TLRY,SOFI,CENN"
     )
     popular_stock_min_volume: int = Field(default=1_000_000, ge=0)
+    # By request: "we want options for more popular stocks only like
+    # in snp and dow" / "make sure the stocks selected for options are
+    # popular like snp500." A curated, large-cap-heavy set spanning
+    # major sectors (tech, financials, healthcare, consumer, energy,
+    # industrials, communications) - deliberately NOT a literal,
+    # complete enumeration of current S&P 500 membership (which
+    # changes over time and would risk a wrong/delisted ticker slipping
+    # in unverified); every symbol here is a well-known, currently-
+    # listed large/mega-cap name. Replaces self.stock_symbols (which
+    # can be the ENTIRE scanned universe, thousands of symbols in
+    # STOCK_SYMBOLS=ALL mode, including penny/micro-cap names) as
+    # discover_option_contracts' candidate pool - see its own comment.
+    # .env can override/extend this.
+    option_candidate_symbols: str = (
+        "AAPL,MSFT,GOOGL,GOOG,AMZN,META,NVDA,AVGO,TSLA,BRK-B,LLY,V,"
+        "UNH,JPM,XOM,MA,COST,HD,PG,NFLX,JNJ,ABBV,BAC,CRM,KO,MRK,"
+        "AMD,PEP,TMO,CSCO,WMT,ACN,ADBE,LIN,MCD,ABT,ORCL,DHR,WFC,"
+        "TXN,PM,NOW,IBM,GE,CAT,INTU,VZ,DIS,AMGN,QCOM,CMCSA,PFE,"
+        "SPGI,NEE,UNP,LOW,UBER,AMAT,HON,ISRG,BKNG,SYK,GS,MS,BLK,"
+        "T,SCHW,ELV,DE,LMT,MDT,PLD,ADP,CI,C,VRTX,TJX,MMC,SBUX,"
+        "REGN,ETN,BSX,GILD,PANW,BA,MU,ADI,SO,ZTS,CB,BX,FI,APH,"
+        "PGR,MO,DUK,KLAC,SHW,CME,EOG,ITW,SNPS,CDNS,NKE,WM,PYPL,"
+        "MCO,CSX,TGT,ORLY,MDLZ,SLB,CL,EQIX,APD,USB,PNC,NOC,GD,"
+        "COP,SPY,QQQ,DIA"
+    )
     popular_stock_max_spread_percent: Decimal = Field(
         default=Decimal("0.50"),
         ge=0,
@@ -546,6 +571,15 @@ class Settings(BaseSettings):
     # CT.
     stock_entry_options_priority_minutes: int = Field(
         default=30, ge=0, le=120
+    )
+    # By request: "do not allow more than 20% in stocks." A hard
+    # portfolio-level ceiling on total stock (EQUITY) exposure as a
+    # fraction of account value - see risk.stock_total_exposure's
+    # stock_total_exposure_at_cap, which reuses the same fresh_entry_
+    # blackout_active gate every fresh stock entry/averaging-down
+    # check already goes through. Never affects exits.
+    stock_max_total_exposure_fraction: Decimal = Field(
+        default=Decimal("0.20"), gt=0, le=1
     )
     # By request: "start transitioning away from core hours strategy
     # around 30 minutes before end of core hours." Softer/earlier than
@@ -1588,6 +1622,13 @@ class Settings(BaseSettings):
         return [
             item.strip().upper()
             for item in self.popular_stock_symbols.split(",")
+            if item.strip()
+        ]
+
+    def option_candidates(self) -> list[str]:
+        return [
+            item.strip().upper()
+            for item in self.option_candidate_symbols.split(",")
             if item.strip()
         ]
 
