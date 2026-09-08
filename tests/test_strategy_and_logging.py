@@ -4381,6 +4381,194 @@ class RepriceRestingExitsTests(unittest.TestCase):
         )
 
 
+class RepriceRestingOptionExitsTests(unittest.TestCase):
+    """Options analog of RepriceRestingExitsTests - by request: "use
+    repricing to capture the trade when buying and selling options
+    also." A resting option PROFIT sell should chase the current ask
+    the same way a resting stock PROFIT sell does.
+    """
+
+    def test_reprice_cancels_and_replaces_option_exit_at_new_ask(self):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        contract = {
+            "symbol": "XYZ260101C00100000",
+            "underlying_symbol": "XYZ",
+            "strike_price": "100",
+            "expiration_date": "2026-01-01",
+            "option_type": "CALL",
+        }
+        quote = {
+            "symbol": "XYZ260101C00100000",
+            "bid": "1.90",
+            "ask": "2.00",
+            "price": "1.95",
+        }
+
+        class FakeApi:
+            @staticmethod
+            def option_quotes(symbols):
+                return [quote]
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def option_position(contract, positions):
+                for item in positions:
+                    if item.get("symbol") == contract["symbol"]:
+                        return (
+                            Decimal(str(item.get("quantity", "0"))),
+                            Decimal(str(item.get("cost_price", "0"))),
+                        )
+                return Decimal("0"), Decimal("0")
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_option(contract, side, quantity, limit_price, position_intent):
+                placed.append((contract["symbol"], side, quantity, limit_price))
+                return "order-2"
+
+        rekeyed = []
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(poll_seconds=Decimal("0.25")),
+            api=FakeApi(),
+            status=SimpleNamespace(
+                rekey_trade=lambda old, new: rekeyed.append((old, new))
+            ),
+            last_option_reprice=0.0,
+            option_contracts=[contract],
+            manual_touch_at={},
+            price_sanity_rejected_at={},
+            is_order_not_cancelable=lambda exc: False,
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "OPTION:XYZ260101C00100000",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("1.80"),
+                }
+            },
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        reprice = AutoTrader.reprice_resting_option_exits.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "OPTION",
+                "symbol": "XYZ260101C00100000",
+                "quantity": "1",
+                "cost_price": "1.50",
+            }
+        ]
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(positions)
+
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(
+            placed[0], ("XYZ260101C00100000", "SELL", 1, Decimal("2.00"))
+        )
+        self.assertNotIn("order-1", fake_bot.working_orders)
+        self.assertIn("order-2", fake_bot.working_orders)
+        self.assertEqual(
+            fake_bot.working_orders["order-2"]["limit_price"], Decimal("2.00")
+        )
+        self.assertEqual(rekeyed, [("order-1", "order-2")])
+
+    def test_never_chases_the_ask_below_entry_cost(self):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        contract = {
+            "symbol": "XYZ260101C00100000",
+            "underlying_symbol": "XYZ",
+            "strike_price": "100",
+            "expiration_date": "2026-01-01",
+            "option_type": "CALL",
+        }
+        quote = {
+            "symbol": "XYZ260101C00100000",
+            "bid": "1.20",
+            "ask": "1.30",
+            "price": "1.25",
+        }
+
+        class FakeApi:
+            @staticmethod
+            def option_quotes(symbols):
+                return [quote]
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def option_position(contract, positions):
+                return Decimal("1"), Decimal("1.50")
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_option(contract, side, quantity, limit_price, position_intent):
+                placed.append((contract["symbol"], side, quantity, limit_price))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(poll_seconds=Decimal("0.25")),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_option_reprice=0.0,
+            option_contracts=[contract],
+            manual_touch_at={},
+            price_sanity_rejected_at={},
+            is_order_not_cancelable=lambda exc: False,
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "OPTION:XYZ260101C00100000",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("1.60"),
+                }
+            },
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        reprice = AutoTrader.reprice_resting_option_exits.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "OPTION",
+                "symbol": "XYZ260101C00100000",
+                "quantity": "1",
+                "cost_price": "1.50",
+            }
+        ]
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(positions)
+
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
+
 class VolatilityScalpRepriceTests(unittest.TestCase):
     """reprice_volatility_scalp_exits - the "cent by cent" active
     repricer, on its own faster VOLATILITY_SCALP_REPRICE_SECONDS cadence,
@@ -8511,6 +8699,25 @@ class WashSaleTrackerTests(unittest.TestCase):
             expected = datetime.now(timezone.utc) + timedelta(days=31)
             self.assertLess(abs((until - expected).total_seconds()), 5)
             self.assertIsNotNone(tracker.blocked_until("AAPL"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_direction_scoped_key_only_blocks_the_matching_side(self):
+        # By request: "you can constantly buy puts and calls on the
+        # same stock as it dips and rises" - option stop-loss wash-
+        # sale blocks are now keyed "UNDERLYING:CALL"/"UNDERLYING:PUT"
+        # (see bot.py's trade_options), not the bare underlying, so a
+        # stopped-out CALL must not block a PUT re-entry on the same
+        # name. WashSaleTracker itself just treats the key as an
+        # opaque string, so this documents/locks in that the compound
+        # key genuinely keeps the two sides independent.
+        path = Path("tests/.generated_wash/direction_scoped.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path, 31)
+            tracker.block("AAPL:CALL", "option stop-loss exit submitted")
+            self.assertIsNotNone(tracker.blocked_until("AAPL:CALL"))
+            self.assertIsNone(tracker.blocked_until("AAPL:PUT"))
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
@@ -12784,16 +12991,26 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
             "tradable_status": "OC",
         }
 
-    def _fake_api(self, contracts, quotes_by_symbol, shortlist_size=6):
+    def _fake_api(
+        self, contracts, quotes_by_symbol, shortlist_size=6, volumes_by_symbol=None
+    ):
         from datetime import date, timedelta
 
         from webull_bot.webull_api import WebullAPI
 
+        volumes_by_symbol = volumes_by_symbol or {}
         expiration = (date.today() + timedelta(days=20)).isoformat()
         contract_list = [
             self._contract(symbol, strike, expiration)
             for symbol, strike in contracts
         ]
+
+        def _quote(s):
+            quote = {"symbol": s, "ask": str(quotes_by_symbol[s])}
+            if s in volumes_by_symbol:
+                quote["volume"] = str(volumes_by_symbol[s])
+            return quote
+
         fake_api = SimpleNamespace(
             config=SimpleNamespace(
                 option_min_dte=7,
@@ -12803,11 +13020,15 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
             ),
             option_contracts=lambda underlying: contract_list,
             option_quotes=lambda symbols: [
-                {"symbol": s, "ask": str(quotes_by_symbol[s])}
-                for s in symbols
-                if s in quotes_by_symbol
+                _quote(s) for s in symbols if s in quotes_by_symbol
             ],
             quote_price=WebullAPI.quote_price,
+        )
+        fake_api._option_greek_field = lambda quote, fields: (
+            WebullAPI._option_greek_field(fake_api, quote, fields)
+        )
+        fake_api.option_volume = lambda quote: WebullAPI.option_volume(
+            fake_api, quote
         )
         return WebullAPI.select_atm_options.__get__(fake_api)
 
@@ -12851,6 +13072,48 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
         )
         result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
         self.assertEqual(result[0]["symbol"], "XYZ260101C00105000")
+
+    def test_prefers_higher_volume_among_affordable_contracts_over_pure_atm_proximity(
+        self,
+    ):
+        # By request: "look at contracts in those stocks with high
+        # volume movement and volatility" - both 100 and 105 strikes
+        # are affordable, but 105 has far more contract volume, so it
+        # should win over the nearer-to-ATM 100 strike.
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00105000", 105),
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "1.00",
+                "XYZ260101C00105000": "1.00",
+            },
+            volumes_by_symbol={
+                "XYZ260101C00100000": 50,
+                "XYZ260101C00105000": 5000,
+            },
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00105000")
+
+    def test_atm_proximity_still_breaks_a_volume_tie(self):
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00105000", 105),
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "1.00",
+                "XYZ260101C00105000": "1.00",
+            },
+            volumes_by_symbol={
+                "XYZ260101C00100000": 500,
+                "XYZ260101C00105000": 500,
+            },
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00100000")
 
     def test_falls_back_to_atm_pick_when_the_quote_batch_fails(self):
         from datetime import date, timedelta
