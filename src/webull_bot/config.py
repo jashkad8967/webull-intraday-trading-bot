@@ -31,7 +31,11 @@ class Settings(BaseSettings):
     option_contracts: str = ""
     option_underlyings: str = ""
     option_type: str = Field(default="BOTH", pattern="^(CALL|PUT|BOTH)$")
-    option_min_dte: int = Field(default=7, ge=0, le=730)
+    # By request: "still at least 2 weeks out" - contracts nearer to
+    # expiration than this are never considered at entry (see
+    # WebullAPI.select_atm_options), regardless of how good the strike/
+    # delta otherwise looks.
+    option_min_dte: int = Field(default=14, ge=0, le=730)
     option_max_dte: int = Field(default=45, ge=0, le=730)
     max_symbols: int = Field(default=800, ge=0, le=50000)
     stock_universe_reserve: int = Field(default=400, ge=0, le=50000)
@@ -1234,8 +1238,9 @@ class Settings(BaseSettings):
     # Forced exit once a held contract is this many days or fewer from
     # expiration, regardless of target/stop - theta/gamma accelerate sharply
     # in the final days and holding through that stops being a directional
-    # bet and becomes pin-risk roulette.
-    option_min_hold_dte: int = Field(default=2, ge=0, le=30)
+    # bet and becomes pin-risk roulette. By request: "closed out at least
+    # 1 week before" expiration.
+    option_min_hold_dte: int = Field(default=7, ge=0, le=30)
     # Never risk more than this fraction of buying power on a single options
     # entry - a defined-risk-per-trade cap layered on top of (not instead
     # of) OPTION_QUANTITY and MAX_ORDER_NOTIONAL.

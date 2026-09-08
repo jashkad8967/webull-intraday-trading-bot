@@ -13008,18 +13008,25 @@ class DiscoverOptionContractsCandidatePoolTests(unittest.TestCase):
     """
 
     @staticmethod
-    def _fake_bot(candidates, metrics, volatility, discovery_order):
+    def _fake_bot(
+        candidates,
+        metrics,
+        volatility,
+        discovery_order,
+        agent_popular_symbols=frozenset(),
+    ):
         from webull_bot.bot import AutoTrader
 
         def select_atm_options(underlying, price, max_contract_cost=None):
             discovery_order.append(underlying)
             return []
 
+        all_symbols = set(candidates) | set(agent_popular_symbols)
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
                 option_candidates=lambda: candidates,
                 option_discovery_seconds=0,
-                option_discovery_per_cycle=len(candidates),
+                option_discovery_per_cycle=len(all_symbols),
             ),
             invalid_symbols=set(),
             options_enabled=True,
@@ -13029,13 +13036,14 @@ class DiscoverOptionContractsCandidatePoolTests(unittest.TestCase):
             option_discovery_attempted=set(),
             option_contracts=[],
             cached_option_buying_power=Decimal("100"),
+            agent_popular_symbols=set(agent_popular_symbols),
             strategy=SimpleNamespace(
                 metrics={
                     symbol: {"volume": volume}
                     for symbol, volume in metrics.items()
                 },
                 realized_volatility_percent=lambda symbol: volatility.get(symbol),
-                prices={symbol: Decimal("10") for symbol in candidates},
+                prices={symbol: Decimal("10") for symbol in all_symbols},
             ),
             api=SimpleNamespace(select_atm_options=select_atm_options),
         )
@@ -13102,6 +13110,29 @@ class DiscoverOptionContractsCandidatePoolTests(unittest.TestCase):
         discover()
 
         self.assertEqual(discovery_order, ["SCANNED", "UNSCANNED"])
+
+    def test_todays_top_gainers_are_included_alongside_the_curated_list(self):
+        """By request: "look at the top gainers, most volatile,
+        similar criteria for stocks, and then look the popular
+        options contracts from those." agent_popular_symbols (today's
+        actual top-gainer/most-active movers, from the same
+        deterministic market_pulse screeners refresh_agent_
+        discoveries already uses) is unioned into the candidate pool
+        alongside the curated option_candidates() list, not limited
+        to it.
+        """
+        discovery_order = []
+        discover = self._fake_bot(
+            candidates=["AAPL"],
+            metrics={"AAPL": 100, "HOTMOVER": 100},
+            volatility={},
+            discovery_order=discovery_order,
+            agent_popular_symbols={"HOTMOVER"},
+        )
+
+        discover()
+
+        self.assertEqual(set(discovery_order), {"AAPL", "HOTMOVER"})
 
 
 if __name__ == "__main__":
