@@ -2,6 +2,17 @@ import math
 from collections import defaultdict, deque
 from decimal import Decimal, ROUND_DOWN
 
+from webull_bot.strategy_logic.constants import (
+    OBI_BUY_THRESHOLD,
+    OBI_DEPTH_LEVELS,
+    OBI_ENABLED,
+    OPTION_DELTA_MAX,
+    OPTION_DELTA_MIN,
+    OPTION_IV_PERCENTILE_MIN_SAMPLES,
+    OPTION_IV_REJECT_PERCENTILE,
+    OPTION_VIXY_REJECT_PERCENTILE,
+    OPTION_VIXY_SYMBOL,
+)
 from webull_bot.strategy_logic.momentum.rsi import (
     relative_strength_index,
     rsi_overbought_exit,
@@ -13,33 +24,22 @@ from webull_bot.strategy_logic.portfolio.position_pnl import (
     position_day_pnl,
     position_unrealized_pnl,
 )
+from webull_bot.strategy_logic.regime.market_regime import (
+    obi_supports_entry,
+    option_delta_ok,
+    option_iv_percentile_ok,
+    option_market_regime_ok,
+    stock_market_regime_ok,
+)
+from webull_bot.strategy_logic.regime.trend_signals import (
+    _ema,
+    option_direction_signal,
+    option_entry_confirmed,
+    tick_direction_ok,
+    tick_direction_score,
+    trend_signal,
+)
 from webull_bot.strategy_logic.types import Decision, PortfolioDecision
-
-# Order-book-imbalance secondary entry gate. Hardcoded, not config, since
-# it's a fixed institutional-style heuristic rather than a per-account
-# tuning knob: real bid/ask depth is scarce data (needs an L2 market-data
-# entitlement most retail accounts don't have) and only ever fetched for a
-# symbol that already cleared every other entry gate, so it isn't worth
-# exposing as yet another .env dial.
-OBI_ENABLED = True
-OBI_DEPTH_LEVELS = 5
-OBI_BUY_THRESHOLD = Decimal("0.60")
-
-# Options quality-filter thresholds. Hardcoded for the same reason as the
-# OBI constants above: these are fixed heuristics on data that may not even
-# be present on this account's option snapshot (delta/IV field names are
-# unconfirmed - see option_delta/option_implied_vol in webull_api.py), not
-# a per-account risk knob a user would tune via .env.
-OPTION_DELTA_MIN = Decimal("0.20")
-OPTION_DELTA_MAX = Decimal("0.85")
-OPTION_IV_PERCENTILE_MIN_SAMPLES = 10
-OPTION_IV_REJECT_PERCENTILE = Decimal("0.85")
-# VIXY (VIX-futures ETF) proxy for a market-wide volatility regime gate -
-# real VIX/CGIF index data isn't reachable through Webull's OpenAPI
-# (confirmed live: raw "VIX" returns INVALID_SYMBOL, VIXY resolves fine
-# through the ordinary stock-quote path everything else here already uses).
-OPTION_VIXY_SYMBOL = "VIXY"
-OPTION_VIXY_REJECT_PERCENTILE = Decimal("0.85")
 
 
 class TradingStrategy:
@@ -1588,324 +1588,17 @@ class TradingStrategy:
                 break
         return results
 
-    @staticmethod
-    def _ema(values: list[float], period: int) -> float:
-        weight = 2 / (period + 1)
-        result = values[0]
-        for value in values[1:]:
-            result = value * weight + result * (1 - weight)
-        return result
-
-    def trend_signal(self, key: str, price: Decimal) -> str:
-        values = self.history[key]
-        values.append(float(price))
-        self.tick_history[key].append(float(price))
-        slow = self.config.ema_slow_period
-        fast = self.config.ema_fast_period
-        if len(values) < slow + 1:
-            self.trend_streak[key] = 0
-            return "HOLD"
-        series = list(values)
-        previous = series[:-1]
-        old_spread = self._ema(previous[-slow:], fast) - self._ema(
-            previous[-slow:],
-            slow,
-        )
-        new_spread = self._ema(series[-slow:], fast) - self._ema(
-            series[-slow:],
-            slow,
-        )
-        if (old_spread > 0) != (new_spread > 0):
-            # A stock that keeps flipping direction is exactly the kind of
-            # choppy, mean-reverting mover that produces repeated small
-            # scalps in a session - track it so priority_score can favor it
-            # over a name that only trended once and went flat.
-            symbol = key.split(":", 1)[-1]
-            self.crossover_counts[symbol] += 1
-        if new_spread <= 0:
-            # A fresh bearish cross (was bullish/flat, now bearish) is the
-            # short-side mirror of the "BUY" fresh-cross case below.
-            # stock_decision only acts on this when SHORT_SELLING_ENABLED
-            # is on; it's always computed here regardless so the signal is
-            # available the moment shorting gets turned on without waiting
-            # on fresh history.
-            #
-            # Mirrors BUY's reenter_on_trend continuation below - a short
-            # entry also requires VWAP/SMA-trend/extension/tick-direction
-            # to all align, and requiring that alignment on the exact
-            # single tick of the fresh cross (with no further chances
-            # after) made a real short entry all but impossible in
-            # practice. trend_streak is negative for a continuing
-            # downtrend, positive for a continuing uptrend, so both
-            # directions share the one counter.
-            if old_spread > 0:
-                self.trend_streak[key] = 0
-                # By request, after live evidence: 6 of 7 open general-
-                # path positions were underwater at once, entered right
-                # as a fresh cross fired - the exact instant a real
-                # reversal and a false-signal whipsaw look identical.
-                # Firing the SAME tick the cross happens means "buying
-                # right when the dip starts," not after it's actually
-                # confirmed. reenter_on_trend=False is the one case
-                # that still fires immediately here (its whole "fires
-                # once per fresh cross" design already has no
-                # continuation mechanism to delay into).
-                if not self.config.reenter_on_trend:
-                    return "SHORT"
-            current_streak = self.trend_streak.get(key, 0)
-            self.trend_streak[key] = current_streak - 1 if current_streak <= 0 else -1
-            if (
-                self.config.reenter_on_trend
-                and -self.trend_streak[key] >= self.config.reenter_confirmation_polls
-            ):
-                return "SHORT"
-            return "HOLD"
-        if old_spread <= 0:
-            self.trend_streak[key] = 0
-            # Same one-extra-tick confirmation delay as the SHORT branch
-            # above, for the same reason - see its comment.
-            if not self.config.reenter_on_trend:
-                return "BUY"
-        self.trend_streak[key] = self.trend_streak.get(key, 0) + 1
-        if (
-            self.config.reenter_on_trend
-            and self.trend_streak[key] >= self.config.reenter_confirmation_polls
-        ):
-            return "BUY"
-        return "HOLD"
-
-    def option_direction_signal(self, key: str, price: Decimal) -> str:
-        """Dual-sided sibling of trend_signal for options: a stock strategy
-        only ever needs a bullish entry, but a call needs the same fresh
-        bullish EMA cross while a put needs the mirror-image fresh bearish
-        cross.
-
-        By explicit request ("screw the direction signal, i feel maybe
-        there are too many barriers"), then clarified as "re-fire on a
-        continued trend, not just the fresh cross": this used to go
-        quiet the instant the fresh-cross cycle passed, even if the
-        underlying kept trending - given how the option-contract quote
-        rotation and the outer loop's own cadence both compete for the
-        same cycle, a real fresh cross could easily land on a cycle
-        that never actually reaches the gate-check loop for that
-        contract, and then never fire again until the NEXT fresh cross.
-        Now mirrors trend_signal's own reenter_on_trend/trend_streak
-        continuation exactly (same config, same "OPTU:"-namespaced key
-        so it shares no state with the stock side's "STOCK:" keys) -
-        a signal keeps re-firing every cycle the trend continues, once
-        it's held for REENTER_CONFIRMATION_POLLS cycles.
-        """
-        values = self.history[key]
-        values.append(float(price))
-        self.tick_history[key].append(float(price))
-        slow = self.config.ema_slow_period
-        fast = self.config.ema_fast_period
-        if len(values) < slow + 1:
-            self.trend_streak[key] = 0
-            return "HOLD"
-        series = list(values)
-        previous = series[:-1]
-        old_spread = self._ema(previous[-slow:], fast) - self._ema(
-            previous[-slow:],
-            slow,
-        )
-        new_spread = self._ema(series[-slow:], fast) - self._ema(
-            series[-slow:],
-            slow,
-        )
-        if new_spread <= 0:
-            if old_spread > 0:
-                self.trend_streak[key] = 0
-                return "PUT"
-            current_streak = self.trend_streak.get(key, 0)
-            self.trend_streak[key] = current_streak - 1 if current_streak <= 0 else -1
-            if (
-                self.config.reenter_on_trend
-                and -self.trend_streak[key] >= self.config.reenter_confirmation_polls
-            ):
-                return "PUT"
-            return "HOLD"
-        if old_spread <= 0:
-            self.trend_streak[key] = 0
-            return "CALL"
-        self.trend_streak[key] = self.trend_streak.get(key, 0) + 1
-        if (
-            self.config.reenter_on_trend
-            and self.trend_streak[key] >= self.config.reenter_confirmation_polls
-        ):
-            return "CALL"
-        return "HOLD"
-
-    def option_entry_confirmed(
-        self,
-        direction: str,
-        tick_score: Decimal | None,
-        obi_score: Decimal | None,
-    ) -> bool:
-        """Secondary confirmation for an option_direction_signal read, same
-        "no data -> don't block" convention as every other entry gate here.
-        tick_score is -1..+1 (see tick_direction_score); obi_score is
-        bid/(bid+ask) depth imbalance (see obi_supports_entry) and is only
-        ever passed when a depth snapshot happened to already be cached for
-        this underlying this cycle.
-        """
-        if direction not in ("CALL", "PUT"):
-            return False
-        if tick_score is not None:
-            if direction == "CALL" and tick_score <= 0:
-                return False
-            if direction == "PUT" and tick_score >= 0:
-                return False
-        if obi_score is not None:
-            if direction == "CALL" and obi_score < OBI_BUY_THRESHOLD:
-                return False
-            if direction == "PUT" and obi_score > Decimal("1") - OBI_BUY_THRESHOLD:
-                return False
-        return True
-
-    def tick_direction_score(self, key: str) -> Decimal:
-        """Net upticks vs downticks over the recent poll-to-poll price
-        prints, as a proxy for order-flow imbalance - real bid/ask depth
-        isn't available from the quote feed. Ranges -1 (all downticks) to
-        +1 (all upticks); 0 when there's too little data or no net
-        direction (flat prints, or an equal mix of up/down).
-        """
-        values = list(self.tick_history.get(key, ()))
-        if len(values) < 2:
-            return Decimal("0")
-        up = down = 0
-        for previous, current in zip(values, values[1:]):
-            if current > previous:
-                up += 1
-            elif current < previous:
-                down += 1
-        total = up + down
-        if total == 0:
-            return Decimal("0")
-        return Decimal(up - down) / Decimal(total)
-
-    def tick_direction_ok(
-        self,
-        key: str,
-        direction: str = "BUY",
-        idle_relaxation_amount: Decimal = Decimal("0"),
-    ) -> bool:
-        if not self.config.tick_direction_enabled:
-            return True
-        score = self.tick_direction_score(key)
-        threshold = self.config.tick_direction_veto_threshold - idle_relaxation_amount
-        if direction == "SHORT":
-            return score <= -threshold
-        return score >= threshold
-
-    @staticmethod
-    def obi_supports_entry(obi_score: Decimal | None) -> bool:
-        """bid volume / (bid + ask volume) across the top few book levels
-        (or top-of-book size as a fallback) - a heavy imbalance toward the
-        bid statistically favors an upward move over the next few seconds.
-        `obi_score` is fetched and computed by the caller (it needs a live
-        API round-trip, unlike every other gate here); `None` means no
-        depth/size data was available and the gate passes through, same
-        convention as entry_spread_ok/entry_extension_ok with missing data.
-        """
-        return (
-            not OBI_ENABLED
-            or obi_score is None
-            or obi_score >= OBI_BUY_THRESHOLD
-        )
-
-    @staticmethod
-    def option_delta_ok(delta: Decimal | None) -> bool:
-        """Quality filter, not strike selection: rejects a contract that's
-        too far OTM to have real directional exposure (lottery-ticket cheap,
-        decays fast) or so deep ITM it's paying for intrinsic value with no
-        leverage left. `None` (delta unavailable on this account's snapshot)
-        passes through untouched, same as every other best-effort gate.
-        """
-        return delta is None or OPTION_DELTA_MIN <= abs(delta) <= OPTION_DELTA_MAX
-
-    @staticmethod
-    def _percentile_reject_ok(
-        history,
-        current: Decimal | None,
-        min_samples: int,
-        reject_percentile: Decimal,
-    ) -> bool:
-        """Shared rank-within-own-history check: rejects when `current`
-        sits at or above `reject_percentile` of `history`'s own samples -
-        relative, not an absolute threshold, since "high" only means
-        anything compared to that same series' own recent range. Passes
-        through when there's no current sample or not enough history yet
-        to judge (both `option_iv_percentile_ok` and
-        `option_market_regime_ok` share this).
-        """
-        if current is None:
-            return True
-        samples = list(history)
-        if len(samples) < min_samples:
-            return True
-        rank = sum(1 for sample in samples if sample <= current) / len(samples)
-        return Decimal(str(rank)) < reject_percentile
-
-    @staticmethod
-    def option_iv_percentile_ok(
-        iv_history,
-        current_iv: Decimal | None,
-    ) -> bool:
-        """Rejects an entry when current_iv sits in the priciest tail of
-        this SAME contract's own recent IV samples - no external IV-rank
-        source exists here. Passes through when IV data or enough history
-        isn't available yet.
-        """
-        return TradingStrategy._percentile_reject_ok(
-            iv_history,
-            current_iv,
-            OPTION_IV_PERCENTILE_MIN_SAMPLES,
-            OPTION_IV_REJECT_PERCENTILE,
-        )
-
-    @staticmethod
-    def option_market_regime_ok(
-        vixy_history,
-        current_vixy: Decimal | None,
-    ) -> bool:
-        """Market-wide volatility regime gate for options entries: VIXY (a
-        VIX-futures ETF - real VIX/CGIF index data isn't reachable through
-        Webull's OpenAPI, confirmed live) stands in for broad market fear.
-        Rejects a new entry when VIXY is spiking into the top of its own
-        recent range - a bad time to be buying option premium anywhere,
-        regardless of how any one contract's own delta/IV look. Relative to
-        VIXY's own recent range, not an absolute level (VIXY's baseline
-        drifts with its futures-roll decay over time). Passes through when
-        there's no VIXY quote or not enough history yet.
-        """
-        return TradingStrategy._percentile_reject_ok(
-            vixy_history,
-            current_vixy,
-            OPTION_IV_PERCENTILE_MIN_SAMPLES,
-            OPTION_VIXY_REJECT_PERCENTILE,
-        )
-
-    @staticmethod
-    def stock_market_regime_ok(
-        vixy_history,
-        current_vixy: Decimal | None,
-        reject_percentile: Decimal,
-    ) -> bool:
-        """Same VIXY-rolling-percentile regime gate as
-        option_market_regime_ok, generalized to stock entries with their
-        own configurable REGIME_GATE_REJECT_PERCENTILE instead of the
-        options-only hardcoded OPTION_VIXY_REJECT_PERCENTILE - a vol
-        regime that's a reason to skip option premium isn't necessarily
-        the same bar for skipping a stock scalp. Passes through when
-        there's no VIXY quote or not enough history yet.
-        """
-        return TradingStrategy._percentile_reject_ok(
-            vixy_history,
-            current_vixy,
-            OPTION_IV_PERCENTILE_MIN_SAMPLES,
-            reject_percentile,
-        )
+    _ema = staticmethod(_ema)
+    trend_signal = trend_signal
+    option_direction_signal = option_direction_signal
+    option_entry_confirmed = option_entry_confirmed
+    tick_direction_score = tick_direction_score
+    tick_direction_ok = tick_direction_ok
+    obi_supports_entry = staticmethod(obi_supports_entry)
+    option_delta_ok = staticmethod(option_delta_ok)
+    option_iv_percentile_ok = staticmethod(option_iv_percentile_ok)
+    option_market_regime_ok = staticmethod(option_market_regime_ok)
+    stock_market_regime_ok = staticmethod(stock_market_regime_ok)
 
     def adaptive_stop_percent(
         self, symbol: str, seconds_since_entry: float | None = None
