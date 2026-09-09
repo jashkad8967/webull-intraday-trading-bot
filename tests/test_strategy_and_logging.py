@@ -4681,6 +4681,133 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
         self.assertEqual(placed, [])
 
 
+class PrepareOptionScanBatchHeldPositionTests(unittest.TestCase):
+    """By request: "why is UBER not averaging down." Live incident: a
+    restart re-discovered a DIFFERENT UBER strike than the one
+    actually held (the underlying's price had moved), and since
+    discover_option_contracts treats "any contract for this
+    underlying" as already-discovered, the originally-held strike
+    never got added back - trade_options' whole per-contract loop
+    only ever iterates self.option_contracts, so the held position
+    became completely invisible to PROFIT/LOSS/averaging-down checks.
+    _prepare_option_scan_batch now backfills any held OPTION
+    position's contract via contract_from_position, and prioritizes
+    held contracts into this cycle's batch ahead of the rotation.
+    """
+
+    def _fake_bot(self, option_contracts, held_position, backfilled_contract):
+        from webull_bot.strategy import TradingStrategy
+        from webull_bot.strategy_logic.market_state.snapshot import rotating_batch
+
+        underlying_quote = {"symbol": "UBER", "price": "50.00"}
+
+        class FakeApi:
+            @staticmethod
+            def stock_quotes_resilient(symbols, category):
+                return ([underlying_quote], set())
+
+            @staticmethod
+            def quote_price(quote):
+                return Decimal(str(quote["price"]))
+
+            @staticmethod
+            def option_quotes(symbols):
+                return []
+
+            @staticmethod
+            def contract_from_position(position):
+                return backfilled_contract
+
+        fake_bot = SimpleNamespace(
+            option_contracts=list(option_contracts),
+            option_cursor=0,
+            vixy_history=deque(maxlen=30),
+            api=FakeApi(),
+            strategy=SimpleNamespace(
+                open_position_count=lambda positions: 1,
+                option_direction_signal=lambda key, price: "HOLD",
+                rotating_batch=rotating_batch,
+            ),
+            stop_loss_guard_active=lambda: False,
+            config=SimpleNamespace(option_batch_size=20),
+        )
+        return fake_bot, [held_position]
+
+    def test_backfills_a_held_contract_missing_from_discovery(self):
+        from webull_bot.bot import AutoTrader
+
+        held_contract = {
+            "symbol": "UBER260925C00075000",
+            "underlying_symbol": "UBER",
+            "strike_price": "75",
+            "expiration_date": "2026-09-25",
+            "option_type": "CALL",
+        }
+        other_contract = {
+            "symbol": "UBER260925C00073000",
+            "underlying_symbol": "UBER",
+            "strike_price": "73",
+            "expiration_date": "2026-09-25",
+            "option_type": "CALL",
+        }
+        held_position = {
+            "instrument_type": "OPTION",
+            "symbol": "UBER260925C00075000",
+            "quantity": "1",
+            "cost_price": "1.30",
+        }
+        fake_bot, positions = self._fake_bot(
+            [other_contract], held_position, held_contract
+        )
+        prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
+
+        prepare(positions)
+
+        symbols = {c["symbol"] for c in fake_bot.option_contracts}
+        self.assertIn("UBER260925C00075000", symbols)
+
+    def test_held_contract_wins_a_batch_slot_over_rotation(self):
+        from webull_bot.bot import AutoTrader
+
+        held_contract = {
+            "symbol": "UBER260925C00075000",
+            "underlying_symbol": "UBER",
+            "strike_price": "75",
+            "expiration_date": "2026-09-25",
+            "option_type": "CALL",
+        }
+        # Fill the rest of the pool with far more than option_batch_
+        # size (20) unrelated contracts, so the held one would have
+        # near-zero chance of winning the rotation on luck alone if
+        # it weren't explicitly prioritized.
+        crowd = [
+            {
+                "symbol": f"XYZ{i}250101C00100000",
+                "underlying_symbol": f"XYZ{i}",
+                "strike_price": "100",
+                "expiration_date": "2026-01-01",
+                "option_type": "CALL",
+            }
+            for i in range(50)
+        ]
+        held_position = {
+            "instrument_type": "OPTION",
+            "symbol": "UBER260925C00075000",
+            "quantity": "1",
+            "cost_price": "1.30",
+        }
+        fake_bot, positions = self._fake_bot(
+            [held_contract] + crowd, held_position, held_contract
+        )
+        prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
+
+        result = prepare(positions)
+
+        batch = result[3]
+        batch_symbols = {c["symbol"] for c in batch}
+        self.assertIn("UBER260925C00075000", batch_symbols)
+
+
 class RepriceRestingOptionEntriesTests(unittest.TestCase):
     """Options analog of reprice_resting_entries - by request: "why is
     the buy price not playing around in the spread, same with sell."
