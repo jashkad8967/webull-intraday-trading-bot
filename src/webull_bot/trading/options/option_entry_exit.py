@@ -36,9 +36,31 @@ def _evaluate_option_entry(
     # Reset averaging-down state the moment the position
     # fully closes - same convention as the stock-side
     # volatility_scalp_average_down_count.pop(...) reset.
+    had_averaging_state = option_symbol in self.option_average_down_count
     self.option_average_down_count.pop(option_symbol, None)
     self.last_option_average_down.pop(option_symbol, None)
     self.option_last_buy_price.pop(option_symbol, None)
+    if had_averaging_state:
+        # By request ("do a full on options sanity check") - persist
+        # the reset too, or a stale count/last-buy-price for an
+        # already-closed position would come back on the next
+        # restart and wrongly narrow that (now-flat, unrelated)
+        # symbol's next fresh entry's averaging-down ladder. Guarded
+        # on had_averaging_state so this doesn't write to disk every
+        # single cycle for every already-flat contract in the batch -
+        # only when there was actually something to clear.
+        self.option_contracts_state.save(
+            self.option_contracts,
+            self.option_discovery_attempted,
+            {
+                symbol: {
+                    "count": count,
+                    "last_buy_price": self.option_last_buy_price[symbol],
+                }
+                for symbol, count in self.option_average_down_count.items()
+                if count > 0 and symbol in self.option_last_buy_price
+            },
+        )
     # By request ("scan through everything... figure out
     # what you missed"): live evidence showed real CALL/
     # PUT signals firing constantly all day (169/186
@@ -367,6 +389,23 @@ def _evaluate_option_exit(
                     time.monotonic()
                 )
                 self.option_last_buy_price[option_symbol] = price
+                # By request ("do a full on options sanity check") -
+                # persist the ladder state right when it changes, not
+                # just on the next fresh discovery - see
+                # OptionContractsStateStore's docstring for why this
+                # must survive a restart.
+                self.option_contracts_state.save(
+                    self.option_contracts,
+                    self.option_discovery_attempted,
+                    {
+                        symbol: {
+                            "count": count,
+                            "last_buy_price": self.option_last_buy_price[symbol],
+                        }
+                        for symbol, count in self.option_average_down_count.items()
+                        if count > 0 and symbol in self.option_last_buy_price
+                    },
+                )
                 buying_power = max(
                     Decimal("0"),
                     buying_power

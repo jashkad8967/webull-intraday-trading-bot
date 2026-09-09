@@ -142,9 +142,21 @@ def discover_option_contracts(self) -> None:
             # By request: "is there a way to save these option
             # contracts" - persist after every real discovery so a
             # restart resumes from here instead of an empty list. See
-            # OptionContractsStateStore.
+            # OptionContractsStateStore. Also carries the current
+            # averaging-down ladder state along (see that store's
+            # docstring for why - "do a full on options sanity check"
+            # found it was previously lost across a restart).
             self.option_contracts_state.save(
-                self.option_contracts, self.option_discovery_attempted
+                self.option_contracts,
+                self.option_discovery_attempted,
+                {
+                    symbol: {
+                        "count": count,
+                        "last_buy_price": self.option_last_buy_price[symbol],
+                    }
+                    for symbol, count in self.option_average_down_count.items()
+                    if count > 0 and symbol in self.option_last_buy_price
+                },
             )
             log.info(
                 "OPTIONS | %s | found=%s | progress=%s/%s",

@@ -86,7 +86,29 @@ def _resolve_targets_work_body(self, moment: datetime) -> None:
             ",".join(missing_watchlist),
         )
     self.refresh_sma_trend(self.stock_symbols)
-    self.option_contracts = self.api.resolve_options()
+    # By request ("do a full on options sanity check", "why does it
+    # keep scanning from scratch every time") - this used to be a
+    # bare `self.option_contracts = self.api.resolve_options()`,
+    # unconditionally REPLACING the whole discovered-contracts list
+    # on every daily reset (this function runs once per calendar
+    # day, independent of process restarts) with whatever resolve_
+    # options() returns from the small, static EXACT_OPTIONS/
+    # OPTION_ROOTS config lists - typically empty/near-empty in
+    # "ALL"-discovery mode, since OPTION_ROOTS' only real entry is
+    # "ALL" itself, which resolve_options() explicitly skips. That
+    # wiped out an entire day's worth of accumulated discovery (and,
+    # transiently, any held position's own contract, until the next
+    # _prepare_option_scan_batch cycle's held-contract backfill
+    # re-added it) every single day at reset, not just on a process
+    # restart - the exact same failure class as the restart bug,
+    # just on a different trigger. Union instead of replace: keep
+    # everything already discovered, only add what resolve_options()
+    # contributes that isn't already present.
+    known_option_symbols = {item["symbol"] for item in self.option_contracts}
+    for item in self.api.resolve_options():
+        if item["symbol"] not in known_option_symbols:
+            self.option_contracts.append(item)
+            known_option_symbols.add(item["symbol"])
     self.discover_all_options = "ALL" in self.config.option_roots()
     self.strategy.clear_market_state()
     self.volatility_scalp_recently_eligible.clear()
@@ -122,7 +144,16 @@ def _resolve_targets_work_body(self, moment: datetime) -> None:
     # resurrect yesterday's attempted set from disk. See
     # OptionContractsStateStore.
     self.option_contracts_state.save(
-        self.option_contracts, self.option_discovery_attempted
+        self.option_contracts,
+        self.option_discovery_attempted,
+        {
+            symbol: {
+                "count": count,
+                "last_buy_price": self.option_last_buy_price[symbol],
+            }
+            for symbol, count in self.option_average_down_count.items()
+            if count > 0 and symbol in self.option_last_buy_price
+        },
     )
     self.invalid_stock_symbols.clear()
     self.resolved_date = moment.date()
