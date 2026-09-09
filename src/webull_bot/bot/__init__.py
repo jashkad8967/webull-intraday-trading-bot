@@ -940,6 +940,32 @@ class AutoTrader:
             try:
                 quote = quote_by_symbol.get(option_symbol)
                 if not quote:
+                    # By request ("check now for uber") - live
+                    # evidence: a held position's own broker-reported
+                    # last_price kept updating in the status snapshot
+                    # (a completely separate positions() API call)
+                    # while this loop's OWN option_quotes() batch
+                    # never surfaced a quote for it, silently skipping
+                    # PROFIT/LOSS/averaging-down every single cycle
+                    # with zero visibility - same silent-skip failure
+                    # mode the held-contract backfill logging above
+                    # was built to catch, just one step further down
+                    # the pipeline. Logged for a HELD position only
+                    # (quantity > 0 in the broker's own position list)
+                    # - a flat/never-bought candidate missing a quote
+                    # is routine and not worth logging every cycle.
+                    if any(
+                        item.get("symbol") == option_symbol
+                        and Decimal(str(item.get("quantity", "0") or "0")) > 0
+                        for item in positions
+                        if item.get("instrument_type") == "OPTION"
+                    ):
+                        log.warning(
+                            "OPTIONS | %-8s | held position has no quote "
+                            "in this cycle's option_quotes batch - "
+                            "exit management skipped",
+                            option_symbol,
+                        )
                     continue
                 price = self.api.quote_price(quote)
                 quantity, cost = self.api.option_position(contract, positions)
