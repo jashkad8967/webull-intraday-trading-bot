@@ -171,6 +171,36 @@ def volatility_scalp_dip_signal(self, symbol: str, price: Decimal) -> bool:
     return drop >= self.config.volatility_scalp_dip_entry_percent
 
 
+def volatility_scalp_rip_signal(self, symbol: str, price: Decimal) -> bool:
+    """Mirror-image of volatility_scalp_dip_signal - true when price
+    has run up at least volatility_scalp_dip_entry_percent from the
+    rolling window's own recent LOW, i.e. the same "genuine local
+    wiggle" bar, just the opposite direction. By request: "it doesn't
+    buy puts while there is a dip, or a call on a dip entry" - a
+    stock's fast up-leg is exactly as tradeable (for a PUT, betting
+    on the reversion back down) as its fast down-leg is for a CALL;
+    this is what lets AutoTrader.trade_options' quick-scalp PUT path
+    identify that up-leg the same way the CALL path already uses
+    volatility_scalp_dip_signal for the down-leg. Same local-window,
+    no-bounce-confirmation reasoning throughout - see that
+    function's docstring for the full rationale.
+    """
+    window = self.volatility_price_history.get(symbol)
+    if not window:
+        return False
+    samples = list(window)
+    if samples and Decimal(str(samples[-1])) == price:
+        samples = samples[:-1]
+    if not samples:
+        return False
+    recent_samples = samples[-self.VOLATILITY_SCALP_LOCAL_HIGH_SAMPLES:]
+    recent_low = Decimal(str(min(recent_samples)))
+    if recent_low <= 0 or price <= 0:
+        return False
+    rise = (price - recent_low) / recent_low
+    return rise >= self.config.volatility_scalp_dip_entry_percent
+
+
 def volatility_scalp_momentum_stalled_or_rising(
     self, symbol: str, price: Decimal
 ) -> bool:
