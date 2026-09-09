@@ -98,6 +98,26 @@ def _evaluate_option_entry(
     # PERCENT restored) once a real end-to-end trade is
     # confirmed.
     if not self.config.option_smoke_test_mode:
+        # By explicit request ("it should consistently take the
+        # perfect volatile and volume stock and trade a popular
+        # call and put as it rises and dips"): every option entry -
+        # not just the dip/rip scalp path below - must clear the
+        # SAME real volatility+volume bar (is_volatility_scalp_
+        # eligible) a stock needs to qualify for the stock-side
+        # volatility-scalp cohort in the first place. Live incident
+        # this catches: KO (a low-volatility blue-chip dividend
+        # stock - about as far from "volatile and volume" as this
+        # candidate pool gets) got a CALL bought purely off the
+        # trend-following EMA direction signal below, which never
+        # checked volatility/volume at all - only the scalp_
+        # direction (dip/rip) path had this floor. Applied here,
+        # before either path, so a boring name can qualify for
+        # NEITHER a trend entry nor a scalp entry, uniformly.
+        if not self.strategy.is_volatility_scalp_eligible(underlying):
+            self.option_gate_rejections[
+                "underlying not volatile/high-volume enough"
+            ] += 1
+            return open_count, buying_power
         # By request: "it doesn't buy puts while there is a
         # dip, or a call on a dip entry and quickly sell it.
         # This should happen for quick profit." The EMA
