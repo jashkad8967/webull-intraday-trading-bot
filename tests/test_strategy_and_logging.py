@@ -4807,6 +4807,56 @@ class PrepareOptionScanBatchHeldPositionTests(unittest.TestCase):
         batch_symbols = {c["symbol"] for c in batch}
         self.assertIn("UBER260925C00075000", batch_symbols)
 
+    def test_matches_a_position_whose_symbol_is_the_bare_underlying_via_legs(self):
+        """Live incident ("check uber now"): Webull's positions()
+        response puts the UNDERLYING symbol (e.g. "UBER"), not the
+        full OCC contract symbol, in a position's top-level "symbol"
+        field - the real contract identity lives in position["legs"].
+        Comparing the bare symbol directly against contract dicts'
+        "symbol" field (as an earlier version of this code did) can
+        never match, silently making the whole held-position
+        guarantee (and the backfill dedup) a no-op. This is the
+        already-discovered (no contract_from_position call needed)
+        case - matched purely via legs against self.option_contracts.
+        """
+        from webull_bot.bot import AutoTrader
+
+        known_contract = {
+            "symbol": "UBER260925C00075000",
+            "underlying_symbol": "UBER",
+            "strike_price": "75",
+            "expiration_date": "2026-09-25",
+            "option_type": "CALL",
+        }
+        held_position = {
+            "instrument_type": "OPTION",
+            "symbol": "UBER",
+            "quantity": "1",
+            "cost_price": "1.30",
+            "legs": [
+                {
+                    "symbol": "UBER",
+                    "option_type": "CALL",
+                    "option_expire_date": "2026-09-25",
+                    "option_exercise_price": "75",
+                }
+            ],
+        }
+        fake_bot, positions = self._fake_bot(
+            [known_contract], held_position, None
+        )
+        prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
+
+        result = prepare(positions)
+
+        batch = result[3]
+        batch_symbols = {c["symbol"] for c in batch}
+        self.assertIn("UBER260925C00075000", batch_symbols)
+        # Already known via legs - contract_from_position (which can
+        # make a real API call) must never be reached, and nothing
+        # gets appended a second time.
+        self.assertEqual(fake_bot.option_contracts, [known_contract])
+
 
 class RepriceRestingOptionEntriesTests(unittest.TestCase):
     """Options analog of reprice_resting_entries - by request: "why is
