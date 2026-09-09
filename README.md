@@ -927,7 +927,7 @@ Repository responsibilities are intentionally separated:
 - `src/webull_bot/strategy/__init__.py`: activity scoring, penny/popular allocation,
   Groq priority weighting, EMA + VWAP entry rules, adaptive targets/stops,
   sizing, and portfolio policy.
-- `src/webull_bot/bot.py`: session scheduling, account caching, wash-block
+- `src/webull_bot/bot/__init__.py`: session scheduling, account caching, wash-block
   coordination, per-symbol trade-rate capping, and order workflow.
 - `src/webull_bot/webull_api/__init__.py`: Webull authentication, throttling, market
   data, and order transport.
