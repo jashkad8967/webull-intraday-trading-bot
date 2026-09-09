@@ -929,7 +929,7 @@ Repository responsibilities are intentionally separated:
   sizing, and portfolio policy.
 - `src/webull_bot/bot.py`: session scheduling, account caching, wash-block
   coordination, per-symbol trade-rate capping, and order workflow.
-- `src/webull_bot/webull_api.py`: Webull authentication, throttling, market
+- `src/webull_bot/webull_api/__init__.py`: Webull authentication, throttling, market
   data, and order transport.
 - `src/webull_bot/market_agent.py`: paced, non-blocking Groq research.
 - `src/webull_bot/wash_sale.py`: persistent repurchase blocks.
