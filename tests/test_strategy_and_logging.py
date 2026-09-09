@@ -13833,6 +13833,7 @@ class DiscoverOptionContractsCandidatePoolTests(unittest.TestCase):
         volatility,
         discovery_order,
         agent_popular_symbols=frozenset(),
+        agent_predicted_gainers=frozenset(),
     ):
         from webull_bot.bot import AutoTrader
 
@@ -13840,7 +13841,11 @@ class DiscoverOptionContractsCandidatePoolTests(unittest.TestCase):
             discovery_order.append(underlying)
             return []
 
-        all_symbols = set(candidates) | set(agent_popular_symbols)
+        all_symbols = (
+            set(candidates)
+            | set(agent_popular_symbols)
+            | set(agent_predicted_gainers)
+        )
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
                 option_candidates=lambda: candidates,
@@ -13856,6 +13861,7 @@ class DiscoverOptionContractsCandidatePoolTests(unittest.TestCase):
             option_contracts=[],
             cached_option_buying_power=Decimal("100"),
             agent_popular_symbols=set(agent_popular_symbols),
+            agent_predicted_gainers=set(agent_predicted_gainers),
             strategy=SimpleNamespace(
                 metrics={
                     symbol: {"volume": volume}
@@ -13952,6 +13958,27 @@ class DiscoverOptionContractsCandidatePoolTests(unittest.TestCase):
         discover()
 
         self.assertEqual(set(discovery_order), {"AAPL", "HOTMOVER"})
+
+    def test_agent_predicted_gainers_are_included_alongside_the_curated_list(self):
+        """By request: "perhaps the correct stocks are not being
+        chosen, maybe we could ask the research agent to provide
+        stocks to do analysis on." agent_predicted_gainers (the AI
+        research agent's own daily pick list) already fed the STOCK
+        universe but never the option candidate pool - now unioned
+        in the same way agent_popular_symbols already was.
+        """
+        discovery_order = []
+        discover = self._fake_bot(
+            candidates=["AAPL"],
+            metrics={"AAPL": 100, "AGENTPICK": 100},
+            volatility={},
+            discovery_order=discovery_order,
+            agent_predicted_gainers={"AGENTPICK"},
+        )
+
+        discover()
+
+        self.assertEqual(set(discovery_order), {"AAPL", "AGENTPICK"})
 
 
 if __name__ == "__main__":

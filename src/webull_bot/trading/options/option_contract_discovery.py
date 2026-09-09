@@ -39,9 +39,24 @@ def discover_option_contracts(self) -> None:
     # runs on the main thread (see run()) - never the separate
     # position-protection thread, so there's no cross-thread race on
     # it the way there was on self.stock_symbols.
+    # By request: "perhaps the correct stocks are not being chosen,
+    # maybe we could ask the research agent to provide stocks to do
+    # analysis on" - agent_predicted_gainers (the AI research
+    # agent's own daily pick list, from refresh_agent_predicted_
+    # gainers) already gets merged into the STOCK universe, but
+    # option discovery never drew from it - only the static curated
+    # list and agent_popular_symbols (despite the name, that one is
+    # the deterministic market_pulse screener data, not the AI
+    # agent). Unioned in here so the AI agent's own volatile/volume
+    # picks - the exact kind of name the rise/dip cycling behavior
+    # needs - become option candidates too, not just stock ones.
     candidates = [
         symbol
-        for symbol in set(self.config.option_candidates()) | self.agent_popular_symbols
+        for symbol in (
+            set(self.config.option_candidates())
+            | self.agent_popular_symbols
+            | self.agent_predicted_gainers
+        )
         if symbol not in self.invalid_symbols
     ]
     if not self.options_enabled or not self.discover_all_options or not candidates:
