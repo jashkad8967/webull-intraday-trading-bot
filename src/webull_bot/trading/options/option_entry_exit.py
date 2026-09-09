@@ -356,6 +356,22 @@ def _evaluate_option_exit(
         average_down_quantity, average_down_contract_cost = (
             self.strategy.option_order_quantity(price, buying_power)
         )
+        if average_down_quantity <= 0:
+            # By request ("check now for uber") - the fresh-entry
+            # path already counts this exact silent-zero-sizing
+            # outcome into option_gate_rejections ("sizing produced
+            # zero contracts"); averaging-down had no equivalent, so
+            # a averaging-down attempt that clears every OTHER gate
+            # (dip signal, cooldown, cap, DTE) but still gets sized
+            # to 0 contracts - e.g. the option capital-fraction risk
+            # cap floors to 0 when the remaining OPTION buying power
+            # is thin relative to this contract's cost - looked
+            # completely silent, indistinguishable from "the gate
+            # never passed at all."
+            self.option_gate_rejections[
+                "averaging down - sizing produced zero contracts "
+                "(price/buying power/risk cap)"
+            ] += 1
         if average_down_quantity > 0:
             try:
                 average_down_price = self.api.option_limit_price(
