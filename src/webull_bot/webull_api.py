@@ -37,7 +37,7 @@ from webull_bot.api.orders import (
     order_status,
     place_stock,
 )
-from webull_bot.api.market_data import (
+from webull_bot.api.history_bars import (
     _average_amplitude,
     _average_close,
     _extract_bars,
@@ -45,13 +45,15 @@ from webull_bot.api.market_data import (
     _history_bars_resilient,
     _parse_amplitudes,
     _parse_closes,
-    _stock_instruments_resilient,
-    analyst_rating,
-    analyst_target_price,
     daily_closes,
     historical_volatility,
     recent_minute_closes,
     sma_trend,
+)
+from webull_bot.api.market_data import (
+    _stock_instruments_resilient,
+    analyst_rating,
+    analyst_target_price,
     stock_categories,
     stock_universe,
 )
