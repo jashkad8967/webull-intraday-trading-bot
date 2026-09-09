@@ -166,7 +166,7 @@ GROQ_API_KEY=your_groq_api_key
 `.env` is deliberately minimal - just these four secrets. Every other setting
 documented in this README (strategy tuning, sizing, pacing, session times,
 research-agent behavior, and so on) already has a sensible built-in default
-in `src/webull_bot/config.py`, so nothing else needs to be set to run the
+in `src/webull_bot/config/__init__.py`, so nothing else needs to be set to run the
 bot. Any of them can still be overridden by adding the corresponding
 `.env` line shown in this README's examples - `Settings` reads `.env` the
 same way regardless of how many lines are in it.

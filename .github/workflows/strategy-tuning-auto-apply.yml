@@ -95,7 +95,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           branch="strategy-tuning/auto-apply-$(date +%Y%m%d-%H%M%S)"
           git checkout -b "$branch"
-          git add src/webull_bot/config.py conf/strategy_tuning_cooldown.json conf/strategy_tuning_last_seen.json
+          git add src/webull_bot/config/__init__.py conf/strategy_tuning_cooldown.json conf/strategy_tuning_last_seen.json
           git commit -m "${{ steps.apply.outputs.commit_message }}"
           git push origin "$branch"
           {
