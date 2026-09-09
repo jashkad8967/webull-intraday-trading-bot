@@ -357,21 +357,28 @@ def _evaluate_option_exit(
             self.strategy.option_order_quantity(price, buying_power)
         )
         if average_down_quantity <= 0:
-            # By request ("check now for uber") - the fresh-entry
-            # path already counts this exact silent-zero-sizing
-            # outcome into option_gate_rejections ("sizing produced
-            # zero contracts"); averaging-down had no equivalent, so
-            # a averaging-down attempt that clears every OTHER gate
-            # (dip signal, cooldown, cap, DTE) but still gets sized
-            # to 0 contracts - e.g. the option capital-fraction risk
-            # cap floors to 0 when the remaining OPTION buying power
-            # is thin relative to this contract's cost - looked
-            # completely silent, indistinguishable from "the gate
-            # never passed at all."
-            self.option_gate_rejections[
-                "averaging down - sizing produced zero contracts "
-                "(price/buying power/risk cap)"
-            ] += 1
+            # By explicit request ("nah there should be no constraint
+            # like that") - option_order_quantity's risk-per-trade
+            # cap (option_capital_fraction, 5% of buying power) was
+            # floor-rounding to 0 contracts whenever the remaining
+            # OPTION buying power was thin relative to this specific
+            # contract's cost, silently blocking every averaging-down
+            # attempt that had otherwise cleared every real gate (dip
+            # signal, cooldown, cap, DTE) - live incident: UBER sat
+            # unaveraged for many cycles this way. Averaging down is
+            # a deliberate decision the signal/cap/cooldown gates
+            # above already vetted; once made, it should still buy at
+            # least ONE contract if genuinely affordable, rather than
+            # let the risk-fraction math alone silently veto it down
+            # to zero. The only real constraint left here is
+            # affordability itself, not the risk fraction.
+            average_down_contract_cost = price * 100
+            if buying_power >= average_down_contract_cost:
+                average_down_quantity = 1
+            else:
+                self.option_gate_rejections[
+                    "averaging down - cannot afford even 1 contract"
+                ] += 1
         if average_down_quantity > 0:
             try:
                 average_down_price = self.api.option_limit_price(
