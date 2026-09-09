@@ -83,6 +83,7 @@ from webull_bot.strategy_logic.volatility_scalp.signals import (
     volatility_scalp_momentum_stalled_or_rising,
     volatility_scalp_momentum_stalling,
     volatility_scalp_momentum_stalling_short,
+    volatility_scalp_rip_signal,
 )
 from webull_bot.strategy_logic.market_state.snapshot import (
     clear_market_state,
@@ -225,6 +226,7 @@ class TradingStrategy:
     seed_volatility_window = seed_volatility_window
     is_volatility_scalp_eligible = is_volatility_scalp_eligible
     volatility_scalp_dip_signal = volatility_scalp_dip_signal
+    volatility_scalp_rip_signal = volatility_scalp_rip_signal
     volatility_scalp_momentum_stalled_or_rising = volatility_scalp_momentum_stalled_or_rising
     volatility_scalp_momentum_stalling = volatility_scalp_momentum_stalling
     volatility_scalp_momentum_stalling_short = volatility_scalp_momentum_stalling_short

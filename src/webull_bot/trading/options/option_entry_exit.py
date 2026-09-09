@@ -76,6 +76,35 @@ def _evaluate_option_entry(
     # PERCENT restored) once a real end-to-end trade is
     # confirmed.
     if not self.config.option_smoke_test_mode:
+        # By request: "it doesn't buy puts while there is a
+        # dip, or a call on a dip entry and quickly sell it.
+        # This should happen for quick profit." The EMA
+        # direction signal is trend-following (needs a fresh
+        # cross to have already happened); it has no mean-
+        # reversion path at all - a CALL on the underlying
+        # DIPPING (betting on the same fast bounce the stock-
+        # side volatility-scalp cohort already trades) or a
+        # PUT on it RIPPING (the mirror-image bet on a fast
+        # pullback) never had a way to fire. Reuses the exact
+        # stock-side dip/rip signals and eligibility bar
+        # (is_volatility_scalp_eligible - already-confirmed-
+        # choppy-enough), so this only fires on names that
+        # already clear the same bar the stock cohort does,
+        # not every quiet name in the candidate pool.
+        scalp_direction = "HOLD"
+        if self.config.option_scalp_enabled and self.strategy.is_volatility_scalp_eligible(
+            underlying
+        ):
+            underlying_price = self.strategy.prices.get(underlying)
+            if underlying_price is not None:
+                if self.strategy.volatility_scalp_dip_signal(
+                    underlying, underlying_price
+                ):
+                    scalp_direction = "CALL"
+                elif self.strategy.volatility_scalp_rip_signal(
+                    underlying, underlying_price
+                ):
+                    scalp_direction = "PUT"
         # By request: "you can... use call and put
         # simultaneously type strategies for options as
         # well" - option_straddle_enabled (opt-in, off
@@ -96,6 +125,8 @@ def _evaluate_option_entry(
             self.config.option_straddle_enabled
             or (contract_type == "CALL" and direction == "CALL")
             or (contract_type == "PUT" and direction == "PUT")
+            or (contract_type == "CALL" and scalp_direction == "CALL")
+            or (contract_type == "PUT" and scalp_direction == "PUT")
         ):
             self.option_gate_rejections[
                 "no direction signal for this underlying"

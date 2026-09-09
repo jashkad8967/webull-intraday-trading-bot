@@ -22,6 +22,16 @@ class OptionTradingSettings(BaseSettings):
     # clear, so a real gain gets locked in instead of being held out
     # for a 75% move that usually never comes before reversing.
     option_take_profit_percent: Decimal = Field(default=Decimal("0.15"), gt=0)
+    # By request: "it doesn't buy puts while there is a dip, or a
+    # call on a dip entry and quickly sell it. This should happen
+    # for quick profit." Lets a CALL enter on the underlying's own
+    # volatility-scalp dip signal (and a PUT on the mirror-image rip
+    # signal) as an ADDITIONAL entry trigger alongside the existing
+    # EMA-trend direction signal - see _evaluate_option_entry. On by
+    # default since it reuses the same already-vetted stock-side
+    # dip/rip signals and eligibility bar, not a new speculative
+    # mechanism.
+    option_scalp_enabled: bool = True
     option_stop_loss_percent: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
     # By explicit request, for a one-off diagnostic: "make sure it
     # fires... no barrier, quickly sell it, and then change the option

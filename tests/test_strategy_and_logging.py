@@ -645,6 +645,34 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertTrue(strategy.volatility_scalp_dip_signal("WILD", Decimal("9.5")))
 
+    def test_rip_signal_fires_once_price_runs_up_far_enough_from_the_local_low(self):
+        # Mirror-image of the dip-signal test - by request: "it
+        # doesn't buy puts while there is a dip, or a call on a dip
+        # entry" - a PUT needs the mirror-image "rip" signal the same
+        # way a CALL uses the dip signal.
+        strategy = TradingStrategy(self.config())
+        self._feed(strategy, "WILD", [10, 9.5, 10.4, 9.6, 10.3, 9.7, 10.2])
+        # Local low over the last 5 samples (10.4, 9.6, 10.3, 9.7,
+        # 10.2) is 9.6. 0.5% above 9.6 is 9.648.
+        self.assertFalse(strategy.volatility_scalp_rip_signal("WILD", Decimal("9.64")))
+        self.assertTrue(strategy.volatility_scalp_rip_signal("WILD", Decimal("9.70")))
+
+    def test_rip_signal_false_for_an_unseen_symbol(self):
+        strategy = TradingStrategy(self.config())
+        self.assertFalse(strategy.volatility_scalp_rip_signal("NEVERSEEN", Decimal("10")))
+
+    def test_rip_signal_excludes_the_current_price_when_already_appended(self):
+        strategy = TradingStrategy(self.config())
+        strategy.volatility_price_history["WILD"].extend(
+            [9.5, 10.0, 10.0, 10.0, 10.0, 10.5]
+        )
+        # True recent low is 9.5 (the oldest sample) - if the current
+        # price (10.5, already appended as the window's last element,
+        # same as real live usage) were double-counted as a 6th
+        # sample, the last-5 lookback would push 9.5 out and mask the
+        # real ~10.5% rise.
+        self.assertTrue(strategy.volatility_scalp_rip_signal("WILD", Decimal("10.5")))
+
     def test_target_price_is_cost_plus_the_configured_small_percent(self):
         strategy = TradingStrategy(self.config())
         target = strategy.volatility_scalp_target_price(Decimal("20.00"))
