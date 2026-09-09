@@ -278,6 +278,7 @@ def _evaluate_option_entry(
             key,
             order_id,
             "BUY",
+            limit_price,
             entry_price=limit_price,
             quantity=buy_quantity,
         )
@@ -403,6 +404,7 @@ def _evaluate_option_exit(
                     key,
                     order_id,
                     "BUY",
+                    average_down_price,
                     entry_price=average_down_price,
                     quantity=average_down_quantity,
                     counts_toward_idle_cash_ramp=False,

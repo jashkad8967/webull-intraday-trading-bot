@@ -3880,6 +3880,62 @@ class StopLossEscalationTests(unittest.TestCase):
         )
         self.assertIn("STOCK:X", fake_bot.last_exit_at)
 
+    def test_a_buy_that_omits_limit_price_leaves_working_orders_unrepriceable(self):
+        """Live incident ("nah there should be no constraint like
+        that" investigation): EVERY BUY/SHORT record_trade call site
+        across the whole bot (stocks, options, pairs, volatility-
+        scalp, averaging-down) used to pass only entry_price=..., never
+        the positional limit_price - so working_orders[order_id]
+        ["limit_price"] was always None for a fresh entry. Both the
+        stock-side reprice_resting_entries and the option-side
+        reprice_resting_option_entries read exactly this field as
+        their "current resting limit" baseline - with it always None,
+        neither repricer could ever detect "the ask moved, chase it,"
+        so a resting BUY just sat at its original price until the
+        hard order-timeout cancelled it, unfilled, with zero visible
+        error. This documents the bug this fixed: entry_price alone
+        is NOT enough, limit_price must also be passed.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            manual_touch_at={},
+            submitted_order_ids_today=set(),
+            last_exit_at={},
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            consecutive_exit_failures=defaultdict(int),
+            recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
+            last_capital_deployed_at=0.0,
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            option_entry_occurred_today=False,
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        # The buggy call shape (entry_price only) - limit_price stays
+        # None, exactly the bug that made both entry repricers no-ops.
+        record_trade(
+            "STOCK:BUGGY", "order-buggy", "BUY", entry_price=Decimal("10.00")
+        )
+        self.assertIsNone(fake_bot.working_orders["order-buggy"]["limit_price"])
+
+        # The fixed call shape (every real call site now uses this) -
+        # limit_price passed positionally, matching entry_price.
+        record_trade(
+            "STOCK:FIXED",
+            "order-fixed",
+            "BUY",
+            Decimal("10.00"),
+            entry_price=Decimal("10.00"),
+        )
+        self.assertEqual(
+            fake_bot.working_orders["order-fixed"]["limit_price"], Decimal("10.00")
+        )
+
     def test_reentry_cooldown_blocks_immediate_rebuy_after_an_exit(self):
         """A stock that just closed shouldn't immediately pull the bot back
         in on the next favorable-looking poll - it must wait out

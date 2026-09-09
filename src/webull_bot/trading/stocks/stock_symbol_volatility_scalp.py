@@ -385,22 +385,22 @@ def _process_stock_symbol_volatility_scalp_entry(
         ):
             scalp_quantity = 0
         if scalp_quantity > 0:
+            scalp_entry_price = self.volatility_scalp_entry_price(quote)
             order_id = self.place_stock_scaled(
                 symbol,
                 "BUY",
                 scalp_quantity,
                 key,
                 quote,
-                limit_price_override=self.volatility_scalp_entry_price(
-                    quote
-                ),
+                limit_price_override=scalp_entry_price,
             )
             if order_id is not None:
                 self.record_trade(
                     key,
                     order_id,
                     "BUY",
-                    entry_price=self.volatility_scalp_entry_price(quote),
+                    scalp_entry_price,
+                    entry_price=scalp_entry_price,
                     quantity=scalp_quantity,
                     # Doesn't reset the general strategy's
                     # idle-cash relaxation clock - see
@@ -710,6 +710,7 @@ def _process_stock_symbol_volatility_scalp_averaging(
                     key,
                     order_id,
                     "BUY",
+                    average_down_price,
                     entry_price=average_down_price,
                     quantity=average_down_quantity,
                     counts_toward_idle_cash_ramp=False,

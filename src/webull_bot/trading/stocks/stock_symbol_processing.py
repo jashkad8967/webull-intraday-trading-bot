@@ -447,11 +447,13 @@ def _process_stock_symbol(
                 )
                 if order_id is None:
                     return
+                buy_limit_price = self.api.stock_limit_price(quote, "BUY")
                 self.record_trade(
                     key,
                     order_id,
                     "BUY",
-                    entry_price=self.api.stock_limit_price(quote, "BUY"),
+                    buy_limit_price,
+                    entry_price=buy_limit_price,
                     quantity=buy_quantity,
                 )
                 state.buying_power = max(
@@ -578,11 +580,13 @@ def _process_stock_symbol(
                 )
                 if order_id is None:
                     return
+                short_limit_price = self.api.stock_limit_price(quote, "SHORT")
                 self.record_trade(
                     key,
                     order_id,
                     "SHORT",
-                    entry_price=self.api.stock_limit_price(quote, "SHORT"),
+                    short_limit_price,
+                    entry_price=short_limit_price,
                     quantity=short_quantity,
                 )
                 # Not exact margin accounting (Webull's actual short

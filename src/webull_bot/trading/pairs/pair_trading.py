@@ -158,22 +158,26 @@ def trade_pairs(self, positions: list[dict], buying_power: Decimal) -> Decimal:
                     ),
                 )
                 continue
+            long_entry_price = self.api.stock_limit_price(
+                quote_by_symbol[long_symbol], "BUY"
+            )
             self.record_trade(
                 f"STOCK:{long_symbol}",
                 long_order,
                 "BUY",
-                entry_price=self.api.stock_limit_price(
-                    quote_by_symbol[long_symbol], "BUY"
-                ),
+                long_entry_price,
+                entry_price=long_entry_price,
                 quantity=long_qty,
+            )
+            short_entry_price = self.api.stock_limit_price(
+                quote_by_symbol[short_symbol], "SHORT"
             )
             self.record_trade(
                 f"STOCK:{short_symbol}",
                 short_order,
                 "BUY",
-                entry_price=self.api.stock_limit_price(
-                    quote_by_symbol[short_symbol], "SHORT"
-                ),
+                short_entry_price,
+                entry_price=short_entry_price,
                 quantity=short_qty,
             )
             self.position_buckets[long_symbol] = "PAIRS_LONG"
