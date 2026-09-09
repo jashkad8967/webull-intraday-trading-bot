@@ -121,6 +121,25 @@ def run(self) -> None:
             if not circuit_active:
                 circuit_active = self.handle_daily_loss_breaker()
             if not circuit_active:
+                # By request: "at least you would be able to see
+                # which contracts are there for core hours later on"
+                # - discovery (listing strikes/expirations, plus a
+                # best-effort affordability pick) doesn't need a
+                # live, currently-tradable option quote to be useful,
+                # only the underlying's own stock price (already
+                # scanned across the wider 4am-8pm stock session -
+                # see discover_option_contracts' own "underlying not
+                # in self.strategy.prices" gate) - and select_atm_
+                # options already falls back gracefully to a plain
+                # nearest-ATM pick if a pre/post-market affordability
+                # quote batch comes back stale or empty. Running this
+                # across the whole stock session instead of only
+                # inside the narrow option trading window means the
+                # contract list (persisted - see OptionContractsState
+                # Store) is already warm by the time real option
+                # trading opens at 9:30, instead of starting the slow
+                # discovery ramp-up cold every morning.
+                self.discover_option_contracts()
                 # By explicit request: "I want priority to option
                 # trades, so make sure you buy options first."
                 # Options and stocks draw from completely separate
@@ -131,9 +150,12 @@ def run(self) -> None:
                 # first crack at this cycle's evaluation instead of
                 # being evaluated after (and therefore effectively
                 # de-prioritized behind) the general/scalp stock
-                # paths every single cycle.
+                # paths every single cycle. Actual order PLACEMENT
+                # still only happens inside real option trading
+                # hours - options have no extended-hours market at
+                # all, so an order outside this window would just be
+                # rejected.
                 if option_open <= moment < option_closeout:
-                    self.discover_option_contracts()
                     buying_power = self.trade_options(positions, buying_power)
                 buying_power = self.trade_pairs(positions, buying_power)
                 buying_power = self.trade_stocks(
