@@ -924,7 +924,7 @@ and skips positions that already have a pending exit.
 
 Repository responsibilities are intentionally separated:
 
-- `src/webull_bot/strategy.py`: activity scoring, penny/popular allocation,
+- `src/webull_bot/strategy/__init__.py`: activity scoring, penny/popular allocation,
   Groq priority weighting, EMA + VWAP entry rules, adaptive targets/stops,
   sizing, and portfolio policy.
 - `src/webull_bot/bot.py`: session scheduling, account caching, wash-block
