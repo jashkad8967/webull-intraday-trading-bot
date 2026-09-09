@@ -1,0 +1,133 @@
+import logging
+import time
+from decimal import Decimal
+
+from webull_bot.trading.guards.price_sanity import OPTION_PRICE_SANITY_TOLERANCE
+from webull_bot.trading.orders.locks import _rekey_working_order, _working_orders_lock
+from webull_bot.trading.orders.manual_touch import _manual_touch_active
+from webull_bot.trading.orders.rate_limit_retry import _retry_once_on_rate_limit
+
+log = logging.getLogger("webull-bot")
+
+
+def reprice_resting_option_entries(self) -> None:
+    """Options analog of reprice_resting_entries - by request: "why is
+    the buy price not playing around in the spread, same with sell."
+    reprice_resting_option_exits already chases the ask on a resting
+    option PROFIT sell; a resting option BUY (fresh entry OR
+    averaging-down) had no equivalent and just sat at its original
+    limit price until order_timeout_seconds' hard cancel gave up on
+    it entirely - live evidence: NKE and a UBER put both got
+    cancelled unfilled after 120s the same session, at the same
+    passive price the whole time, exactly the stock-side IBRX
+    incident reprice_resting_entries was built to fix.
+
+    Chases UP toward the current ask only (an option BUY, never a
+    SHORT/write here) - never chases the ask DOWN below entry cost
+    the way reprice_resting_option_exits guards its SELL side,
+    because there's no equivalent floor to protect on the buy side;
+    it simply never reprices to a WORSE (lower, more likely to sit
+    unfilled again) price than the current resting limit.
+    """
+    now = time.monotonic()
+    if now - self.last_option_entry_reprice < float(
+        getattr(self.config, "poll_seconds", Decimal("0.25"))
+    ):
+        return
+    self.last_option_entry_reprice = now
+    with _working_orders_lock(self):
+        snapshot = list(self.working_orders.items())
+    candidates: list[tuple[str, str, dict]] = []
+    for order_id, order in snapshot:
+        action = order.get("action")
+        key = str(order.get("key") or "")
+        if action != "BUY" or not key.startswith("OPTION:"):
+            continue
+        if order.get("cancel_requested_at") is not None:
+            continue
+        symbol = key.split(":", 1)[1]
+        if _manual_touch_active(self, symbol):
+            continue
+        quantity = order.get("quantity")
+        if not quantity or quantity <= 0:
+            continue
+        candidates.append((order_id, symbol, order))
+    if not candidates:
+        return
+    contract_by_symbol = {
+        contract["symbol"]: contract for contract in self.option_contracts
+    }
+    candidates = [
+        candidate for candidate in candidates if candidate[1] in contract_by_symbol
+    ]
+    if not candidates:
+        return
+    # option_quotes hard-rejects a batch over 20 symbols.
+    quote_by_symbol: dict[str, dict] = {}
+    symbols = [symbol for _, symbol, _ in candidates]
+    for start in range(0, len(symbols), 20):
+        chunk = symbols[start : start + 20]
+        try:
+            for quote in self.api.option_quotes(chunk):
+                quote_by_symbol[str(quote.get("symbol", ""))] = quote
+        except Exception as exc:
+            log.warning("REPRICE| option quote batch failed | %s", exc)
+
+    for order_id, symbol, order in candidates:
+        key = str(order.get("key") or "")
+        action = order.get("action")
+        quantity = order.get("quantity")
+        try:
+            quote = quote_by_symbol.get(symbol)
+            if quote is None:
+                continue
+            ask = self.api.quote_ask(quote)
+            current_limit = order.get("limit_price")
+            if (
+                ask is None
+                or current_limit is None
+                or ask <= current_limit
+            ):
+                continue
+            contract = contract_by_symbol[symbol]
+            if not self.price_sanity_ok(
+                symbol, self.api.quote_price(quote), ask,
+                tolerance=OPTION_PRICE_SANITY_TOLERANCE,
+            ):
+                continue
+            _retry_once_on_rate_limit(self.api.cancel, order_id)
+            new_order_id = _retry_once_on_rate_limit(
+                self.api.place_option,
+                contract,
+                "BUY",
+                int(quantity),
+                ask,
+                "BUY_TO_OPEN",
+            )
+            _rekey_working_order(
+                self,
+                order_id,
+                new_order_id,
+                {
+                    "submitted_at": now,
+                    "key": key,
+                    "action": action,
+                    "cancel_requested_at": None,
+                    "limit_price": ask,
+                    "pnl": order.get("pnl"),
+                    "quantity": quantity,
+                },
+            )
+            self.status.rekey_trade(order_id, new_order_id)
+            log.info(
+                "REPRICE| %-8s | %-6s | ask=%s | id=%s",
+                symbol, action, ask, new_order_id,
+            )
+        except Exception as exc:
+            if self.is_order_not_cancelable(exc):
+                log.warning(
+                    "REPRICE| %s | entry reprice skipped | order "
+                    "already resolving | %s", symbol, exc,
+                )
+            else:
+                log.error("REPRICE| %s | entry reprice failed | %s", symbol, exc)

@@ -150,6 +150,9 @@ from webull_bot.trading.repricing.resting_entry_repricer import (
     reprice_resting_entries,
 )
 from webull_bot.trading.repricing.resting_exit_repricer import reprice_resting_exits
+from webull_bot.trading.repricing.resting_option_entry_repricer import (
+    reprice_resting_option_entries,
+)
 from webull_bot.trading.repricing.resting_option_exit_repricer import (
     reprice_resting_option_exits,
 )
@@ -398,6 +401,7 @@ class AutoTrader:
     reprice_resting_entries = reprice_resting_entries
     reprice_volatility_scalp_exits = reprice_volatility_scalp_exits
     reprice_resting_exits = reprice_resting_exits
+    reprice_resting_option_entries = reprice_resting_option_entries
     reprice_resting_option_exits = reprice_resting_option_exits
     escalate_stalled_stop_losses = escalate_stalled_stop_losses
     evaluate_held_stock_exits = evaluate_held_stock_exits
@@ -647,6 +651,7 @@ class AutoTrader:
         self.last_order_monitor = 0.0
         self.last_reprice = 0.0
         self.last_option_reprice = 0.0
+        self.last_option_entry_reprice = 0.0
         self.last_volatility_reprice = 0.0
         self.last_volatility_entry_reprice = 0.0
         self.last_held_exit_scan = 0.0
