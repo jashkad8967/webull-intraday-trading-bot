@@ -50,10 +50,12 @@ from webull_bot.api.history_bars import (
     recent_minute_closes,
     sma_trend,
 )
-from webull_bot.api.market_data import (
-    _stock_instruments_resilient,
+from webull_bot.api.analyst_data import (
     analyst_rating,
     analyst_target_price,
+)
+from webull_bot.api.market_data import (
+    _stock_instruments_resilient,
     stock_categories,
     stock_universe,
 )
