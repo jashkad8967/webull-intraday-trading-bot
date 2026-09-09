@@ -21,6 +21,43 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     batch could not be built at all - callers should treat None the same
     as the "return buying_power unchanged" cases it replaces.
     """
+    # By request ("why is UBER not averaging down") - live incident:
+    # discover_option_contracts treats an underlying as "already
+    # discovered" the moment ANY contract for it exists in self.
+    # option_contracts (see its own `discovered` set), so a restart
+    # that re-discovers a DIFFERENT strike for that underlying (the
+    # underlying's price moved between the original entry and the
+    # restart) never adds the originally-HELD strike back. Since
+    # trade_options' whole per-contract loop only ever iterates
+    # self.option_contracts, a held position whose exact contract
+    # fell out of that list was completely invisible to it from then
+    # on - no PROFIT/LOSS check, no averaging-down, nothing, just an
+    # unmanaged position sitting there. Backfills any open OPTION
+    # position's contract that isn't currently in self.option_
+    # contracts using contract_from_position (already used by the
+    # manual-sell/stall-boost paths for the same reason), every
+    # cycle - cheap, since it only touches the handful of positions
+    # actually held, not the whole discovery candidate pool.
+    known_symbols = {item["symbol"] for item in self.option_contracts}
+    for position in positions:
+        if position.get("instrument_type") != "OPTION":
+            continue
+        symbol = str(position.get("symbol", ""))
+        if not symbol or symbol in known_symbols:
+            continue
+        try:
+            contract = self.api.contract_from_position(position)
+        except Exception:
+            contract = None
+        if contract is not None:
+            self.option_contracts.append(contract)
+            known_symbols.add(symbol)
+            log.info(
+                "OPTIONS | %-8s | re-added held contract missing from "
+                "discovery | %s",
+                contract.get("underlying_symbol", symbol),
+                symbol,
+            )
     open_count = self.strategy.open_position_count(positions)
     # See stop_loss_guard_active() / trade_stocks - same freqtrade-
     # style frequency-based entry pause, applied here too.
@@ -129,9 +166,32 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     rotation, self.option_cursor = self.strategy.rotating_batch(
         self.option_contracts, self.option_cursor, fill_size
     )
+    # By request ("why is UBER not averaging down") - being IN self.
+    # option_contracts (see the backfill above) isn't enough on its
+    # own: this batch is still capped at option_batch_size (20,
+    # Webull's own per-call option-snapshot limit) and shared with
+    # the direction-signal-priority/rotation contracts above, so an
+    # actively-HELD position could still lose out to the rotation on
+    # any given cycle purely by bad luck, leaving its PROFIT/LOSS/
+    # averaging-down check skipped that cycle. A position that's
+    # actively risking real capital must never be skippable just
+    # because it didn't win this cycle's rotation slot - listed
+    # first, ahead of both, so it only ever gets bumped out of the
+    # 20-wide cap by having more than 20 open option positions at
+    # once (a real ceiling, not this bug).
+    held_symbols = {
+        str(position.get("symbol", ""))
+        for position in positions
+        if position.get("instrument_type") == "OPTION"
+    }
+    held_contracts = [
+        contract
+        for contract in self.option_contracts
+        if contract["symbol"] in held_symbols
+    ]
     seen_symbols: set[str] = set()
     batch: list[dict] = []
-    for contract in priority_contracts + rotation:
+    for contract in held_contracts + priority_contracts + rotation:
         symbol = contract["symbol"]
         if symbol not in seen_symbols:
             seen_symbols.add(symbol)
