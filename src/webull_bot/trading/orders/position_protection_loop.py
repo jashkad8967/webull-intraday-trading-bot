@@ -46,6 +46,7 @@ def _position_protection_loop(self) -> None:
             )
             self.reprice_volatility_scalp_entries()
             self.reprice_resting_entries(self.cached_core_session_active)
+            self.reprice_resting_option_entries()
             self.escalate_stalled_stop_losses()
         except Exception as exc:
             log.error("PROTECT| position-protection cycle failed | %s", exc)
