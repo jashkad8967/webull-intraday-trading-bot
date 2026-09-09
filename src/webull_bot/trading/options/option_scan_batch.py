@@ -38,44 +38,82 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     # manual-sell/stall-boost paths for the same reason), every
     # cycle - cheap, since it only touches the handful of positions
     # actually held, not the whole discovery candidate pool.
-    known_symbols = {item["symbol"] for item in self.option_contracts}
+    # By request ("check uber now") - live incident: the very first
+    # version of this backfill compared each position's top-level
+    # "symbol" field directly against contract dicts' "symbol" field
+    # to decide "already known, skip." That comparison can NEVER
+    # match: Webull's positions() response puts the UNDERLYING
+    # symbol (e.g. "UBER") in a position's top-level "symbol" field
+    # for an option, not the full OCC contract symbol - the real
+    # contract identity lives in position["legs"][0] (see option_
+    # position's own dual symbol-then-legs matching in api/
+    # options.py, which this now mirrors). The mismatch meant this
+    # "skip if already known" check was always false, so a held
+    # position got a NEW backfill attempt logged every single cycle
+    # regardless of whether the prior one had already succeeded -
+    # and, worse, the SAME bare-symbol comparison in the held-
+    # contract batch-priority code further below meant that
+    # guarantee was silently a complete no-op the whole time.
+    held_contracts: list[dict] = []
     for position in positions:
         if position.get("instrument_type") != "OPTION":
             continue
-        symbol = str(position.get("symbol", ""))
-        if not symbol or symbol in known_symbols:
-            continue
-        try:
-            contract = self.api.contract_from_position(position)
-        except Exception as exc:
-            contract = None
-            log.warning(
-                "OPTIONS | %-8s | held-contract backfill raised | %s",
-                symbol, exc,
-            )
+        raw_symbol = str(position.get("symbol", ""))
+        legs = position.get("legs", [])
+        contract = None
+        # Cheap, no-API-call match against what's already known
+        # first - only fall through to contract_from_position (which
+        # can make a real API call) when nothing local matches.
+        for candidate in self.option_contracts:
+            if candidate["symbol"] == raw_symbol:
+                contract = candidate
+                break
+            for leg in legs:
+                if (
+                    candidate.get("underlying_symbol") == leg.get("symbol")
+                    and candidate.get("option_type") == leg.get("option_type")
+                    and candidate.get("expiration_date")
+                    == leg.get("option_expire_date")
+                    and Decimal(str(candidate.get("strike_price", "0")))
+                    == Decimal(str(leg.get("option_exercise_price", "0")))
+                ):
+                    contract = candidate
+                    break
+            if contract is not None:
+                break
         if contract is None:
-            # contract_from_position itself swallows exact_option's
-            # own exception internally (falls through to a legs-
-            # based lookup instead), so a bare None here gives no
-            # detail on which of its two paths actually failed -
-            # logged anyway so a persistently-unbackfilled position
-            # is at least VISIBLE instead of silently never managed
-            # again, the exact failure mode this whole backfill
-            # exists to fix.
-            log.warning(
-                "OPTIONS | %-8s | held-contract backfill found nothing "
-                "(neither exact_option nor a legs-based match)",
-                symbol,
-            )
+            try:
+                contract = self.api.contract_from_position(position)
+            except Exception as exc:
+                contract = None
+                log.warning(
+                    "OPTIONS | %-8s | held-contract backfill raised | %s",
+                    raw_symbol, exc,
+                )
+            if contract is None:
+                # contract_from_position itself swallows exact_
+                # option's own exception internally (falls through to
+                # a legs-based lookup instead), so a bare None here
+                # gives no detail on which of its two paths actually
+                # failed - logged anyway so a persistently-
+                # unbackfilled position is at least VISIBLE instead
+                # of silently never managed again.
+                log.warning(
+                    "OPTIONS | %-8s | held-contract backfill found "
+                    "nothing (neither exact_option nor a legs-based "
+                    "match)",
+                    raw_symbol,
+                )
+            else:
+                self.option_contracts.append(contract)
+                log.info(
+                    "OPTIONS | %-8s | re-added held contract missing "
+                    "from discovery | %s",
+                    contract.get("underlying_symbol", raw_symbol),
+                    contract["symbol"],
+                )
         if contract is not None:
-            self.option_contracts.append(contract)
-            known_symbols.add(symbol)
-            log.info(
-                "OPTIONS | %-8s | re-added held contract missing from "
-                "discovery | %s",
-                contract.get("underlying_symbol", symbol),
-                symbol,
-            )
+            held_contracts.append(contract)
     open_count = self.strategy.open_position_count(positions)
     # See stop_loss_guard_active() / trade_stocks - same freqtrade-
     # style frequency-based entry pause, applied here too.
@@ -196,17 +234,10 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     # because it didn't win this cycle's rotation slot - listed
     # first, ahead of both, so it only ever gets bumped out of the
     # 20-wide cap by having more than 20 open option positions at
-    # once (a real ceiling, not this bug).
-    held_symbols = {
-        str(position.get("symbol", ""))
-        for position in positions
-        if position.get("instrument_type") == "OPTION"
-    }
-    held_contracts = [
-        contract
-        for contract in self.option_contracts
-        if contract["symbol"] in held_symbols
-    ]
+    # once (a real ceiling, not this bug). held_contracts was already
+    # correctly resolved (symbol-or-legs matched, not a broken bare-
+    # symbol comparison) in the backfill pass above - reused here
+    # rather than recomputed.
     seen_symbols: set[str] = set()
     batch: list[dict] = []
     for contract in held_contracts + priority_contracts + rotation:
