@@ -47,8 +47,26 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
             continue
         try:
             contract = self.api.contract_from_position(position)
-        except Exception:
+        except Exception as exc:
             contract = None
+            log.warning(
+                "OPTIONS | %-8s | held-contract backfill raised | %s",
+                symbol, exc,
+            )
+        if contract is None:
+            # contract_from_position itself swallows exact_option's
+            # own exception internally (falls through to a legs-
+            # based lookup instead), so a bare None here gives no
+            # detail on which of its two paths actually failed -
+            # logged anyway so a persistently-unbackfilled position
+            # is at least VISIBLE instead of silently never managed
+            # again, the exact failure mode this whole backfill
+            # exists to fix.
+            log.warning(
+                "OPTIONS | %-8s | held-contract backfill found nothing "
+                "(neither exact_option nor a legs-based match)",
+                symbol,
+            )
         if contract is not None:
             self.option_contracts.append(contract)
             known_symbols.add(symbol)
