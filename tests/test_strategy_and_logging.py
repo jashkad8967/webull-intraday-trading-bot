@@ -9117,9 +9117,12 @@ class OptionContractsStateStoreTests(unittest.TestCase):
                 }
             ]
             store.save(contracts, {"XYZ", "ABC"})
-            loaded_contracts, loaded_attempted = self._store(path).load()
+            loaded_contracts, loaded_attempted, loaded_averaging = (
+                self._store(path).load()
+            )
             self.assertEqual(loaded_contracts, contracts)
             self.assertEqual(loaded_attempted, {"XYZ", "ABC"})
+            self.assertEqual(loaded_averaging, {})
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
@@ -9145,7 +9148,7 @@ class OptionContractsStateStoreTests(unittest.TestCase):
                 ],
                 set(),
             )
-            loaded_contracts, _ = self._store(path).load()
+            loaded_contracts, _, _ = self._store(path).load()
             self.assertEqual([c["symbol"] for c in loaded_contracts], ["STILL_GOOD"])
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
@@ -9153,9 +9156,48 @@ class OptionContractsStateStoreTests(unittest.TestCase):
     def test_load_with_no_file_yet_returns_empty(self):
         path = Path("tests/.generated_option_state/missing.json")
         shutil.rmtree(path.parent, ignore_errors=True)
-        contracts, attempted = self._store(path).load()
+        contracts, attempted, averaging = self._store(path).load()
         self.assertEqual(contracts, [])
         self.assertEqual(attempted, set())
+        self.assertEqual(averaging, {})
+
+    def test_save_then_load_round_trips_averaging_down_state(self):
+        path = Path("tests/.generated_option_state/averaging.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            store = self._store(path)
+            store.save(
+                [],
+                set(),
+                {"XYZ260101C00100000": {"count": 1, "last_buy_price": Decimal("0.85")}},
+            )
+            _, _, loaded_averaging = self._store(path).load()
+            self.assertEqual(
+                loaded_averaging,
+                {
+                    "XYZ260101C00100000": {
+                        "count": 1,
+                        "last_buy_price": Decimal("0.85"),
+                    }
+                },
+            )
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_load_drops_a_zero_count_averaging_entry(self):
+        path = Path("tests/.generated_option_state/averaging_zero.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            store = self._store(path)
+            store.save(
+                [],
+                set(),
+                {"XYZ260101C00100000": {"count": 0, "last_buy_price": Decimal("0.85")}},
+            )
+            _, _, loaded_averaging = self._store(path).load()
+            self.assertEqual(loaded_averaging, {})
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
 
 
 class WashSaleTrackerTests(unittest.TestCase):

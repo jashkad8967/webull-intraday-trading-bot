@@ -611,10 +611,21 @@ class AutoTrader:
         self.option_contracts_state = OptionContractsStateStore(
             self.config.option_contracts_state_file, log
         )
-        restored_contracts, restored_attempted = self.option_contracts_state.load()
+        restored_contracts, restored_attempted, restored_averaging = (
+            self.option_contracts_state.load()
+        )
         if restored_contracts:
             self.option_contracts = restored_contracts
             self.option_discovery_attempted = restored_attempted
+        # By request ("do a full on options sanity check") - restores
+        # each held position's averaging-down ladder (count + last
+        # buy price) too, so a position that already used some/all of
+        # its allowed averaging-down buys before a restart doesn't
+        # get a fresh allotment after one. See OptionContractsState
+        # Store's docstring for the full incident this fixes.
+        for symbol, entry in restored_averaging.items():
+            self.option_average_down_count[symbol] = entry["count"]
+            self.option_last_buy_price[symbol] = entry["last_buy_price"]
         self.discover_all_options = False
         self.option_iv_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=30)
