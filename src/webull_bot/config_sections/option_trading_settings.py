@@ -11,7 +11,17 @@ class OptionTradingSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    option_take_profit_percent: Decimal = Field(default=Decimal("0.75"), gt=0)
+    # By request: "if there is immediate profit after a buy, why are
+    # you waiting to sell it, just capture the profit" / "it just
+    # ends up going down then." Options routinely move 10-30%+
+    # intraday off a modest underlying move (leverage), but a 75%
+    # target was rare enough to hit before the premium round-tripped
+    # back down - a real, genuinely-favorable move was regularly
+    # never captured because the bar was set for a much bigger,
+    # rarer run. Lowered to a bar an actual quick pop can realistically
+    # clear, so a real gain gets locked in instead of being held out
+    # for a 75% move that usually never comes before reversing.
+    option_take_profit_percent: Decimal = Field(default=Decimal("0.15"), gt=0)
     option_stop_loss_percent: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
     # By explicit request, for a one-off diagnostic: "make sure it
     # fires... no barrier, quickly sell it, and then change the option

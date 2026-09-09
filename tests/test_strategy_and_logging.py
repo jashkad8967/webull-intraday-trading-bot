@@ -3736,6 +3736,27 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(quantity, 2)
 
+    def test_real_config_default_captures_a_realistic_quick_pop_as_profit(self):
+        # By request: "if there is immediate profit after a buy, why
+        # are you waiting to sell it, just capture the profit" / "it
+        # just ends up going down then." option_take_profit_percent
+        # used to default to 0.75 (a 75% premium gain) - rare enough
+        # that a real, favorable quick pop routinely reversed before
+        # ever hitting it. Using the REAL Settings default (not a
+        # test fixture's hardcoded value) confirms a realistic ~20%
+        # premium pop right after entry now actually triggers PROFIT.
+        from webull_bot.config import Settings
+
+        config = Settings(_env_file=None)
+        strategy = TradingStrategy(config)
+        decision = strategy.option_decision(
+            price=Decimal("1.20"),
+            quantity=1,
+            average_cost=Decimal("1.00"),
+            days_to_expiration=20,
+        )
+        self.assertEqual(decision.action, "PROFIT")
+
     def test_option_average_down_signal_widens_the_required_drop_per_level(self):
         # By request: "you can also use averaging down... for options
         # as well" - same widening-ladder shape as volatility_scalp_
