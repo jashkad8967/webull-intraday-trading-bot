@@ -32,7 +32,13 @@ from webull_bot.strategy_tuning import (  # noqa: E402
     apply_lever_adjustment,
 )
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "src" / "webull_bot" / "config.py"
+CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "src"
+    / "webull_bot"
+    / "config"
+    / "__init__.py"
+)
 COOLDOWN_STATE_PATH = "conf/strategy_tuning_cooldown.json"
 LAST_SEEN_PATH = Path(__file__).resolve().parent.parent / "conf" / "strategy_tuning_last_seen.json"
 
