@@ -89,3 +89,15 @@ class OptionTradingSettings(BaseSettings):
     # underlying doesn't move enough), opt-in via this flag. See its
     # use in trade_options' direction-match gate.
     option_straddle_enabled: bool = False
+    # By explicit request ("the options chosen are not as volatile...
+    # nike again is failing"): a strictly higher, option-specific
+    # volatility floor on top of is_volatility_scalp_eligible's own
+    # stdev bar (0.8%, tuned for the stock-side cohort and already
+    # lowered once at that side's own request) - SPY (a broad index
+    # ETF, inherently dampened relative to a single stock) and NKE (a
+    # historically calm blue-chip) were both clearing the stock bar
+    # repeatedly without being genuinely volatile enough to justify
+    # the premium risked on an option.
+    option_min_volatility_percent: Decimal = Field(
+        default=Decimal("0.02"), gt=0, le=1
+    )

@@ -4948,8 +4948,9 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
                 return [quote]
 
             @staticmethod
-            def quote_ask(q):
-                return Decimal(str(q["ask"]))
+            def option_limit_price(q, side):
+                # Mirrors the real (bid+ask)/2 midpoint convention.
+                return (Decimal(str(q["bid"])) + Decimal(str(q["ask"]))) / 2
 
             @staticmethod
             def quote_price(q):
@@ -4993,15 +4994,18 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         with unittest.mock.patch("time.monotonic", return_value=100.0):
             reprice()
 
+        # By request: "you don't have to buy at the edges of the
+        # spread, the mid price is also fine" - chases the midpoint
+        # (1.95), not the full ask (2.00).
         self.assertEqual(cancelled, ["order-1"])
         self.assertEqual(len(placed), 1)
         self.assertEqual(
-            placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("2.00"))
+            placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("1.95"))
         )
         self.assertNotIn("order-1", fake_bot.working_orders)
         self.assertIn("order-2", fake_bot.working_orders)
         self.assertEqual(
-            fake_bot.working_orders["order-2"]["limit_price"], Decimal("2.00")
+            fake_bot.working_orders["order-2"]["limit_price"], Decimal("1.95")
         )
         self.assertEqual(rekeyed, [("order-1", "order-2")])
 
@@ -5031,8 +5035,8 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
                 return [quote]
 
             @staticmethod
-            def quote_ask(q):
-                return Decimal(str(q["ask"]))
+            def option_limit_price(q, side):
+                return (Decimal(str(q["bid"])) + Decimal(str(q["ask"]))) / 2
 
             @staticmethod
             def quote_price(q):
