@@ -1158,6 +1158,57 @@ class OrderNotCancelableTests(unittest.TestCase):
         self.assertTrue(AutoTrader.is_order_not_cancelable(exc))
 
 
+class SellWithNoPositionTests(unittest.TestCase):
+    """is_sell_with_no_position - by request ("check the logs and see
+    what errors happened, and ensure they do not happen again"): live
+    incident, AHMA - the fast held-exit evaluator's cached_positions
+    snapshot showed a stale nonzero quantity for a symbol already
+    closed, so it tried to sell it again and got rejected as an
+    attempted short.
+    """
+
+    def test_true_for_the_webull_no_position_rejection_code(self):
+        from webull_bot.bot import AutoTrader
+
+        exc = Exception(
+            "HTTP Status: 417, Code: "
+            "OPENAPI_NEW_NO_POSITION_MARGIN_ACCOUNT_CAN_NOT_SELL_SHORT_FOR_LT_2K, "
+            "Msg: You currently have no open positions in AHMA."
+        )
+        self.assertTrue(AutoTrader.is_sell_with_no_position(exc))
+
+    def test_false_for_an_unrelated_error(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(AutoTrader.is_sell_with_no_position(Exception("timeout")))
+
+
+class OtcExtendedHoursUnsupportedTests(unittest.TestCase):
+    """is_otc_extended_hours_unsupported - by request ("check the logs
+    and see what errors happened, and ensure they do not happen
+    again"): live incident, NLST - an OTC-listed security has no
+    extended-hours session at all, and this rejection was falling
+    through to a raw, unclassified ERROR log.
+    """
+
+    def test_true_for_the_webull_otc_extended_hours_rejection_code(self):
+        from webull_bot.bot import AutoTrader
+
+        exc = Exception(
+            "HTTP Status: 417, Code: OPENAPI_OTC_TICKER_NOT_SUPPORT_X_P, "
+            "Msg: Extended hours trading is not available for OTC "
+            "market stock."
+        )
+        self.assertTrue(AutoTrader.is_otc_extended_hours_unsupported(exc))
+
+    def test_false_for_an_unrelated_error(self):
+        from webull_bot.bot import AutoTrader
+
+        self.assertFalse(
+            AutoTrader.is_otc_extended_hours_unsupported(Exception("timeout"))
+        )
+
+
 class OrderReversesExistingPositionTests(unittest.TestCase):
     """is_order_reverses_existing_position - live incident:
     escalate_stalled_stop_losses cancels a stalled exit then
@@ -8031,6 +8082,32 @@ class BrokerConflictTests(unittest.TestCase):
         # otherwise spam a warning every cycle forever.
         with unittest.mock.patch.object(bot_module.log, "warning") as warn:
             handle("XHG", RuntimeError("FRACT_TICKER_DONT_SUPPORT_TRADE"))
+        warn.assert_not_called()
+
+    def test_handle_otc_extended_hours_unsupported_blacklists_only_that_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(otc_extended_hours_unsupported_symbols=set())
+        handle = AutoTrader.handle_otc_extended_hours_unsupported.__get__(fake_bot)
+
+        handle("NLST", RuntimeError("OTC_TICKER_NOT_SUPPORT_X_P"))
+
+        self.assertEqual(fake_bot.otc_extended_hours_unsupported_symbols, {"NLST"})
+        self.assertNotIn("AAPL", fake_bot.otc_extended_hours_unsupported_symbols)
+
+    def test_handle_otc_extended_hours_unsupported_is_idempotent(self):
+        from webull_bot.bot import AutoTrader
+        from webull_bot.trading.handlers import otc_extended_hours_handler
+
+        fake_bot = SimpleNamespace(
+            otc_extended_hours_unsupported_symbols={"NLST"}
+        )
+        handle = AutoTrader.handle_otc_extended_hours_unsupported.__get__(fake_bot)
+
+        with unittest.mock.patch.object(
+            otc_extended_hours_handler.log, "warning"
+        ) as warn:
+            handle("NLST", RuntimeError("OTC_TICKER_NOT_SUPPORT_X_P"))
         warn.assert_not_called()
 
     def test_is_short_selling_unsupported_matches_sub_2k_equity_rejection(self):
