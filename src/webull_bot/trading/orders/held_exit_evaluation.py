@@ -252,6 +252,35 @@ def evaluate_held_stock_exits(self) -> None:
                 order_id,
             )
         except Exception as exc:
+            if self.is_sell_with_no_position(exc):
+                # By request ("check the logs and see what errors
+                # happened, and ensure they do not happen again") -
+                # live incident: cached_positions only gets
+                # overwritten once per SLOW scan cycle; if that
+                # refresh lands before the broker's own account state
+                # has caught up to a fill that already happened, this
+                # symbol can look held again for one more fast-loop
+                # pass even though it's genuinely already flat -
+                # Webull correctly rejects the resulting sell as an
+                # attempted short. Benign and self-resolving (the
+                # position really is closed), not a fault - zero the
+                # stale entry immediately (same convention record_
+                # trade's own PROFIT/STOP/MANUAL_SELL zeroing already
+                # uses) so this cycle's own view corrects itself
+                # without waiting out another full slow-scan cycle.
+                for item in self.cached_positions:
+                    if (
+                        item.get("instrument_type") == "EQUITY"
+                        and str(item.get("symbol", "")).upper() == symbol
+                    ):
+                        item["quantity"] = "0"
+                log.warning(
+                    "PROTECT| %s | fast held-exit evaluation found no "
+                    "real position (already closed) | %s",
+                    symbol,
+                    exc,
+                )
+                return
             log.error(
                 "PROTECT| %s | fast held-exit evaluation failed | %s",
                 symbol,

@@ -14,6 +14,8 @@ from webull_bot.config import settings
 from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.errors.broker_conflict import is_broker_position_conflict
 from webull_bot.errors.fractional_ticker import is_fractional_ticker_unsupported
+from webull_bot.errors.otc_extended_hours import is_otc_extended_hours_unsupported
+from webull_bot.errors.sell_with_no_position import is_sell_with_no_position
 from webull_bot.errors.fractional_trading import is_fractional_trading_not_enabled
 from webull_bot.errors.order_cancellation import is_order_not_cancelable
 from webull_bot.errors.order_reverses_position import (
@@ -66,6 +68,9 @@ from webull_bot.trading.handlers.fractional_ticker_handler import (
 )
 from webull_bot.trading.handlers.fractional_trading_handler import (
     handle_fractional_trading_not_enabled,
+)
+from webull_bot.trading.handlers.otc_extended_hours_handler import (
+    handle_otc_extended_hours_unsupported,
 )
 from webull_bot.trading.handlers.short_selling_handler import (
     handle_short_selling_unsupported,
@@ -280,6 +285,8 @@ class AutoTrader:
     is_broker_position_conflict = staticmethod(is_broker_position_conflict)
     is_fractional_quantity = staticmethod(is_fractional_quantity)
     is_fractional_ticker_unsupported = staticmethod(is_fractional_ticker_unsupported)
+    is_sell_with_no_position = staticmethod(is_sell_with_no_position)
+    is_otc_extended_hours_unsupported = staticmethod(is_otc_extended_hours_unsupported)
     is_fractional_trading_not_enabled = staticmethod(is_fractional_trading_not_enabled)
     is_order_not_cancelable = staticmethod(is_order_not_cancelable)
     is_order_reverses_existing_position = staticmethod(
@@ -318,6 +325,7 @@ class AutoTrader:
     handle_broker_conflict = handle_broker_conflict
     handle_fractional_trading_not_enabled = handle_fractional_trading_not_enabled
     handle_fractional_ticker_unsupported = handle_fractional_ticker_unsupported
+    handle_otc_extended_hours_unsupported = handle_otc_extended_hours_unsupported
     handle_short_selling_unsupported = handle_short_selling_unsupported
     handle_symbol_restricted_to_closing_only = handle_symbol_restricted_to_closing_only
     should_force_market_exit = should_force_market_exit
@@ -847,6 +855,7 @@ class AutoTrader:
         self.cost_sanity_warned_at: dict[str, float] = {}
         self.fractional_trading_enabled = True
         self.fractional_unsupported_symbols: set[str] = set()
+        self.otc_extended_hours_unsupported_symbols: set[str] = set()
         self.short_selling_supported = True
         self.iceberg_orders: dict[str, dict] = {}
         self.order_error_times: deque = deque()

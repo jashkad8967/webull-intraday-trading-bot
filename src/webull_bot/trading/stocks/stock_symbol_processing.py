@@ -383,6 +383,20 @@ def _process_stock_symbol(
                     "entries this close to the bell"
                 ] += 1
                 return
+            # By request ("ensure they do not happen again") - once a
+            # symbol has confirmed it has no extended-hours session at
+            # all (see handle_otc_extended_hours_unsupported), don't
+            # waste another doomed order attempt on it outside core
+            # hours - core-hours entries on the same symbol are
+            # unaffected.
+            if (
+                not core_session_active
+                and symbol in self.otc_extended_hours_unsupported_symbols
+            ):
+                self.gate_rejections[
+                    "no extended-hours session for this security (OTC)"
+                ] += 1
+                return
             entry_budget = min(
                 state.buying_power,
                 state.bucket_remaining.get(bucket, Decimal("0")),
@@ -536,6 +550,20 @@ def _process_stock_symbol(
                 self.gate_rejections[
                     "core session closing soon - no new fresh "
                     "entries this close to the bell"
+                ] += 1
+                return
+            # By request ("ensure they do not happen again") - once a
+            # symbol has confirmed it has no extended-hours session at
+            # all (see handle_otc_extended_hours_unsupported), don't
+            # waste another doomed order attempt on it outside core
+            # hours - core-hours entries on the same symbol are
+            # unaffected.
+            if (
+                not core_session_active
+                and symbol in self.otc_extended_hours_unsupported_symbols
+            ):
+                self.gate_rejections[
+                    "no extended-hours session for this security (OTC)"
                 ] += 1
                 return
             entry_budget = min(
@@ -977,5 +1005,8 @@ def _process_stock_symbol(
             return
         if self.is_symbol_restricted_to_closing_only(exc):
             self.handle_symbol_restricted_to_closing_only(symbol, exc)
+            return
+        if self.is_otc_extended_hours_unsupported(exc):
+            self.handle_otc_extended_hours_unsupported(symbol, exc)
             return
         log.error("STOCK  | %s | %s", symbol, exc)
