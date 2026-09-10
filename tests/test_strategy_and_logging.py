@@ -1142,6 +1142,21 @@ class OrderNotCancelableTests(unittest.TestCase):
 
         self.assertFalse(AutoTrader.is_order_not_cancelable(Exception("timeout")))
 
+    def test_true_for_the_can_not_be_cancel_variant(self):
+        """Live incident ("why does it keep trying to sell RIVN for
+        0.55"): Webull's REAL error code is OPENAPI_ORDER_CAN_NOT_BE_
+        CANCEL (with "BE") - the original exact-substring check for
+        CAN_NOT_CANCEL never matched it, so this benign race got
+        misclassified as an unrecognized ERROR every time it fired.
+        """
+        from webull_bot.bot import AutoTrader
+
+        exc = Exception(
+            "HTTP Status: 417, Code: OPENAPI_ORDER_CAN_NOT_BE_CANCEL, "
+            "Msg: Order can not be canceled"
+        )
+        self.assertTrue(AutoTrader.is_order_not_cancelable(exc))
+
 
 class OrderReversesExistingPositionTests(unittest.TestCase):
     """is_order_reverses_existing_position - live incident:
