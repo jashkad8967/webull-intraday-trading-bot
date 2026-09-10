@@ -118,6 +118,49 @@ def _evaluate_option_entry(
                 "underlying not volatile/high-volume enough"
             ] += 1
             return open_count, buying_power
+        # By explicit request ("the options chosen are not as
+        # volatile... nike again is failing"): is_volatility_scalp_
+        # eligible's stdev floor (0.8%) was tuned for the STOCK-side
+        # cohort, which also lowered it once already ("if the bar for
+        # entry is too restrictive, lower the bar"). Reused as-is for
+        # options, it was letting SPY - a broad index ETF, inherently
+        # dampened relative to a single stock by construction - and
+        # NKE - a large, historically calm blue-chip - both through
+        # repeatedly. Options need a genuinely bigger real move to be
+        # worth the premium risked; this is a strictly higher,
+        # option-specific floor on top of (not instead of) the
+        # existing eligibility check above.
+        underlying_volatility = self.strategy.realized_volatility_percent(
+            underlying
+        )
+        if (
+            underlying_volatility is None
+            or underlying_volatility < self.config.option_min_volatility_percent
+        ):
+            self.option_gate_rejections[
+                "underlying volatility below the option-specific floor"
+            ] += 1
+            return open_count, buying_power
+        # By explicit request ("you are buying calls at daily
+        # peaks... same mistakes as you did in stocks"): the stock-
+        # side general strategy already refuses to chase a name still
+        # actively racing toward today's high/low (entry_extension_
+        # ok) - options had no equivalent at all, so a CALL could
+        # fire right as the underlying topped out for the day, and a
+        # PUT right as it bottomed. Reuses that exact same check
+        # against the underlying, direction-mapped (CALL behaves like
+        # a BUY - blocked near today's high; PUT behaves like a
+        # SHORT - blocked near today's low).
+        underlying_price = self.strategy.prices.get(underlying)
+        if underlying_price is not None and not self.strategy.entry_extension_ok(
+            underlying,
+            underlying_price,
+            direction="SHORT" if contract_type == "PUT" else "BUY",
+        ):
+            self.option_gate_rejections[
+                "underlying still jumping toward today's high/low"
+            ] += 1
+            return open_count, buying_power
         # By request: "it doesn't buy puts while there is a
         # dip, or a call on a dip entry and quickly sell it.
         # This should happen for quick profit." The EMA

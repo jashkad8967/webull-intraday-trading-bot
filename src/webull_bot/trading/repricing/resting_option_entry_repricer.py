@@ -6,6 +6,7 @@ from webull_bot.trading.guards.price_sanity import OPTION_PRICE_SANITY_TOLERANCE
 from webull_bot.trading.orders.locks import _rekey_working_order, _working_orders_lock
 from webull_bot.trading.orders.manual_touch import _manual_touch_active
 from webull_bot.trading.orders.rate_limit_retry import _retry_once_on_rate_limit
+from webull_bot.webull_api import QuoteUnavailableError
 
 log = logging.getLogger("webull-bot")
 
@@ -22,12 +23,19 @@ def reprice_resting_option_entries(self) -> None:
     passive price the whole time, exactly the stock-side IBRX
     incident reprice_resting_entries was built to fix.
 
-    Chases UP toward the current ask only (an option BUY, never a
-    SHORT/write here) - never chases the ask DOWN below entry cost
-    the way reprice_resting_option_exits guards its SELL side,
-    because there's no equivalent floor to protect on the buy side;
-    it simply never reprices to a WORSE (lower, more likely to sit
-    unfilled again) price than the current resting limit.
+    Chases UP toward the current MIDPOINT (not the full ask) only
+    - an option BUY, never a SHORT/write here. By explicit request
+    ("you don't have to buy at the edges of the spread, the mid
+    price is also fine"): this used to chase the full quoted ask,
+    which is the AGGRESSIVE edge of the spread - fine for the very
+    first, urgent submission of a genuinely time-sensitive entry, but
+    not something a passive re-quote needs to escalate all the way
+    to. option_limit_price already computes the same (bid+ask)/2
+    midpoint the INITIAL entry order uses, so a reprice just keeps
+    tracking that same passive reference price as it moves, instead
+    of ratcheting toward the ask over successive reprices. Never
+    reprices to a WORSE (lower, more likely to sit unfilled again)
+    price than the current resting limit.
     """
     now = time.monotonic()
     if now - self.last_option_entry_reprice < float(
@@ -81,17 +89,20 @@ def reprice_resting_option_entries(self) -> None:
             quote = quote_by_symbol.get(symbol)
             if quote is None:
                 continue
-            ask = self.api.quote_ask(quote)
+            try:
+                target_price = self.api.option_limit_price(quote, "BUY")
+            except QuoteUnavailableError:
+                continue
             current_limit = order.get("limit_price")
             if (
-                ask is None
+                target_price is None
                 or current_limit is None
-                or ask <= current_limit
+                or target_price <= current_limit
             ):
                 continue
             contract = contract_by_symbol[symbol]
             if not self.price_sanity_ok(
-                symbol, self.api.quote_price(quote), ask,
+                symbol, self.api.quote_price(quote), target_price,
                 tolerance=OPTION_PRICE_SANITY_TOLERANCE,
             ):
                 continue
@@ -101,7 +112,7 @@ def reprice_resting_option_entries(self) -> None:
                 contract,
                 "BUY",
                 int(quantity),
-                ask,
+                target_price,
                 "BUY_TO_OPEN",
             )
             _rekey_working_order(
@@ -113,15 +124,15 @@ def reprice_resting_option_entries(self) -> None:
                     "key": key,
                     "action": action,
                     "cancel_requested_at": None,
-                    "limit_price": ask,
+                    "limit_price": target_price,
                     "pnl": order.get("pnl"),
                     "quantity": quantity,
                 },
             )
             self.status.rekey_trade(order_id, new_order_id)
             log.info(
-                "REPRICE| %-8s | %-6s | ask=%s | id=%s",
-                symbol, action, ask, new_order_id,
+                "REPRICE| %-8s | %-6s | mid=%s | id=%s",
+                symbol, action, target_price, new_order_id,
             )
         except Exception as exc:
             if self.is_order_not_cancelable(exc):
