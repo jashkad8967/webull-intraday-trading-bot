@@ -381,8 +381,27 @@ def _evaluate_option_exit(
     return here is equivalent - trade_options moves on to the next
     contract immediately after calling this either way.
     """
+    # By explicit request ("why does it keep trying to sell RIVN for
+    # 0.55 when the spread is actually way lower"): quote_price (the
+    # `price` this function was called with) prioritizes the LAST
+    # TRADE print, which on a thin/illiquid contract can be stale -
+    # reflecting a trade from well before the underlying moved.
+    # option_decision's PROFIT/LOSS thresholds are fixed (derived
+    # from average_cost alone), but comparing them against a stale
+    # last-trade price meant the bot kept believing a target was hit
+    # when the REAL current bid (what a sale can actually realize)
+    # was nowhere close - submit, never fill, cancel, recompute off
+    # the same stale print, resubmit at the same unreachable price,
+    # repeat. Uses the real current bid for this comparison instead
+    # (falling back to the passed-in price if the bid is invalid/
+    # unavailable) - target/stop thresholds themselves are unchanged,
+    # only what gets compared against them. Averaging-down's own dip-
+    # signal/sizing below intentionally keeps using the original
+    # `price`, not this - that's a separate, already-tuned mechanism
+    # and out of scope for this fix.
+    sell_realizable_price = self.api.quote_bid(quote) or price
     decision = self.strategy.option_decision(
-        price,
+        sell_realizable_price,
         quantity,
         cost,
         days_to_expiration,
