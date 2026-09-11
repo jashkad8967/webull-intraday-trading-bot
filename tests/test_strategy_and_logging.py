@@ -5033,7 +5033,9 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
 
         rekeyed = []
         fake_bot = SimpleNamespace(
-            config=SimpleNamespace(poll_seconds=Decimal("0.25")),
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30
+            ),
             api=FakeApi(),
             status=SimpleNamespace(
                 rekey_trade=lambda old, new: rekeyed.append((old, new))
@@ -5045,7 +5047,9 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
             is_order_not_cancelable=lambda exc: False,
             working_orders={
                 "order-1": {
-                    "submitted_at": 0.0,
+                    # Resting 10s - under option_entry_escalate_seconds
+                    # (30), so this should still chase mid, not ask.
+                    "submitted_at": 90.0,
                     "key": "OPTION:XYZ260101C00100000",
                     "action": "BUY",
                     "cancel_requested_at": None,
@@ -5118,7 +5122,9 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
                 return "order-2"
 
         fake_bot = SimpleNamespace(
-            config=SimpleNamespace(poll_seconds=Decimal("0.25")),
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30
+            ),
             api=FakeApi(),
             status=SimpleNamespace(rekey_trade=lambda old, new: None),
             last_option_entry_reprice=0.0,
@@ -5145,6 +5151,87 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
 
         self.assertEqual(cancelled, [])
         self.assertEqual(placed, [])
+
+    def test_escalates_to_the_full_ask_once_the_entry_has_stalled(self):
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        contract = {
+            "symbol": "XYZ260101C00100000",
+            "underlying_symbol": "XYZ",
+            "strike_price": "100",
+            "expiration_date": "2026-01-01",
+            "option_type": "CALL",
+        }
+        quote = {
+            "symbol": "XYZ260101C00100000",
+            "bid": "1.90",
+            "ask": "2.00",
+            "price": "1.95",
+        }
+
+        class FakeApi:
+            @staticmethod
+            def option_quotes(symbols):
+                return [quote]
+
+            @staticmethod
+            def option_limit_price(q, side):
+                return (Decimal(str(q["bid"])) + Decimal(str(q["ask"]))) / 2
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_option(contract, side, quantity, limit_price, position_intent):
+                placed.append((contract["symbol"], side, quantity, limit_price))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30
+            ),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_option_entry_reprice=0.0,
+            option_contracts=[contract],
+            manual_touch_at={},
+            price_sanity_rejected_at={},
+            is_order_not_cancelable=lambda exc: False,
+            working_orders={
+                "order-1": {
+                    # Resting 40s - past option_entry_escalate_seconds
+                    # (30), so this should escalate straight to ask
+                    # instead of tracking mid indefinitely.
+                    "submitted_at": 60.0,
+                    "key": "OPTION:XYZ260101C00100000",
+                    "action": "BUY",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("1.80"),
+                    "quantity": 1,
+                }
+            },
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        reprice = AutoTrader.reprice_resting_option_entries.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice()
+
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertEqual(
+            placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("2.00"))
+        )
 
 
 class VolatilityScalpRepriceTests(unittest.TestCase):

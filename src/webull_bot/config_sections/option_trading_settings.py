@@ -128,3 +128,20 @@ class OptionTradingSettings(BaseSettings):
     option_max_moneyness_percent: Decimal = Field(
         default=Decimal("0.15"), gt=0, le=1
     )
+    # By explicit request ("lots of orders are being cancelled, make
+    # me think that the pricing is not working correctly"): a resting
+    # option BUY starts at the passive midpoint (per the earlier "mid
+    # price is also fine" request) and reprice_resting_option_entries
+    # kept tracking that same midpoint indefinitely - live evidence
+    # showed NKE/RIVN/SNAP entries sitting at mid with ZERO entry-side
+    # REPRICE activity until the generic order_timeout_seconds (120s)
+    # hard-cancelled them unfilled. A passive mid order simply has
+    # nothing to cross on a thin/wide-spread contract. Once an entry
+    # has been resting this long unfilled, reprice_resting_option_
+    # entries escalates its chase target from mid to the full ask
+    # (still bounded, still only what the existing initial-entry path
+    # would pay to open urgently) instead of staying pinned to mid
+    # all the way to the hard cancel. Mirrors stop_loss_escalate_
+    # seconds' existing shape for stalled STOCK stop-loss exits, which
+    # had no options/entry-side equivalent until now.
+    option_entry_escalate_seconds: int = Field(default=30, ge=5, le=120)
