@@ -101,3 +101,30 @@ class OptionTradingSettings(BaseSettings):
     option_min_volatility_percent: Decimal = Field(
         default=Decimal("0.02"), gt=0, le=1
     )
+    # By explicit request ("is something wrong with the options
+    # strategy that it keeps making losing entries" / "do research
+    # online... to see what you are missing") - research confirmed
+    # the exact pattern showing up in this account's real positions
+    # ($0.13-0.30 contracts): buying cheap, far-out-of-the-money
+    # options is a well-documented small-account failure mode (the
+    # "lottery ticket" trap) - a near-zero-delta contract needs a
+    # huge underlying move just to become profitable, while theta
+    # bleeds the whole time. The INTENDED guard against this,
+    # option_delta_ok (OPTION_DELTA_MIN/MAX), turned out to be
+    # completely inert in practice: Webull's option snapshot doesn't
+    # return a delta field on this account, so option_delta() always
+    # returns None and the gate always fails OPEN (24h of live logs,
+    # zero "delta out of range" rejections and zero confirmed delta
+    # readings). Moneyness (strike distance from the current
+    # underlying price) is a reliable, always-available proxy for
+    # the same thing delta was meant to filter - unlike delta, it
+    # never depends on the broker actually returning a greek. Used
+    # to cap BOTH select_atm_options' primary near-ATM shortlist and
+    # its further-OTM affordability fallback search (the fallback
+    # previously had no distance ceiling at all, only a count cap -
+    # exactly how a "can't afford anything near the money" underlying
+    # could end up trading a genuine lottery ticket instead of simply
+    # being skipped that cycle).
+    option_max_moneyness_percent: Decimal = Field(
+        default=Decimal("0.15"), gt=0, le=1
+    )
