@@ -36,6 +36,14 @@ def reprice_resting_option_entries(self) -> None:
     of ratcheting toward the ask over successive reprices. Never
     reprices to a WORSE (lower, more likely to sit unfilled again)
     price than the current resting limit.
+
+    Once an order has been resting unfilled for longer than
+    option_entry_escalate_seconds (live evidence: NKE/RIVN/SNAP BUYs
+    sat at mid with zero reprice activity until the generic 120s hard
+    cancel gave up on them), the chase target escalates from mid to
+    the full ask instead - a passive mid order has nothing to cross
+    on a thin/wide-spread contract, so staying pinned to mid all the
+    way to the hard cancel just guarantees the miss.
     """
     now = time.monotonic()
     if now - self.last_option_entry_reprice < float(
@@ -89,8 +97,17 @@ def reprice_resting_option_entries(self) -> None:
             quote = quote_by_symbol.get(symbol)
             if quote is None:
                 continue
+            submitted_at = order.get("submitted_at")
+            escalated = (
+                submitted_at is not None
+                and now - submitted_at
+                >= float(self.config.option_entry_escalate_seconds)
+            )
             try:
-                target_price = self.api.option_limit_price(quote, "BUY")
+                if escalated:
+                    target_price = self.api.quote_ask(quote)
+                else:
+                    target_price = self.api.option_limit_price(quote, "BUY")
             except QuoteUnavailableError:
                 continue
             current_limit = order.get("limit_price")
@@ -131,8 +148,10 @@ def reprice_resting_option_entries(self) -> None:
             )
             self.status.rekey_trade(order_id, new_order_id)
             log.info(
-                "REPRICE| %-8s | %-6s | mid=%s | id=%s",
-                symbol, action, target_price, new_order_id,
+                "REPRICE| %-8s | %-6s | %s=%s | id=%s",
+                symbol, action,
+                "ask (escalated)" if escalated else "mid",
+                target_price, new_order_id,
             )
         except Exception as exc:
             if self.is_order_not_cancelable(exc):
