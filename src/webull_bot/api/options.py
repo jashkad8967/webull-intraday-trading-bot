@@ -112,9 +112,26 @@ def select_atm_options(
             abs(Decimal(str(item["strike_price"])) - stock_price),
         )
 
+    # By explicit request ("is something wrong with the options
+    # strategy that it keeps making losing entries" / "do research
+    # online... to see what you are missing") - moneyness cap, a
+    # reliable proxy for option_delta_ok's intended job (Webull
+    # doesn't return delta on this account, so that gate was always
+    # failing open - see option_max_moneyness_percent's own comment).
+    # Excludes any strike more than this fraction away from the
+    # current underlying price BEFORE either the primary shortlist or
+    # the further-OTM affordability fallback below ever sees it - the
+    # fallback previously had no distance ceiling at all, only a count
+    # cap, letting it wander arbitrarily far OTM (a real lottery
+    # ticket) just to find SOMETHING affordable.
+    moneyness_cap = stock_price * self.config.option_max_moneyness_percent
     selected: list[dict] = []
     for kind in option_types:
-        pool = candidates[kind]
+        pool = [
+            item
+            for item in candidates[kind]
+            if abs(Decimal(str(item["strike_price"])) - stock_price) <= moneyness_cap
+        ]
         if not pool:
             continue
         pool_sorted = sorted(pool, key=_sort_key)

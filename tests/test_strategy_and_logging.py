@@ -13708,7 +13708,12 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
         }
 
     def _fake_api(
-        self, contracts, quotes_by_symbol, shortlist_size=6, volumes_by_symbol=None
+        self,
+        contracts,
+        quotes_by_symbol,
+        shortlist_size=6,
+        volumes_by_symbol=None,
+        moneyness_percent=Decimal("1"),
     ):
         from datetime import date, timedelta
 
@@ -13733,6 +13738,13 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
                 option_max_dte=45,
                 option_type="CALL",
                 option_affordability_shortlist_size=shortlist_size,
+                # These tests exercise affordability-fallback
+                # mechanics specifically, not the moneyness cap -
+                # effectively unbounded here so existing strikes
+                # (up to 20% away) aren't excluded before reaching
+                # the logic under test. See the dedicated moneyness
+                # cap tests below for that behavior.
+                option_max_moneyness_percent=moneyness_percent,
             ),
             option_contracts=lambda underlying: contract_list,
             option_quotes=lambda symbols: [
@@ -13841,6 +13853,7 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
                 option_max_dte=45,
                 option_type="CALL",
                 option_affordability_shortlist_size=6,
+                option_max_moneyness_percent=Decimal("1"),
             ),
             option_contracts=lambda underlying: [
                 self._contract("XYZ260101C00100000", 100, expiration),
@@ -13894,6 +13907,74 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
         )
         result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("10"))
         self.assertEqual(result[0]["symbol"], "XYZ260101C00105000")
+
+    def test_moneyness_cap_excludes_a_strike_too_far_from_the_underlying(self):
+        """By explicit request ("is something wrong with the options
+        strategy... do research online to see what you are missing"):
+        research confirmed buying cheap, far-OTM options is a well-
+        documented small-account failure mode (the "lottery ticket"
+        trap) - option_delta_ok was meant to guard against exactly
+        this but turned out to be inert (Webull never returns delta
+        on this account, so it always fails open). Moneyness is the
+        reliable substitute: a strike more than option_max_moneyness_
+        percent away from the underlying is excluded outright, even
+        if it's the cheapest/most affordable one available.
+        """
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),  # ATM, unaffordable
+                ("XYZ260101C00130000", 130),  # 30% OTM, cheap, affordable
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "8.00",
+                "XYZ260101C00130000": "0.10",
+            },
+            moneyness_percent=Decimal("0.15"),
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        # The far-OTM lottery ticket is affordable, but excluded by
+        # the moneyness cap - falls back to the nearest (ATM) strike
+        # instead of taking it, even though the ATM one doesn't fit
+        # the cost cap either.
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00100000")
+
+    def test_moneyness_cap_still_allows_an_affordable_strike_within_range(self):
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00110000", 110),  # 10% OTM, within a 15% cap
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "8.00",
+                "XYZ260101C00110000": "1.00",
+            },
+            moneyness_percent=Decimal("0.15"),
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00110000")
+
+    def test_moneyness_cap_excludes_the_fallback_search_too(self):
+        """The further-OTM affordability fallback search must also
+        respect the moneyness cap, not just the primary shortlist -
+        it used to have no distance ceiling at all, only a count cap.
+        """
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),  # ATM, unaffordable
+                ("XYZ260101C00105000", 105),  # near, also unaffordable
+                ("XYZ260101C00150000", 150),  # 50% OTM, cheap but excluded
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "8.00",
+                "XYZ260101C00105000": "7.00",
+                "XYZ260101C00150000": "0.05",
+            },
+            shortlist_size=2,
+            moneyness_percent=Decimal("0.15"),
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        batch_symbols = {"XYZ260101C00100000", "XYZ260101C00105000"}
+        self.assertIn(result[0]["symbol"], batch_symbols)
 
 
 class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):
