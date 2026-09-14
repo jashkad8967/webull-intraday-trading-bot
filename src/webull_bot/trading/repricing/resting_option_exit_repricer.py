@@ -84,6 +84,17 @@ def reprice_resting_option_exits(
                 # Never chase the ask down below entry cost - see the
                 # matching stock-side guard in reprice_resting_exits.
                 continue
+            if not self.price_sanity_cooldown_ready(symbol):
+                # Live incident (NVDA/BMEA-style): without this, a
+                # symbol whose ask sits durably past the sanity
+                # tolerance gets re-rejected on literally every poll
+                # cycle with zero backoff - 60+ ERROR lines in under
+                # 10 minutes for one contract. price_sanity_ok itself
+                # already stamps price_sanity_rejected_at on a
+                # rejection; this just has to actually be checked
+                # before trying again, same as every stock-side caller
+                # already does.
+                continue
             if not self.price_sanity_ok(
                 symbol, self.api.quote_price(quote), ask,
                 tolerance=OPTION_PRICE_SANITY_TOLERANCE,

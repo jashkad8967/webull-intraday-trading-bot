@@ -4756,7 +4756,9 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
 
         rekeyed = []
         fake_bot = SimpleNamespace(
-            config=SimpleNamespace(poll_seconds=Decimal("0.25")),
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"), price_sanity_cooldown_seconds=60
+            ),
             api=FakeApi(),
             status=SimpleNamespace(
                 rekey_trade=lambda old, new: rekeyed.append((old, new))
@@ -4777,6 +4779,7 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
             },
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         reprice = AutoTrader.reprice_resting_option_exits.__get__(fake_bot)
 
         positions = [
@@ -4848,7 +4851,9 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
                 return "order-2"
 
         fake_bot = SimpleNamespace(
-            config=SimpleNamespace(poll_seconds=Decimal("0.25")),
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"), price_sanity_cooldown_seconds=60
+            ),
             api=FakeApi(),
             status=SimpleNamespace(rekey_trade=lambda old, new: None),
             last_option_reprice=0.0,
@@ -4867,6 +4872,7 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
             },
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         reprice = AutoTrader.reprice_resting_option_exits.__get__(fake_bot)
 
         positions = [
@@ -5115,7 +5121,8 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         rekeyed = []
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
-                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30
+                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                price_sanity_cooldown_seconds=60
             ),
             api=FakeApi(),
             status=SimpleNamespace(
@@ -5140,6 +5147,7 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
             },
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         reprice = AutoTrader.reprice_resting_option_entries.__get__(fake_bot)
 
         with unittest.mock.patch("time.monotonic", return_value=100.0):
@@ -5214,7 +5222,8 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
 
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
-                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30
+                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                price_sanity_cooldown_seconds=60
             ),
             api=FakeApi(),
             status=SimpleNamespace(rekey_trade=lambda old, new: None),
@@ -5235,6 +5244,7 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
             },
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         reprice = AutoTrader.reprice_resting_option_entries.__get__(fake_bot)
 
         with unittest.mock.patch("time.monotonic", return_value=100.0):
@@ -5299,7 +5309,8 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
 
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
-                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30
+                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                price_sanity_cooldown_seconds=60
             ),
             api=FakeApi(),
             status=SimpleNamespace(rekey_trade=lambda old, new: None),
@@ -5327,6 +5338,7 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
             },
         )
         fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
         reprice = AutoTrader.reprice_resting_option_entries.__get__(fake_bot)
 
         with unittest.mock.patch("time.monotonic", return_value=100.0):
@@ -5340,6 +5352,110 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         self.assertEqual(
             placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("1.95"))
         )
+
+    def test_a_sanity_rejected_escalation_backs_off_instead_of_retrying_every_cycle(self):
+        """Live incident: NVDA's escalated (mid->ask) target sat
+        durably past OPTION_PRICE_SANITY_TOLERANCE (a genuinely wide
+        spread, not a bad quote) and got re-rejected on literally
+        every poll cycle with zero backoff - 60 ERROR log lines in
+        under 10 minutes for one contract. price_sanity_cooldown_ready
+        must be checked before price_sanity_ok, not just recorded by
+        it, or nothing ever actually backs off.
+        """
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        contract = {
+            "symbol": "XYZ260101C00100000",
+            "underlying_symbol": "XYZ",
+            "strike_price": "100",
+            "expiration_date": "2026-01-01",
+            "option_type": "CALL",
+        }
+        # deviation from last=0.15 to ask=0.20 is 33.3%, past the 30%
+        # option sanity tolerance - a real, durable wide-spread
+        # rejection, not a transient blip.
+        quote = {
+            "symbol": "XYZ260101C00100000",
+            "bid": "0.10",
+            "ask": "0.20",
+            "price": "0.15",
+        }
+
+        class FakeApi:
+            @staticmethod
+            def option_quotes(symbols):
+                return [quote]
+
+            @staticmethod
+            def option_limit_price(q, side):
+                return (Decimal(str(q["bid"])) + Decimal(str(q["ask"]))) / 2
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def _quantize_to_option_tick(price, rounding):
+                tick = Decimal("0.05")
+                steps = (price / tick).quantize(Decimal("1"), rounding=rounding)
+                return (steps * tick).quantize(Decimal("0.01"))
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_option(contract, side, quantity, limit_price, position_intent):
+                placed.append((contract["symbol"], side, quantity, limit_price))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                price_sanity_cooldown_seconds=60
+            ),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_option_entry_reprice=0.0,
+            option_contracts=[contract],
+            manual_touch_at={},
+            price_sanity_rejected_at={},
+            is_order_not_cancelable=lambda exc: False,
+            working_orders={
+                "order-1": {
+                    "submitted_at": 60.0,
+                    "key": "OPTION:XYZ260101C00100000",
+                    "action": "BUY",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("0.05"),
+                    "quantity": 1,
+                }
+            },
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
+        reprice = AutoTrader.reprice_resting_option_entries.__get__(fake_bot)
+
+        # First call: past the escalate threshold, hits the sanity
+        # rejection, stamps price_sanity_rejected_at.
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice()
+        self.assertEqual(placed, [])
+        self.assertIn("XYZ260101C00100000", fake_bot.price_sanity_rejected_at)
+
+        # Second call, moments later (well within the cooldown window):
+        # must skip retrying entirely, not re-attempt and re-reject.
+        fake_bot.last_option_entry_reprice = 0.0
+        with unittest.mock.patch("time.monotonic", return_value=100.5):
+            reprice()
+        self.assertEqual(placed, [])
+        self.assertEqual(cancelled, [])
 
 
 class VolatilityScalpRepriceTests(unittest.TestCase):
