@@ -2,7 +2,10 @@ import logging
 import time
 from decimal import Decimal
 
-from webull_bot.trading.guards.price_sanity import OPTION_PRICE_SANITY_TOLERANCE
+from webull_bot.trading.guards.price_sanity import (
+    OPTION_PRICE_SANITY_TOLERANCE,
+    option_entry_spread_ok,
+)
 from webull_bot.webull_api import QuoteUnavailableError
 
 log = logging.getLogger("webull-bot")
@@ -79,6 +82,24 @@ def _evaluate_option_entry(
     if days_to_expiration <= self.config.option_min_hold_dte:
         self.option_gate_rejections[
             "too close to expiration"
+        ] += 1
+        return open_count, buying_power
+    # By explicit request ("just do not trade contracts that are not
+    # easy to liquidify") - live incident: ORCL got bought into, then
+    # its own STOP-loss couldn't find a buyer at any sane price (40%+
+    # real bid/ask spread) and just kept resubmitting and timing out
+    # unfilled while the position sat exposed. A structural, entry-
+    # side liquidity floor - not a fix for a stuck exit, a refusal to
+    # ever create one. Checked here, before any of the direction/
+    # quality gates below, so a genuinely illiquid contract can't
+    # qualify through any entry path (trend, scalp, or straddle).
+    if not option_entry_spread_ok(
+        self.api.quote_bid(quote),
+        self.api.quote_ask(quote),
+        self.config.option_max_entry_spread_percent,
+    ):
+        self.option_gate_rejections[
+            "contract bid/ask spread too wide to liquidate reliably"
         ] += 1
         return open_count, buying_power
     underlying = contract["underlying_symbol"]
@@ -414,11 +435,22 @@ def _evaluate_option_exit(
     # lower-price bar. Sized with the same option_order_
     # quantity risk-cap fresh entries use, against whatever
     # buying power remains this cycle.
+    # By explicit request ("just do not trade contracts that are not
+    # easy to liquidify") - the same entry-side spread floor applies
+    # to averaging down: buying MORE of an already-illiquid contract
+    # only deepens the exposure a stuck exit can't get out of, even
+    # though the position itself is already held.
+    average_down_spread_ok = option_entry_spread_ok(
+        self.api.quote_bid(quote),
+        self.api.quote_ask(quote),
+        self.config.option_max_entry_spread_percent,
+    )
     if (
         decision.action == "HOLD"
         and quantity > 0
         and option_symbol not in self.pending_option_exits
         and days_to_expiration > self.config.option_min_hold_dte
+        and average_down_spread_ok
         and self.option_average_down_count[option_symbol]
         < self.config.option_max_averaging_buys
         and (

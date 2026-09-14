@@ -11024,6 +11024,41 @@ class ExecutionGuardrailTests(unittest.TestCase):
                 )
             )
 
+    def test_option_entry_spread_ok_allows_a_normal_liquid_spread(self):
+        """By request ("just do not trade contracts that are not easy
+        to liquidify"). A $1.00 contract quoting $0.90/$1.10 is a
+        normal, liquid 20% option spread - must not be blocked.
+        """
+        from webull_bot.trading.guards.price_sanity import option_entry_spread_ok
+
+        self.assertTrue(
+            option_entry_spread_ok(
+                Decimal("0.90"), Decimal("1.10"), Decimal("25")
+            )
+        )
+
+    def test_option_entry_spread_ok_rejects_the_orcl_incident_spread(self):
+        """Live incident: ORCL got bought into, then its own STOP-loss
+        could never find a buyer at any sane price - a genuine 42.9%
+        bid/ask spread. This should never have qualified for entry in
+        the first place.
+        """
+        from webull_bot.trading.guards.price_sanity import option_entry_spread_ok
+
+        self.assertFalse(
+            option_entry_spread_ok(
+                Decimal("0.07"), Decimal("0.10"), Decimal("25")
+            )
+        )
+
+    def test_option_entry_spread_ok_passes_open_on_a_missing_quote(self):
+        from webull_bot.trading.guards.price_sanity import option_entry_spread_ok
+
+        self.assertTrue(option_entry_spread_ok(None, None, Decimal("25")))
+        self.assertTrue(
+            option_entry_spread_ok(Decimal("1.00"), None, Decimal("25"))
+        )
+
     def test_entry_price_sanity_cooldown_blocks_a_recent_rejection(self):
         """Live incident: one illiquid symbol's quote sat just past
         price_sanity_ok's tolerance and got retried (and re-rejected) on
