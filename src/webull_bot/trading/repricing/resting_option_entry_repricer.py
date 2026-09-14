@@ -1,6 +1,6 @@
 import logging
 import time
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 
 from webull_bot.trading.guards.price_sanity import OPTION_PRICE_SANITY_TOLERANCE
 from webull_bot.trading.orders.locks import _rekey_working_order, _working_orders_lock
@@ -114,11 +114,21 @@ def reprice_resting_option_entries(self) -> None:
                 mid_price = self.api.option_limit_price(quote, "BUY")
                 if escalated:
                     ask_price = self.api.quote_ask(quote)
-                    target_price = (
-                        (mid_price + ask_price) / 2
-                        if mid_price is not None and ask_price is not None
-                        else ask_price
-                    )
+                    if mid_price is not None and ask_price is not None:
+                        # Live incident (this fix): the raw (mid+ask)/2
+                        # average lands on off-tick values like 1.975,
+                        # which OPENAPI_OPTION_PRICE_STEP_LT rejects
+                        # outright (option premiums must be quoted in
+                        # $0.05 increments) - route the blend through
+                        # the same tick-quantizer option_limit_price
+                        # itself uses, rounding UP so it stays a real
+                        # escalation and not a silent no-op back to mid.
+                        target_price = self.api._quantize_to_option_tick(
+                            max(Decimal("0.01"), (mid_price + ask_price) / 2),
+                            ROUND_UP,
+                        )
+                    else:
+                        target_price = ask_price
                 else:
                     target_price = mid_price
             except QuoteUnavailableError:

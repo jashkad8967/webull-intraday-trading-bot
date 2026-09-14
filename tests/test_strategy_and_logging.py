@@ -5109,8 +5109,18 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
                 return (Decimal(str(q["bid"])) + Decimal(str(q["ask"]))) / 2
 
             @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
             def quote_price(q):
                 return Decimal(str(q["price"]))
+
+            @staticmethod
+            def _quantize_to_option_tick(price, rounding):
+                tick = Decimal("0.05")
+                steps = (price / tick).quantize(Decimal("1"), rounding=rounding)
+                return (steps * tick).quantize(Decimal("0.01"))
 
             @staticmethod
             def cancel(order_id):
@@ -5164,11 +5174,14 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
             "expiration_date": "2026-01-01",
             "option_type": "CALL",
         }
+        # Wide spread so the halfway escalation target is clearly
+        # distinct from both mid and the full ask after quantizing to
+        # the real $0.05 option tick.
         quote = {
             "symbol": "XYZ260101C00100000",
-            "bid": "1.90",
+            "bid": "1.70",
             "ask": "2.00",
-            "price": "1.95",
+            "price": "1.85",
         }
 
         class FakeApi:
@@ -5187,6 +5200,12 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
             @staticmethod
             def quote_price(q):
                 return Decimal(str(q["price"]))
+
+            @staticmethod
+            def _quantize_to_option_tick(price, rounding):
+                tick = Decimal("0.05")
+                steps = (price / tick).quantize(Decimal("1"), rounding=rounding)
+                return (steps * tick).quantize(Decimal("0.01"))
 
             @staticmethod
             def cancel(order_id):
@@ -5212,10 +5231,11 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
                 "order-1": {
                     # Resting 40s - past option_entry_escalate_seconds
                     # (30), so this should escalate to the midpoint of
-                    # mid and ask, not track mid indefinitely and not
-                    # jump straight to the full ask (a first version
-                    # did that, and a VZ put dip-entry filled at the
-                    # max-spread price as a result).
+                    # mid and ask (rounded UP to a valid $0.05 tick),
+                    # not track mid indefinitely and not jump straight
+                    # to the full ask (a first version did that, and a
+                    # VZ put dip-entry filled at the max-spread price
+                    # as a result).
                     "submitted_at": 60.0,
                     "key": "OPTION:XYZ260101C00100000",
                     "action": "BUY",
@@ -5231,10 +5251,13 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         with unittest.mock.patch("time.monotonic", return_value=100.0):
             reprice()
 
-        # mid=1.95, ask=2.00 -> halfway = 1.975
+        # mid=1.85, ask=2.00 -> raw halfway = 1.925, quantized UP to
+        # the nearest $0.05 tick = 1.95 (distinct from both mid and
+        # the full ask - proves this isn't silently degrading to
+        # either extreme).
         self.assertEqual(cancelled, ["order-1"])
         self.assertEqual(
-            placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("1.975"))
+            placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("1.95"))
         )
 
 
