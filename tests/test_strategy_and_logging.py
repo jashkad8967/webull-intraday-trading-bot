@@ -2725,6 +2725,87 @@ class HasPendingBuyOrderTests(unittest.TestCase):
         self.assertFalse(has_pending("STOCK:MTNB"))
 
 
+class HasPendingSellOrderTests(unittest.TestCase):
+    """SELL analog of HasPendingBuyOrderTests. Live incident: VZ hit
+    OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION and OPENAPI_POSITION_
+    ORDER_INTENT_MISMATCH when boost_stalled_positions placed its own
+    SELL_TO_CLOSE while a STOP/PROFIT exit order for the same symbol
+    was already resting - has_pending_sell_order checks working_orders
+    directly so a second sweep can't double-book a close.
+    """
+
+    @staticmethod
+    def _fake_bot(working_orders):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(working_orders=working_orders)
+        return AutoTrader.has_pending_sell_order.__get__(fake_bot)
+
+    def test_true_while_an_uncancelled_stop_order_is_resting(self):
+        has_pending = self._fake_bot(
+            {
+                "order-1": {
+                    "key": "OPTION:VZ260925P00050000",
+                    "action": "STOP",
+                    "cancel_requested_at": None,
+                }
+            }
+        )
+        self.assertTrue(has_pending("OPTION:VZ260925P00050000"))
+
+    def test_true_while_an_uncancelled_profit_order_is_resting(self):
+        has_pending = self._fake_bot(
+            {
+                "order-1": {
+                    "key": "OPTION:VZ260925P00050000",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                }
+            }
+        )
+        self.assertTrue(has_pending("OPTION:VZ260925P00050000"))
+
+    def test_false_once_a_cancel_has_been_requested(self):
+        has_pending = self._fake_bot(
+            {
+                "order-1": {
+                    "key": "OPTION:VZ260925P00050000",
+                    "action": "STOP",
+                    "cancel_requested_at": time.monotonic(),
+                }
+            }
+        )
+        self.assertFalse(has_pending("OPTION:VZ260925P00050000"))
+
+    def test_false_for_a_different_symbol(self):
+        has_pending = self._fake_bot(
+            {
+                "order-1": {
+                    "key": "OPTION:OTHER",
+                    "action": "STOP",
+                    "cancel_requested_at": None,
+                }
+            }
+        )
+        self.assertFalse(has_pending("OPTION:VZ260925P00050000"))
+
+    def test_false_for_a_buy_order_on_the_same_symbol(self):
+        has_pending = self._fake_bot(
+            {
+                "order-1": {
+                    "key": "OPTION:VZ260925P00050000",
+                    "action": "BUY",
+                    "cancel_requested_at": None,
+                }
+            }
+        )
+        self.assertFalse(has_pending("OPTION:VZ260925P00050000"))
+
+    def test_false_with_no_working_orders_at_all(self):
+        has_pending = self._fake_bot({})
+        self.assertFalse(has_pending("OPTION:VZ260925P00050000"))
+
+
 class VolatilityScalpPositionValueCapTests(unittest.TestCase):
     """Live incident: GAUZ alone grew to ~66% of a small account's total
     value. volatility_scalp_position_value_ok caps any single cohort
@@ -9711,6 +9792,40 @@ class DailyPnlTrackerTests(unittest.TestCase):
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
+    def test_concurrent_saves_never_raise_enoent_on_the_shared_tmp_file(self):
+        """Live incident: two order events landing on the same poll
+        cycle both called record() close together, and whichever
+        replace() ran second found the first had already renamed
+        away the shared ".tmp" path - ENOENT ("daily_pnl.tmp ->
+        daily_pnl.json"). _save_lock serializes the write-then-
+        replace pair so this race can't happen.
+        """
+        path = Path("tests/.generated_daily_pnl/concurrent.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path)
+            errors: list[Exception] = []
+
+            def hammer(n: int) -> None:
+                try:
+                    for i in range(25):
+                        tracker.record(Decimal(n * 100 + i), Decimal("0"))
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=hammer, args=(n,)) for n in range(8)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            self.assertTrue(path.exists())
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
 
 class OrderBookImbalanceTests(unittest.TestCase):
     def test_obi_supports_entry_passes_through_when_no_data(self):
@@ -11240,6 +11355,7 @@ class FractionalExitGuardTests(unittest.TestCase):
             last_trade={},
         )
         fake_bot.cooldown_ready = lambda key: True
+        fake_bot.has_pending_sell_order = lambda key: False
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
         fetch = AutoTrader._stall_equity_quotes.__get__(fake_bot)
         positions = [
@@ -11303,6 +11419,7 @@ class FractionalExitGuardTests(unittest.TestCase):
             pending_option_exits=set(),
         )
         fake_bot.cooldown_ready = lambda key: True
+        fake_bot.has_pending_sell_order = lambda key: False
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
         fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
         fake_bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(fake_bot)
@@ -11371,6 +11488,7 @@ class FractionalExitGuardTests(unittest.TestCase):
             pending_option_exits=set(),
         )
         fake_bot.cooldown_ready = lambda key: True
+        fake_bot.has_pending_sell_order = lambda key: False
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
         fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
         fake_bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(fake_bot)
@@ -11453,6 +11571,7 @@ class FractionalExitGuardTests(unittest.TestCase):
             pending_option_exits=set(),
         )
         fake_bot.cooldown_ready = lambda key: True
+        fake_bot.has_pending_sell_order = lambda key: False
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
         fake_bot.record_realized_exit = lambda *a, **k: Decimal("0.05")
         fake_bot.record_trade = lambda *a, **k: None
@@ -11658,6 +11777,7 @@ class StallBreakerWideSpreadResubmitTests(unittest.TestCase):
             pending_option_exits=set(),
         )
         fake_bot.cooldown_ready = lambda key: True
+        fake_bot.has_pending_sell_order = lambda key: False
         fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
         fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
         fake_bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(fake_bot)

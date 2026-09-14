@@ -242,6 +242,7 @@ from webull_bot.trading.util.concurrent_dispatch import (
 from webull_bot.trading.util.cooldowns import (
     cooldown_ready,
     has_pending_buy_order,
+    has_pending_sell_order,
     rate_capped,
     reentry_cooldown_ready,
 )
@@ -320,6 +321,7 @@ class AutoTrader:
     reentry_cooldown_ready = reentry_cooldown_ready
     rate_capped = rate_capped
     has_pending_buy_order = has_pending_buy_order
+    has_pending_sell_order = has_pending_sell_order
     # Broker-error handlers, each paired with its errors/ classifier -
     # moved out to trading/*_handler.py.
     handle_broker_conflict = handle_broker_conflict
