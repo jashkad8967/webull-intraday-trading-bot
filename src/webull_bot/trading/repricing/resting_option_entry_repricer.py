@@ -141,6 +141,15 @@ def reprice_resting_option_entries(self) -> None:
             ):
                 continue
             contract = contract_by_symbol[symbol]
+            if not self.price_sanity_cooldown_ready(symbol):
+                # Live incident: NVDA's escalated (mid->ask) target
+                # sat durably past the sanity tolerance and got
+                # re-rejected on literally every poll cycle - 60
+                # ERROR lines in under 10 minutes for one contract,
+                # zero backoff. Same BMEA-style fix already applied
+                # to place_stock_scaled/stock-side callers, now
+                # applied here too.
+                continue
             if not self.price_sanity_ok(
                 symbol, self.api.quote_price(quote), target_price,
                 tolerance=OPTION_PRICE_SANITY_TOLERANCE,
