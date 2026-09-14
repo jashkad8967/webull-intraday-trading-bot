@@ -65,6 +65,26 @@ def price_sanity_ok(
     return True
 
 
+def option_entry_spread_ok(
+    bid: Decimal | None, ask: Decimal | None, max_spread_percent: Decimal
+) -> bool:
+    """True while a contract's own bid/ask spread is tight enough to
+    realistically liquidate later - by explicit request ("just do not
+    trade contracts that are not easy to liquidify"). Live incident:
+    ORCL was bought into, then its own STOP-loss could never find a
+    buyer at any sane price (a genuine 40%+ bid/ask spread) and just
+    kept resubmitting and timing out unfilled while the position sat
+    exposed. This is a structural entry-side floor, not a fix for a
+    stuck exit - a refusal to ever create one. Passes open (True) on
+    a missing/invalid quote, matching every other gate's fail-open
+    convention for missing data.
+    """
+    if not bid or not ask or bid <= 0:
+        return True
+    spread_percent = (ask - bid) / bid * 100
+    return spread_percent <= max_spread_percent
+
+
 def price_sanity_cooldown_ready(self, symbol: str) -> bool:
     """False while symbol is still within PRICE_SANITY_COOLDOWN_SECONDS
     of its last price_sanity_ok rejection - without this, a symbol

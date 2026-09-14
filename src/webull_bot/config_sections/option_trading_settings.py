@@ -148,3 +148,19 @@ class OptionTradingSettings(BaseSettings):
     # exits, which
     # had no options/entry-side equivalent until now.
     option_entry_escalate_seconds: int = Field(default=30, ge=5, le=120)
+    # By explicit request ("just do not trade contracts that are not
+    # easy to liquidify"): ORCL was stuck in a repeated STOP-loss
+    # cycle - the position's own contract had a genuinely wide 40%+
+    # bid/ask spread, so no exit price was ever "sane" enough to find
+    # a buyer, and the stop-loss just kept resubmitting and timing out
+    # unfilled while the position sat exposed. This never should have
+    # been entered in the first place. A normal LIQUID option spread
+    # runs wide by stock standards (a $1.00 contract quoting
+    # $0.90/$1.10 - 20% - is fine, not broken), so this is deliberately
+    # much looser than stock_entry_max_spread_percent (0.5%), but it
+    # still draws a real line before OPTION_PRICE_SANITY_TOLERANCE's
+    # 30% backstop would even engage - the goal is to never buy into a
+    # contract that backstop would already struggle to exit later.
+    option_max_entry_spread_percent: Decimal = Field(
+        default=Decimal("25"), gt=0, le=100
+    )
