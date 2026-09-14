@@ -40,10 +40,17 @@ def reprice_resting_option_entries(self) -> None:
     Once an order has been resting unfilled for longer than
     option_entry_escalate_seconds (live evidence: NKE/RIVN/SNAP BUYs
     sat at mid with zero reprice activity until the generic 120s hard
-    cancel gave up on them), the chase target escalates from mid to
-    the full ask instead - a passive mid order has nothing to cross
-    on a thin/wide-spread contract, so staying pinned to mid all the
-    way to the hard cancel just guarantees the miss.
+    cancel gave up on them), the chase target escalates from mid
+    halfway toward the ask instead of staying pinned to mid all the
+    way to the hard cancel. By request, after a first version of this
+    jumped straight to the full ask and a VZ put dip-entry filled at
+    the max-spread price as a result: escalating all the way to the
+    raw ask on the very first step pays the full spread cost on what
+    is meant to be a cheap scalp entry - the same "you lose edge every
+    trade" cost this session's own research flagged for thin
+    contracts. The midpoint-of-mid-and-ask still gives real room to
+    fill (unlike staying at mid forever) without paying the full
+    spread outright.
     """
     now = time.monotonic()
     if now - self.last_option_entry_reprice < float(
@@ -104,10 +111,16 @@ def reprice_resting_option_entries(self) -> None:
                 >= float(self.config.option_entry_escalate_seconds)
             )
             try:
+                mid_price = self.api.option_limit_price(quote, "BUY")
                 if escalated:
-                    target_price = self.api.quote_ask(quote)
+                    ask_price = self.api.quote_ask(quote)
+                    target_price = (
+                        (mid_price + ask_price) / 2
+                        if mid_price is not None and ask_price is not None
+                        else ask_price
+                    )
                 else:
-                    target_price = self.api.option_limit_price(quote, "BUY")
+                    target_price = mid_price
             except QuoteUnavailableError:
                 continue
             current_limit = order.get("limit_price")
@@ -150,7 +163,7 @@ def reprice_resting_option_entries(self) -> None:
             log.info(
                 "REPRICE| %-8s | %-6s | %s=%s | id=%s",
                 symbol, action,
-                "ask (escalated)" if escalated else "mid",
+                "mid->ask (escalated)" if escalated else "mid",
                 target_price, new_order_id,
             )
         except Exception as exc:
