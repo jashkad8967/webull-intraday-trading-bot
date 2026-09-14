@@ -23,6 +23,15 @@ def boost_stalled_positions(
     landing every minute or two) would otherwise never let this run at
     all, even though a specific older position has been sitting
     untouched the whole time.
+
+    Live incident: VZ hit OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION and
+    OPENAPI_POSITION_ORDER_INTENT_MISMATCH here - this swept in and
+    placed its own SELL_TO_CLOSE while the normal STOP/PROFIT exit
+    path already had a resting close order out for the same symbol,
+    double-booking against the broker's reserved quantity. pending_
+    stock_exits/pending_option_exits only track orders THIS sweep
+    itself submitted; has_pending_sell_order checks the actual
+    working_orders state regardless of which code path put it there.
     """
     if not self.config.stall_breaker_enabled:
         return
@@ -48,6 +57,8 @@ def boost_stalled_positions(
                 if symbol in self.pending_stock_exits:
                     continue
                 key = f"STOCK:{symbol}"
+                if self.has_pending_sell_order(key):
+                    continue
                 if not self.cooldown_ready(key):
                     continue
                 # This specific symbol's own last order activity, not
@@ -96,6 +107,8 @@ def boost_stalled_positions(
                 if symbol in self.pending_option_exits:
                     continue
                 key = f"OPTION:{symbol}"
+                if self.has_pending_sell_order(key):
+                    continue
                 if not self.cooldown_ready(key):
                     continue
                 if now - self.last_trade.get(key, 0.0) < stall_seconds:

@@ -45,3 +45,28 @@ def has_pending_buy_order(self, key: str) -> bool:
         and order.get("cancel_requested_at") is None
         for order in orders
     )
+
+
+def has_pending_sell_order(self, key: str) -> bool:
+    """SELL analog of has_pending_buy_order. Live incident: VZ's
+    stall-position-boost sweep (boost_stalled_positions) placed its
+    own SELL_TO_CLOSE for a symbol that already had a resting
+    STOP/PROFIT exit order out from the normal exit path - Webull's
+    broker-side reservation against the held quantity meant the
+    second close attempt would have tried to close more than the
+    unreserved balance, rejected outright as reversing the position
+    (OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION) or as a direction
+    mismatch (OPENAPI_POSITION_ORDER_INTENT_MISMATCH). pending_stock_
+    exits/pending_option_exits already guard against this in the
+    common case, but only while this process's own in-memory flag is
+    set - this checks the actual resting order state directly, the
+    same way has_pending_buy_order already does for entries.
+    """
+    with _working_orders_lock(self):
+        orders = list(self.working_orders.values())
+    return any(
+        order.get("key") == key
+        and order.get("action") in ("SELL", "STOP", "PROFIT")
+        and order.get("cancel_requested_at") is None
+        for order in orders
+    )

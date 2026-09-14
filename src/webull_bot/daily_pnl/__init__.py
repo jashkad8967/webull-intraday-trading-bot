@@ -1,4 +1,5 @@
 import json
+import threading
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -18,6 +19,7 @@ class DailyPnlTracker:
         self.path = Path(state_file)
         self.timezone = timezone
         self.log = log
+        self._save_lock = threading.Lock()
         self.realized_pnl, self.realized_loss = self._load()
 
     def _load(self) -> tuple[Decimal, Decimal]:
@@ -49,6 +51,16 @@ class DailyPnlTracker:
         self.record(Decimal("0"), Decimal("0"))
 
     def _save(self) -> None:
+        """Live incident: two concurrent record()/reset() calls (an
+        exit's realized-pnl recording landing on the same poll cycle
+        as another order event's) both wrote the same fixed ".tmp"
+        path and both called replace() on it - whichever ran second
+        found the first had already consumed (renamed away) the
+        file, failing with ENOENT ("No such file or directory:
+        daily_pnl.tmp -> daily_pnl.json"). A lock serializes the
+        write-then-replace pair so a second concurrent save can't
+        observe the first's temp file mid-consumption.
+        """
         payload = {
             "date": datetime.now(self.timezone).date().isoformat(),
             "realized_pnl": str(self.realized_pnl),
@@ -56,5 +68,8 @@ class DailyPnlTracker:
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        temporary.replace(self.path)
+        with self._save_lock:
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            temporary.replace(self.path)
