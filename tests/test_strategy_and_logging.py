@@ -5152,7 +5152,7 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         self.assertEqual(cancelled, [])
         self.assertEqual(placed, [])
 
-    def test_escalates_to_the_full_ask_once_the_entry_has_stalled(self):
+    def test_escalates_halfway_to_the_ask_once_the_entry_has_stalled(self):
         from webull_bot.bot import AutoTrader
 
         cancelled = []
@@ -5211,8 +5211,11 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
             working_orders={
                 "order-1": {
                     # Resting 40s - past option_entry_escalate_seconds
-                    # (30), so this should escalate straight to ask
-                    # instead of tracking mid indefinitely.
+                    # (30), so this should escalate to the midpoint of
+                    # mid and ask, not track mid indefinitely and not
+                    # jump straight to the full ask (a first version
+                    # did that, and a VZ put dip-entry filled at the
+                    # max-spread price as a result).
                     "submitted_at": 60.0,
                     "key": "OPTION:XYZ260101C00100000",
                     "action": "BUY",
@@ -5228,9 +5231,10 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         with unittest.mock.patch("time.monotonic", return_value=100.0):
             reprice()
 
+        # mid=1.95, ask=2.00 -> halfway = 1.975
         self.assertEqual(cancelled, ["order-1"])
         self.assertEqual(
-            placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("2.00"))
+            placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("1.975"))
         )
 
 

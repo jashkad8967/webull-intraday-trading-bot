@@ -138,10 +138,13 @@ class OptionTradingSettings(BaseSettings):
     # hard-cancelled them unfilled. A passive mid order simply has
     # nothing to cross on a thin/wide-spread contract. Once an entry
     # has been resting this long unfilled, reprice_resting_option_
-    # entries escalates its chase target from mid to the full ask
-    # (still bounded, still only what the existing initial-entry path
-    # would pay to open urgently) instead of staying pinned to mid
-    # all the way to the hard cancel. Mirrors stop_loss_escalate_
-    # seconds' existing shape for stalled STOCK stop-loss exits, which
+    # entries escalates its chase target from mid halfway toward the
+    # ask (not the full ask - a first version of this did jump
+    # straight to the full ask and a VZ put dip-entry filled at the
+    # max-spread price as a result, paying the full spread cost on
+    # what's meant to be a cheap scalp entry) instead of staying
+    # pinned to mid all the way to the hard cancel. Mirrors stop_loss_
+    # escalate_seconds' existing shape for stalled STOCK stop-loss
+    # exits, which
     # had no options/entry-side equivalent until now.
     option_entry_escalate_seconds: int = Field(default=30, ge=5, le=120)
