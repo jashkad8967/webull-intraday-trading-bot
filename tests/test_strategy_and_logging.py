@@ -9824,6 +9824,60 @@ class WashSaleTrackerTests(unittest.TestCase):
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
+    def test_a_non_string_blocked_at_self_heals_instead_of_crashing(self):
+        """Live incident: 11 symbols (all with a genuine wash-sale
+        block entry) hit "fromisoformat: argument must be str" on
+        every single scan - a TypeError, not the ValueError the
+        existing malformed-string handling caught, so it crashed
+        instead of self-healing like every other corrupt-entry case
+        here already does.
+        """
+        path = Path("tests/.generated_wash/non_string_blocked_at.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path, 31)
+            tracker.blocks["ORCL"] = {"blocked_at": None}
+
+            result = tracker.blocked_until("ORCL")
+
+            self.assertIsNone(result)
+            self.assertNotIn("ORCL", tracker.blocks)
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_concurrent_saves_never_raise_enoent_on_the_shared_tmp_file(self):
+        """Same race as DailyPnlTracker's - two concurrent block()
+        calls for different symbols both write the same shared
+        ".tmp" path; whichever replace() ran second used to find the
+        first had already consumed it. _save_lock serializes the
+        write-then-replace pair so this can't happen.
+        """
+        path = Path("tests/.generated_wash/concurrent.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            tracker = self._tracker(path, 31)
+            errors: list[Exception] = []
+
+            def hammer(n: int) -> None:
+                try:
+                    for i in range(10):
+                        tracker.block(f"SYM{n}-{i}", "stop-loss exit submitted")
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=hammer, args=(n,)) for n in range(4)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            self.assertTrue(path.exists())
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
 
 class DailyPnlTrackerTests(unittest.TestCase):
     def _tracker(self, path):
