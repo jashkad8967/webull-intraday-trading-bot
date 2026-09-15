@@ -1,4 +1,5 @@
 import json
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,6 +24,10 @@ class WashSaleTracker:
         self.block_days = block_days
         self.timezone = timezone
         self.log = log
+        # RLock (not Lock): block() calls blocked_until() while
+        # already holding this - a plain Lock would deadlock on that
+        # reentrant acquisition from the same thread.
+        self._lock = threading.RLock()
         self.blocks = self._load()
 
     def _load(self) -> dict[str, dict]:
@@ -63,6 +68,17 @@ class WashSaleTracker:
         return blocks
 
     def _save(self) -> None:
+        """Live incident: concurrent block() calls for different
+        symbols (each reading/writing the same shared self.blocks
+        dict and the same fixed ".tmp" path) raced the write-then-
+        replace pair, the same class of bug fixed for DailyPnlTracker
+        - a second concurrent save could observe the first save's
+        temp file mid-consumption, or json.dumps could observe
+        self.blocks mid-mutation from another thread ("dictionary
+        changed size during iteration"). Callers must hold self._lock
+        for the whole read-modify-write, not just this file I/O -
+        see block()/blocked_until()'s self-heal paths.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(
@@ -73,31 +89,39 @@ class WashSaleTracker:
 
     def blocked_until(self, symbol: str) -> datetime | None:
         symbol = symbol.upper()
-        entry = self.blocks.get(symbol)
-        if not entry:
-            return None
-        try:
-            blocked_at = datetime.fromisoformat(entry["blocked_at"])
-        except (KeyError, ValueError):
-            self.blocks.pop(symbol, None)
-            self._save()
-            return None
-        until = blocked_at + timedelta(days=self.block_days)
-        if datetime.now(self.timezone) >= until:
-            self.blocks.pop(symbol, None)
-            self._save()
-            return None
-        return until
+        with self._lock:
+            entry = self.blocks.get(symbol)
+            if not entry:
+                return None
+            try:
+                blocked_at = datetime.fromisoformat(entry["blocked_at"])
+            except (KeyError, ValueError, TypeError):
+                # Live incident: a live block entry was found with a
+                # non-string "blocked_at" (raises TypeError, not the
+                # ValueError a malformed-but-string value would raise) -
+                # every scan of an already-blocked symbol crashed with
+                # "fromisoformat: argument must be str" instead of
+                # self-healing like the other corrupt-entry case below.
+                self.blocks.pop(symbol, None)
+                self._save()
+                return None
+            until = blocked_at + timedelta(days=self.block_days)
+            if datetime.now(self.timezone) >= until:
+                self.blocks.pop(symbol, None)
+                self._save()
+                return None
+            return until
 
     def block(self, symbol: str, reason: str) -> datetime:
         symbol = symbol.upper()
-        current = self.blocked_until(symbol)
-        if current:
-            return current
-        now = datetime.now(self.timezone)
-        self.blocks[symbol] = {"blocked_at": now.isoformat()}
-        self._save()
-        until = now + timedelta(days=self.block_days)
+        with self._lock:
+            current = self.blocked_until(symbol)
+            if current:
+                return current
+            now = datetime.now(self.timezone)
+            self.blocks[symbol] = {"blocked_at": now.isoformat()}
+            self._save()
+            until = now + timedelta(days=self.block_days)
         self.log.warning(
             "WASH   | %-8s | blocked until %s | %s",
             symbol,
