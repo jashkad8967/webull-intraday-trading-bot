@@ -320,7 +320,18 @@ def _evaluate_option_entry(
     # gate) since price_sanity_ok has a side effect
     # (logs + records the rejection timestamp) that
     # would otherwise double-fire.
-    price_sane = self.price_sanity_ok(
+    #
+    # Live incident (AMC): a candidate still qualifying every
+    # scan cycle with a durably-too-wide spread re-triggered
+    # price_sanity_ok's ERROR log every cycle with zero backoff
+    # - 20+ lines in under 5 minutes for one contract, the same
+    # class of bug already fixed for the option repricers.
+    # price_sanity_cooldown_ready gates the call itself here (not
+    # just the eventual order placement) so a stale rejection
+    # doesn't get re-logged before its cooldown window clears.
+    price_sane = self.price_sanity_cooldown_ready(
+        option_symbol
+    ) and self.price_sanity_ok(
         option_symbol,
         price,
         limit_price,
@@ -501,11 +512,15 @@ def _evaluate_option_exit(
                 )
             except QuoteUnavailableError:
                 average_down_price = None
-            if average_down_price is not None and self.price_sanity_ok(
-                option_symbol,
-                price,
-                average_down_price,
-                tolerance=OPTION_PRICE_SANITY_TOLERANCE,
+            if (
+                average_down_price is not None
+                and self.price_sanity_cooldown_ready(option_symbol)
+                and self.price_sanity_ok(
+                    option_symbol,
+                    price,
+                    average_down_price,
+                    tolerance=OPTION_PRICE_SANITY_TOLERANCE,
+                )
             ):
                 order_id = self.api.place_option(
                     contract,
@@ -570,7 +585,9 @@ def _evaluate_option_exit(
             target,
             self.api.option_limit_price(quote, "SELL"),
         )
-        if not self.price_sanity_ok(
+        if not self.price_sanity_cooldown_ready(
+            option_symbol
+        ) or not self.price_sanity_ok(
             option_symbol,
             price,
             limit_price,
@@ -596,7 +613,9 @@ def _evaluate_option_exit(
         and self.cooldown_ready(key)
     ):
         limit_price = self.api.option_limit_price(quote, "SELL")
-        if not self.price_sanity_ok(
+        if not self.price_sanity_cooldown_ready(
+            option_symbol
+        ) or not self.price_sanity_ok(
             option_symbol,
             price,
             limit_price,

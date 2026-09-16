@@ -11015,6 +11015,141 @@ class IdleCashRelaxationTests(unittest.TestCase):
 
         self.assertEqual(fake_bot.last_capital_deployed_at, stale)
 
+    def test_record_trade_zeroes_a_stale_option_position_matched_by_full_symbol(self):
+        """Live incident (RIVN): boost_stalled_positions read a stale,
+        still-positive cached_positions quantity for a contract this
+        exact exit had just closed, then tried to sell that stale
+        amount, rejected by Webull ("excess of current holding
+        quantity"). Only the STOCK side self-corrected cached_
+        positions in place - this is the OPTION equivalent.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=0.0,
+            recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            submitted_order_ids_today=set(),
+            option_contracts=[],
+            cached_positions=[
+                {
+                    "instrument_type": "OPTION",
+                    "symbol": "RIVN260925P00015000",
+                    "quantity": "3",
+                }
+            ],
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade(
+            "OPTION:RIVN260925P00015000", "order-1", "PROFIT", Decimal("0.30"),
+            pnl=Decimal("1"), entry_price=Decimal("0.27"), quantity=Decimal("3"),
+        )
+
+        self.assertEqual(fake_bot.cached_positions[0]["quantity"], "0")
+
+    def test_record_trade_zeroes_a_stale_option_position_matched_via_legs(self):
+        """Same incident as above, but exercising the case where the
+        broker's top-level "symbol" is the bare underlying (a
+        documented Webull quirk) - only the legs identify the real
+        contract, matched here against the cached, already-discovered
+        option_contracts list (no live network call)."""
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=0.0,
+            recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            submitted_order_ids_today=set(),
+            option_contracts=[
+                {
+                    "symbol": "RIVN260925P00015000",
+                    "underlying_symbol": "RIVN",
+                    "option_type": "PUT",
+                    "expiration_date": "2026-09-25",
+                    "strike_price": "15",
+                }
+            ],
+            cached_positions=[
+                {
+                    "instrument_type": "OPTION",
+                    "symbol": "RIVN",
+                    "quantity": "3",
+                    "legs": [
+                        {
+                            "symbol": "RIVN",
+                            "option_type": "PUT",
+                            "option_expire_date": "2026-09-25",
+                            "option_exercise_price": "15",
+                        }
+                    ],
+                }
+            ],
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade(
+            "OPTION:RIVN260925P00015000", "order-1", "PROFIT", Decimal("0.30"),
+            pnl=Decimal("1"), entry_price=Decimal("0.27"), quantity=Decimal("3"),
+        )
+
+        self.assertEqual(fake_bot.cached_positions[0]["quantity"], "0")
+
+    def test_record_trade_leaves_an_unrelated_option_position_untouched(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(
+            last_trade={},
+            last_exit_at={},
+            trade_times=defaultdict(deque),
+            working_orders={},
+            status=SimpleNamespace(record_trade=lambda *a, **k: None),
+            last_capital_deployed_at=0.0,
+            recent_stop_losses=deque(),
+            last_volatility_stop_loss_at={},
+            position_opened_at={},
+            symbol_pnl_history=defaultdict(deque),
+            submitted_order_ids_today=set(),
+            option_contracts=[
+                {
+                    "symbol": "RIVN260925P00015000",
+                    "underlying_symbol": "RIVN",
+                    "option_type": "PUT",
+                    "expiration_date": "2026-09-25",
+                    "strike_price": "15",
+                }
+            ],
+            cached_positions=[
+                {
+                    "instrument_type": "OPTION",
+                    "symbol": "AAPL260925C00200000",
+                    "quantity": "1",
+                }
+            ],
+        )
+        record_trade = AutoTrader.record_trade.__get__(fake_bot)
+
+        record_trade(
+            "OPTION:RIVN260925P00015000", "order-1", "PROFIT", Decimal("0.30"),
+            pnl=Decimal("1"), entry_price=Decimal("0.27"), quantity=Decimal("3"),
+        )
+
+        self.assertEqual(fake_bot.cached_positions[0]["quantity"], "1")
+
 
 class ExecutionGuardrailTests(unittest.TestCase):
     def test_price_sanity_ok_within_tolerance(self):
