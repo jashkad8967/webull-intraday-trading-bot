@@ -85,6 +85,53 @@ def record_trade(
                     and str(item.get("symbol", "")).upper() == exited_symbol
                 ):
                     item["quantity"] = "0"
+        # Live incident (RIVN): the same staleness bug as above, but
+        # for OPTIONS - boost_stalled_positions read a stale, still-
+        # positive cached_positions quantity for a contract this exact
+        # exit had just closed, then tried to sell that stale amount,
+        # rejected by Webull as "excess of current holding quantity."
+        # An OPTION position's own top-level "symbol" field is often
+        # just the bare underlying (not the full OCC contract symbol
+        # this key carries) - matched against the already-discovered,
+        # cached self.option_contracts (NOT api.contract_from_position,
+        # which can fall through to a live network lookup; record_trade
+        # is a hot path, not a place to add a real API call) via the
+        # same symbol-then-legs matching option_position() uses.
+        elif key.startswith("OPTION:"):
+            exited_symbol = key.split(":", 1)[1]
+            exited_contract = next(
+                (
+                    c
+                    for c in getattr(self, "option_contracts", None) or []
+                    if c.get("symbol") == exited_symbol
+                ),
+                None,
+            )
+            for item in getattr(self, "cached_positions", None) or []:
+                if item.get("instrument_type") != "OPTION":
+                    continue
+                if item.get("symbol") == exited_symbol:
+                    item["quantity"] = "0"
+                    continue
+                if not exited_contract:
+                    continue
+                for leg in item.get("legs", []):
+                    try:
+                        leg_matches = (
+                            leg.get("symbol")
+                            == exited_contract["underlying_symbol"]
+                            and leg.get("option_type")
+                            == exited_contract["option_type"]
+                            and leg.get("option_expire_date")
+                            == exited_contract["expiration_date"]
+                            and Decimal(str(leg.get("option_exercise_price", "0")))
+                            == Decimal(str(exited_contract["strike_price"]))
+                        )
+                    except Exception:
+                        leg_matches = False
+                    if leg_matches:
+                        item["quantity"] = "0"
+                        break
         if pnl is not None:
             # Feeds symbol_quarantined() - every realized exit's P&L,
             # partitioned per-key so one bad symbol can't drag down
