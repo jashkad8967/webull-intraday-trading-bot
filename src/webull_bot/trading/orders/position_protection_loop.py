@@ -48,6 +48,21 @@ def _position_protection_loop(self) -> None:
             self.reprice_resting_entries(self.cached_core_session_active)
             self.reprice_resting_option_entries()
             self.escalate_stalled_stop_losses()
+            # By request: "ui is not always showing all buy sell
+            # profit accurately, and is not updating as quick as
+            # needed since scans are slower, put that on a parallel
+            # thread" - write_status_snapshot used to only run once
+            # per full slow scan cycle (30-90s+ live), so a fill/exit
+            # this fast loop had already acted on above could sit
+            # invisible on the dashboard until the next slow cycle
+            # finished. Now written every fast-loop tick instead -
+            # write_status_snapshot has its own internal poll_seconds
+            # throttle already, so this doesn't over-write.
+            self.write_status_snapshot(
+                self.cached_positions,
+                self.cached_raw_buying_power,
+                self.cached_circuit_active,
+            )
         except Exception as exc:
             log.error("PROTECT| position-protection cycle failed | %s", exc)
         elapsed = time.monotonic() - started

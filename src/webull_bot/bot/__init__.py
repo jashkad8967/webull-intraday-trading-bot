@@ -706,6 +706,21 @@ class AutoTrader:
         self.cached_option_buying_power = Decimal("0")
         self.cached_raw_buying_power = Decimal("0")
         self.cached_positions: list[dict] = []
+        # By request: "ui is not always showing all buy sell profit
+        # accurately, and is not updating as quick as needed since
+        # scans are slower, put that on a parallel thread" -
+        # write_status_snapshot used to only run once per full slow
+        # scan cycle (SCAN cycles observed 30-90s+ live, sometimes
+        # minutes during universe growth/VOLFILT), so a fill/exit
+        # detected by the fast _position_protection_loop thread could
+        # sit invisible on the dashboard until the next slow cycle
+        # finished. Now written from that same fast thread instead -
+        # see its docstring for the identical, already-established
+        # "cached, read-only snapshot" pattern this reuses. Defaults
+        # to False (not paused) so the very first fast-loop write
+        # before the main loop's own first circuit-breaker check
+        # doesn't show a false "paused" state.
+        self.cached_circuit_active: bool = False
         # Read by _position_protection_loop's background thread - see
         # its docstring and run()'s "self.cached_core_session_active =
         # core_session_active" assignment.
