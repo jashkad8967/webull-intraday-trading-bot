@@ -1,7 +1,10 @@
+import logging
 import time
 from decimal import Decimal
 
 from webull_bot.trading.orders.locks import _working_orders_lock
+
+log = logging.getLogger("webull-bot")
 
 
 def write_status_snapshot(
@@ -91,7 +94,32 @@ def write_status_snapshot(
             ),
             Decimal("0"),
         )
-        self.status.record_balance(total_equity)
+        # Live incident (user-reported, real distress: "why is it ONLY
+        # LOSING"): a transient bad read - cached_raw_buying_power
+        # momentarily 0 right after this thread starts (before the
+        # first account_state() refresh has landed), or an isolated
+        # stale-quote blip - produced a single balance_history point
+        # of exactly $0, sandwiched between two normal readings
+        # seconds apart. The dashboard chart showed this as the
+        # account being wiped out and instantly recovering, several
+        # times in one day, even though the real balance never
+        # actually moved. total_equity hitting exactly 0 while a
+        # moment ago (or a moment later) it was hundreds of dollars is
+        # never a real reading on an account with actual buying power
+        # or open positions - skip recording it rather than corrupt
+        # the chart with a fake wipeout.
+        recent_balances = self.status.balance_history
+        previously_nonzero = bool(recent_balances) and Decimal(
+            str(recent_balances[-1]["balance"])
+        ) > 0
+        if total_equity <= 0 and previously_nonzero:
+            log.warning(
+                "STATUS | discarded an implausible $0 total_equity "
+                "reading (last known balance was nonzero) - not "
+                "writing it to the balance chart"
+            )
+        else:
+            self.status.record_balance(total_equity)
     with _working_orders_lock(self):
         working_orders_snapshot = list(self.working_orders.items())
     pending_order_rows = [

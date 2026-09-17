@@ -10318,6 +10318,91 @@ class DailyPnlTrackerTests(unittest.TestCase):
             shutil.rmtree(path.parent, ignore_errors=True)
 
 
+class WriteStatusSnapshotBalanceGuardTests(unittest.TestCase):
+    """Live incident (user-reported, real distress: "why is it ONLY
+    LOSING"): the balance chart showed the account crashing to
+    literally $0 and instantly recovering, several times in one day,
+    even though the real balance never moved - a transient bad
+    total_equity read (e.g. cached_raw_buying_power momentarily 0
+    right after the fast thread starts, before the first account_
+    state() refresh lands) got written straight into balance_history.
+    """
+
+    def setUp(self):
+        self.addCleanup(
+            lambda: shutil.rmtree(
+                Path("tests/.generated_status"), ignore_errors=True
+            )
+        )
+
+    def _fake_bot(self, raw_buying_power, prior_balance=None):
+        from webull_bot.bot import AutoTrader
+
+        status = StatusWriter(
+            path=str(Path("tests/.generated_status/snapshot.json"))
+        )
+        if prior_balance is not None:
+            status.balance_history.append(
+                {"time": time.time(), "balance": str(prior_balance)}
+            )
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(poll_seconds=Decimal("0.25"), mode="LIVE"),
+            last_status_write=0.0,
+            last_balance_history_write=0.0,
+            position_buckets={},
+            user_watchlist=set(),
+            market_agent=None,
+            strategy=SimpleNamespace(
+                prices={},
+                selection_bucket=lambda symbol: "DISCOVERY",
+                metrics={},
+                position_unrealized_pnl=lambda position: Decimal("0"),
+                position_day_pnl=lambda position: Decimal("0"),
+            ),
+            cached_raw_buying_power=raw_buying_power,
+            cached_account_day_pnl=None,
+            cached_account_value=None,
+            daily_realized_pnl=Decimal("0"),
+            stock_symbols=[],
+            option_contracts=[],
+            working_orders={},
+            status=status,
+        )
+        return AutoTrader.write_status_snapshot.__get__(fake_bot), status
+
+    def test_discards_an_implausible_zero_reading_after_a_real_balance(self):
+        write, status = self._fake_bot(
+            raw_buying_power=Decimal("0"), prior_balance=Decimal("363.96")
+        )
+
+        with self.assertLogs("webull-bot", level="WARNING"):
+            write(positions=[], buying_power=Decimal("0"), paused=False)
+
+        self.assertEqual(len(status.balance_history), 1)
+        self.assertEqual(status.balance_history[-1]["balance"], "363.96")
+
+    def test_records_a_genuine_zero_when_there_is_no_prior_balance_yet(self):
+        # A real $0 balance on a fresh account (nothing recorded yet)
+        # must still be recorded - the guard only discards a $0 blip
+        # that contradicts an already-known nonzero balance.
+        write, status = self._fake_bot(raw_buying_power=Decimal("0"))
+
+        write(positions=[], buying_power=Decimal("0"), paused=False)
+
+        self.assertEqual(len(status.balance_history), 1)
+        self.assertEqual(status.balance_history[-1]["balance"], "0")
+
+    def test_records_a_normal_nonzero_balance_as_usual(self):
+        write, status = self._fake_bot(
+            raw_buying_power=Decimal("400"), prior_balance=Decimal("363.96")
+        )
+
+        write(positions=[], buying_power=Decimal("400"), paused=False)
+
+        self.assertEqual(len(status.balance_history), 2)
+        self.assertEqual(status.balance_history[-1]["balance"], "400")
+
+
 class OrderBookImbalanceTests(unittest.TestCase):
     def test_obi_supports_entry_passes_through_when_no_data(self):
         self.assertTrue(TradingStrategy.obi_supports_entry(None))
