@@ -69,6 +69,19 @@ class OptionTradingSettings(BaseSettings):
     # -close strike can be picked instead when the true ATM one doesn't
     # fit - see WebullAPI.select_atm_options's own docstring.
     option_affordability_shortlist_size: int = Field(default=6, ge=1, le=20)
+    # By explicit request, after real account data confirmed it: 15 of
+    # 19 recent exits were losses, every single one an option bought
+    # under $0.20/share, averaging -$3.90 against $1.02 average wins.
+    # Cheap option premiums swing 30-50%+ on routine noise (near-zero
+    # intrinsic/extrinsic value, all leverage/decay), so a stop tight
+    # enough to matter still gives back several times what a win
+    # captures - a structural mismatch, not a timing/pricing bug. A
+    # small account's own affordability ceiling was mechanically
+    # forcing select_atm_options into exactly this cohort every time
+    # nothing near-ATM fit. Applied as a hard floor BEFORE
+    # affordability gets a vote (see select_atm_options) - a contract
+    # this cheap is excluded outright, never merely deprioritized.
+    option_min_premium_dollars: Decimal = Field(default=Decimal("0.50"), gt=0)
     # By request: "you can also use averaging down... for options as
     # well" - options analog of the volatility-scalp averaging-down
     # knobs, but wider, since options routinely move a much larger

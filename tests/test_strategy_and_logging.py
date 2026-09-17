@@ -14754,6 +14754,7 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
         shortlist_size=6,
         volumes_by_symbol=None,
         moneyness_percent=Decimal("1"),
+        min_premium_dollars=Decimal("0"),
     ):
         from datetime import date, timedelta
 
@@ -14785,6 +14786,11 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
                 # the logic under test. See the dedicated moneyness
                 # cap tests below for that behavior.
                 option_max_moneyness_percent=moneyness_percent,
+                # Same reasoning as moneyness_percent above - defaults
+                # to unbounded (0) here so existing affordability-
+                # mechanics tests aren't affected; see the dedicated
+                # minimum-premium tests below for that behavior.
+                option_min_premium_dollars=min_premium_dollars,
             ),
             option_contracts=lambda underlying: contract_list,
             option_quotes=lambda symbols: [
@@ -15015,6 +15021,94 @@ class SelectAtmOptionsAffordabilityTests(unittest.TestCase):
         result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
         batch_symbols = {"XYZ260101C00100000", "XYZ260101C00105000"}
         self.assertIn(result[0]["symbol"], batch_symbols)
+
+    def test_minimum_premium_excludes_a_lottery_ticket_cheap_contract(self):
+        """Live incident: real account data confirmed 15 of 19 recent
+        exits were losses, every single one an option bought under
+        $0.20/share, averaging -$3.90 against $1.02 average wins -
+        cheap premiums swing 30-50%+ on routine noise. A too-cheap
+        contract must be excluded outright, not merely deprioritized -
+        even when it's the only "affordable" one on a small account.
+        """
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),  # ATM, unaffordable
+                ("XYZ260101C00110000", 110),  # affordable but $0.10 - too cheap
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "8.00",
+                "XYZ260101C00110000": "0.10",
+            },
+            min_premium_dollars=Decimal("0.50"),
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        # The cheap contract is excluded by the premium floor - falls
+        # back to the ATM strike instead, even though it doesn't fit
+        # the cost cap either (better than a lottery ticket).
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00100000")
+
+    def test_minimum_premium_still_allows_a_contract_above_the_floor(self):
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00110000", 110),
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "8.00",
+                "XYZ260101C00110000": "0.75",
+            },
+            min_premium_dollars=Decimal("0.50"),
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        self.assertEqual(result[0]["symbol"], "XYZ260101C00110000")
+
+    def test_minimum_premium_excludes_the_fallback_search_too(self):
+        """The further-OTM affordability fallback search must also
+        respect the premium floor, not just the primary shortlist."""
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00105000", 105),
+                ("XYZ260101C00150000", 150),  # affordable but $0.05 - too cheap
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "8.00",
+                "XYZ260101C00105000": "7.00",
+                "XYZ260101C00150000": "0.05",
+            },
+            shortlist_size=2,
+            min_premium_dollars=Decimal("0.50"),
+        )
+        result = select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
+        batch_symbols = {"XYZ260101C00100000", "XYZ260101C00105000"}
+        self.assertIn(result[0]["symbol"], batch_symbols)
+
+    def test_nothing_clearing_both_floors_skips_this_underlying(self):
+        """By explicit request ("still make sure to try and make
+        profit, not sell a loss for a profit" / real account data
+        confirming the lottery-ticket pattern): when NOTHING clears
+        both the moneyness cap and the minimum premium, the correct
+        outcome is skipping this underlying entirely this cycle - not
+        the old unconditional last-resort fallback to an unquoted,
+        possibly-far-too-cheap pool_sorted[0].
+        """
+        # Two candidates (not one) so this exercises the real
+        # shortlist/quoting path instead of the single-candidate
+        # shortcut (which skips affordability/premium checks
+        # entirely).
+        select = self._fake_api(
+            contracts=[
+                ("XYZ260101C00100000", 100),
+                ("XYZ260101C00105000", 105),
+            ],
+            quotes_by_symbol={
+                "XYZ260101C00100000": "0.10",
+                "XYZ260101C00105000": "0.05",
+            },
+            min_premium_dollars=Decimal("0.50"),
+        )
+        with self.assertRaises(RuntimeError):
+            select("XYZ", Decimal("100"), max_contract_cost=Decimal("110"))
 
 
 class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):

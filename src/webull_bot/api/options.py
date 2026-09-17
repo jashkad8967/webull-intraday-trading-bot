@@ -159,6 +159,21 @@ def select_atm_options(
         # that way). Affordability stays the hard filter; volume
         # only re-ranks within it, so this never picks a contract
         # that doesn't fit max_contract_cost.
+        # By explicit request, after real account data confirmed it -
+        # 15 of 19 recent exits were losses, every single one an
+        # option bought under $0.20/share, averaging -$3.90 against
+        # $1.02 average wins: cheap option premiums (near-zero
+        # intrinsic/extrinsic value) swing 30-50%+ on routine noise,
+        # so ANY stop-loss tight enough to matter on a small account
+        # still gives back several times what a win captures. This is
+        # a structural mismatch, not a pricing/timing bug - a small
+        # account's own affordability ceiling was mechanically forcing
+        # a selection into exactly this "lottery ticket" cohort every
+        # time nothing near-ATM fit. option_min_premium_dollars is a
+        # hard floor applied here, before affordability even gets a
+        # vote - a contract too cheap to survive real premium noise
+        # is excluded outright, not merely deprioritized.
+        min_premium = self.config.option_min_premium_dollars
         priced: list[tuple[dict, Decimal, Decimal, int]] = []
         for index, item in enumerate(shortlist):
             quote = quote_by_symbol.get(item["symbol"])
@@ -167,6 +182,8 @@ def select_atm_options(
             try:
                 premium = self.quote_price(quote)
             except Exception:
+                continue
+            if premium < min_premium:
                 continue
             volume = self.option_volume(quote) or Decimal("0")
             priced.append((item, premium * 100, volume, index))
@@ -215,6 +232,8 @@ def select_atm_options(
                         premium = self.quote_price(quote)
                     except Exception:
                         continue
+                    if premium < min_premium:
+                        continue
                     cost = premium * 100
                     if cost <= max_contract_cost:
                         affordable.append(
@@ -228,8 +247,12 @@ def select_atm_options(
             selected.append(best[0])
         elif priced:
             selected.append(min(priced, key=lambda pair: pair[1])[0])
-        else:
-            selected.append(pool_sorted[0])
+        # No unconditional last-resort fallback to pool_sorted[0] (an
+        # unquoted contract that could be well under the premium
+        # floor) - if nothing on this underlying clears BOTH the
+        # moneyness cap and the minimum premium, the correct outcome
+        # is skipping it this cycle, not forcing a trade into whatever
+        # happens to still be near-ATM.
     if not selected:
         raise RuntimeError(f"No matching options found for {underlying}")
     return selected
