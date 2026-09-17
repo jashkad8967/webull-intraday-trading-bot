@@ -1,6 +1,6 @@
 import logging
 import time
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 
 from webull_bot.strategy_logic.types import Decision
 from webull_bot.trading.guards.price_sanity import (
@@ -498,7 +498,21 @@ def _evaluate_option_exit(
     if decision.action == "HOLD" and sell_realizable_price > cost:
         fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
         momentum_exit = False
-        if sell_realizable_price - cost > fee_per_share:
+        # Live incident (NKE, recurring even after the AMD fix): the
+        # AMD fix required clearing cost by more than fee_per_share
+        # (~$0.0002/share for a typical contract) - nowhere near
+        # enough. decision.target_price gets quantized to the cent
+        # (.quantize(Decimal("0.01")) in the PROFIT branch below)
+        # before ever becoming the actual sell limit - a razor-thin
+        # sub-cent edge (which clears fee_per_share trivially) rounds
+        # right back down to the SAME price as cost, reproducing
+        # "PROFIT" at the exact entry price (NKE sold at 0.18/0.15/
+        # 0.12 - identical to its own entry price, three times, each
+        # a real -$0.02 loss). Requiring the margin to clear a full
+        # $0.05 option tick - not just the fee - guarantees the
+        # quantized price is genuinely, meaningfully above cost.
+        min_margin = max(fee_per_share, Decimal("0.05"))
+        if sell_realizable_price - cost > min_margin:
             underlying = contract["underlying_symbol"]
             underlying_price = self.strategy.prices.get(underlying)
             if underlying_price is not None and self.strategy.rsi_divergence(
@@ -686,7 +700,17 @@ def _evaluate_option_exit(
     ):
         if decision.target_price is None:
             return buying_power
-        target = decision.target_price.quantize(Decimal("0.01"))
+        # Live incident (NKE, recurring even after the AMD fee-margin
+        # fix): quantizing to the CENT here, not the real $0.05 option
+        # tick, silently erased genuine profit targets - a 2% target
+        # on a $0.18 cost (0.1836) rounds to 0.18 at 2 decimal places,
+        # the SAME price as cost, so "PROFIT" filled at cost exactly
+        # (0.18 -> 0.18, three times, each a real -$0.02 loss). ROUND_UP
+        # to the real tick guarantees the placed price is never
+        # quantized back down below the intended target.
+        target = self.api._quantize_to_option_tick(
+            decision.target_price, ROUND_UP
+        )
         limit_price = max(
             target,
             self.api.option_limit_price(quote, "SELL"),
