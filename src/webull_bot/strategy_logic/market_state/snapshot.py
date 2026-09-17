@@ -12,6 +12,7 @@ def clear_market_state(self) -> None:
     self.tick_history.clear()
     self.volatility_price_history.clear()
     self.recent_tick_history.clear()
+    self.recent_rsi_history.clear()
     self.volume_delta_baseline.clear()
     self.volume_delta_ema.clear()
     self.volume_delta_latest.clear()

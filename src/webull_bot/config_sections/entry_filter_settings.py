@@ -94,6 +94,36 @@ class EntryFilterSettings(BaseSettings):
     rsi_period: int = Field(default=14, ge=2, le=100)
     rsi_oversold_threshold: Decimal = Field(default=Decimal("30"), ge=0, le=100)
     rsi_overbought_threshold: Decimal = Field(default=Decimal("70"), ge=0, le=100)
+    # By request (momentum-shift overview + reference walkthrough):
+    # price/RSI divergence - a new high/low in price NOT confirmed by
+    # a matching new high/low in RSI - is a distinct, earlier-warning
+    # signal from the flat overbought/oversold threshold above. The
+    # walkthrough's own reference trade is a divergence, not a
+    # threshold breach (price makes a HIGHER high while RSI makes a
+    # LOWER high) - see TradingStrategy.rsi_divergence. A profit-
+    # protection-only exit signal (see its wiring in volatility_scalp_
+    # exit_override/option_entry_exit) - by explicit request ("still
+    # make sure to try and make profit, not sell a loss for a
+    # profit"), it only fires on a position already showing a gain,
+    # never as a substitute for the stop-loss.
+    rsi_divergence_exit_enabled: bool = True
+    # 15 min - scaled down from the walkthrough's ~20-25 min shift-
+    # detection window to match this account's faster intraday cadence.
+    rsi_divergence_lookback_seconds: int = Field(default=900, ge=60, le=7200)
+    # Minimum RSI-point gap between the reading at the prior price
+    # extreme and the current RSI before this counts as a real
+    # divergence, not noise-level RSI wiggle around the same level.
+    rsi_divergence_min_gap: Decimal = Field(default=Decimal("3"), gt=0, le=50)
+    # By request (momentum-shift overview): a general entry-quality
+    # filter - is this trend-following candidate actually backed by
+    # real volume? Reuses the existing volume_delta_ema/latest state
+    # (see TradingStrategy.relative_volume_ok) with a deliberately
+    # gentler bar than volatility_scalp_micro_exhaustion_volume_
+    # multiplier's own sharper reversal-confirmation threshold - this
+    # is a baseline conviction check on the general/option entry
+    # paths, not a sharp reversal-confirmation gate.
+    rvol_entry_filter_enabled: bool = True
+    rvol_entry_multiplier: Decimal = Field(default=Decimal("1.2"), gt=0, le=10)
     # By request: "also include not only short term patterns like 5-10
     # mins, but also 1 day and 5 day and month." recent_momentum (10
     # min) and sma_trend (50-day average) already exist - this fills
