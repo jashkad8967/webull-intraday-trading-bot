@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_DOWN
 from webull_bot.strategy_logic.decision.stock_option_decision import (
     _exit_bias,
     adaptive_stop_percent,
+    approaching_resistance,
     entry_extension_ok,
     entry_spread_ok,
     option_average_down_signal,
@@ -298,6 +299,7 @@ class TradingStrategy:
     entry_spread_ok = entry_spread_ok
     volatility_scalp_entry_spread_ok = volatility_scalp_entry_spread_ok
     entry_extension_ok = entry_extension_ok
+    approaching_resistance = approaching_resistance
     research_supports_entry = staticmethod(research_supports_entry)
     option_decision = option_decision
     minimum_lot_size = staticmethod(minimum_lot_size)

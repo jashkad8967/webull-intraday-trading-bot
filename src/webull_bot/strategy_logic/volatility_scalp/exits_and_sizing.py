@@ -157,6 +157,23 @@ def volatility_scalp_exit_override(
             return Decision(
                 "PROFIT", "bearish RSI divergence - locking in the gain", price
             )
+        # By explicit request ("as a human I can see and make profit
+        # off of the swings... seeing when there is resistance so
+        # just sell off the profit"): a natural human read on a chart
+        # - sell into strength once price is right at today's high
+        # (approaching_resistance), the level a fast move is
+        # statistically likely to stall or reverse at, rather than
+        # waiting for the flat quick-target percentage to be hit
+        # exactly. Same fee-aware profit guard as the divergence
+        # check above - never fires on a fee-thin, barely-above-cost
+        # position.
+        if (
+            price - average_cost > fee_per_share
+            and self.approaching_resistance(symbol, price, "BUY")
+        ):
+            return Decision(
+                "PROFIT", "selling into resistance at today's high", price
+            )
         min_stall_price = average_cost + (target - average_cost) * (
             self.config.volatility_scalp_momentum_stall_min_profit_fraction
         )
