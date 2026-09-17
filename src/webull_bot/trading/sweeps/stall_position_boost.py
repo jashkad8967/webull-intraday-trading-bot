@@ -140,6 +140,28 @@ def boost_stalled_positions(
         except Exception as exc:
             if isinstance(exc, QuoteUnavailableError):
                 continue
+            if "INVALID_SYMBOL" in str(exc).upper():
+                # Live incident (BA): a 2-contract OPTION position's
+                # own top-level "symbol" field came back from Webull's
+                # positions() as "2BA260925C00220000" - the quantity
+                # itself prefixed onto the real OCC symbol, a genuine
+                # broker-data artifact (single-contract positions
+                # never showed this). contract_from_position trusted
+                # it (len > 10, tries exact_option first) and Webull's
+                # quote endpoint correctly rejects the malformed
+                # string - but that rejection isn't caught internally,
+                # so it escaped here as a raw ERROR every stall cycle
+                # (~2-3 min) for as long as the position was held.
+                # Recognized broker rejection code, same downgrade-and-
+                # move-on convention as every other classified
+                # rejection this session - not a bug in this process
+                # to alarm on repeatedly.
+                log.warning(
+                    "STALL  | %s | broker returned an unresolvable "
+                    "option symbol for this position - skipping this "
+                    "cycle | %s", symbol, exc,
+                )
+                continue
             log.error("STALL  | %s | %s", symbol, exc)
     if boosted:
         self.last_account_refresh = 0.0
