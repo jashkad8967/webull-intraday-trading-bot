@@ -292,6 +292,14 @@ def stock_decision(
         key, opening_grace_active, idle_relaxation_multiplier, core_session_active
     ):
         return Decision("HOLD", "spread too wide to scalp profitably")
+    # By request (momentum-shift overview): general entry-quality
+    # filter - is this trend-following signal actually backed by real
+    # volume? See TradingStrategy.relative_volume_ok - reuses the
+    # existing volume_delta_ema/latest state already tracked for
+    # volatility_scalp_micro_exhaustion_confirmed, with a gentler bar
+    # for this general (non-reversal) entry path.
+    if not self.relative_volume_ok(symbol):
+        return Decision("HOLD", "move not backed by above-average volume")
     if trend == "SHORT" and self.config.short_selling_enabled:
         if not self.vwap_supports_entry(
             symbol, price, "SHORT", idle_relaxation_multiplier
