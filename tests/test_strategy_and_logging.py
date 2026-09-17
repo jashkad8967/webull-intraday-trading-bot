@@ -12455,6 +12455,66 @@ class StallBreakerWideSpreadResubmitTests(unittest.TestCase):
         self.assertEqual(calls, ["TBB"])
         self.assertNotIn("TBB", fake_bot.pending_stock_exits)
 
+    def test_boost_stalled_positions_downgrades_invalid_symbol_to_a_warning(self):
+        """Live incident (BA): a 2-contract OPTION position's own
+        top-level "symbol" field came back from Webull's positions()
+        as "2BA260925C00220000" - the quantity itself prefixed onto
+        the real OCC symbol. contract_from_position trusted it and the
+        quote endpoint correctly rejected the malformed string, but
+        that exception escaped uncaught as a raw ERROR every stall
+        cycle. Recognized broker rejection code, same downgrade-and-
+        move-on convention as every other classified rejection this
+        session.
+        """
+        from webull_bot.bot import AutoTrader
+
+        class FakeApi:
+            @staticmethod
+            def contract_from_position(position):
+                return {"symbol": "2BA260925C00220000"}
+
+            @staticmethod
+            def option_quote(symbol):
+                raise RuntimeError(
+                    "HTTP Status: 417, Code: INVALID_SYMBOL, Msg: "
+                    f"Invalid Symbol:[{symbol}]."
+                )
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                stall_breaker_enabled=True,
+                stall_breaker_seconds=1,
+                stall_breaker_min_profit=Decimal("0.01"),
+                sell_fee_dollars=Decimal("0.02"),
+            ),
+            api=FakeApi(),
+            stock_categories={},
+            last_trade={},
+            last_stall_boost=0.0,
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+        )
+        fake_bot.cooldown_ready = lambda key: True
+        fake_bot.has_pending_sell_order = lambda key: False
+        fake_bot._stall_equity_quotes = AutoTrader._stall_equity_quotes.__get__(fake_bot)
+        boost = AutoTrader.boost_stalled_positions.__get__(fake_bot)
+        positions = [
+            {
+                "instrument_type": "OPTION",
+                "symbol": "2BA260925C00220000",
+                "quantity": "2",
+                "cost_price": "2.20",
+            }
+        ]
+
+        with self.assertLogs("webull-bot", level="WARNING") as logs:
+            boost(positions, options_active=True, core_session_active=True)
+
+        self.assertTrue(
+            any("unresolvable option symbol" in message for message in logs.output)
+        )
+        self.assertFalse(any(r.levelname == "ERROR" for r in logs.records))
+
 
 class EntrySizingSplitTests(unittest.TestCase):
     @staticmethod
