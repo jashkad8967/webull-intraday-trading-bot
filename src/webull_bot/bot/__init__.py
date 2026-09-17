@@ -582,6 +582,15 @@ class AutoTrader:
         self.option_average_down_count: dict[str, int] = defaultdict(int)
         self.last_option_average_down: dict[str, float] = {}
         self.option_last_buy_price: dict[str, Decimal] = {}
+        # By explicit request ("how to immediately sell call and buy
+        # a put at the tip of momentum and vice versa") - stamped by
+        # _evaluate_option_exit the moment a momentum-exhaustion exit
+        # (divergence or resistance, not the flat DTE/target exit)
+        # fires, read by _evaluate_option_entry's scalp_direction
+        # check to let the opposite-type entry fire immediately
+        # instead of waiting for a fresh dip/rip signal to build.
+        # underlying -> (opposite_contract_type, time.monotonic()).
+        self.option_momentum_flip: dict[str, tuple[str, float]] = {}
         # -inf, not 0.0: time.monotonic() starts near zero at process
         # boot too, so a 0.0 default would silently throttle the very
         # first selection until VOLATILITY_SCALP_RESELECT_SECONDS

@@ -223,6 +223,27 @@ def _evaluate_option_entry(
                     underlying, underlying_price
                 ):
                     scalp_direction = "PUT"
+        # By explicit request ("how to immediately sell call and buy
+        # a put at the tip of momentum and vice versa"): the momentum
+        # vision this whole options strategy was built around -
+        # continuously trading a volatile underlying's swings, not
+        # just one entry and done. _evaluate_option_exit stamps
+        # option_momentum_flip[underlying] the moment it sells a CALL
+        # into resistance or a PUT into support (a real momentum-
+        # exhaustion signal, not the flat DTE/target exit) - that
+        # exit itself IS the confirmation the OPPOSITE side just
+        # became attractive, so the flip entry doesn't have to wait
+        # for a fresh, separate dip/rip signal to build up again.
+        # Bounded to option_momentum_flip_window_seconds so a stale
+        # flip from long ago can't linger and fire on unrelated
+        # later movement.
+        flip = self.option_momentum_flip.get(underlying)
+        if flip is not None:
+            flip_type, flipped_at = flip
+            if time.monotonic() - flipped_at <= float(
+                self.config.option_momentum_flip_window_seconds
+            ):
+                scalp_direction = flip_type
         # By request: "you can... use call and put
         # simultaneously type strategies for options as
         # well" - option_straddle_enabled (opt-in, off
@@ -476,6 +497,7 @@ def _evaluate_option_exit(
     # this only fires on a genuinely realizable gain.
     if decision.action == "HOLD" and sell_realizable_price > cost:
         fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
+        momentum_exit = False
         if sell_realizable_price - cost > fee_per_share:
             underlying = contract["underlying_symbol"]
             underlying_price = self.strategy.prices.get(underlying)
@@ -487,6 +509,7 @@ def _evaluate_option_exit(
                     "bearish RSI divergence on the underlying - locking in the gain",
                     sell_realizable_price,
                 )
+                momentum_exit = True
             # By explicit request ("as a human I can see and make
             # profit off of the swings... seeing when there is
             # resistance so just sell off the profit"): a CALL
@@ -506,6 +529,21 @@ def _evaluate_option_exit(
                         "underlying approaching resistance - locking in the gain",
                         sell_realizable_price,
                     )
+                    momentum_exit = True
+            # By explicit request ("how to immediately sell call and
+            # buy a put at the tip of momentum and vice versa"): this
+            # exit itself (divergence or resistance - a real momentum-
+            # exhaustion read, not the flat DTE/target exit) IS the
+            # confirmation the OPPOSITE side just became attractive.
+            # Stamped here, read by _evaluate_option_entry's
+            # scalp_direction check, so the flip entry doesn't have
+            # to wait for a fresh, separate dip/rip signal to build.
+            if momentum_exit:
+                option_type = contract.get("option_type")
+                self.option_momentum_flip[underlying] = (
+                    "PUT" if option_type == "CALL" else "CALL",
+                    time.monotonic(),
+                )
     # By request: "you can also use averaging down... for
     # options as well" - only when the position is neither
     # profiting nor already at its stop (decision == HOLD),
