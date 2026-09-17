@@ -33,10 +33,13 @@ from webull_bot.strategy_logic.constants import (
     OPTION_VIXY_REJECT_PERCENTILE,
     OPTION_VIXY_SYMBOL,
 )
+from webull_bot.strategy_logic.momentum.relative_volume import relative_volume_ok
 from webull_bot.strategy_logic.momentum.rsi import (
     relative_strength_index,
+    rsi_divergence,
     rsi_overbought_exit,
     rsi_supports_entry,
+    update_recent_rsi_history,
 )
 from webull_bot.strategy_logic.portfolio.position_pnl import (
     open_position_count,
@@ -187,6 +190,15 @@ class TradingStrategy:
         self.recent_tick_history: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=50)
         )
+        # Parallel to recent_tick_history, same (moment, value) shape
+        # and maxlen, but for RSI readings instead of price - see
+        # rsi_divergence's docstring for why a divergence check needs
+        # to compare the RSI value recorded AT a past price extreme,
+        # not just the single current RSI reading relative_strength_
+        # index already provides.
+        self.recent_rsi_history: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=50)
+        )
         # Per-symbol volume-delta tracking for the same confirmation
         # gate - Webull's snapshot volume is cumulative for the day, so
         # a meaningful "volume spike" has to be derived from the DELTA
@@ -257,6 +269,9 @@ class TradingStrategy:
     relative_strength_index = relative_strength_index
     rsi_supports_entry = rsi_supports_entry
     rsi_overbought_exit = rsi_overbought_exit
+    update_recent_rsi_history = update_recent_rsi_history
+    rsi_divergence = rsi_divergence
+    relative_volume_ok = relative_volume_ok
 
     priority_score = priority_score
     analyst_priority_bonus = staticmethod(analyst_priority_bonus)

@@ -88,6 +88,11 @@ def _process_stock_symbol(
             self.strategy.update_recent_tick_history(
                 symbol, price, batch_moment
             )
+            # By request (momentum-shift overview): rsi_divergence
+            # needs RSI values tied to past moments, not just the
+            # current reading - recorded right after the price sample
+            # above so both series share the same batch_moment.
+            self.strategy.update_recent_rsi_history(symbol, batch_moment)
         snapshot_volume = self.strategy.metrics.get(symbol, {}).get("volume")
         if snapshot_volume is not None:
             self.strategy.update_volume_delta(

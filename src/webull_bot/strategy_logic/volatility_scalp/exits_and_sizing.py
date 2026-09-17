@@ -1,3 +1,4 @@
+import time
 from decimal import Decimal, ROUND_DOWN
 
 from webull_bot.strategy_logic.types import Decision
@@ -132,6 +133,20 @@ def volatility_scalp_exit_override(
         if self.rsi_overbought_exit(symbol):
             return Decision(
                 "PROFIT", "RSI overbought - selling into the peak", price
+            )
+        # By request (momentum-shift overview): a bearish price/RSI
+        # divergence - price makes a new high RSI doesn't confirm - is
+        # an earlier warning than the flat overbought threshold above
+        # (the walkthrough's own reference trade is exactly this: RSI
+        # 74 isn't overbought, but it's a LOWER high than the prior
+        # 78 while price made a higher high). Only reached inside this
+        # `price >= average_cost` branch - by explicit request ("still
+        # make sure to try and make profit, not sell a loss for a
+        # profit"), this locks in an existing gain earlier, it never
+        # closes a losing position (STOP owns that on its own terms).
+        if self.rsi_divergence(symbol, price, time.monotonic()) == "BEARISH":
+            return Decision(
+                "PROFIT", "bearish RSI divergence - locking in the gain", price
             )
         min_stall_price = average_cost + (target - average_cost) * (
             self.config.volatility_scalp_momentum_stall_min_profit_fraction

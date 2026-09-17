@@ -2,6 +2,7 @@ import logging
 import time
 from decimal import Decimal
 
+from webull_bot.strategy_logic.types import Decision
 from webull_bot.trading.guards.price_sanity import (
     OPTION_PRICE_SANITY_TOLERANCE,
     option_entry_spread_ok,
@@ -432,12 +433,40 @@ def _evaluate_option_exit(
     # `price`, not this - that's a separate, already-tuned mechanism
     # and out of scope for this fix.
     sell_realizable_price = self.api.quote_bid(quote) or price
+    opened_at = self.position_opened_at.get(key)
+    seconds_since_entry = (
+        time.monotonic() - opened_at if opened_at is not None else None
+    )
     decision = self.strategy.option_decision(
         sell_realizable_price,
         quantity,
         cost,
         days_to_expiration,
+        seconds_since_entry=seconds_since_entry,
     )
+    # By request (momentum-shift overview): a bearish price/RSI
+    # divergence on the UNDERLYING (not the option premium itself,
+    # which is much noisier/leveraged) is an earlier warning than
+    # waiting for option_decision's fixed profit target. Checked
+    # against the underlying because RSI on a thinly-traded option's
+    # own tick history would be measuring noise, not a real momentum
+    # shift. Only upgrades a HOLD, and only when this position is
+    # already profitable (sell_realizable_price > cost) - by explicit
+    # request ("still make sure to try and make profit, not sell a
+    # loss for a profit"), this locks in an existing gain earlier, it
+    # never closes a losing position (LOSS/option_stop_loss_percent
+    # owns that on its own terms).
+    if decision.action == "HOLD" and sell_realizable_price > cost:
+        underlying = contract["underlying_symbol"]
+        underlying_price = self.strategy.prices.get(underlying)
+        if underlying_price is not None and self.strategy.rsi_divergence(
+            underlying, underlying_price, time.monotonic()
+        ) == "BEARISH":
+            decision = Decision(
+                "PROFIT",
+                "bearish RSI divergence on the underlying - locking in the gain",
+                sell_realizable_price,
+            )
     # By request: "you can also use averaging down... for
     # options as well" - only when the position is neither
     # profiting nor already at its stop (decision == HOLD),

@@ -492,6 +492,7 @@ def option_decision(
     quantity: int,
     average_cost: Decimal,
     days_to_expiration: int,
+    seconds_since_entry: float | None = None,
 ) -> Decision:
     """Exit-only: entries are now decided externally by
     option_direction_signal/option_entry_confirmed (bot.py calls those
@@ -517,9 +518,24 @@ def option_decision(
     target = average_cost * (
         Decimal("1") + self.config.option_take_profit_percent
     ) + fee_per_share
-    stop = average_cost * (
-        Decimal("1") - self.config.option_stop_loss_percent
-    )
+    stop_percent = self.config.option_stop_loss_percent
+    # Live incident (NKE): bought at $0.15, stop-loss fired just 6
+    # minutes later at $0.10 (a 33% realized loss on a 10% stop,
+    # slippage on a thin/fast contract) - normal short-term option
+    # premium noise right after fill, not a real reversal (NKE would
+    # have been profitable had it been held). Options are inherently
+    # MORE volatile tick-to-tick than the underlying, so a fixed
+    # percent stop with no grace period is even more exposed to this
+    # than stock_decision's adaptive_stop_percent already was before
+    # its own time_aware_stop widening was added - same mechanism,
+    # applied here for the first time.
+    if (
+        self.config.time_aware_stop_enabled
+        and seconds_since_entry is not None
+        and seconds_since_entry < self.config.time_aware_stop_widen_seconds
+    ):
+        stop_percent *= self.config.time_aware_stop_widen_multiplier
+    stop = average_cost * (Decimal("1") - stop_percent)
     if average_cost > 0 and price <= stop:
         return Decision("LOSS", "option percentage stop reached", price)
     if average_cost > 0 and price >= target:
