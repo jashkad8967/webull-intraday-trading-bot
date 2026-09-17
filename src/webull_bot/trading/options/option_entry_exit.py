@@ -163,6 +163,17 @@ def _evaluate_option_entry(
                 "underlying volatility below the option-specific floor"
             ] += 1
             return open_count, buying_power
+        # By request (momentum-shift overview): general entry-quality
+        # filter - is this candidate's move actually backed by real
+        # volume? Same TradingStrategy.relative_volume_ok used on the
+        # stock trend-entry side, checked against the underlying (the
+        # option contract itself has no comparable volume-delta
+        # tracking of its own).
+        if not self.strategy.relative_volume_ok(underlying):
+            self.option_gate_rejections[
+                "underlying move not backed by above-average volume"
+            ] += 1
+            return open_count, buying_power
         # By explicit request ("you are buying calls at daily
         # peaks... same mistakes as you did in stocks"): the stock-
         # side general strategy already refuses to chase a name still
