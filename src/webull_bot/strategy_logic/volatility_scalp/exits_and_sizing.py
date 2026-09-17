@@ -144,7 +144,16 @@ def volatility_scalp_exit_override(
         # make sure to try and make profit, not sell a loss for a
         # profit"), this locks in an existing gain earlier, it never
         # closes a losing position (STOP owns that on its own terms).
-        if self.rsi_divergence(symbol, price, time.monotonic()) == "BEARISH":
+        # Live incident (AMD, the option-side twin of this same check):
+        # a nominal price > cost isn't enough - after the flat sell
+        # fee it can still net a real loss labeled PROFIT. Requires
+        # clearing cost by more than fee_per_share, same margin
+        # stock_decision's own real profit target already builds in.
+        fee_per_share = self.config.sell_fee_dollars / quantity
+        if (
+            price - average_cost > fee_per_share
+            and self.rsi_divergence(symbol, price, time.monotonic()) == "BEARISH"
+        ):
             return Decision(
                 "PROFIT", "bearish RSI divergence - locking in the gain", price
             )

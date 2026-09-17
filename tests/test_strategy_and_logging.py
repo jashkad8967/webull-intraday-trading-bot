@@ -795,6 +795,46 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertIs(result, loss)
 
+    def test_exit_override_bearish_divergence_never_sells_a_fee_thin_gain_as_profit(self):
+        """Live incident (AMD): a nominal price > cost isn't enough to
+        safely call something PROFIT - the flat sell fee can still eat
+        the whole margin (bought and sold at the same $0.15 tick,
+        recorded as PROFIT, actually a -$0.02 realized loss). By
+        explicit request ("still make sure to try and make profit, not
+        sell a loss for a profit"): the bearish-divergence early exit
+        must require clearing cost by more than fee_per_share before
+        it's allowed to fire, not just a bare price > average_cost.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.rsi_divergence = lambda symbol, price, moment: "BEARISH"
+        from webull_bot.strategy import Decision
+
+        hold = Decision("HOLD", "position between target and stop", Decimal("20.50"))
+
+        # fee_per_share = 0.02 / 10 = 0.002 - price only 0.001 above
+        # cost, less than the fee margin, so this must NOT fire.
+        thin = strategy.volatility_scalp_exit_override(
+            hold,
+            quantity=10,
+            average_cost=Decimal("20.000"),
+            price=Decimal("20.001"),
+            symbol="AMD",
+        )
+        self.assertIs(thin, hold)
+
+        # A real margin clearing the fee DOES fire - price is below
+        # the quick target (20.10, so that path doesn't fire first)
+        # but well above cost + fee_per_share.
+        real = strategy.volatility_scalp_exit_override(
+            hold,
+            quantity=10,
+            average_cost=Decimal("20.00"),
+            price=Decimal("20.05"),
+            symbol="AMD",
+        )
+        self.assertEqual(real.action, "PROFIT")
+        self.assertEqual(real.reason, "bearish RSI divergence - locking in the gain")
+
     def test_average_down_signal_fires_once_price_clears_the_dip_threshold(self):
         strategy = TradingStrategy(self.config())
         # dip_entry_percent default 0.2% - 0.15% below cost doesn't

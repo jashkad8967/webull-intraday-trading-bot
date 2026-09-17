@@ -462,22 +462,31 @@ def _evaluate_option_exit(
     # against the underlying because RSI on a thinly-traded option's
     # own tick history would be measuring noise, not a real momentum
     # shift. Only upgrades a HOLD, and only when this position is
-    # already profitable (sell_realizable_price > cost) - by explicit
-    # request ("still make sure to try and make profit, not sell a
-    # loss for a profit"), this locks in an existing gain earlier, it
-    # never closes a losing position (LOSS/option_stop_loss_percent
-    # owns that on its own terms).
+    # already profitable AFTER the flat sell fee AND past the next
+    # valid option tick (not just nominally sell_realizable_price >
+    # cost) - by explicit request ("still make sure to try and make
+    # profit, not sell a loss for a profit"): live incident (AMD)
+    # caught exactly this gap - the raw bid sat a hair above cost
+    # (passing a naive ">"), the divergence check fired PROFIT, but
+    # the actual SELL order price gets tick-quantized DOWN to the
+    # SAME $0.05 tick as the entry, landing at cost - after the flat
+    # $0.02 fee, a real loss labeled PROFIT. Requiring the price to
+    # clear cost by at least fee_per_share (the exact margin option_
+    # decision's own real profit target already builds in) guarantees
+    # this only fires on a genuinely realizable gain.
     if decision.action == "HOLD" and sell_realizable_price > cost:
-        underlying = contract["underlying_symbol"]
-        underlying_price = self.strategy.prices.get(underlying)
-        if underlying_price is not None and self.strategy.rsi_divergence(
-            underlying, underlying_price, time.monotonic()
-        ) == "BEARISH":
-            decision = Decision(
-                "PROFIT",
-                "bearish RSI divergence on the underlying - locking in the gain",
-                sell_realizable_price,
-            )
+        fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
+        if sell_realizable_price - cost > fee_per_share:
+            underlying = contract["underlying_symbol"]
+            underlying_price = self.strategy.prices.get(underlying)
+            if underlying_price is not None and self.strategy.rsi_divergence(
+                underlying, underlying_price, time.monotonic()
+            ) == "BEARISH":
+                decision = Decision(
+                    "PROFIT",
+                    "bearish RSI divergence on the underlying - locking in the gain",
+                    sell_realizable_price,
+                )
     # By request: "you can also use averaging down... for
     # options as well" - only when the position is neither
     # profiting nor already at its stop (decision == HOLD),
