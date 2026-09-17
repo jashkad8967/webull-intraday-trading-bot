@@ -114,12 +114,23 @@ def run(self) -> None:
             buying_power = self.process_ui_commands(
                 positions, buying_power, core_session_active
             )
+            # Refreshed here (not just after trading below) so the
+            # fast thread's dashboard writes never show stale
+            # positions/buying_power during a circuit-breaker pause,
+            # when the post-trading refresh below is skipped entirely.
+            self.cached_positions = [dict(item) for item in positions]
+            self.cached_buying_power = buying_power
             circuit_active = self.handle_portfolio_circuit_breaker(
                 positions,
                 buying_power,
             )
             if not circuit_active:
                 circuit_active = self.handle_daily_loss_breaker()
+            # Read by _position_protection_loop's fast thread, which now
+            # owns writing the dashboard's status snapshot - see its
+            # docstring and the matching cached_circuit_active comment
+            # in AutoTrader.__init__.
+            self.cached_circuit_active = circuit_active
             if not circuit_active:
                 # By request: "at least you would be able to see
                 # which contracts are there for core hours later on"
@@ -172,7 +183,11 @@ def run(self) -> None:
                 self.cached_buying_power = buying_power
                 self.cached_positions = [dict(item) for item in positions]
                 self.submit_strategy_review(positions, buying_power)
-            self.write_status_snapshot(positions, buying_power, circuit_active)
+            # write_status_snapshot now runs from the fast
+            # _position_protection_loop thread instead - see its
+            # docstring - so the dashboard no longer waits on this
+            # slow cycle to reflect a fill/exit the fast thread
+            # already detected.
             if time.monotonic() - self.last_status_log >= 1:
                 self.last_status_log = time.monotonic()
                 log.info(
