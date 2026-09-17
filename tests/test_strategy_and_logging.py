@@ -14705,7 +14705,7 @@ class OptionPriceTickSizeTests(unittest.TestCase):
         self.assertEqual(price, Decimal("1.20"))
         self.assertEqual(price % Decimal("0.05"), Decimal("0"))
 
-    def test_sell_limit_price_rounds_up_to_the_nearest_nickel_above_three(self):
+    def test_sell_limit_price_rounds_down_to_the_nearest_nickel_above_three(self):
         api = WebullAPI.__new__(WebullAPI)
         api.config = SimpleNamespace(
             option_limit_offset=Decimal("0.01"),
@@ -14714,12 +14714,49 @@ class OptionPriceTickSizeTests(unittest.TestCase):
         price = api.option_limit_price(
             {"bid": "5.51", "price": "5.51"}, "SELL"
         )
-        # base (5.51) * (1 - 1% offset) = 5.4549, rounded UP to the
-        # nearest nickel = 5.50 - the offset deliberately prices a
-        # touch below base for an aggressive sell crossing, so this
-        # only checks tick alignment, not a floor at base itself.
-        self.assertEqual(price, Decimal("5.50"))
+        # base (5.51) * (1 - 1% offset) = 5.4549, rounded DOWN to the
+        # nearest nickel = 5.45 - by request ("the exit price is not
+        # competitive"): rounding UP here used to be able to push the
+        # crossing price back ABOVE the original bid (see the
+        # dedicated regression test below), defeating the whole point
+        # of an aggressive-crossing exit price.
+        self.assertEqual(price, Decimal("5.45"))
+        self.assertLess(price, Decimal("5.51"))
         self.assertEqual(price % Decimal("0.05"), Decimal("0"))
+
+    def test_sell_limit_price_never_rounds_back_above_the_bid(self):
+        """Live incident: a $0.14 bid (AMC/SNAP-style cheap contract),
+        3% below is 0.1358 - the old ROUND_UP quantization gave 0.15,
+        ABOVE the original bid, turning an urgent stop-loss into a
+        passive order that sat unfilled ("never filled (CANCELLED)"
+        repeated live on AMC/SNAP/ORCL). The quantized SELL price must
+        never exceed the bid it was crossing below.
+        """
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            option_limit_offset=Decimal("0.03"),
+            quote_price_sanity_percent=Decimal("0.08"),
+        )
+        price = api.option_limit_price({"bid": "0.14", "price": "0.14"}, "SELL")
+        self.assertLessEqual(price, Decimal("0.14"))
+        self.assertEqual(price, Decimal("0.10"))
+
+    def test_buy_limit_price_rounds_to_the_nearest_nickel_not_always_down(self):
+        """Live incident: bid=0.10/ask=0.15, a normal 33%-wide but
+        genuinely liquid spread on a cheap contract - the true
+        midpoint is 0.125. Always rounding DOWN collapsed this to
+        0.10, i.e. the raw bid itself, not a real midpoint - by
+        request ("the entry price is... not competitive"). Nearest-
+        tick rounding keeps it representative of the actual midpoint.
+        """
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            option_limit_offset=Decimal("0.03"),
+            quote_price_sanity_percent=Decimal("0.08"),
+        )
+        price = api.option_limit_price({"bid": "0.10", "ask": "0.15"}, "BUY")
+        self.assertEqual(price, Decimal("0.15"))
+        self.assertGreater(price, Decimal("0.10"))
 
 
 class DiscoverOptionContractsCandidatePoolTests(unittest.TestCase):
