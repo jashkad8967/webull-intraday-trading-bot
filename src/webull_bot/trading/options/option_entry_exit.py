@@ -487,6 +487,25 @@ def _evaluate_option_exit(
                     "bearish RSI divergence on the underlying - locking in the gain",
                     sell_realizable_price,
                 )
+            # By explicit request ("as a human I can see and make
+            # profit off of the swings... seeing when there is
+            # resistance so just sell off the profit"): a CALL
+            # behaves like a BUY (resistance at today's high), a PUT
+            # like a SHORT (resistance at today's low) - same
+            # direction-mapping convention as entry_extension_ok's
+            # own use of this same underlying price data.
+            if decision.action == "HOLD" and underlying_price is not None:
+                option_type = contract.get("option_type")
+                if self.strategy.approaching_resistance(
+                    underlying,
+                    underlying_price,
+                    "SHORT" if option_type == "PUT" else "BUY",
+                ):
+                    decision = Decision(
+                        "PROFIT",
+                        "underlying approaching resistance - locking in the gain",
+                        sell_realizable_price,
+                    )
     # By request: "you can also use averaging down... for
     # options as well" - only when the position is neither
     # profiting nor already at its stop (decision == HOLD),

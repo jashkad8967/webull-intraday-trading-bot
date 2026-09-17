@@ -479,6 +479,37 @@ def entry_extension_ok(
     return price <= reference_decimal * (Decimal("1") - extension_percent)
 
 
+def approaching_resistance(
+    self, symbol: str, price: Decimal, direction: str = "BUY"
+) -> bool:
+    """By explicit request ("as a human I can see... when there is
+    resistance so just sell off the profit"): the mirror of entry_
+    extension_ok's SAME today's-high/low reference data, but for
+    exits - true once a profitable long is within resistance_exit_
+    band_percent of today's high (or a short is within it of today's
+    low), the natural level where a fast move is statistically likely
+    to stall or reverse, same read a discretionary trader watching the
+    chart would make. False (never blocks) with no high/low tracked
+    yet, same "no data -> don't block" convention as every other gate
+    here.
+    """
+    reference = self.metrics.get(symbol, {}).get(
+        "low" if direction == "SHORT" else "high"
+    )
+    if not reference:
+        return False
+    try:
+        reference_decimal = Decimal(str(reference))
+    except Exception:
+        return False
+    if reference_decimal <= 0:
+        return False
+    band = self.config.resistance_exit_band_percent
+    if direction == "SHORT":
+        return price <= reference_decimal * (Decimal("1") + band)
+    return price >= reference_decimal * (Decimal("1") - band)
+
+
 def research_supports_entry(assessment: dict | None) -> bool:
     if not assessment:
         return False

@@ -70,6 +70,7 @@ class StrategyConfigMixin:
             stock_price_sanity_percent=Decimal("0.15"),
             stock_entry_max_spread_percent=Decimal("0.15"),
             stock_entry_max_extension_percent=Decimal("0.01"),
+            resistance_exit_band_percent=Decimal("0.01"),
             entry_extension_jump_momentum_percent=Decimal("0.03"),
             stock_core_session_position_fraction=Decimal("0.10"),
             sma_trend_filter_enabled=False,
@@ -834,6 +835,48 @@ class VolatilityScalpTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertEqual(real.action, "PROFIT")
         self.assertEqual(real.reason, "bearish RSI divergence - locking in the gain")
+
+    def test_exit_override_sells_into_resistance_at_todays_high(self):
+        """By explicit request ("as a human I can see and make profit
+        off of the swings... seeing when there is resistance so just
+        sell off the profit"): a profitable position within
+        resistance_exit_band_percent of today's high should lock in
+        the gain there, rather than waiting for the flat quick-target
+        percentage to be hit exactly.
+        """
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["AMD"] = {"high": "20.10"}
+        from webull_bot.strategy import Decision
+
+        hold = Decision("HOLD", "position between target and stop", Decimal("20.50"))
+
+        # Within the default 1% band of today's high (20.10) and
+        # clears the fee margin - should fire.
+        result = strategy.volatility_scalp_exit_override(
+            hold,
+            quantity=10,
+            average_cost=Decimal("20.00"),
+            price=Decimal("20.05"),
+            symbol="AMD",
+        )
+        self.assertEqual(result.action, "PROFIT")
+        self.assertEqual(result.reason, "selling into resistance at today's high")
+
+    def test_exit_override_does_not_sell_into_resistance_far_below_the_high(self):
+        strategy = TradingStrategy(self.config())
+        strategy.metrics["AMD"] = {"high": "25.00"}
+        from webull_bot.strategy import Decision
+
+        hold = Decision("HOLD", "position between target and stop", Decimal("20.50"))
+
+        result = strategy.volatility_scalp_exit_override(
+            hold,
+            quantity=10,
+            average_cost=Decimal("20.00"),
+            price=Decimal("20.05"),
+            symbol="AMD",
+        )
+        self.assertIs(result, hold)
 
     def test_average_down_signal_fires_once_price_clears_the_dip_threshold(self):
         strategy = TradingStrategy(self.config())

@@ -192,6 +192,18 @@ class StockExitSettings(BaseSettings):
         ge=0,
         le=Decimal("0.20"),
     )
+    # By explicit request ("as a human I can see and make profit off
+    # of the swings... seeing when there is resistance so just sell
+    # off the profit"): the exit-side mirror of entry_extension_ok's
+    # same today's-high/low reference - see TradingStrategy.
+    # approaching_resistance. Once a profitable position sits within
+    # this band of today's high (long) or low (short), that's a
+    # natural level for a fast move to stall/reverse, so it's taken
+    # as an early profit-take trigger rather than waiting for the
+    # flat percentage target to be hit exactly.
+    resistance_exit_band_percent: Decimal = Field(
+        default=Decimal("0.01"), ge=0, le=Decimal("0.20")
+    )
     # By request: "days high only matters when it is a straight jump
     # pattern, once it stabilizes it is fine." entry_extension_ok used
     # to unconditionally require price sit stock_entry_max_extension_
