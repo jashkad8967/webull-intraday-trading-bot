@@ -4889,6 +4889,200 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
         self.assertEqual(cancelled, [])
         self.assertEqual(placed, [])
 
+    def test_reprice_also_actively_chases_a_resting_stop_order(self):
+        """By explicit request ("profit is only realized when the
+        order goes through, not just getting cancelled... same with
+        exit"): a resting STOP now gets actively re-quoted too, not
+        just PROFIT - tracking option_limit_price's aggressive bid-
+        crossing formula (never the ask, unlike PROFIT) so it stays a
+        loss-capping exit that keeps up with a moving market instead
+        of sitting stale for up to 120s between attempts.
+        """
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        contract = {
+            "symbol": "XYZ260101C00100000",
+            "underlying_symbol": "XYZ",
+            "strike_price": "100",
+            "expiration_date": "2026-01-01",
+            "option_type": "CALL",
+        }
+        quote = {
+            "symbol": "XYZ260101C00100000",
+            "bid": "1.00",
+            "ask": "1.10",
+            "price": "1.00",
+        }
+
+        class FakeApi:
+            @staticmethod
+            def option_quotes(symbols):
+                return [quote]
+
+            @staticmethod
+            def option_limit_price(q, side):
+                # Mirrors the real aggressive-crossing formula: 3%
+                # below bid, quantized DOWN to the nearest nickel.
+                return Decimal("0.95")
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def option_position(contract, positions):
+                for item in positions:
+                    if item.get("symbol") == contract["symbol"]:
+                        return (
+                            Decimal(str(item.get("quantity", "0"))),
+                            Decimal(str(item.get("cost_price", "0"))),
+                        )
+                return Decimal("0"), Decimal("0")
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_option(contract, side, quantity, limit_price, position_intent):
+                placed.append((contract["symbol"], side, quantity, limit_price))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"), price_sanity_cooldown_seconds=60
+            ),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_option_reprice=0.0,
+            option_contracts=[contract],
+            manual_touch_at={},
+            price_sanity_rejected_at={},
+            is_order_not_cancelable=lambda exc: False,
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "OPTION:XYZ260101C00100000",
+                    "action": "STOP",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("1.05"),
+                }
+            },
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
+        reprice = AutoTrader.reprice_resting_option_exits.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "OPTION",
+                "symbol": "XYZ260101C00100000",
+                "quantity": "1",
+                "cost_price": "1.50",
+            }
+        ]
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(positions)
+
+        self.assertEqual(cancelled, ["order-1"])
+        self.assertEqual(
+            placed[0], ("XYZ260101C00100000", "SELL", 1, Decimal("0.95"))
+        )
+        self.assertEqual(
+            fake_bot.working_orders["order-2"]["action"], "STOP"
+        )
+
+    def test_reprice_skips_a_broker_conflict_flagged_symbol(self):
+        """Live incident precedent (PETZ, stock side): every other
+        repricer already skips a broker-conflict-flagged symbol -
+        these two option repricers never did.
+        """
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        contract = {
+            "symbol": "XYZ260101C00100000",
+            "underlying_symbol": "XYZ",
+            "strike_price": "100",
+            "expiration_date": "2026-01-01",
+            "option_type": "CALL",
+        }
+        quote = {
+            "symbol": "XYZ260101C00100000",
+            "bid": "1.90",
+            "ask": "2.00",
+            "price": "1.95",
+        }
+
+        class FakeApi:
+            @staticmethod
+            def option_quotes(symbols):
+                return [quote]
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def option_position(contract, positions):
+                return Decimal("1"), Decimal("1.50")
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_option(contract, side, quantity, limit_price, position_intent):
+                placed.append((contract["symbol"], side, quantity, limit_price))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"), price_sanity_cooldown_seconds=60
+            ),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_option_reprice=0.0,
+            option_contracts=[contract],
+            manual_touch_at={},
+            price_sanity_rejected_at={},
+            is_order_not_cancelable=lambda exc: False,
+            broker_conflict_symbols={"XYZ260101C00100000"},
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "OPTION:XYZ260101C00100000",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("1.80"),
+                }
+            },
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
+        reprice = AutoTrader.reprice_resting_option_exits.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "OPTION",
+                "symbol": "XYZ260101C00100000",
+                "quantity": "1",
+                "cost_price": "1.50",
+            }
+        ]
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(positions)
+
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
+
 
 class PrepareOptionScanBatchHeldPositionTests(unittest.TestCase):
     """By request: "why is UBER not averaging down." Live incident: a
@@ -5456,6 +5650,85 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
             reprice()
         self.assertEqual(placed, [])
         self.assertEqual(cancelled, [])
+
+    def test_reprice_skips_a_broker_conflict_flagged_symbol(self):
+        """Live incident precedent (PETZ, stock side): every other
+        repricer already skips a broker-conflict-flagged symbol -
+        these two option repricers never did.
+        """
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        contract = {
+            "symbol": "XYZ260101C00100000",
+            "underlying_symbol": "XYZ",
+            "strike_price": "100",
+            "expiration_date": "2026-01-01",
+            "option_type": "CALL",
+        }
+        quote = {
+            "symbol": "XYZ260101C00100000",
+            "bid": "1.90",
+            "ask": "2.00",
+            "price": "1.95",
+        }
+
+        class FakeApi:
+            @staticmethod
+            def option_quotes(symbols):
+                return [quote]
+
+            @staticmethod
+            def option_limit_price(q, side):
+                return (Decimal(str(q["bid"])) + Decimal(str(q["ask"]))) / 2
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_option(contract, side, quantity, limit_price, position_intent):
+                placed.append((contract["symbol"], side, quantity, limit_price))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                price_sanity_cooldown_seconds=60
+            ),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_option_entry_reprice=0.0,
+            option_contracts=[contract],
+            manual_touch_at={},
+            price_sanity_rejected_at={},
+            is_order_not_cancelable=lambda exc: False,
+            broker_conflict_symbols={"XYZ260101C00100000"},
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "OPTION:XYZ260101C00100000",
+                    "action": "BUY",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("1.80"),
+                    "quantity": 1,
+                }
+            },
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
+        reprice = AutoTrader.reprice_resting_option_entries.__get__(fake_bot)
+
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice()
+
+        self.assertEqual(cancelled, [])
+        self.assertEqual(placed, [])
 
 
 class VolatilityScalpRepriceTests(unittest.TestCase):
