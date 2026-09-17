@@ -3,6 +3,7 @@ import time
 from decimal import ROUND_UP, Decimal
 
 from webull_bot.trading.guards.price_sanity import OPTION_PRICE_SANITY_TOLERANCE
+from webull_bot.trading.handlers.broker_conflict_check import _broker_conflict
 from webull_bot.trading.orders.locks import _rekey_working_order, _working_orders_lock
 from webull_bot.trading.orders.manual_touch import _manual_touch_active
 from webull_bot.trading.orders.rate_limit_retry import _retry_once_on_rate_limit
@@ -70,6 +71,11 @@ def reprice_resting_option_entries(self) -> None:
             continue
         symbol = key.split(":", 1)[1]
         if _manual_touch_active(self, symbol):
+            continue
+        # Live incident precedent (PETZ, stock side): every other
+        # repricer already skips a broker-conflict-flagged symbol;
+        # these two option repricers never did.
+        if _broker_conflict(self, symbol):
             continue
         quantity = order.get("quantity")
         if not quantity or quantity <= 0:

@@ -3,9 +3,11 @@ import time
 from decimal import Decimal
 
 from webull_bot.trading.guards.price_sanity import OPTION_PRICE_SANITY_TOLERANCE
+from webull_bot.trading.handlers.broker_conflict_check import _broker_conflict
 from webull_bot.trading.orders.locks import _rekey_working_order, _working_orders_lock
 from webull_bot.trading.orders.manual_touch import _manual_touch_active
 from webull_bot.trading.orders.rate_limit_retry import _retry_once_on_rate_limit
+from webull_bot.webull_api import QuoteUnavailableError
 
 log = logging.getLogger("webull-bot")
 
@@ -21,9 +23,20 @@ def reprice_resting_option_exits(
     track the ask, same "keep modifying to stay in the spread until
     sold" behavior the stock side already had.
 
-    PROFIT only, deliberately - not STOP, same reasoning as the stock
-    repricer: a stop needs to fill fast to cap a loss, and chasing an
-    ask upward on a falling option would only delay that fill.
+    Also actively re-quotes resting STOP orders now - by explicit
+    request ("profit is only realized when the order goes through,
+    not just getting cancelled... same with exit"): the original
+    "PROFIT only" scoping here assumed a stop just needs to fill fast
+    once, so continuously repricing it would only delay that. Live
+    evidence didn't bear that out - AMC/SNAP/ORCL stop-loss orders sat
+    unfilled for full 120s cycles, repeatedly, on thin contracts whose
+    bid kept drifting away from the order's now-stale crossing price
+    in the meantime. A STOP's target here still ONLY tracks
+    option_limit_price's aggressive bid-crossing formula (never chases
+    upward toward the ask the way PROFIT does), so it stays a
+    loss-capping exit, not a profit-maximizing one - it just stays
+    live against a moving market instead of going stale for up to two
+    full minutes between attempts.
     """
     now = time.monotonic()
     if now - self.last_option_reprice < float(
@@ -37,12 +50,21 @@ def reprice_resting_option_exits(
     for order_id, order in snapshot:
         action = order.get("action")
         key = str(order.get("key") or "")
-        if action != "PROFIT" or not key.startswith("OPTION:"):
+        if action not in ("PROFIT", "STOP") or not key.startswith("OPTION:"):
             continue
         if order.get("cancel_requested_at") is not None:
             continue
         symbol = key.split(":", 1)[1]
         if _manual_touch_active(self, symbol):
+            continue
+        # Live incident precedent (PETZ, stock side): a broker-conflict
+        # symbol's own view of its position doesn't match the account,
+        # and every OTHER repricer (stock entries/exits, scalp
+        # entries/exits, stop-loss escalation) already skips it while
+        # flagged - these two option repricers never did.
+        # handle_broker_conflict is called with the full OCC contract
+        # symbol for options (see bot.py), matching `symbol` here.
+        if _broker_conflict(self, symbol):
             continue
         candidates.append((order_id, symbol, order))
     if not candidates:
@@ -73,17 +95,30 @@ def reprice_resting_option_exits(
             quote = quote_by_symbol.get(symbol)
             if quote is None:
                 continue
-            ask = self.api.quote_ask(quote)
-            if ask is None or ask == order.get("limit_price"):
-                continue
             contract = contract_by_symbol[symbol]
             quantity, cost = self.api.option_position(contract, positions)
             if quantity <= 0:
                 continue
-            if cost > 0 and ask < cost:
-                # Never chase the ask down below entry cost - see the
-                # matching stock-side guard in reprice_resting_exits.
-                continue
+            if action == "PROFIT":
+                target = self.api.quote_ask(quote)
+                if target is None or target == order.get("limit_price"):
+                    continue
+                if cost > 0 and target < cost:
+                    # Never chase the ask down below entry cost - see
+                    # the matching stock-side guard in
+                    # reprice_resting_exits.
+                    continue
+            else:
+                # STOP: track the same aggressive bid-crossing formula
+                # the initial exit used, not the ask - a stop stays a
+                # loss-capping exit, never chasing upward toward
+                # profit-taking territory the way PROFIT's target does.
+                try:
+                    target = self.api.option_limit_price(quote, "SELL")
+                except QuoteUnavailableError:
+                    continue
+                if target is None or target == order.get("limit_price"):
+                    continue
             if not self.price_sanity_cooldown_ready(symbol):
                 # Live incident (NVDA/BMEA-style): without this, a
                 # symbol whose ask sits durably past the sanity
@@ -96,7 +131,7 @@ def reprice_resting_option_exits(
                 # already does.
                 continue
             if not self.price_sanity_ok(
-                symbol, self.api.quote_price(quote), ask,
+                symbol, self.api.quote_price(quote), target,
                 tolerance=OPTION_PRICE_SANITY_TOLERANCE,
             ):
                 continue
@@ -106,7 +141,7 @@ def reprice_resting_option_exits(
                 contract,
                 "SELL",
                 int(quantity),
-                ask,
+                target,
                 "SELL_TO_CLOSE",
             )
             _rekey_working_order(
@@ -118,15 +153,17 @@ def reprice_resting_option_exits(
                     "key": key,
                     "action": action,
                     "cancel_requested_at": None,
-                    "limit_price": ask,
+                    "limit_price": target,
                     "pnl": order.get("pnl"),
                     "quantity": quantity,
                 },
             )
             self.status.rekey_trade(order_id, new_order_id)
             log.info(
-                "REPRICE| %-8s | %-6s | ask=%s | id=%s",
-                symbol, action, ask, new_order_id,
+                "REPRICE| %-8s | %-6s | %s=%s | id=%s",
+                symbol, action,
+                "ask" if action == "PROFIT" else "bid-cross",
+                target, new_order_id,
             )
         except Exception as exc:
             if self.is_order_not_cancelable(exc):
