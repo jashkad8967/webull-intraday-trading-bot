@@ -82,6 +82,18 @@ class OptionTradingSettings(BaseSettings):
     # affordability gets a vote (see select_atm_options) - a contract
     # this cheap is excluded outright, never merely deprioritized.
     option_min_premium_dollars: Decimal = Field(default=Decimal("0.50"), gt=0)
+    # By explicit request ("how to immediately sell call and buy a
+    # put at the tip of momentum and vice versa") - the original
+    # options vision this whole strategy was built around: "take a
+    # volatile, volume stock and keep buying calls on the rise,
+    # selling calls, buying puts as the dip starts, sell puts, buy
+    # calls as the dip ends... for multiple stocks simultaneously."
+    # How long a momentum-exhaustion exit's flip signal (see
+    # option_momentum_flip) stays valid before it's considered stale
+    # and ignored - long enough to let the entry evaluation catch up
+    # within the same or next scan cycle, short enough that it never
+    # fires on unrelated later movement.
+    option_momentum_flip_window_seconds: int = Field(default=180, ge=10, le=1800)
     # By request: "you can also use averaging down... for options as
     # well" - options analog of the volatility-scalp averaging-down
     # knobs, but wider, since options routinely move a much larger
