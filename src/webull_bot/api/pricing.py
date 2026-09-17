@@ -1,4 +1,4 @@
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 
 from webull_bot.api.errors import QuoteUnavailableError
 
@@ -133,6 +133,32 @@ def _quantize_to_option_tick(
 
 
 def option_limit_price(self, quote: dict, side: str) -> Decimal:
+    """By explicit request ("the options entry price is always
+    outside spread or not competitive leading to so many cancels and
+    missouts... same with exit") - two real rounding-direction bugs,
+    both caused by the fixed $0.05 option tick (option_price_tick_
+    size) swallowing a sub-tick price adjustment on the cheap
+    contracts ($0.10-0.30) this account mostly trades:
+
+    BUY used to always ROUND_DOWN the midpoint to the nearest tick.
+    On a bid=0.10/ask=0.15 contract the true mid is 0.125 - rounding
+    DOWN collapses that all the way to 0.10, i.e. the raw BID, not a
+    genuine midpoint. Nearest-tick rounding (ROUND_HALF_UP) keeps the
+    computed price the closest real tick to the true midpoint instead
+    of a price permanently biased toward the passive/bid side.
+
+    The SELL/urgent-exit branch (a stop-loss or profit-take crossing
+    below the bid to guarantee a fast fill) used to ROUND_UP after
+    applying option_limit_offset (3%). On a $0.14 bid, 3% below is
+    0.1358 - rounding UP to the next $0.05 tick gives 0.15, which is
+    ABOVE the original bid, not below it. The "aggressive crossing"
+    price ended up less competitive than the bid itself, silently
+    turning an urgent stop-loss into a passive order that just sits
+    unfilled - exactly the repeated "never filled (CANCELLED)"
+    pattern seen live on AMC/SNAP/ORCL. ROUND_DOWN keeps the
+    quantized price at or below the intended crossing price, so it
+    stays genuinely marketable.
+    """
     offset = self.config.option_limit_offset
     if side == "BUY":
         bid = self._sane_bid_or_ask(quote, "bid")
@@ -143,7 +169,7 @@ def option_limit_price(self, quote: dict, side: str) -> Decimal:
             )
         price = (bid + ask) / 2
         return self._quantize_to_option_tick(
-            max(Decimal("0.01"), price), ROUND_DOWN
+            max(Decimal("0.01"), price), ROUND_HALF_UP
         )
     else:
         base = (
@@ -153,5 +179,5 @@ def option_limit_price(self, quote: dict, side: str) -> Decimal:
         )
         price = base * (Decimal("1") - offset)
     return self._quantize_to_option_tick(
-        max(Decimal("0.01"), price), ROUND_UP
+        max(Decimal("0.01"), price), ROUND_DOWN
     )
