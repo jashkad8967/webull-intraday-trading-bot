@@ -15243,6 +15243,31 @@ class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):
         self.assertEqual(calls, [["AAPL"]])
 
 
+class ProfitTargetTickQuantizationTests(unittest.TestCase):
+    """Live incident (NKE, recurring even after the AMD fee-margin
+    fix): _evaluate_option_exit's PROFIT branch used to quantize
+    decision.target_price to the CENT (.quantize(Decimal("0.01"))),
+    not the real $0.05 option tick - a 2% target on a $0.18 cost
+    (0.18 * 1.02 = 0.1836) rounds to $0.18 at 2 decimal places, the
+    SAME price as cost, so the order filled at cost exactly (0.18 ->
+    0.18, three times, each a real -$0.02 loss labeled PROFIT).
+    ROUND_UP to the real tick guarantees the placed price is never
+    quantized back down below the intended target.
+    """
+
+    def test_a_small_profit_target_never_collapses_to_the_entry_price(self):
+        from webull_bot.webull_api import WebullAPI
+        from decimal import ROUND_UP
+
+        api = WebullAPI.__new__(WebullAPI)
+        # NKE's exact numbers: cost 0.18, a 2% target (0.1836) used to
+        # collapse right back to 0.18 under cent-rounding.
+        target = api._quantize_to_option_tick(Decimal("0.1836"), ROUND_UP)
+        self.assertGreater(target, Decimal("0.18"))
+        self.assertEqual(target, Decimal("0.20"))
+        self.assertEqual(target % Decimal("0.05"), Decimal("0"))
+
+
 class OptionPriceTickSizeTests(unittest.TestCase):
     """WebullAPI.option_price_tick_size / option_limit_price - live
     incident: a real order attempt at $7.47 (AAPL, premium >= $3) was
