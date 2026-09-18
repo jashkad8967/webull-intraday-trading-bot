@@ -10570,6 +10570,59 @@ class WriteStatusSnapshotBalanceGuardTests(unittest.TestCase):
         self.assertEqual(len(status.balance_history), 1)
         self.assertEqual(status.balance_history[-1]["balance"], "0")
 
+    def test_option_positions_count_their_full_100x_contract_value(self):
+        """Live incident, found by reconciling the balance chart
+        against the broker: the account showed a ~$75 "loss" over a
+        morning it was actually flat. total_equity multiplied
+        quantity * last_price for every row, so a $0.475 OPTION
+        contract counted as 48 CENTS instead of $47.50 - buying an
+        option moved real cash out of buying_power but added only
+        1/100th of the position value back, making every option entry
+        look like an instant ~99% loss on the chart.
+        """
+        write, status = self._fake_bot(raw_buying_power=Decimal("293.85"))
+        positions = [
+            {
+                "instrument_type": "OPTION",
+                "symbol": "QQQ260930P00655000",
+                "quantity": "1",
+                "cost_price": "0.51",
+                "last_price": "0.475",
+            },
+            {
+                "instrument_type": "OPTION",
+                "symbol": "SPY260930P00700000",
+                "quantity": "1",
+                "cost_price": "0.30",
+                "last_price": "0.275",
+            },
+        ]
+
+        write(positions=positions, buying_power=Decimal("293.85"), paused=False)
+
+        # 0.475*100 + 0.275*100 = 75.00 of real contract value, not 0.75
+        self.assertEqual(
+            Decimal(status.balance_history[-1]["balance"]), Decimal("368.85")
+        )
+
+    def test_a_stock_position_is_not_multiplied(self):
+        write, status = self._fake_bot(raw_buying_power=Decimal("100"))
+        positions = [
+            {
+                "instrument_type": "EQUITY",
+                "symbol": "TNMG",
+                "quantity": "10",
+                "cost_price": "3.97",
+                "last_price": "4.00",
+            }
+        ]
+
+        write(positions=positions, buying_power=Decimal("100"), paused=False)
+
+        self.assertEqual(
+            Decimal(status.balance_history[-1]["balance"]), Decimal("140.00")
+        )
+
     def test_records_a_normal_nonzero_balance_as_usual(self):
         write, status = self._fake_bot(
             raw_buying_power=Decimal("400"), prior_balance=Decimal("363.96")
