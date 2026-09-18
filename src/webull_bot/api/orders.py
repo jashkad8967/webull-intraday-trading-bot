@@ -76,6 +76,56 @@ def order_status(detail: dict) -> str | None:
     return None
 
 
+def order_filled_price(detail: dict) -> Decimal | None:
+    """Best-effort AVERAGE FILL price of a fetched order - what the
+    trade actually executed at, as opposed to the limit price it was
+    submitted with.
+
+    By explicit request, after a live incident: FIGR was recorded as a
+    +$0.05 PROFIT because record_realized_exit prices an exit from the
+    submitted limit (35.81) at submission time, but the position was
+    FRACTIONAL (1.2067 shares) and Webull routes fractional orders as
+    MARKET orders - it actually filled at 35.71, a real loss. "Your
+    number calculations are wrong, make sure you are getting the
+    correct numbers from the openapi endpoints" - this reads the real
+    executed price back from the broker so the estimate can be
+    corrected against it.
+
+    Same defensive shape-handling as order_status: the useful fields
+    live one level down inside the "orders" list (alongside the
+    already-confirmed "status"/"filled_quantity"), with flat top-level
+    keys kept as a fallback. Returns None on any unrecognized/missing/
+    unparseable shape - callers must leave the existing estimate
+    alone rather than correcting it toward a guess.
+    """
+    fields = (
+        "avg_filled_price",
+        "avgFilledPrice",
+        "average_filled_price",
+        "filled_price",
+        "filledPrice",
+        "avg_fill_price",
+        "avgFillPrice",
+    )
+    candidates = []
+    orders = detail.get("orders") or []
+    if orders and isinstance(orders[0], dict):
+        candidates.append(orders[0])
+    candidates.append(detail)
+    for source in candidates:
+        for field in fields:
+            value = source.get(field)
+            if value in (None, ""):
+                continue
+            try:
+                price = Decimal(str(value))
+            except (ArithmeticError, ValueError, TypeError):
+                continue
+            if price > 0:
+                return price
+    return None
+
+
 def cancel_all_orders(self) -> list[str]:
     unique = self.open_order_ids(self.open_orders())
     for order_id in unique:

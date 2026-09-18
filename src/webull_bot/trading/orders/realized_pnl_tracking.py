@@ -23,6 +23,40 @@ def record_realized_exit(
     return pnl
 
 
+def correct_realized_exit(
+    self, order_id: str, estimated_pnl: Decimal | None, delta: Decimal
+) -> None:
+    """Re-price an already-recorded exit against its REAL fill.
+
+    record_realized_exit books an exit's pnl at SUBMISSION time from
+    the limit price, because that's all that's known then. For a
+    limit order that's usually exact, but Webull routes FRACTIONAL
+    stock orders as MARKET orders - live incident (FIGR, by explicit
+    request): submitted at 35.81 on 1.2067 shares, actually filled at
+    35.71, so a recorded +$0.05 "PROFIT" was really a loss. delta is
+    (actual_fill - estimated_price) * quantity * multiplier, i.e. the
+    exact amount the original estimate was off by, so this just shifts
+    the running totals and the displayed trade by it rather than
+    recomputing a cost basis this layer doesn't have.
+    """
+    if not delta:
+        return
+    previous = estimated_pnl or Decimal("0")
+    corrected = previous + delta
+    self.daily_realized_pnl += delta
+    # daily_realized_loss only tracks the LOSING side, so it has to be
+    # rebuilt from the before/after signs rather than shifted by delta
+    # (a trade crossing zero changes it by a different amount).
+    if previous < 0:
+        self.daily_realized_loss = max(
+            Decimal("0"), self.daily_realized_loss - (-previous)
+        )
+    if corrected < 0:
+        self.daily_realized_loss += -corrected
+    self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
+    self.status.amend_trade_pnl(order_id, corrected)
+
+
 def reverse_phantom_exit(
     self, pnl: Decimal | None, order_id: str | None = None
 ) -> None:

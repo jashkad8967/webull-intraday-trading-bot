@@ -130,6 +130,7 @@ from webull_bot.trading.orders.rate_limit_retry import (
     _retry_once_on_rate_limit,
 )
 from webull_bot.trading.orders.realized_pnl_tracking import (
+    correct_realized_exit,
     record_realized_exit,
     reverse_phantom_exit,
 )
@@ -358,6 +359,7 @@ class AutoTrader:
     obi_score_for = obi_score_for
     refresh_agent_discoveries = refresh_agent_discoveries
     record_realized_exit = record_realized_exit
+    correct_realized_exit = correct_realized_exit
     reverse_phantom_exit = reverse_phantom_exit
     price_sanity_ok = price_sanity_ok
     price_sanity_cooldown_ready = price_sanity_cooldown_ready

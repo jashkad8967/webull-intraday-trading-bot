@@ -13686,6 +13686,12 @@ class PhantomExitReversalTests(unittest.TestCase):
             def open_order_ids(groups):
                 return []
 
+            def order_filled_price(self, detail):
+                # These fixtures exercise fill/cancel status only -
+                # None means "no fill price known", so the
+                # correction path fails open and leaves pnl alone.
+                return None
+
             def order_detail(self, order_id):
                 return {"status": "CANCELLED"}
 
@@ -13746,6 +13752,12 @@ class PhantomExitReversalTests(unittest.TestCase):
             def open_order_ids(groups):
                 return []
 
+            def order_filled_price(self, detail):
+                # These fixtures exercise fill/cancel status only -
+                # None means "no fill price known", so the
+                # correction path fails open and leaves pnl alone.
+                return None
+
             def order_detail(self, order_id):
                 return {"status": "FILLED"}
 
@@ -13797,6 +13809,12 @@ class PhantomExitReversalTests(unittest.TestCase):
             @staticmethod
             def open_order_ids(groups):
                 return []
+
+            def order_filled_price(self, detail):
+                # These fixtures exercise fill/cancel status only -
+                # None means "no fill price known", so the
+                # correction path fails open and leaves pnl alone.
+                return None
 
             def order_detail(self, order_id):
                 return {}
@@ -13905,6 +13923,12 @@ class ManualOrderDiscoveryTests(unittest.TestCase):
             @staticmethod
             def open_order_ids(groups):
                 return open_order_ids
+
+            def order_filled_price(self, detail):
+                # These fixtures exercise fill/cancel status only -
+                # None means "no fill price known", so the
+                # correction path fails open and leaves pnl alone.
+                return None
 
             def order_detail(self, order_id):
                 if raise_on_detail:
@@ -15376,6 +15400,104 @@ class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):
         )
         refresh(["AAPL"])
         self.assertEqual(calls, [["AAPL"]])
+
+
+class ActualFillPriceCorrectionTests(unittest.TestCase):
+    """Live incident (FIGR, by explicit request: "figr was sold at
+    35.71 not 35.81 leading to a loss not a profit, so your number
+    calculations are wrong, make sure you are getting the correct
+    numbers from the openapi endpoints").
+
+    record_realized_exit prices an exit at SUBMISSION time from the
+    submitted limit, because that's all that's known then. That's
+    exact for a limit fill - but Webull routes FRACTIONAL stock
+    orders as MARKET orders, so FIGR (1.2067 shares, submitted 35.81)
+    actually filled at 35.71 and a recorded +$0.05 PROFIT was really
+    a loss. The fill-confirmation path already fetches order_detail,
+    so the real executed price is read back from it and the estimate
+    corrected.
+    """
+
+    def test_reads_the_real_fill_price_from_webulls_nested_shape(self):
+        from webull_bot.webull_api import WebullAPI
+
+        detail = {
+            "client_order_id": "d26f4040",
+            "orders": [
+                {
+                    "status": "FILLED",
+                    "filled_quantity": "1.2067",
+                    "avg_filled_price": "35.71",
+                }
+            ],
+        }
+        self.assertEqual(
+            WebullAPI.order_filled_price(detail), Decimal("35.71")
+        )
+
+    def test_returns_none_on_an_unrecognized_shape_so_callers_fail_open(self):
+        from webull_bot.webull_api import WebullAPI
+
+        self.assertIsNone(WebullAPI.order_filled_price({}))
+        self.assertIsNone(
+            WebullAPI.order_filled_price({"orders": [{"status": "FILLED"}]})
+        )
+        # Unparseable / non-positive values must not be trusted either.
+        self.assertIsNone(
+            WebullAPI.order_filled_price(
+                {"orders": [{"avg_filled_price": "not-a-number"}]}
+            )
+        )
+        self.assertIsNone(
+            WebullAPI.order_filled_price({"orders": [{"avg_filled_price": "0"}]})
+        )
+
+    def test_figr_profit_is_corrected_into_the_real_loss(self):
+        from webull_bot.bot import AutoTrader
+
+        amended = {}
+        fake_bot = SimpleNamespace(
+            daily_realized_pnl=Decimal("0.052402"),
+            daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda pnl, loss: None),
+            status=SimpleNamespace(
+                amend_trade_pnl=lambda oid, pnl: amended.update({oid: pnl})
+            ),
+        )
+        correct = AutoTrader.correct_realized_exit.__get__(fake_bot)
+
+        # (35.71 actual - 35.81 submitted) * 1.2067 shares
+        delta = (Decimal("35.71") - Decimal("35.81")) * Decimal("1.2067")
+        correct("order-figr", Decimal("0.052402"), delta)
+
+        corrected = amended["order-figr"]
+        self.assertLess(corrected, 0)
+        self.assertAlmostEqual(float(corrected), -0.068268, places=6)
+        # The running totals must follow the correction, including the
+        # losing-side tracker the daily breaker reads.
+        self.assertAlmostEqual(
+            float(fake_bot.daily_realized_pnl), -0.068268, places=6
+        )
+        self.assertAlmostEqual(
+            float(fake_bot.daily_realized_loss), 0.068268, places=6
+        )
+
+    def test_an_exact_limit_fill_needs_no_correction(self):
+        from webull_bot.bot import AutoTrader
+
+        touched = []
+        fake_bot = SimpleNamespace(
+            daily_realized_pnl=Decimal("5"),
+            daily_realized_loss=Decimal("0"),
+            daily_pnl=SimpleNamespace(record=lambda pnl, loss: None),
+            status=SimpleNamespace(
+                amend_trade_pnl=lambda oid, pnl: touched.append(oid)
+            ),
+        )
+        correct = AutoTrader.correct_realized_exit.__get__(fake_bot)
+        correct("order-1", Decimal("5"), Decimal("0"))
+        self.assertEqual(touched, [])
+        self.assertEqual(fake_bot.daily_realized_pnl, Decimal("5"))
 
 
 class EntryTimePremiumFloorTests(unittest.TestCase):

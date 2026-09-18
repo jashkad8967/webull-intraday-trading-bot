@@ -150,6 +150,21 @@ class StatusWriter:
                     self._save_state()
                     return
 
+    def amend_trade_pnl(self, order_id: str, pnl: Decimal) -> None:
+        """Rewrite a already-displayed trade's pnl once its REAL fill
+        price is known - see AutoTrader.correct_realized_exit. Without
+        this the dashboard keeps showing the submission-time estimate
+        (FIGR: a "+$0.05 PROFIT" that actually filled as a loss),
+        which is exactly the number the user is reading to judge
+        whether the bot is working.
+        """
+        with self._lock:
+            for trade in self.trades:
+                if trade.get("order_id") == order_id:
+                    trade["pnl"] = str(pnl)
+                    self._save_state()
+                    return
+
     def record_balance(self, balance: Decimal) -> None:
         """Appends one point to the account-equity history the dashboard
         charts - see AutoTrader.write_status_snapshot for the throttling
