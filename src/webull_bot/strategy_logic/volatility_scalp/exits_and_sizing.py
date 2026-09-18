@@ -121,7 +121,21 @@ def volatility_scalp_exit_override(
     target = self.volatility_scalp_target_price(average_cost)
     if price >= target:
         return Decision("PROFIT", "volatility scalp quick target reached", target)
-    if symbol and price >= average_cost:
+    # Live incident ("there are now losses for some weird reason"):
+    # LFUS sold 406.51 -> 406.91, FIGR 35.85 -> 35.90, MAGN 11.53 ->
+    # 11.55 - all ABOVE their entry, all recorded as PROFIT, all
+    # actually NEGATIVE. These are dollar-sized fractional positions,
+    # so a few cents per share is only a fraction of a cent of gross
+    # gain, and the FLAT $0.02 sell fee swallows it whole. This gate
+    # used to be a bare `price >= average_cost`, which let every early
+    # exit below (parabolic SAR, RSI overbought, divergence,
+    # resistance, momentum stall) fire on a gain too small to survive
+    # its own exit fee - a guaranteed loss, by construction, on every
+    # small fractional position. Requiring the move to clear
+    # fee_per_share first makes "profitable" mean profitable NET of
+    # the fee for all of them at once.
+    fee_per_share = self.config.sell_fee_dollars / quantity
+    if symbol and price - average_cost > fee_per_share:
         if self.parabolic_sar_exit_signal(symbol, price):
             return Decision(
                 "PROFIT", "parabolic SAR trend reversal exit", price
@@ -148,12 +162,10 @@ def volatility_scalp_exit_override(
         # a nominal price > cost isn't enough - after the flat sell
         # fee it can still net a real loss labeled PROFIT. Requires
         # clearing cost by more than fee_per_share, same margin
-        # stock_decision's own real profit target already builds in.
-        fee_per_share = self.config.sell_fee_dollars / quantity
-        if (
-            price - average_cost > fee_per_share
-            and self.rsi_divergence(symbol, price, time.monotonic()) == "BEARISH"
-        ):
+        # stock_decision's own real profit target already builds in -
+        # now hoisted into this block's own entry condition above, so
+        # every early exit here inherits it rather than just this one.
+        if self.rsi_divergence(symbol, price, time.monotonic()) == "BEARISH":
             return Decision(
                 "PROFIT", "bearish RSI divergence - locking in the gain", price
             )
@@ -164,13 +176,10 @@ def volatility_scalp_exit_override(
         # (approaching_resistance), the level a fast move is
         # statistically likely to stall or reverse at, rather than
         # waiting for the flat quick-target percentage to be hit
-        # exactly. Same fee-aware profit guard as the divergence
-        # check above - never fires on a fee-thin, barely-above-cost
-        # position.
-        if (
-            price - average_cost > fee_per_share
-            and self.approaching_resistance(symbol, price, "BUY")
-        ):
+        # exactly. The fee-aware profit guard that used to sit here
+        # now gates this whole block above, so a fee-thin,
+        # barely-above-cost position never reaches any of these.
+        if self.approaching_resistance(symbol, price, "BUY"):
             return Decision(
                 "PROFIT", "selling into resistance at today's high", price
             )
