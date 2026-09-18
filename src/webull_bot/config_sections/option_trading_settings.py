@@ -60,17 +60,24 @@ class OptionTradingSettings(BaseSettings):
     # share count (buying_power * fraction / cost), layered on top of
     # (not instead of) OPTION_QUANTITY and MAX_ORDER_NOTIONAL.
     #
-    # By explicit request ("how do you decide quantity for stocks, do
-    # same with options"): raised 0.05 -> 0.15 to MATCH the stock side's
-    # own stock_max_position_fraction_of_buying_power (0.15). The
-    # mechanism was always identical to stocks; only this number
-    # differed, at 3x tighter. On a small account that gap was the
-    # whole problem - 5% of ~$370 is ~$18, which cannot afford a single
-    # contract above the $0.50/share premium floor ($50), so options
-    # stopped trading entirely. Matching the stock fraction restores
-    # entries without inventing a separate, looser risk model for
-    # options than the one stocks already run under.
-    option_capital_fraction: Decimal = Field(default=Decimal("0.15"), gt=0, le=1)
+    # Raised in two steps, both by explicit request. First 0.05 ->
+    # 0.15 ("how do you decide quantity for stocks, do same with
+    # options") to match the stock side's own stock_max_position_
+    # fraction_of_buying_power. Then 0.15 -> 1.0 ("no cap for options,
+    # i trust your algorithms judgement on entry" / "i told you it
+    # should spend all the money if needed"): at 0.15 a ~$373 account
+    # budgets ~$56 per option position, which affords exactly ONE $50
+    # contract no matter how much buying power is actually free, so
+    # the bot could never scale into a position it liked.
+    #
+    # At 1.0 this stops being a cap at all - affordability,
+    # MAX_ORDER_NOTIONAL and OPTION_QUANTITY become the only real
+    # bounds, and a single entry can consume most of the account.
+    # That concentration is the deliberate, requested tradeoff: the
+    # entry QUALITY gates (premium floor, moneyness cap, IV
+    # percentile, volatility/RVOL floors, spread ceiling) are what
+    # carry the risk budget now, not a blanket sizing cap.
+    option_capital_fraction: Decimal = Field(default=Decimal("1.0"), gt=0, le=1)
     # By request: "look for cheaper options to buy in to." select_atm_
     # options always picked the single strike nearest the money -
     # correct for delta, but on a small account often unaffordable
