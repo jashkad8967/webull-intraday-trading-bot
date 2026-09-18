@@ -4818,6 +4818,22 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
                 return Decimal(str(q["ask"]))
 
             @staticmethod
+            def quote_bid(q):
+                return Decimal(str(q["bid"]))
+
+            @staticmethod
+            def option_tick_from_quote(*prices):
+                from webull_bot.webull_api import WebullAPI
+
+                return WebullAPI.option_tick_from_quote(*prices)
+
+            @staticmethod
+            def _quantize_to_option_tick(price, rounding, tick=None):
+                from webull_bot.webull_api import WebullAPI
+
+                return WebullAPI._quantize_to_option_tick(price, rounding, tick)
+
+            @staticmethod
             def quote_price(q):
                 return Decimal(str(q["price"]))
 
@@ -4843,7 +4859,9 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
         rekeyed = []
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
-                poll_seconds=Decimal("0.25"), price_sanity_cooldown_seconds=60
+                poll_seconds=Decimal("0.25"),
+                price_sanity_cooldown_seconds=60,
+                option_take_profit_percent=Decimal("0.02"),
             ),
             api=FakeApi(),
             status=SimpleNamespace(
@@ -4879,17 +4897,131 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
         with unittest.mock.patch("time.monotonic", return_value=100.0):
             reprice(positions)
 
+        # By explicit request ("the bot keeps requesting 50 even though
+        # 49 reprice midpoint would bring significant profit as well"),
+        # with the "only if the midpoint is a good profit though"
+        # guard: bid 1.90 / ask 2.00 -> midpoint 1.95, which clears
+        # cost (1.50) plus the 2% take-profit bar, so it re-quotes to
+        # the fillable 1.95 rather than hanging at the 2.00 ask.
         self.assertEqual(cancelled, ["order-1"])
         self.assertEqual(len(placed), 1)
         self.assertEqual(
-            placed[0], ("XYZ260101C00100000", "SELL", 1, Decimal("2.00"))
+            placed[0], ("XYZ260101C00100000", "SELL", 1, Decimal("1.95"))
         )
         self.assertNotIn("order-1", fake_bot.working_orders)
         self.assertIn("order-2", fake_bot.working_orders)
         self.assertEqual(
-            fake_bot.working_orders["order-2"]["limit_price"], Decimal("2.00")
+            fake_bot.working_orders["order-2"]["limit_price"], Decimal("1.95")
         )
         self.assertEqual(rekeyed, [("order-1", "order-2")])
+
+    def test_holds_at_the_ask_when_the_midpoint_is_not_a_good_profit(self):
+        """By explicit request ("only if the midpoint is a good profit
+        though"): conceding half the spread is only worth it when what
+        remains still clears this position's own take-profit bar. Here
+        cost 1.90 against a 1.90/2.00 quote leaves a 1.95 midpoint -
+        only ~2.6% over cost, under the 15% bar - so it holds out at
+        the 2.00 ask instead of giving up the spread for scraps.
+        """
+        from webull_bot.bot import AutoTrader
+
+        cancelled = []
+        placed = []
+        contract = {
+            "symbol": "XYZ260101C00100000",
+            "underlying_symbol": "XYZ",
+            "strike_price": "100",
+            "expiration_date": "2026-01-01",
+            "option_type": "CALL",
+        }
+        quote = {
+            "symbol": "XYZ260101C00100000",
+            "bid": "1.90",
+            "ask": "2.00",
+            "price": "1.95",
+        }
+
+        class FakeApi:
+            @staticmethod
+            def option_quotes(symbols):
+                return [quote]
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def quote_bid(q):
+                return Decimal(str(q["bid"]))
+
+            @staticmethod
+            def option_tick_from_quote(*prices):
+                from webull_bot.webull_api import WebullAPI
+
+                return WebullAPI.option_tick_from_quote(*prices)
+
+            @staticmethod
+            def _quantize_to_option_tick(price, rounding, tick=None):
+                from webull_bot.webull_api import WebullAPI
+
+                return WebullAPI._quantize_to_option_tick(price, rounding, tick)
+
+            @staticmethod
+            def quote_price(q):
+                return Decimal(str(q["price"]))
+
+            @staticmethod
+            def option_position(contract, positions):
+                return Decimal("1"), Decimal("1.90")
+
+            @staticmethod
+            def cancel(order_id):
+                cancelled.append(order_id)
+
+            @staticmethod
+            def place_option(contract, side, quantity, limit_price, position_intent):
+                placed.append((contract["symbol"], side, quantity, limit_price))
+                return "order-2"
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                poll_seconds=Decimal("0.25"),
+                price_sanity_cooldown_seconds=60,
+                option_take_profit_percent=Decimal("0.15"),
+            ),
+            api=FakeApi(),
+            status=SimpleNamespace(rekey_trade=lambda old, new: None),
+            last_option_reprice=0.0,
+            option_contracts=[contract],
+            manual_touch_at={},
+            price_sanity_rejected_at={},
+            is_order_not_cancelable=lambda exc: False,
+            working_orders={
+                "order-1": {
+                    "submitted_at": 0.0,
+                    "key": "OPTION:XYZ260101C00100000",
+                    "action": "PROFIT",
+                    "cancel_requested_at": None,
+                    "limit_price": Decimal("1.80"),
+                }
+            },
+        )
+        fake_bot.price_sanity_ok = AutoTrader.price_sanity_ok.__get__(fake_bot)
+        fake_bot.price_sanity_cooldown_ready = AutoTrader.price_sanity_cooldown_ready.__get__(fake_bot)
+        reprice = AutoTrader.reprice_resting_option_exits.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "OPTION",
+                "symbol": "XYZ260101C00100000",
+                "quantity": "1",
+                "cost_price": "1.90",
+            }
+        ]
+        with unittest.mock.patch("time.monotonic", return_value=100.0):
+            reprice(positions)
+
+        self.assertEqual(placed[0][3], Decimal("2.00"))
 
     def test_never_chases_the_ask_below_entry_cost(self):
         from webull_bot.bot import AutoTrader

@@ -22,6 +22,7 @@ from webull_bot.api.pricing import (
     _quantize_to_option_tick,
     option_limit_price,
     option_price_tick_size,
+    option_tick_from_quote,
     price_tick_size,
     stock_limit_price,
     stock_stop_exit_price,
@@ -240,6 +241,7 @@ class WebullAPI:
     stock_limit_price = stock_limit_price
     stock_stop_exit_price = stock_stop_exit_price
     option_price_tick_size = staticmethod(option_price_tick_size)
+    option_tick_from_quote = staticmethod(option_tick_from_quote)
     _quantize_to_option_tick = classmethod(_quantize_to_option_tick)
     option_limit_price = option_limit_price
 
