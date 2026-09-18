@@ -15246,6 +15246,44 @@ class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):
         self.assertEqual(calls, [["AAPL"]])
 
 
+class EntryTimePremiumFloorTests(unittest.TestCase):
+    """Live incident: option_min_premium_dollars ($0.50) shipped, yet
+    SPY260930P00700000 was bought at $0.30 and QQQ260930P00655000 at
+    $0.45 the same day. The floor was only enforced in select_atm_
+    options at contract-SELECTION time, which isn't authoritative -
+    selection has a bypass path (single candidate, or no
+    max_contract_cost, skips the quoted-premium check entirely), and
+    the discovery-time premium it checks can drift well below the
+    floor before the entry actually prices. The floor now also gates
+    limit_price in _evaluate_option_entry, which IS the price the
+    contract gets bought at.
+    """
+
+    @staticmethod
+    def _entry_limit(bid, ask):
+        from webull_bot.config import Settings
+        from webull_bot.webull_api import WebullAPI
+
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = Settings(_env_file=None)
+        return api.option_limit_price({"bid": bid, "ask": ask}, "BUY")
+
+    def test_the_real_contracts_that_slipped_through_are_now_below_the_floor(self):
+        from webull_bot.config import Settings
+
+        floor = Settings(_env_file=None).option_min_premium_dollars
+        # SPY P700 filled at 0.30, QQQ P655 filled at 0.45 - both must
+        # price below the floor so the entry gate rejects them.
+        self.assertLess(self._entry_limit("0.25", "0.35"), floor)
+        self.assertLess(self._entry_limit("0.40", "0.50"), floor)
+
+    def test_a_genuinely_priced_contract_still_clears_the_floor(self):
+        from webull_bot.config import Settings
+
+        floor = Settings(_env_file=None).option_min_premium_dollars
+        self.assertGreaterEqual(self._entry_limit("0.60", "0.70"), floor)
+
+
 class ProfitTargetTickQuantizationTests(unittest.TestCase):
     """Live incident (NKE, recurring even after the AMD fee-margin
     fix): _evaluate_option_exit's PROFIT branch used to quantize

@@ -338,6 +338,21 @@ def _evaluate_option_entry(
             self.option_gate_rejections["symbol quarantined"] += 1
             return open_count, buying_power
     limit_price = self.api.option_limit_price(quote, "BUY")
+    # Live incident (SPY at $0.30, QQQ at $0.45 - both bought BELOW
+    # the floor the same day it shipped): option_min_premium_dollars
+    # was only enforced in select_atm_options, at contract-SELECTION
+    # time. That isn't authoritative for two reasons - selection has a
+    # bypass path (a single candidate, or no max_contract_cost, skips
+    # the quoted-premium check entirely), and the premium it checks is
+    # a discovery-time quote that can drift well below the floor by
+    # the time this entry actually prices. limit_price here IS the
+    # price the contract gets bought at, so the floor has to be
+    # enforced against it, not against an earlier snapshot.
+    if limit_price < self.config.option_min_premium_dollars:
+        self.option_gate_rejections[
+            "premium below the minimum (too cheap to survive its own noise)"
+        ] += 1
+        return open_count, buying_power
     buy_quantity, contract_cost = (
         self.strategy.option_order_quantity(
             limit_price,
@@ -632,8 +647,16 @@ def _evaluate_option_exit(
                 )
             except QuoteUnavailableError:
                 average_down_price = None
+            # Same premium floor the fresh-entry path enforces (see its
+            # comment) - averaging down buys MORE of a contract whose
+            # premium has by definition already fallen, so this is the
+            # most likely path of all to end up adding to a position
+            # that has decayed into exactly the too-cheap-to-recover
+            # cohort the floor exists to keep out.
             if (
                 average_down_price is not None
+                and average_down_price
+                >= self.config.option_min_premium_dollars
                 and self.price_sanity_cooldown_ready(option_symbol)
                 and self.price_sanity_ok(
                     option_symbol,
