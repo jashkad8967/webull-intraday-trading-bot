@@ -647,16 +647,24 @@ def _evaluate_option_exit(
                 )
             except QuoteUnavailableError:
                 average_down_price = None
-            # Same premium floor the fresh-entry path enforces (see its
-            # comment) - averaging down buys MORE of a contract whose
-            # premium has by definition already fallen, so this is the
-            # most likely path of all to end up adding to a position
-            # that has decayed into exactly the too-cheap-to-recover
-            # cohort the floor exists to keep out.
+            # NOTE: option_min_premium_dollars is deliberately NOT
+            # applied here, unlike the fresh-entry path.
+            #
+            # By explicit request ("it isnt even averaging down"): the
+            # floor briefly gated this too, which silently disabled
+            # averaging down entirely - a position only becomes a
+            # candidate for it AFTER its premium has fallen, so a
+            # $0.51 entry sitting at $0.475 was rejected for being
+            # "too cheap" despite the floor's whole purpose being to
+            # vet the ORIGINAL entry, which it had already passed.
+            # The floor exists to stop NEW money going into
+            # lottery-ticket contracts, not to stop a validated thesis
+            # from being averaged into. The averaging ladder's own
+            # caps (option_max_averaging_buys, the widening dip
+            # threshold, the cooldown, and the strictly-lower-price
+            # bar) are what bound this path's risk.
             if (
                 average_down_price is not None
-                and average_down_price
-                >= self.config.option_min_premium_dollars
                 and self.price_sanity_cooldown_ready(option_symbol)
                 and self.price_sanity_ok(
                     option_symbol,
