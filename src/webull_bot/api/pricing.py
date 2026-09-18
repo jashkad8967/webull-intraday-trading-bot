@@ -124,10 +124,45 @@ def option_price_tick_size(premium: Decimal) -> Decimal:
     return Decimal("0.05")
 
 
+def option_tick_from_quote(*prices: Decimal | None) -> Decimal:
+    """Infer a contract's REAL tick from its own quoted prices instead
+    of assuming the conservative $0.05 for everything.
+
+    By explicit request, after a live miss: a QQQ put was held with a
+    quoted 0.48/0.50 spread, so the 0.49 midpoint was a genuine,
+    fillable, profitable exit - but option_price_tick_size's flat
+    $0.05 made 0.49 unrepresentable, so every re-quote rounded back to
+    the full 0.50 ask and the fill never came ("the bot keeps
+    requesting 50 even though 49 reprice midpoint would bring
+    significant profit as well... now that chance is gone").
+
+    A bid or ask that ISN'T itself a multiple of $0.05 is direct
+    evidence from the exchange that this contract quotes on the finer
+    penny grid (a Penny Pilot name - QQQ/SPY and other very liquid
+    ETFs are enrolled). That's far better evidence than guessing, and
+    it fails safe: when every quoted price IS nickel-aligned, nothing
+    distinguishes a penny-grid name from a nickel-only one, so the
+    conservative $0.05 stands - exactly the behaviour that fixed the
+    original OPENAPI_OPTION_PRICE_STEP_LT rejection on CD.
+    """
+    nickel = Decimal("0.05")
+    for price in prices:
+        if price is None or price <= 0:
+            continue
+        if price % nickel != 0:
+            return Decimal("0.01")
+    return nickel
+
+
 def _quantize_to_option_tick(
-    cls, price: Decimal, rounding: str
+    cls, price: Decimal, rounding: str, tick: Decimal | None = None
 ) -> Decimal:
-    tick = cls.option_price_tick_size(price)
+    """tick defaults to option_price_tick_size's conservative $0.05;
+    callers holding a live quote can pass option_tick_from_quote's
+    inferred, evidence-based tick instead.
+    """
+    if tick is None:
+        tick = cls.option_price_tick_size(price)
     steps = (price / tick).quantize(Decimal("1"), rounding=rounding)
     return (steps * tick).quantize(Decimal("0.01"))
 

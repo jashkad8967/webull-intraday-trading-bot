@@ -1,6 +1,6 @@
 import logging
 import time
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from webull_bot.trading.guards.price_sanity import OPTION_PRICE_SANITY_TOLERANCE
 from webull_bot.trading.handlers.broker_conflict_check import _broker_conflict
@@ -100,12 +100,53 @@ def reprice_resting_option_exits(
             if quantity <= 0:
                 continue
             if action == "PROFIT":
-                target = self.api.quote_ask(quote)
+                # By explicit request, after a live miss: a QQQ put
+                # bought at 0.45 sat with a 0.48/0.50 quote, and this
+                # re-quoted to the FULL ASK (0.50) every cycle - so it
+                # never filled, even though the 0.49 midpoint was a
+                # genuine, fillable profit ("the bot keeps requesting
+                # 50 even though 49 reprice midpoint would bring
+                # significant profit as well... now that chance is
+                # gone"). An unfilled order at the ask is worth
+                # nothing; a filled one at the midpoint is real money.
+                # Targets the midpoint now, on the contract's REAL
+                # tick (option_tick_from_quote - a 0.48 bid is itself
+                # proof this one quotes in pennies, so 0.49 is a valid
+                # price the old flat $0.05 grid could never express).
+                # Clamped at/above the bid so this only ever gives up
+                # the half-spread it has to, never more.
+                #
+                # By explicit follow-up ("only if the midpoint is a
+                # good profit though"): dropping to the midpoint gives
+                # up half the spread, so it's only worth doing when
+                # what's left is still a real win. The bar is this
+                # position's OWN configured profit target - if the
+                # midpoint clears cost * (1 + option_take_profit_
+                # percent) it's a good profit by the strategy's own
+                # definition and worth banking; if it doesn't, hold out
+                # at the ask rather than concede the spread for a
+                # marginal gain.
+                bid = self.api.quote_bid(quote)
+                ask = self.api.quote_ask(quote)
+                target = ask
+                if bid is not None and ask is not None and 0 < bid <= ask:
+                    tick = self.api.option_tick_from_quote(bid, ask)
+                    midpoint = max(
+                        self.api._quantize_to_option_tick(
+                            (bid + ask) / 2, ROUND_DOWN, tick
+                        ),
+                        bid,
+                    )
+                    good_profit = cost > 0 and midpoint >= cost * (
+                        Decimal("1") + self.config.option_take_profit_percent
+                    )
+                    if good_profit:
+                        target = midpoint
                 if target is None or target == order.get("limit_price"):
                     continue
                 if cost > 0 and target < cost:
-                    # Never chase the ask down below entry cost - see
-                    # the matching stock-side guard in
+                    # Never chase down below entry cost - see the
+                    # matching stock-side guard in
                     # reprice_resting_exits.
                     continue
             else:
