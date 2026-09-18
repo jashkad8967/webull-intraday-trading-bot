@@ -87,9 +87,27 @@ def write_status_snapshot(
         # cached_raw_buying_power (not the buying_power parameter,
         # which is reserved-down for trading sizing) so this doesn't
         # understate real equity by MIN_CASH_RESERVE_DOLLARS.
+        # An OPTION contract controls 100 shares, so its market value
+        # is quantity * price * 100 - without the multiplier a $0.475
+        # contract counts as 48 CENTS instead of $47.50.
+        #
+        # Live incident, found by reconciling the balance chart
+        # against the broker: the account showed a $75 "loss" over a
+        # morning it was actually flat. Buying an option moved real
+        # cash out of buying_power (say $50) but added only 1/100th of
+        # the position's value back, so every option entry looked like
+        # an instant ~99% loss on the chart, and every exit looked like
+        # a windfall. Three open contracts worth $79.50 were being
+        # counted as $0.80.
         total_equity = self.cached_raw_buying_power + sum(
             (
-                Decimal(row["quantity"]) * Decimal(row["last_price"])
+                Decimal(row["quantity"])
+                * Decimal(row["last_price"])
+                * (
+                    Decimal("100")
+                    if row.get("instrument_type") == "OPTION"
+                    else Decimal("1")
+                )
                 for row in position_rows
             ),
             Decimal("0"),
