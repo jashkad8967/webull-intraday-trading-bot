@@ -54,10 +54,23 @@ class OptionTradingSettings(BaseSettings):
     # bet and becomes pin-risk roulette. By request: "closed out at least
     # 1 week before" expiration.
     option_min_hold_dte: int = Field(default=7, ge=0, le=30)
-    # Never risk more than this fraction of buying power on a single options
-    # entry - a defined-risk-per-trade cap layered on top of (not instead
-    # of) OPTION_QUANTITY and MAX_ORDER_NOTIONAL.
-    option_capital_fraction: Decimal = Field(default=Decimal("0.05"), gt=0, le=1)
+    # The dollar budget a single option position targets, as a fraction
+    # of buying power - option_order_quantity turns it into a contract
+    # count exactly the way the stock side turns its own budget into a
+    # share count (buying_power * fraction / cost), layered on top of
+    # (not instead of) OPTION_QUANTITY and MAX_ORDER_NOTIONAL.
+    #
+    # By explicit request ("how do you decide quantity for stocks, do
+    # same with options"): raised 0.05 -> 0.15 to MATCH the stock side's
+    # own stock_max_position_fraction_of_buying_power (0.15). The
+    # mechanism was always identical to stocks; only this number
+    # differed, at 3x tighter. On a small account that gap was the
+    # whole problem - 5% of ~$370 is ~$18, which cannot afford a single
+    # contract above the $0.50/share premium floor ($50), so options
+    # stopped trading entirely. Matching the stock fraction restores
+    # entries without inventing a separate, looser risk model for
+    # options than the one stocks already run under.
+    option_capital_fraction: Decimal = Field(default=Decimal("0.15"), gt=0, le=1)
     # By request: "look for cheaper options to buy in to." select_atm_
     # options always picked the single strike nearest the money -
     # correct for delta, but on a small account often unaffordable

@@ -3986,13 +3986,16 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
 
         config = Settings(_env_file=None)
         strategy = TradingStrategy(config)
-        # $1 premium -> $100/contract. 5% risk cap of $5000 = $250 -> 2
-        # contracts; option_quantity's default ceiling must not clamp
-        # this down to 1.
+        # $1 premium -> $100/contract. By explicit request ("how do you
+        # decide quantity for stocks, do same with options"),
+        # option_capital_fraction now matches the stock side's own
+        # position fraction (0.15, was 0.05) - 15% of $5000 = $750 ->
+        # 7 contracts. option_quantity's default ceiling must not
+        # clamp this down to 1.
         quantity, _ = strategy.option_order_quantity(
             Decimal("1.00"), Decimal("5000")
         )
-        self.assertEqual(quantity, 2)
+        self.assertEqual(quantity, 7)
 
     def test_real_config_default_captures_a_realistic_quick_pop_as_profit(self):
         # By request: "if there is immediate profit after a buy, why
