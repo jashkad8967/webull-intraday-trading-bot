@@ -35,6 +35,7 @@ from webull_bot.api.orders import (
     open_orders,
     order_detail,
     order_history,
+    order_filled_price,
     order_status,
     place_stock,
 )
@@ -232,6 +233,7 @@ class WebullAPI:
     cancel = cancel
     order_detail = order_detail
     order_status = staticmethod(order_status)
+    order_filled_price = staticmethod(order_filled_price)
     cancel_all_orders = cancel_all_orders
     place_stock = place_stock
     order_history = order_history
