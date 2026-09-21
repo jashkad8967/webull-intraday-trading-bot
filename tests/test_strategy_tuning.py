@@ -981,10 +981,13 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         self.assertTrue(TradingStrategy.option_market_regime_ok(history, None))
 
     def test_option_order_quantity_applies_the_capital_fraction_cap(self):
-        strategy = TradingStrategy(self.config())
+        strategy = TradingStrategy(self.config(focus_mode_enabled=False))
         # $1 premium -> $100/contract. 5% of $500 buying power caps at 0
         # contracts even though option_quantity/max_order_notional would
-        # otherwise allow one.
+        # otherwise allow one. focus_mode_enabled=False so this exercises
+        # the generic (non-focus) caps this test is actually about - see
+        # test_focus_mode_ignores_option_quantity_and_notional_caps below
+        # for the focus-mode full-utilization behavior.
         quantity, contract_cost = strategy.option_order_quantity(
             Decimal("1.00"), Decimal("500")
         )
@@ -1006,7 +1009,7 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         # caps now actually get to size more than one contract.
         from webull_bot.config import Settings
 
-        config = Settings(_env_file=None)
+        config = Settings(_env_file=None, focus_mode_enabled=False)
         strategy = TradingStrategy(config)
         # $1 premium -> $100/contract. By explicit request ("i told you
         # it should spend all the money if needed"),
@@ -1014,10 +1017,41 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         # so MAX_ORDER_NOTIONAL ($1000) becomes the binding limit here
         # at 10 contracts, rather than the fraction. option_quantity's
         # default ceiling must not clamp this down to 1.
+        # focus_mode_enabled=False here - it defaults True and exempts
+        # both option_quantity and max_order_notional entirely (see the
+        # focus-mode test below), which would make this specific
+        # max_order_notional assertion moot.
         quantity, _ = strategy.option_order_quantity(
             Decimal("1.00"), Decimal("5000")
         )
         self.assertEqual(quantity, 10)
+
+    def test_focus_mode_ignores_option_quantity_and_notional_caps(self):
+        """By explicit request ("it utilizes the entire account
+        value"): focus mode commits the whole account to ONE position
+        by design (see option_capital_fraction's own history - raised
+        0.05 -> 1.0 for "no cap for options... spend all the money if
+        needed"). option_quantity (20) and max_order_notional ($1000)
+        are flat ceilings left over from the old multi-symbol
+        strategy that would silently undercut full utilization on a
+        cheap contract or a larger account - not yet binding at this
+        account's current size, but a real violation of this
+        requirement once it grows. Both are exempted in focus mode
+        (the real Settings default), leaving pure affordability
+        (capital_fraction=1.0) as the only bound.
+        """
+        from webull_bot.config import Settings
+
+        config = Settings(_env_file=None)
+        self.assertTrue(config.focus_mode_enabled)  # the real default
+        strategy = TradingStrategy(config)
+        # $1 premium -> $100/contract, $5000 buying power -> 50
+        # contracts fully affordable. Neither option_quantity=20 nor
+        # max_order_notional=$1000 (10 contracts) may clamp this.
+        quantity, _ = strategy.option_order_quantity(
+            Decimal("1.00"), Decimal("5000")
+        )
+        self.assertEqual(quantity, 50)
 
     def test_real_config_default_captures_a_realistic_quick_pop_as_profit(self):
         # By request: "if there is immediate profit after a buy, why
