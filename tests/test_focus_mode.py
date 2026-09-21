@@ -51,6 +51,7 @@ def focus_config(**overrides):
         option_max_moneyness_percent=Decimal("0.15"),
         option_eod_close_time="15:50",
         option_min_hold_dte=7,
+        option_discovery_seconds=300,
         time_aware_stop_enabled=False,
         time_aware_stop_widen_seconds=60,
         time_aware_stop_widen_multiplier=Decimal("1.5"),
@@ -614,6 +615,7 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
             focus_symbol_no_chain=set(),
             focus_contract_discovery_failures=0,
             focus_symbol_affordability_checked=None,
+            last_stale_contract_prune=0.0,
         )
         bot.ensure_focus_symbol_contracts = (
             AutoTrader.ensure_focus_symbol_contracts.__get__(bot)
@@ -728,6 +730,33 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
         quote_calls_after_first = len(calls["option_quotes"])
         bot.ensure_focus_symbol_contracts()
         self.assertEqual(len(calls["option_quotes"]), quote_calls_after_first)
+
+    def test_stale_persisted_contracts_are_dropped_and_rediscovered(self):
+        """Live incident ("we both know something is not working
+        here"): NFLX locked, direction signals fired repeatedly,
+        nothing ever entered. Direct inspection found NFLX's already-
+        discovered contracts (persisted from a prior session) expired
+        in 4 days - inside the 14-day floor - so _evaluate_option_
+        entry's own DTE gate silently rejected every attempt as "too
+        close to expiration," while ensure_focus_symbol_contracts
+        treated their mere presence as "chain already exists" and
+        never rediscovered a fresh, tradeable one.
+        """
+        stale = _fake_contract("MRNA", "MRNAC-OLD", "CALL", 170, dte=4)
+        bot, calls = self.bot(existing_contracts=[stale])
+        bot.ensure_focus_symbol_contracts()
+        self.assertNotIn(stale, bot.option_contracts)
+        self.assertEqual(calls["option_contracts"], ["MRNA"])
+        self.assertTrue(
+            any(c["underlying_symbol"] == "MRNA" for c in bot.option_contracts)
+        )
+
+    def test_a_fresh_persisted_contract_is_left_alone(self):
+        fresh = _fake_contract("MRNA", "MRNAC-OLD", "CALL", 170, dte=20)
+        bot, calls = self.bot(existing_contracts=[fresh])
+        bot.ensure_focus_symbol_contracts()
+        self.assertIn(fresh, bot.option_contracts)
+        self.assertEqual(calls["option_contracts"], [])
 
 
 class RepickOnNoChainTests(unittest.TestCase):

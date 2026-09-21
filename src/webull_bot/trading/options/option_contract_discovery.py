@@ -145,6 +145,70 @@ def focus_symbol_is_affordable(self, symbol: str) -> bool:
     return affordable
 
 
+def _prune_stale_contracts(self) -> None:
+    """Live incident ("we both know something is not working here"):
+    NFLX locked, direction signals fired repeatedly, nothing ever
+    entered. Direct inspection of persisted state found the cause -
+    NFLX's already-discovered contracts (from a prior session,
+    persisted across restarts via OptionContractsStateStore) expired
+    2026-09-25, four days out, far inside the 14-day floor. Nothing
+    ever re-validated a persisted contract was still within the
+    tradeable DTE window before treating it as real - so a stale
+    contract from days ago sat in self.option_contracts forever,
+    silently rejected every cycle by _evaluate_option_entry's own DTE
+    gate as "too close to expiration." This wasn't scoped to the
+    focus symbol alone - the same staleness affects every underlying
+    ever discovered, which is why that exact rejection reason has
+    been the dominant, near-constant noise in every gate-rejection
+    summary logged today regardless of which symbol was locked.
+
+    Throttled to once per option_discovery_seconds (the same cadence
+    discover_option_contracts already uses) - this is a full scan of
+    self.option_contracts, not worth repeating every single cycle.
+    """
+    now = time.monotonic()
+    if now - self.last_stale_contract_prune < float(
+        self.config.option_discovery_seconds
+    ):
+        return
+    self.last_stale_contract_prune = now
+    today = date.today()
+    live = []
+    dropped = 0
+    for item in self.option_contracts:
+        try:
+            expiration = date.fromisoformat(item["expiration_date"])
+        except (KeyError, ValueError):
+            live.append(item)
+            continue
+        if (expiration - today).days > self.config.option_min_hold_dte:
+            live.append(item)
+        else:
+            dropped += 1
+    if dropped:
+        log.warning(
+            "OPTIONS | dropped %s stale (too-close-to-expiration) "
+            "contract(s) from prior sessions",
+            dropped,
+        )
+        self.option_contracts = live
+        # Persist immediately - otherwise the next restart reloads
+        # the same stale contracts from disk and this whole prune
+        # has to rediscover it live all over again.
+        self.option_contracts_state.save(
+            self.option_contracts,
+            self.option_discovery_attempted,
+            {
+                symbol: {
+                    "count": count,
+                    "last_buy_price": self.option_last_buy_price[symbol],
+                }
+                for symbol, count in self.option_average_down_count.items()
+                if count > 0 and symbol in self.option_last_buy_price
+            },
+        )
+
+
 def ensure_focus_symbol_contracts(self) -> None:
     """By request ("you should be able to request contract by stock
     in webull openapi"): the moment a focus symbol locks, the whole
@@ -170,11 +234,14 @@ def ensure_focus_symbol_contracts(self) -> None:
     and PUT) - see that function's docstring for why. A cheap no-op
     once the chain already exists (checked first) or on a symbol with
     no price yet (retries next cycle, same as everything else in
-    focus mode).
+    focus mode). Prunes stale (too-close-to-expiration) contracts
+    first - see _prune_stale_contracts - so "already exists" means a
+    genuinely tradeable chain, not a leftover from a prior session.
     """
     if not self.config.focus_mode_enabled or not self.focus_symbol:
         return
     underlying = self.focus_symbol
+    _prune_stale_contracts(self)
     if any(
         item["underlying_symbol"] == underlying for item in self.option_contracts
     ):
