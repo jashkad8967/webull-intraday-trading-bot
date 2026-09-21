@@ -22,7 +22,7 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
     signal that matters refreshed.
     """
 
-    def _fake_bot(self, focus_symbol, focus_mode_enabled, contracts):
+    def _fake_bot(self, focus_symbol, focus_mode_enabled, contracts, daily_batch=None):
         from webull_bot.strategy_logic.market_state.snapshot import rotating_batch
 
         requested: list[list[str]] = []
@@ -56,6 +56,7 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
             ),
             stop_loss_guard_active=lambda: False,
             focus_symbol=focus_symbol,
+            daily_batch=daily_batch or [],
             config=SimpleNamespace(
                 option_batch_size=20, focus_mode_enabled=focus_mode_enabled
             ),
@@ -82,16 +83,45 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
         prepare([])
         self.assertEqual(requested, [["NVDA"]])
 
-    def test_focus_mode_without_a_lock_yet_falls_back_to_the_full_board(self):
+    def test_focus_mode_without_a_lock_or_a_daily_batch_falls_back_to_the_full_board(
+        self,
+    ):
+        # No daily_batch built yet (e.g. before 08:45) - nothing to
+        # pre-warm, so this falls all the way back to whatever's
+        # already been discovered.
         from webull_bot.bot import AutoTrader
 
-        fake_bot, requested = self._fake_bot(None, True, self._contracts())
+        fake_bot, requested = self._fake_bot(
+            None, True, self._contracts(), daily_batch=[]
+        )
         prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
         prepare([])
         self.assertIn("AAPL", requested[0])
         self.assertIn("MSFT", requested[0])
         self.assertIn("NVDA", requested[0])
         self.assertIn("VIXY", requested[0])
+
+    def test_pre_lock_pre_warms_daily_batch_candidates_not_the_full_board(self):
+        """By explicit request ("at 9:45am, the stock needs to be
+        selected, and its options should all be discovered and
+        analyzed, I want the first order to go out at 9:45, not
+        later"): option_direction_signal's EMA needs real price
+        history to produce anything but HOLD. Feeding it from the
+        moment the daily batch exists (08:45, a full hour before the
+        09:45 lock) - not just whatever discover_option_contracts'
+        unrelated background rotation happened to reach - means
+        whichever candidate wins the lock already has a warm signal
+        the instant it's picked, instead of starting from zero.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, requested = self._fake_bot(
+            None, True, contracts=[], daily_batch=["NVDA", "TSLA"]
+        )
+        prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
+        prepare([])
+        self.assertEqual(sorted(requested[0]), ["NVDA", "TSLA"])
+        self.assertNotIn("VIXY", requested[0])
 
     def test_disabled_focus_mode_quotes_every_underlying_plus_vixy(self):
         from webull_bot.bot import AutoTrader

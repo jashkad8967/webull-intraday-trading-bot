@@ -158,6 +158,26 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     if self.config.focus_mode_enabled and self.focus_symbol:
         underlyings = [self.focus_symbol]
         quote_symbols = [self.focus_symbol]
+    elif self.config.focus_mode_enabled and self.daily_batch:
+        # By explicit request ("at 9:45am, the stock needs to be
+        # selected, and its options should all be discovered and
+        # analyzed, I want the first order to go out at 9:45, not
+        # later"): before a symbol locks, option_direction_signal's
+        # EMA(3/8) for whichever underlying the batch is about to pick
+        # was starting from ZERO samples the instant it became today's
+        # focus symbol - it was never fed before that, since the
+        # generic fallback below only samples whatever discover_
+        # option_contracts' slow background rotation happened to reach
+        # (unrelated to today's actual candidate pool). An EMA needs
+        # real history to produce anything but HOLD, so the account
+        # could sit signal-less for several minutes past the lock no
+        # matter how fast everything else ran. Pre-warming every daily-
+        # batch candidate's direction-signal history from the moment
+        # the batch exists (08:45, a full hour before the 09:45 lock)
+        # means whichever one wins already has a fully warm EMA the
+        # instant it's picked.
+        underlyings = sorted(set(self.daily_batch))
+        quote_symbols = underlyings
     else:
         underlyings = sorted(
             {contract["underlying_symbol"] for contract in self.option_contracts}
