@@ -532,6 +532,8 @@ def option_decision(
     average_cost: Decimal,
     days_to_expiration: int,
     seconds_since_entry: float | None = None,
+    peak_price: Decimal | None = None,
+    giveback_fraction: Decimal | None = None,
 ) -> Decision:
     """Exit-only: entries are now decided externally by
     option_direction_signal/option_entry_confirmed (bot.py calls those
@@ -577,9 +579,71 @@ def option_decision(
     stop = average_cost * (Decimal("1") - stop_percent)
     if average_cost > 0 and price <= stop:
         return Decision("LOSS", "option percentage stop reached", price)
+    # By explicit request: "make sure when there is a profit to not
+    # let on too much loss" - don't let a winner round-trip back into
+    # a loser. Nothing in this codebase trailed a stop off peak profit
+    # before this (stop_loss_guard's "trailing" is a time window for
+    # counting stop-outs, unrelated).
+    #
+    # Checked BEFORE the fixed target below on purpose: a position
+    # whose peak ran well past the target has a floor ABOVE that
+    # target, and firing the trail there captures more than the fixed
+    # target would. That case is not hypothetical here - a PROFIT
+    # order that rests unfilled (the exact failure this project has
+    # already hit repeatedly) is how a position runs past its target
+    # while still being open.
+    lock = _profit_lock_floor(
+        self, price, average_cost, fee_per_share, peak_price, giveback_fraction
+    )
+    if lock is not None:
+        return Decision("PROFIT", "profit-lock trail hit", lock)
     if average_cost > 0 and price >= target:
         return Decision("PROFIT", "option profit target reached", target)
     return Decision("HOLD", "option waiting for profit", target)
+
+
+def _profit_lock_floor(
+    self,
+    price: Decimal,
+    average_cost: Decimal,
+    fee_per_share: Decimal,
+    peak_price: Decimal | None,
+    giveback_fraction: Decimal | None,
+) -> Decimal | None:
+    """The trailing profit floor, or None when the trail shouldn't
+    fire. Split out so the arming conditions stay readable and are
+    directly unit-testable.
+
+    Returns a price only when ALL of these hold:
+    - the trail is enabled and a real peak has been recorded
+    - the peak cleared profit_lock_arm_percent, so this is protecting
+      an actual gain rather than tightening a stop on a flat position
+    - price has fallen back to or below the floor
+    - the floor still clears cost PLUS the sell fee
+
+    That last condition is the one that matters most. A flat $0.02
+    sell fee already turned several nominally-profitable exits in
+    this account into real losses, so a "profit lock" that fired
+    below cost+fee would be booking exactly the loss it exists to
+    prevent, while labelling it a profit.
+    """
+    if not self.config.profit_lock_enabled:
+        return None
+    if peak_price is None or average_cost <= 0 or price <= 0:
+        return None
+    arm_at = average_cost * (Decimal("1") + self.config.profit_lock_arm_percent)
+    if peak_price < arm_at:
+        return None
+    if giveback_fraction is None:
+        giveback_fraction = self.config.profit_lock_giveback_fraction
+    floor = average_cost + (peak_price - average_cost) * (
+        Decimal("1") - giveback_fraction
+    )
+    if floor <= average_cost + fee_per_share:
+        return None
+    if price > floor:
+        return None
+    return floor
 
 
 def option_average_down_signal(

@@ -126,6 +126,13 @@ def write_status_snapshot(
         # never a real reading on an account with actual buying power
         # or open positions - skip recording it rather than corrupt
         # the chart with a fake wipeout.
+        # By request ("once you hit a certain profit slow down") -
+        # fed from here because this is the ONLY place equity is
+        # computed correctly (it is the only caller that applies the
+        # 100x option multiplier above); a second derivation
+        # elsewhere would risk reintroducing the phantom-loss bug
+        # that multiplier fixed.
+        self.update_profit_throttle(total_equity)
         recent_balances = self.status.balance_history
         previously_nonzero = bool(recent_balances) and Decimal(
             str(recent_balances[-1]["balance"])

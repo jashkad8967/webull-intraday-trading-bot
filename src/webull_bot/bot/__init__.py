@@ -2,8 +2,8 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import date, datetime, timezone
-from decimal import Decimal, ROUND_UP
+from datetime import date, datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from rich.logging import RichHandler
@@ -39,13 +39,12 @@ from webull_bot.sizing.fractional_quantity import is_fractional_quantity
 from webull_bot.sizing.fractional_slots import max_fractional_position_slots
 from webull_bot.sizing.stock_entry_sizing import size_stock_entry
 from webull_bot.status import StatusWriter
-from webull_bot.strategy import (
-    OBI_DEPTH_LEVELS,
-    Decision,
-    TradingStrategy,
-)
+from webull_bot.strategy import TradingStrategy
 from webull_bot.trade_events import TradeEventStreamService
 from webull_bot.trading.guards.daily_loss_breaker import handle_daily_loss_breaker
+# CONSECUTIVE_ORDER_ERROR_LIMIT/ORDER_ERROR_WINDOW_SECONDS look unused here
+# but are deliberate re-exports - other modules and tests import them from
+# this module rather than from the guard directly.
 from webull_bot.trading.guards.order_error_guard import (
     CONSECUTIVE_ORDER_ERROR_LIMIT,
     ORDER_ERROR_WINDOW_SECONDS,
@@ -61,7 +60,6 @@ from webull_bot.trading.guards.price_sanity import (
 )
 from webull_bot.trading.guards.stop_loss_guard import stop_loss_guard_active
 from webull_bot.trading.guards.symbol_quarantine import symbol_quarantined
-from webull_bot.trading.handlers.broker_conflict_check import _broker_conflict
 from webull_bot.trading.handlers.broker_conflict_handler import handle_broker_conflict
 from webull_bot.trading.handlers.fractional_ticker_handler import (
     handle_fractional_ticker_unsupported,
@@ -109,7 +107,7 @@ from webull_bot.trading.orders.held_exit_evaluation import evaluate_held_stock_e
 from webull_bot.trading.orders.iceberg_order_processing import (
     process_iceberg_orders,
 )
-from webull_bot.trading.orders.locks import _rekey_working_order, _working_orders_lock
+from webull_bot.trading.orders.locks import _rekey_working_order
 from webull_bot.trading.orders.manual_buy import _manual_buy
 from webull_bot.trading.orders.manual_cancel_order import _manual_cancel_order
 from webull_bot.trading.orders.manual_sell import _manual_sell
@@ -125,17 +123,13 @@ from webull_bot.trading.orders.phantom_exit_confirmation import (
 from webull_bot.trading.orders.position_protection_loop import (
     _position_protection_loop,
 )
-from webull_bot.trading.orders.rate_limit_retry import (
-    _is_rate_limited,
-    _retry_once_on_rate_limit,
-)
+from webull_bot.trading.orders.rate_limit_retry import _retry_once_on_rate_limit
 from webull_bot.trading.orders.realized_pnl_tracking import (
     correct_realized_exit,
     record_realized_exit,
     reverse_phantom_exit,
 )
 from webull_bot.trading.orders.scaled_order_placement import (
-    HARD_ORDER_NOTIONAL_CEILING,
     ICEBERG_MIN_SHARES,
     ICEBERG_SLICE_INTERVAL_SECONDS,
     ICEBERG_SLICE_SHARES,
@@ -184,6 +178,13 @@ from webull_bot.trading.screeners.agent_discoveries import refresh_agent_discove
 from webull_bot.trading.screeners.agent_predicted_gainers_refresh import (
     refresh_agent_predicted_gainers,
 )
+from webull_bot.trading.guards.focus_mode_guards import (
+    new_entries_blocked,
+    stock_entries_suspended,
+    update_profit_throttle,
+)
+from webull_bot.trading.screeners.daily_batch_refresh import refresh_daily_batch
+from webull_bot.trading.screeners.focus_symbol_selection import select_focus_symbol
 from webull_bot.trading.screeners.market_pulse_entries import _market_pulse_entries
 from webull_bot.trading.screeners.market_pulse_refresh import refresh_market_pulse
 from webull_bot.trading.screeners.premarket_gainers_refresh import (
@@ -236,10 +237,7 @@ from webull_bot.trading.universe.universe_resolution_body import (
 from webull_bot.trading.util.account_state import account_state
 from webull_bot.trading.util.clock import is_trading_day, now, session_moment
 from webull_bot.trading.util.compact_number import _compact_number
-from webull_bot.trading.util.concurrent_dispatch import (
-    _POSITION_PROTECTION_MAX_WORKERS,
-    _dispatch_concurrently,
-)
+from webull_bot.trading.util.concurrent_dispatch import _dispatch_concurrently
 from webull_bot.trading.util.cooldowns import (
     cooldown_ready,
     has_pending_buy_order,
@@ -254,7 +252,6 @@ from webull_bot.trading.util.status_snapshot import write_status_snapshot
 from webull_bot.trading.util.trade_event_logging import log_trade_events
 from webull_bot.wash_sale import WashSaleTracker
 from webull_bot.webull_api import (
-    MarketDataPermissionError,
     QuoteUnavailableError,
     WebullAPI,
 )
@@ -382,6 +379,11 @@ class AutoTrader:
     refresh_market_pulse = refresh_market_pulse
     refresh_premarket_gainers = refresh_premarket_gainers
     refresh_agent_predicted_gainers = refresh_agent_predicted_gainers
+    refresh_daily_batch = refresh_daily_batch
+    select_focus_symbol = select_focus_symbol
+    stock_entries_suspended = stock_entries_suspended
+    update_profit_throttle = update_profit_throttle
+    new_entries_blocked = new_entries_blocked
     stop_loss_guard_active = stop_loss_guard_active
     symbol_quarantined = symbol_quarantined
     close_instruments = close_instruments
@@ -795,6 +797,29 @@ class AutoTrader:
         # own speculative once/day pre-market gainer predictions.
         self.agent_predicted_gainers: set[str] = set()
         self.agent_predicted_gainers_date = None
+        # Focus mode (see screeners/daily_batch_refresh.py and
+        # selection/focus_symbol.py) - by request, "only take a good
+        # batch of stocks to look out for everyday" then "go all in"
+        # on the single best one. daily_batch is the researched
+        # morning shortlist; focus_symbol is the one name picked out
+        # of it once the opening range has resolved. Both are
+        # date-stamped so they rebuild exactly once per session and
+        # survive a mid-session restart without re-picking.
+        self.daily_batch: list[str] = []
+        self.daily_batch_date = None
+        self.focus_symbol: str | None = None
+        self.focus_symbol_date = None
+        # Equity captured on the first cycle of the day, the
+        # denominator for the daily profit throttle - see
+        # focus_daily_profit_target_fraction.
+        self.day_start_equity: Decimal | None = None
+        self.day_start_equity_date = None
+        self.profit_throttle_armed = False
+        self.cached_total_equity: Decimal | None = None
+        # Peak premium seen on each open option position, the high-
+        # water mark the profit-lock trail rides - by request, "make
+        # sure when there is a profit to not let on too much loss."
+        self.option_peak_price: dict[str, Decimal] = {}
         self.market_pulse_cache: dict[str, list[dict]] = {
             "gainers": [],
             "losers": [],

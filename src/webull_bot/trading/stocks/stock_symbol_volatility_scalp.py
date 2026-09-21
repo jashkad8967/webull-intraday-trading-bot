@@ -39,6 +39,10 @@ def _process_stock_symbol_volatility_scalp_entry(
         < volatility_scalp_effective_max_concurrent
         and state.open_count < self.config.max_open_positions
         and not regime_gate_active
+        # Focus mode reserves the whole account for one option
+        # underlying - see stock_entries_suspended.
+        and not self.stock_entries_suspended()
+        and not self.new_entries_blocked()
     ):
         # Diagnostic-only pass, by request after live evidence
         # of zero volatility-scalp entries over a multi-hour
@@ -204,6 +208,10 @@ def _process_stock_symbol_volatility_scalp_entry(
         and len(self.volatility_scalp_positions)
         < volatility_scalp_effective_max_concurrent
         and state.open_count < self.config.max_open_positions
+        # Focus mode reserves the whole account for one option
+        # underlying - see stock_entries_suspended.
+        and not self.stock_entries_suspended()
+        and not self.new_entries_blocked()
         # By explicit request: keep buying this cohort's
         # dips continuously, multiple times a minute, EVEN
         # THROUGH a losing stretch - unlike every other

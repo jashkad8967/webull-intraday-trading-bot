@@ -44,6 +44,11 @@ def _evaluate_option_entry(
     self.option_average_down_count.pop(option_symbol, None)
     self.last_option_average_down.pop(option_symbol, None)
     self.option_last_buy_price.pop(option_symbol, None)
+    # Same reset reasoning, for the profit-lock high-water mark: a
+    # stale peak from a closed position would arm the trail
+    # immediately on the NEXT entry into this contract and exit it at
+    # a floor derived from a gain this position never had.
+    self.option_peak_price.pop(option_symbol, None)
     if had_averaging_state:
         # By request ("do a full on options sanity check") - persist
         # the reset too, or a stale count/last-buy-price for an
@@ -104,6 +109,34 @@ def _evaluate_option_entry(
         ] += 1
         return open_count, buying_power
     underlying = contract["underlying_symbol"]
+    # By explicit request: "find one really good volatile stock to
+    # play with and go all in on that for the day... make sure you
+    # use all of the capital." Deliberately placed ABOVE the smoke-
+    # test bypass below, and above every entry-QUALITY gate, because
+    # this is a STRUCTURAL constraint (which symbol the account is
+    # committed to today), not a judgment about whether this setup
+    # looks good. Sizing was never the thing preventing an all-in
+    # position - option_capital_fraction is already 1.0 - it was
+    # max_open_positions letting buying power drain into whatever
+    # the scanner surfaced first. Gating entry to the one focus
+    # symbol is what actually leaves the whole account available to
+    # it. Until a focus symbol is locked (pre-09:45, or a day where
+    # nothing cleared the gates) no option entry is allowed at all.
+    if self.config.focus_mode_enabled and underlying != self.focus_symbol:
+        self.option_gate_rejections[
+            "not today's focus symbol"
+            if self.focus_symbol
+            else "no focus symbol locked yet"
+        ] += 1
+        return open_count, buying_power
+    # By request ("once you hit a certain profit slow down") - the
+    # day's target is already banked, so stop ADDING risk. Exits, the
+    # profit-lock trail and the EOD close all stay live below.
+    if self.new_entries_blocked():
+        self.option_gate_rejections[
+            "daily profit target reached - new entries throttled"
+        ] += 1
+        return open_count, buying_power
     direction = directions.get(underlying, "HOLD")
     contract_type = contract.get("option_type")
     # By explicit request, for a one-off diagnostic
@@ -172,6 +205,18 @@ def _evaluate_option_entry(
         if not self.strategy.relative_volume_ok(underlying):
             self.option_gate_rejections[
                 "underlying move not backed by above-average volume"
+            ] += 1
+            return open_count, buying_power
+        # By request ("see the momentum by the buys and sells" / "make
+        # sure the entry and exit happens at the right time according
+        # to the momentum"): relative_volume_ok above only asks
+        # whether volume is elevated - it is direction-blind. This
+        # asks who is actually winning: a CALL needs buyers in
+        # control, a PUT needs sellers. A dip nobody is buying is not
+        # a dip worth buying a call into.
+        if not self.strategy.pressure_supports_entry(underlying, contract_type):
+            self.option_gate_rejections[
+                "buy/sell pressure does not support this direction"
             ] += 1
             return open_count, buying_power
         # By explicit request ("you are buying calls at daily
@@ -484,12 +529,31 @@ def _evaluate_option_exit(
     seconds_since_entry = (
         time.monotonic() - opened_at if opened_at is not None else None
     )
+    # By request ("make sure when there is a profit to not let on too
+    # much loss") - the high-water mark the profit-lock trail rides.
+    # Tracked off sell_realizable_price (the bid, what the position
+    # could actually be sold for) rather than the mark, so the peak
+    # reflects a gain that was genuinely realizable rather than one
+    # that only ever existed on the mid.
+    peak_price = max(
+        self.option_peak_price.get(option_symbol, sell_realizable_price),
+        sell_realizable_price,
+    )
+    self.option_peak_price[option_symbol] = peak_price
     decision = self.strategy.option_decision(
         sell_realizable_price,
         quantity,
         cost,
         days_to_expiration,
         seconds_since_entry=seconds_since_entry,
+        peak_price=peak_price,
+        # Once the day's target is banked, hold open winners on a
+        # shorter leash - see focus_daily_profit_target_fraction.
+        giveback_fraction=(
+            self.config.profit_lock_giveback_fraction_after_throttle
+            if self.profit_throttle_armed
+            else self.config.profit_lock_giveback_fraction
+        ),
     )
     # By request (momentum-shift overview): a bearish price/RSI
     # divergence on the UNDERLYING (not the option premium itself,
@@ -559,6 +623,24 @@ def _evaluate_option_exit(
                         sell_realizable_price,
                     )
                     momentum_exit = True
+            # By request ("see the momentum by the buys and sells"):
+            # participation has turned against this position hard
+            # enough to read as exhaustion - the "tip of momentum"
+            # this whole flip mechanic is built around. Sits inside
+            # the same min_margin guard as the two checks above, so
+            # like them it can only ever convert a HOLD into a
+            # genuinely realizable PROFIT, never cut a loser (STOP
+            # owns loss-cutting on its own separate terms).
+            if decision.action == "HOLD" and self.strategy.pressure_flipped_against(
+                underlying, contract.get("option_type")
+            ):
+                decision = Decision(
+                    "PROFIT",
+                    "buy/sell pressure flipped against the position - "
+                    "locking in the gain",
+                    sell_realizable_price,
+                )
+                momentum_exit = True
             # By explicit request ("how to immediately sell call and
             # buy a put at the tip of momentum and vice versa"): this
             # exit itself (divergence or resistance - a real momentum-
@@ -596,6 +678,12 @@ def _evaluate_option_exit(
         and quantity > 0
         and option_symbol not in self.pending_option_exits
         and days_to_expiration > self.config.option_min_hold_dte
+        # By explicit request, averaging down is deliberately NOT
+        # gated on the daily profit throttle: the throttle stops
+        # OPENING new risk, while averaging down is managing a
+        # position that is already open and already exposed. Blocking
+        # it would strand an underwater position with no way to
+        # improve its basis while the throttle is armed.
         and average_down_spread_ok
         and self.option_average_down_count[option_symbol]
         < self.config.option_max_averaging_buys

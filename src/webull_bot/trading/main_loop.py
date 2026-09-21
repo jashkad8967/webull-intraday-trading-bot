@@ -49,6 +49,12 @@ def run(self) -> None:
             # is a no-op on every later tick of the same wait.
             self.refresh_premarket_gainers(moment)
             self.refresh_agent_predicted_gainers(moment)
+            # By request ("only take a good batch of stocks to look out
+            # for everyday") - built during the pre-market wait, after
+            # the two gainer screeners above have populated the sources
+            # it draws from. Internally time-gated to daily_batch_
+            # refresh_time, so this is a no-op until that lands.
+            self.refresh_daily_batch(moment)
             time.sleep(min(60, max(1, (market_open - moment).total_seconds())))
             continue
 
@@ -98,6 +104,14 @@ def run(self) -> None:
             # this a no-op on every cycle after the first.
             self.refresh_premarket_gainers(moment)
             self.refresh_agent_predicted_gainers(moment)
+            # Same fallback-call-site reasoning as the two above: a
+            # restart that lands after market_open never runs the
+            # pre-market branch, so without these the batch would
+            # never be built and no focus symbol could ever be
+            # locked. Both are internally date- and time-guarded, so
+            # they're no-ops on every cycle after the first.
+            self.refresh_daily_batch(moment)
+            self.select_focus_symbol(moment)
             # monitor_working_orders/the repricers/escalate_stalled_
             # stop_losses now run on their own fast, dedicated
             # thread (see _position_protection_loop, started once

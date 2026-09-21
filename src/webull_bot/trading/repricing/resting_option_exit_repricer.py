@@ -144,10 +144,22 @@ def reprice_resting_option_exits(
                         target = midpoint
                 if target is None or target == order.get("limit_price"):
                     continue
-                if cost > 0 and target < cost:
+                if cost > 0 and target < cost + (
+                    self.config.sell_fee_dollars / (quantity * 100)
+                ):
                     # Never chase down below entry cost - see the
                     # matching stock-side guard in
                     # reprice_resting_exits.
+                    #
+                    # Includes the flat sell fee, not just bare cost,
+                    # by explicit request ("still make sure to try and
+                    # make profit, not sell a loss for a profit"). A
+                    # target sitting between cost and cost+fee looks
+                    # like a gain and books as a LOSS once the $0.02
+                    # lands - exactly how LFUS/FIGR/MAGN exited
+                    # "profitably" into real losses. A genuine STOP is
+                    # unaffected: it takes the branch below, which is
+                    # meant to cross down and cap a loss.
                     continue
             else:
                 # STOP: track the same aggressive bid-crossing formula
