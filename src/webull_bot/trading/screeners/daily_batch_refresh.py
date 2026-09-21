@@ -159,28 +159,32 @@ def refresh_daily_batch(self, moment: datetime) -> None:
         # the wall clock already says. option_eod_close_time remains
         # a hard backstop - a batch built with no real session left
         # to trade it in is pointless regardless of elapsed time.
-        if self.daily_batch_first_attempt_at is None:
-            self.daily_batch_first_attempt_at = time.monotonic()
-        elapsed_minutes = (
-            time.monotonic() - self.daily_batch_first_attempt_at
-        ) / 60
-        # The elapsed-time give-up must not be able to fire BEFORE the
-        # focus lock, or the retry window silently kills the whole
-        # session it exists to protect: the batch's first attempt is at
-        # daily_batch_refresh_time, a full hour before focus_lock_time,
-        # and the default retry window is 20 minutes - so a quiet
-        # pre-market stretch would mark the day done ~40 minutes before
-        # the lock and ~25 minutes before the opening bell had even
-        # printed the regular-session gaps this screens on. Nothing
-        # could then trade for the rest of the day. Gaps are measured
-        # pre-market but only become reliable once real volume arrives,
-        # so "nothing qualifies yet at 07:45" is the normal morning
-        # state, not a reason to stop looking.
+        # The retry window is anchored at focus_lock_time, not at the
+        # first attempt of the morning, so pre-market attempts can
+        # never burn it. The batch's first attempt is at daily_batch_
+        # refresh_time, a full hour before the lock, against a default
+        # 20-minute window - so counting from then, a quiet pre-market
+        # marked the whole day done ~40 minutes BEFORE the lock and ~25
+        # before the opening bell had even printed the regular-session
+        # gaps this screens on, and nothing could trade for the rest of
+        # that session. Anchoring at the lock also avoids the opposite
+        # error of merely gating give-up on the lock: the window would
+        # already be spent by 08:45, so the batch would quit at the
+        # very instant the post-bell data it needs became available.
+        # "Nothing qualifies yet at 07:45" is the normal quiet pre-
+        # market state, not a verdict.
         past_lock = moment >= self.session_moment(
             moment, self.config.focus_lock_time
         )
+        if past_lock and self.daily_batch_first_attempt_at is None:
+            self.daily_batch_first_attempt_at = time.monotonic()
+        elapsed_minutes = (
+            0.0
+            if self.daily_batch_first_attempt_at is None
+            else (time.monotonic() - self.daily_batch_first_attempt_at) / 60
+        )
         give_up = (
-            (elapsed_minutes >= self.config.daily_batch_retry_minutes and past_lock)
+            (past_lock and elapsed_minutes >= self.config.daily_batch_retry_minutes)
             or moment >= self.session_moment(
                 moment, self.config.option_eod_close_time
             )
