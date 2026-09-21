@@ -274,10 +274,23 @@ def _prepare_stock_scan_batch(
     # focus_mode_stock_batch_size of 20). premarket_gainers/agent_
     # predicted_gainers are kept - those still feed refresh_daily_
     # batch/select_focus_symbol's own re-pick candidate pool.
-    force_scan = self.premarket_gainers | self.agent_predicted_gainers
-    if not focus_entries_suspended:
+    # By explicit request ("i want this to be faster more high
+    # frequency trades"): premarket_gainers/agent_predicted_gainers
+    # can each hold up to their own configured limit (confirmed live:
+    # 50 and 15) and were being force-scanned in FULL every cycle,
+    # even though only the handful that actually made refresh_daily_
+    # batch's own selection (self.daily_batch, typically 3-8 names)
+    # matter for a real re-pick while entries are suspended - the
+    # other ~57 gainers that didn't make the cut don't need
+    # continuous per-cycle freshness in the meantime.
+    if focus_entries_suspended:
         force_scan = (
-            force_scan
+            self.premarket_gainers | self.agent_predicted_gainers
+        ) & set(self.daily_batch)
+    else:
+        force_scan = (
+            self.premarket_gainers
+            | self.agent_predicted_gainers
             | self.volatility_scalp_symbols
             | self.volatility_scalp_recently_eligible
         )
