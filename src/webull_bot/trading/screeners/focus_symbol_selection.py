@@ -72,7 +72,12 @@ def select_focus_symbol(self, moment: datetime) -> None:
             "re-picking a replacement for the rest of the session",
             self.focus_symbol,
         )
-    self.focus_symbol_date = moment.date()
+    # Deliberately NOT date-stamped until a symbol is actually
+    # locked, for the same reason refresh_daily_batch defers its
+    # stamp: RVOL comes from volume_delta, which needs consecutive
+    # intraday scan samples, so a container that starts near
+    # focus_lock_time would otherwise score an unwarmed field,
+    # lock nothing, and mark the day done.
     scored: list[tuple[float, str, dict]] = []
     for symbol in self.daily_batch:
         price = self.strategy.prices.get(symbol)
@@ -110,21 +115,33 @@ def select_focus_symbol(self, moment: datetime) -> None:
             (score, symbol, {"rvol": rvol, "volatility": volatility, "score": score})
         )
     if not scored:
-        log.info(
-            "FOCUS  | no symbol in today's batch (%s) cleared the focus "
-            "gates (rvol>=%s | volatility>=%s | price %s-%s | volume>=%s) "
-            "- not trading options today",
-            ",".join(self.daily_batch) or "empty",
-            self.config.focus_min_rvol,
-            self.config.option_min_volatility_percent,
-            self.config.focus_min_price,
-            self.config.focus_max_price,
-            self.config.popular_stock_min_volume,
+        # Keep retrying while there is still a session left to trade;
+        # stop once the option closeout window begins, since a symbol
+        # locked then could only be flattened immediately.
+        give_up = moment >= self.session_moment(
+            moment, self.config.option_eod_close_time
         )
+        if give_up:
+            self.focus_symbol_date = moment.date()
+        if self.focus_logged_empty_date != moment.date():
+            self.focus_logged_empty_date = moment.date()
+            log.info(
+                "FOCUS  | no symbol in today's batch (%s) cleared the focus "
+                "gates (rvol>=%s | volatility>=%s | price %s-%s | volume>=%s) "
+                "- %s",
+                ",".join(self.daily_batch) or "empty",
+                self.config.focus_min_rvol,
+                self.config.option_min_volatility_percent,
+                self.config.focus_min_price,
+                self.config.focus_max_price,
+                self.config.popular_stock_min_volume,
+                "not trading options today" if give_up else "will retry",
+            )
         return
     scored.sort(key=lambda row: row[0], reverse=True)
     best_score, best_symbol, detail = scored[0]
     self.focus_symbol = best_symbol
+    self.focus_symbol_date = moment.date()
     log.info(
         "FOCUS  | %s locked for the session | rvol=%.2fx volatility=%.2f%% "
         "score=%.1f | beat %s other candidate(s): %s",

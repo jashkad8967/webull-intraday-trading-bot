@@ -2,6 +2,7 @@ import time
 import unittest
 from collections import defaultdict, deque
 from datetime import datetime
+from datetime import time as dt_time
 from decimal import Decimal
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -46,7 +47,13 @@ def focus_config(**overrides):
         volatility_scalp_micro_exhaustion_volume_ema_alpha=Decimal("0.2"),
     )
     base.update(overrides)
-    return SimpleNamespace(**base)
+    cfg = SimpleNamespace(**base)
+    # session_moment() calls through to this, same as the real
+    # SessionScheduleSettings helper.
+    cfg.session_time = lambda value: dt_time(
+        *(int(part) for part in value.split(":"))
+    )
+    return cfg
 
 
 class NetPressureTests(unittest.TestCase):
@@ -301,6 +308,98 @@ class ProfitThrottleTests(unittest.TestCase):
         bot.update_profit_throttle(Decimal("400"))
         bot.update_profit_throttle(Decimal("500"))
         self.assertFalse(bot.new_entries_blocked())
+
+
+class EmptyResultRetryTests(unittest.TestCase):
+    """Regression: both once-daily routines used to stamp the date
+    BEFORE producing a result, so an empty first attempt marked the
+    day done permanently.
+
+    That is not a rare edge case - it is every mid-session deploy.
+    The container starts with no scan history, so strategy.metrics is
+    empty and volume_delta (which RVOL needs) has no samples yet, the
+    first attempt legitimately finds nothing, and the bot would then
+    refuse to trade for the rest of the session.
+    """
+
+    def bot(self, now, metrics=None):
+        tz = ZoneInfo("America/New_York")
+        bot = SimpleNamespace(
+            config=focus_config(option_eod_close_time="15:50"),
+            daily_batch=[],
+            daily_batch_date=None,
+            daily_batch_logged_empty_date=None,
+            focus_symbol=None,
+            focus_symbol_date=None,
+            focus_logged_empty_date=None,
+            premarket_gainers=set(),
+            agent_predicted_gainers=set(),
+            seed_popular_symbols=set(),
+            agent_popular_symbols=set(),
+            market_pulse_cache={},
+            wash_sales=SimpleNamespace(blocked_until=lambda key: None),
+            agent_assessment=lambda symbol: None,
+            strategy=SimpleNamespace(
+                metrics=metrics or {},
+                prices={},
+                volume_delta_ema={},
+                volume_delta_latest={},
+                priority_score=lambda s, a: 1.0,
+                realized_volatility_percent=lambda s: None,
+            ),
+            timezone=tz,
+        )
+        bot.session_moment = AutoTrader.session_moment.__get__(bot)
+        bot.refresh_daily_batch = AutoTrader.refresh_daily_batch.__get__(bot)
+        bot.select_focus_symbol = AutoTrader.select_focus_symbol.__get__(bot)
+        bot._now = now
+        return bot
+
+    def moment(self, hh, mm):
+        return datetime(2026, 9, 21, hh, mm, tzinfo=ZoneInfo("America/New_York"))
+
+    def test_empty_batch_before_the_lock_retries_instead_of_ending_the_day(self):
+        bot = self.bot(self.moment(9, 20))
+        bot.refresh_daily_batch(self.moment(9, 20))
+        self.assertIsNone(
+            bot.daily_batch_date,
+            "an empty batch before focus_lock_time must stay retryable",
+        )
+
+    def test_empty_batch_after_the_lock_gives_up_for_the_day(self):
+        bot = self.bot(self.moment(10, 30))
+        bot.refresh_daily_batch(self.moment(10, 30))
+        self.assertEqual(bot.daily_batch_date, self.moment(10, 30).date())
+
+    def test_a_real_batch_stamps_the_day(self):
+        metrics = {
+            "AAA": {
+                "volume": 5_000_000,
+                "spread_percent": 0.1,
+                "change_ratio": 0.05,
+            }
+        }
+        bot = self.bot(self.moment(9, 0), metrics=metrics)
+        bot.premarket_gainers = {"AAA"}
+        bot.strategy.prices = {"AAA": Decimal("50")}
+        bot.refresh_daily_batch(self.moment(9, 0))
+        self.assertEqual(bot.daily_batch, ["AAA"])
+        self.assertEqual(bot.daily_batch_date, self.moment(9, 0).date())
+
+    def test_no_focus_pick_mid_session_retries(self):
+        bot = self.bot(self.moment(9, 50))
+        bot.daily_batch = ["AAA"]
+        bot.select_focus_symbol(self.moment(9, 50))
+        self.assertIsNone(
+            bot.focus_symbol_date,
+            "an unwarmed field at the lock time must stay retryable",
+        )
+
+    def test_no_focus_pick_at_closeout_gives_up(self):
+        bot = self.bot(self.moment(15, 50))
+        bot.daily_batch = ["AAA"]
+        bot.select_focus_symbol(self.moment(15, 50))
+        self.assertEqual(bot.focus_symbol_date, self.moment(15, 50).date())
 
 
 class StockSuspensionTests(unittest.TestCase):

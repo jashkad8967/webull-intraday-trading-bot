@@ -54,7 +54,16 @@ def refresh_daily_batch(self, moment: datetime) -> None:
         # this branch, so it retries on the next cycle instead of
         # marking the day done before the batch was ever built.
         return
-    self.daily_batch_date = moment.date()
+    # Deliberately NOT date-stamped until a non-empty batch actually
+    # exists (see the end of this function).
+    #
+    # Stamping up front looks equivalent and is not: this reads
+    # strategy.metrics, which is populated by the scan loop, so a
+    # container that STARTS after daily_batch_refresh_time - every
+    # mid-session deploy - runs this on its very first cycle with
+    # metrics still empty, produces an empty batch, marks the day
+    # done, and then never trades again that session. Retrying
+    # until focus_lock_time gives the scan loop time to warm up.
     # Every already-wired morning source, unioned. Each of these is
     # refreshed by its own once-daily screener before this runs.
     candidates = (
@@ -104,18 +113,31 @@ def refresh_daily_batch(self, moment: datetime) -> None:
     selected = scored[: self.config.daily_batch_size]
     self.daily_batch = [symbol for _, symbol, _ in selected]
     if not self.daily_batch:
-        log.info(
-            "BATCH  | no candidate cleared the daily-batch gates "
-            "(gap>=%s%% | volume>=%s | spread<=%s%% | price %s-%s) | "
-            "%s candidates considered",
-            self.config.daily_batch_min_gap_percent,
-            self.config.popular_stock_min_volume,
-            self.config.popular_stock_max_spread_percent,
-            self.config.focus_min_price,
-            self.config.focus_max_price,
-            len(candidates),
+        # Keep retrying while there is still time for a pick to
+        # matter; give up (and stamp) once focus_lock_time has
+        # passed, so a genuinely weak morning stops re-scanning
+        # every cycle for the rest of the day.
+        give_up = moment >= self.session_moment(
+            moment, self.config.focus_lock_time
         )
+        if give_up:
+            self.daily_batch_date = moment.date()
+        if not self.daily_batch_logged_empty_date == moment.date():
+            self.daily_batch_logged_empty_date = moment.date()
+            log.info(
+                "BATCH  | no candidate cleared the daily-batch gates "
+                "(gap>=%s%% | volume>=%s | spread<=%s%% | price %s-%s) | "
+                "%s candidates considered | %s",
+                self.config.daily_batch_min_gap_percent,
+                self.config.popular_stock_min_volume,
+                self.config.popular_stock_max_spread_percent,
+                self.config.focus_min_price,
+                self.config.focus_max_price,
+                len(candidates),
+                "giving up for today" if give_up else "will retry",
+            )
         return
+    self.daily_batch_date = moment.date()
     log.info(
         "BATCH  | %s of %s candidates | %s",
         len(self.daily_batch),

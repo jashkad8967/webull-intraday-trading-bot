@@ -809,6 +809,13 @@ class AutoTrader:
         self.daily_batch_date = None
         self.focus_symbol: str | None = None
         self.focus_symbol_date = None
+        # Both routines retry until their cutoff rather than marking
+        # the day done on an empty result (a mid-session restart
+        # starts with no scan history, so the first attempt legitimately
+        # finds nothing). These stamps keep that retry loop from
+        # re-logging the same "nothing qualified" line every cycle.
+        self.daily_batch_logged_empty_date = None
+        self.focus_logged_empty_date = None
         # Equity captured on the first cycle of the day, the
         # denominator for the daily profit throttle - see
         # focus_daily_profit_target_fraction.
