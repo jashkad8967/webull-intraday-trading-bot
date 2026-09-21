@@ -86,7 +86,10 @@ def analyst_priority_bonus(
 
 
 def stock_scan_concurrent_batches(
-    self, total_symbols: int, core_session_active: bool
+    self,
+    total_symbols: int,
+    core_session_active: bool,
+    focus_mode_suppressing_entries: bool = False,
 ) -> int:
     """How many STOCK_BATCH_SIZE-sized quote batches trade_stocks
     should fetch CONCURRENTLY this cycle - by request: "scan
@@ -116,8 +119,25 @@ def stock_scan_concurrent_batches(
     universe size - a hard safety cap on real Webull API request
     volume, given it already returned live 429 TOO_MANY_REQUESTS
     errors this session.
+
+    By explicit request ("i want this to be faster more high
+    frequency trades"): pinned to a single batch when focus mode has
+    suspended new stock entries. Live evidence showed "direction
+    signals" (the option entry timing signal) refreshing only every
+    40-90+ seconds despite poll_seconds being 0.25s - the actual gate
+    was wall-clock time PER CYCLE, and full multi-batch universe
+    coverage exists to feed the general multi-symbol stock strategy,
+    which is exactly what's suspended in this state. The one
+    underlying that still needs fresh data (the locked focus symbol)
+    is separately guaranteed into every single-batch scan via
+    prioritized_stock_batch's force_include - so this doesn't lose
+    that symbol's freshness, it only stops paying for full-universe
+    coverage nothing is currently allowed to act on, freeing real
+    cycle time for trade_options to run again sooner.
     """
     if total_symbols <= 0 or self.config.stock_batch_size <= 0:
+        return 1
+    if focus_mode_suppressing_entries:
         return 1
     cycles = max(1, self.config.stock_scan_target_full_coverage_cycles)
     needed = -(-total_symbols // (self.config.stock_batch_size * cycles))
@@ -140,10 +160,13 @@ def prioritized_stock_batch(
     positions: list[dict],
     assessment_for,
     research_symbols: set[str] | None = None,
+    force_include: set[str] | None = None,
+    max_size: int | None = None,
 ) -> tuple[list[str], int]:
     if not symbols:
         return [], 0
-    size = min(self.config.stock_batch_size, len(symbols))
+    batch_size = self.config.stock_batch_size if max_size is None else max_size
+    size = min(batch_size, len(symbols))
     available = set(symbols)
     research_symbols = (research_symbols or set()) & available
     held = [
@@ -153,6 +176,22 @@ def prioritized_stock_batch(
         and Decimal(str(item.get("quantity", "0"))) != 0
         and str(item.get("symbol", "")).upper() in available
     ]
+    # By explicit request ("i want this to be faster more high
+    # frequency trades") - focus mode commits the whole account to
+    # options on ONE underlying, but that underlying is usually never
+    # itself an EQUITY position (the bot holds the option contract,
+    # not the stock), so it was getting diluted into the same ~100-
+    # symbol rotation as every other candidate - its price/EMA history
+    # (and therefore the direction signal option entries gate on)
+    # only refreshed once every several cycles instead of every
+    # single one. Guaranteed inclusion here, same "always in the
+    # batch" treatment as an open position, is a genuine speedup (a
+    # real EMA cross gets DETECTED sooner) rather than a quality
+    # relaxation (the signal itself is unchanged) - it costs one quote
+    # slot per cycle, negligible against stock_batch_size.
+    for symbol in force_include or set():
+        if symbol in available and symbol not in held:
+            held.append(symbol)
     ranked = sorted(
         (symbol for symbol in self.activity if symbol in available),
         key=lambda symbol: self.priority_score(
