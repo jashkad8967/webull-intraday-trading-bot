@@ -4,6 +4,79 @@ import time
 log = logging.getLogger("webull-bot")
 
 
+def ensure_focus_symbol_contracts(self) -> None:
+    """By request ("you should be able to request contract by stock
+    in webull openapi"): the moment a focus symbol locks, the whole
+    account is committed to trading it, so its option chain must
+    exist NOW rather than depending on discover_option_contracts'
+    generic rotation eventually reaching it.
+
+    That rotation cannot be relied on here for two independent
+    reasons: (1) its candidate pool is config.option_candidates()
+    union agent_popular_symbols union agent_predicted_gainers, which
+    is NOT the same set select_focus_symbol picks from (the daily
+    batch draws from premarket_gainers/seed_popular_symbols too) - a
+    locked symbol may simply never be in that pool; (2) even if it
+    is, option_discovery_attempted is permanent per session (and
+    persisted across restarts) - one prior attempt with zero results
+    (common; not every name has a listed chain, or didn't clear a
+    filter that day) silently forecloses it forever, with no
+    awareness that the symbol has since become the one thing the
+    account needs to trade.
+
+    Directly calls the same select_atm_options OpenAPI lookup
+    discover_option_contracts uses per-candidate, just targeted and
+    immediate instead of part of the rotation. A cheap no-op once the
+    chain already exists (checked first) or on a symbol with no price
+    yet (retries next cycle, same as everything else in focus mode).
+    """
+    if not self.config.focus_mode_enabled or not self.focus_symbol:
+        return
+    underlying = self.focus_symbol
+    if any(
+        item["underlying_symbol"] == underlying for item in self.option_contracts
+    ):
+        return
+    if underlying not in self.strategy.prices:
+        return
+    try:
+        max_contract_cost = (
+            self.cached_option_buying_power
+            if self.cached_option_buying_power
+            else None
+        )
+        contracts = self.api.select_atm_options(
+            underlying,
+            self.strategy.prices[underlying],
+            max_contract_cost=max_contract_cost,
+        )
+        self.option_contracts.extend(contracts)
+        self.option_discovery_attempted.add(underlying)
+        self.option_contracts_state.save(
+            self.option_contracts,
+            self.option_discovery_attempted,
+            {
+                symbol: {
+                    "count": count,
+                    "last_buy_price": self.option_last_buy_price[symbol],
+                }
+                for symbol, count in self.option_average_down_count.items()
+                if count > 0 and symbol in self.option_last_buy_price
+            },
+        )
+        log.info(
+            "OPTIONS | %s | focus-symbol contracts discovered | found=%s",
+            underlying,
+            ",".join(contract["symbol"] for contract in contracts) or "none",
+        )
+    except Exception as exc:
+        log.error(
+            "OPTIONS | %s | focus-symbol contract discovery failed | %s",
+            underlying,
+            exc,
+        )
+
+
 def discover_option_contracts(self) -> None:
     # Live incident: dispatching this onto its own background
     # thread (tried this session, immediately reverted) produced
