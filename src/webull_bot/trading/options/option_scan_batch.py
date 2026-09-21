@@ -142,10 +142,27 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     # option-quote batch's much tighter pace - every known
     # underlying now gets a fresh sample every single cycle,
     # completely decoupled from the option-contract quote rotation.
-    underlyings = sorted(
-        {contract["underlying_symbol"] for contract in self.option_contracts}
-    )
-    quote_symbols = sorted(set(underlyings) | {OPTION_VIXY_SYMBOL})
+    # By explicit request ("i want this to be faster more high
+    # frequency trades"): with focus mode locked onto one symbol,
+    # every OTHER discovered underlying's direction signal is
+    # provably unusable - option entry already rejects anything that
+    # isn't the focus symbol before direction is even checked (see
+    # "not today's focus symbol" in _evaluate_option_entry) - yet
+    # this quote batch kept fetching all of them anyway (confirmed
+    # live: quoted=69/69 and climbing as background discovery kept
+    # finding more names), directly slowing how often THIS cycle's
+    # actual signal (the focus symbol's) refreshes. VIXY is dropped
+    # too in this state: option_market_regime_ok is itself already
+    # skipped for focus-mode entries (see _evaluate_option_entry),
+    # so there is nothing left that reads current_vixy.
+    if self.config.focus_mode_enabled and self.focus_symbol:
+        underlyings = [self.focus_symbol]
+        quote_symbols = [self.focus_symbol]
+    else:
+        underlyings = sorted(
+            {contract["underlying_symbol"] for contract in self.option_contracts}
+        )
+        quote_symbols = sorted(set(underlyings) | {OPTION_VIXY_SYMBOL})
     underlying_quote_by_symbol: dict[str, dict] = {}
     current_vixy: Decimal | None = None
     try:
