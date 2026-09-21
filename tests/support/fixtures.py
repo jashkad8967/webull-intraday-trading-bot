@@ -7,8 +7,15 @@ from types import SimpleNamespace
 
 
 class StrategyConfigMixin:
-    def config(self):
-        return SimpleNamespace(
+    def config(self, **overrides):
+        base = dict(
+            # Defaults False here - this fixture represents the
+            # pre-focus-mode generic multi-symbol surface most of this
+            # suite already exercises; individual focus-mode tests
+            # live in tests/test_focus_mode.py's own focus_config(),
+            # or pass focus_mode_enabled=True explicitly here when a
+            # test needs both surfaces in one place.
+            focus_mode_enabled=False,
             ema_fast_period=3,
             ema_slow_period=8,
             stock_batch_size=5,
@@ -98,3 +105,5 @@ class StrategyConfigMixin:
             parabolic_sar_af_step=Decimal("0.02"),
             parabolic_sar_af_max=Decimal("0.2"),
         )
+        base.update(overrides)
+        return SimpleNamespace(**base)

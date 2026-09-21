@@ -56,6 +56,32 @@ def focus_config(**overrides):
         time_aware_stop_widen_seconds=60,
         time_aware_stop_widen_multiplier=Decimal("1.5"),
         volatility_scalp_micro_exhaustion_volume_ema_alpha=Decimal("0.2"),
+        # Added for full _evaluate_option_entry/_evaluate_option_exit
+        # integration coverage - see
+        # tests/trading/test_focus_mode_entry_exit_integration.py.
+        option_max_entry_spread_percent=Decimal("25"),
+        option_smoke_test_mode=False,
+        option_scalp_enabled=True,
+        option_straddle_enabled=False,
+        option_momentum_flip_window_seconds=180,
+        option_min_premium_dollars=Decimal("0.50"),
+        option_quantity=20,
+        option_capital_fraction=Decimal("1.0"),
+        max_order_notional=Decimal("1000"),
+        max_open_positions=50,
+        trade_cooldown_seconds=Decimal("0"),
+        stock_reentry_cooldown_seconds=Decimal("180"),
+        stock_max_trades_per_hour=0,
+        price_sanity_cooldown_seconds=60,
+        symbol_quarantine_enabled=False,
+        symbol_quarantine_lookback_seconds=1800,
+        symbol_quarantine_min_trades=3,
+        symbol_quarantine_loss_dollars=Decimal("0.50"),
+        symbol_quarantine_cooldown_seconds=900,
+        option_averaging_down_dip_percent=Decimal("0.20"),
+        option_averaging_step_multiplier=Decimal("0.5"),
+        option_max_averaging_buys=2,
+        option_averaging_reentry_cooldown_seconds=Decimal("60"),
     )
     base.update(overrides)
     cfg = SimpleNamespace(**base)

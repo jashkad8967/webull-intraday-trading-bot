@@ -163,10 +163,28 @@ def option_order_quantity(
             rounding=ROUND_DOWN
         )
     )
-    notional_limit = int(
-        (
-            self.config.max_order_notional / contract_cost
-        ).to_integral_value(rounding=ROUND_DOWN)
+    # By explicit request ("it utilizes the entire account value"):
+    # max_order_notional ($1000) exists to bound per-trade risk in the
+    # OLD multi-symbol strategy, where capital was deliberately spread
+    # across many small positions and no single one was meant to be
+    # able to consume the whole account. Focus mode inverts that on
+    # purpose - one position IS the whole account by design (see
+    # option_capital_fraction's own history: raised 0.05 -> 1.0 for
+    # the identical "no cap for options... it should spend all the
+    # money if needed" request). Not yet binding at this account's
+    # current size, but a flat $1000 ceiling would silently start
+    # contradicting full-account utilization the moment the account
+    # grows past it - exempted here for the same reason capital_
+    # fraction already was, before that becomes a live incident
+    # instead of a caught one.
+    notional_limit = (
+        affordable
+        if self.config.focus_mode_enabled
+        else int(
+            (
+                self.config.max_order_notional / contract_cost
+            ).to_integral_value(rounding=ROUND_DOWN)
+        )
     )
     # Never risk more than this fraction of buying power on one entry -
     # a defined-risk-per-trade cap on top of (not instead of) the
@@ -176,7 +194,16 @@ def option_order_quantity(
             buying_power * self.config.option_capital_fraction / contract_cost
         ).to_integral_value(rounding=ROUND_DOWN)
     )
+    # Same full-account-utilization reasoning as notional_limit above -
+    # option_quantity (20) is a flat integer ceiling that can still
+    # undercut full utilization on a cheap contract or a larger
+    # account (e.g. a $1/share contract with $10,000 buying power
+    # affords 100 contracts; 20 would silently leave 80% of the
+    # account unused). Exempted in focus mode for the same reason.
+    quantity_cap = (
+        affordable if self.config.focus_mode_enabled else self.config.option_quantity
+    )
     return (
-        min(self.config.option_quantity, affordable, notional_limit, risk_cap),
+        min(quantity_cap, affordable, notional_limit, risk_cap),
         contract_cost,
     )
