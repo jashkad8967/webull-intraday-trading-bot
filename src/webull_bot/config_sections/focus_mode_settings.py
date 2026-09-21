@@ -66,13 +66,21 @@ class FocusModeSettings(BaseSettings):
     # Pre-market ranking frequently does not survive the open, so the
     # batch is re-measured on regular-session data before the pick.
     focus_lock_time: str = "09:45"
-    # Relative volume floor, applied to both the batch and the focus
-    # pick. The evidence here is unusually clean: below-average RVOL
-    # averaged -0.02R per trade while above-average averaged +0.08R -
-    # i.e. trading a name that isn't unusually active is a negative-
-    # expectancy activity before any strategy is applied. Conventional
-    # day-trading practice puts the useful band at 2x-5x.
-    focus_min_rvol: Decimal = Field(default=Decimal("2.0"), gt=0, le=50)
+    # NOTE: there is deliberately no live-RVOL gate ON THE FOCUS PICK
+    # itself, though the underlying research is real (below-average
+    # RVOL averaged -0.02R per trade, above-average +0.08R). An
+    # earlier version required select_focus_symbol to re-check live
+    # RVOL on top of what the batch already filtered on - by request
+    # ("it should just be scanning contracts by the momentum and
+    # entering"), that was removed after it stalled the live account
+    # for 20+ minutes: volume_delta resets to empty on every restart,
+    # so the gate could sit unsatisfied on a perfectly good candidate
+    # for a long stretch. Momentum belongs at ENTRY time instead,
+    # where pressure_supports_entry/rsi_divergence/the direction
+    # signal already gate it against a live contract quote rather
+    # than a value that just reset to zero - see
+    # _evaluate_option_entry.
+    #
     # Price band for the focus symbol. This DELIBERATELY departs from
     # the usual gap-trading advice ($5-$50, low float under 20M shares
     # for maximum raw movement): that advice optimizes for trading the

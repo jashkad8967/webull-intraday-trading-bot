@@ -1,6 +1,5 @@
 import logging
 from datetime import datetime
-from decimal import Decimal
 
 log = logging.getLogger("webull-bot")
 
@@ -22,33 +21,42 @@ def _both_directions_blocked(self, symbol: str) -> bool:
 
 def select_focus_symbol(self, moment: datetime) -> None:
     """By explicit request: "find one really good volatile stock to
-    play with and go all in on that for the day... make sure you use
-    all of the capital and know how to select the perfect stock."
+    play with and go all in on that for the day" - and, when this
+    first shipped and stalled with nothing locking for 20+ minutes:
+    "once you figure out the stock, it should just be scanning
+    contracts by the momentum and entering."
 
     Stage two of the funnel refresh_daily_batch starts - it narrows
     this morning's researched shortlist to the ONE name the whole
     account will trade options on today.
 
     Runs at focus_lock_time (09:45 by default) rather than at the
-    bell. The first hour genuinely does carry the best setups, but
-    09:30-09:45 is also where opening-range fakeouts concentrate, and
-    pre-market ranking frequently does not survive the open -
-    committing the entire account at 09:30 on pre-market data alone
-    is the exact trap this timing avoids. Every candidate is
-    re-measured on live regular-session data here.
+    bell, since 09:30-09:45 is where opening-range fakeouts
+    concentrate.
+
+    Picks the top-scored survivor of the daily batch, gated only on
+    what is STRUCTURAL - a live price, the same price band and share-
+    volume floor the batch itself already enforced, and not being
+    wash-blocked in both directions. Deliberately does NOT re-require
+    a live RVOL/volatility reading here (an earlier version did): that
+    duplicated what direction the batch was already built on and, in
+    practice, produced exactly the failure mode being fixed - after
+    ANY restart, volume_delta and volatility_price_history reset to
+    empty, so this second gate could sit unsatisfied for many minutes
+    even on a perfectly good candidate, leaving the account earning
+    nothing while a real setup went untraded. Momentum is not this
+    function's job: pressure_supports_entry, rsi_divergence and the
+    direction signal already gate every individual option ENTRY once
+    a symbol is locked (_evaluate_option_entry) - that is where "by
+    the momentum" belongs, checked against a live contract quote
+    instead of a value that just reset to zero.
 
     Contract-level quality (premium floor, chain spread, moneyness,
-    IV percentile) is deliberately NOT re-checked here. Those gates
-    already exist and already run at entry time in _evaluate_option_
-    entry - duplicating them would mean a second, divergent copy of
-    the same rules plus extra option-chain API calls at exactly the
-    busiest moment of the session.
+    IV percentile) is likewise not re-checked here for the same
+    reason plus the added cost of extra option-chain API calls.
 
-    If nothing clears the gates, NO focus symbol is set and the bot
-    simply does not trade options today. That is deliberate: forcing
-    a pick out of a weak field is precisely the low-quality trade
-    that a fixed daily target pushes traders into, and this account
-    has already paid for enough of those.
+    If nothing even clears the structural gates, no focus symbol is
+    set and the bot does not trade options that day.
     """
     if not self.config.focus_mode_enabled:
         return
@@ -73,20 +81,15 @@ def select_focus_symbol(self, moment: datetime) -> None:
             self.focus_symbol,
         )
     # Deliberately NOT date-stamped until a symbol is actually
-    # locked, for the same reason refresh_daily_batch defers its
-    # stamp: RVOL comes from volume_delta, which needs consecutive
-    # intraday scan samples, so a container that starts near
-    # focus_lock_time would otherwise score an unwarmed field,
-    # lock nothing, and mark the day done.
-    scored: list[tuple[float, str, dict]] = []
+    # locked - a container that starts near focus_lock_time (every
+    # mid-session restart) has no price data at all for the first
+    # instant, and stamping early would mark the day done before a
+    # real pick was ever possible.
+    scored: list[tuple[float, str]] = []
     for symbol in self.daily_batch:
         price = self.strategy.prices.get(symbol)
         if price is None or price <= 0:
             continue
-        # Never commit the whole account to a name that can't be
-        # traded in either direction. The wash-sale block is a real
-        # 31-day lockout and persists across restarts, so a symbol
-        # stopped out on both sides last week is still dead today.
         if _both_directions_blocked(self, symbol):
             continue
         if not (self.config.focus_min_price <= price <= self.config.focus_max_price):
@@ -94,26 +97,8 @@ def select_focus_symbol(self, moment: datetime) -> None:
         metrics = self.strategy.metrics.get(symbol, {})
         if metrics.get("volume", 0) < self.config.popular_stock_min_volume:
             continue
-        # Now that regular-session samples exist, RVOL is finally
-        # measurable - it could not be gated at batch time (08:45),
-        # since volume_delta needs consecutive intraday snapshots to
-        # mean anything. The evidence for this particular bar is
-        # unusually clean: below-average RVOL averaged -0.02R per
-        # trade while above-average averaged +0.08R.
-        volume_ema = self.strategy.volume_delta_ema.get(symbol)
-        latest_delta = self.strategy.volume_delta_latest.get(symbol)
-        if volume_ema is None or volume_ema <= 0 or latest_delta is None:
-            continue
-        rvol = Decimal(latest_delta) / Decimal(volume_ema)
-        if rvol < self.config.focus_min_rvol:
-            continue
-        volatility = self.strategy.realized_volatility_percent(symbol)
-        if volatility is None or volatility < self.config.option_min_volatility_percent:
-            continue
         score = self.strategy.priority_score(symbol, self.agent_assessment(symbol))
-        scored.append(
-            (score, symbol, {"rvol": rvol, "volatility": volatility, "score": score})
-        )
+        scored.append((score, symbol))
     if not scored:
         # Keep retrying while there is still a session left to trade;
         # stop once the option closeout window begins, since a symbol
@@ -126,32 +111,22 @@ def select_focus_symbol(self, moment: datetime) -> None:
         if self.focus_logged_empty_date != moment.date():
             self.focus_logged_empty_date = moment.date()
             log.info(
-                "FOCUS  | no symbol in today's batch (%s) cleared the focus "
-                "gates (rvol>=%s | volatility>=%s | price %s-%s | volume>=%s) "
-                "- %s",
+                "FOCUS  | no symbol in today's batch (%s) has price "
+                "data yet - %s",
                 ",".join(self.daily_batch) or "empty",
-                self.config.focus_min_rvol,
-                self.config.option_min_volatility_percent,
-                self.config.focus_min_price,
-                self.config.focus_max_price,
-                self.config.popular_stock_min_volume,
                 "not trading options today" if give_up else "will retry",
             )
         return
     scored.sort(key=lambda row: row[0], reverse=True)
-    best_score, best_symbol, detail = scored[0]
+    best_score, best_symbol = scored[0]
     self.focus_symbol = best_symbol
     self.focus_symbol_date = moment.date()
     log.info(
-        "FOCUS  | %s locked for the session | rvol=%.2fx volatility=%.2f%% "
-        "score=%.1f | beat %s other candidate(s): %s",
+        "FOCUS  | %s locked for the session | score=%.1f | beat %s other "
+        "candidate(s): %s",
         best_symbol,
-        detail["rvol"],
-        detail["volatility"] * 100,
         best_score,
         len(scored) - 1,
-        ", ".join(
-            f"{symbol}({row_score:.1f})" for row_score, symbol, _ in scored[1:]
-        )
+        ", ".join(f"{symbol}({row_score:.1f})" for row_score, symbol in scored[1:])
         or "none",
     )
