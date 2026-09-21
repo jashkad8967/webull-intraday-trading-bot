@@ -94,6 +94,7 @@ from webull_bot.trading.momentum.volatility_window_seeding import (
 )
 from webull_bot.trading.options.option_contract_discovery import (
     discover_option_contracts,
+    ensure_focus_symbol_contracts,
 )
 from webull_bot.trading.options.option_entry_exit import (
     _evaluate_option_entry,
@@ -455,6 +456,7 @@ class AutoTrader:
     trade_pairs = trade_pairs
     # Options-chain discovery - moved out to trading/options/.
     discover_option_contracts = discover_option_contracts
+    ensure_focus_symbol_contracts = ensure_focus_symbol_contracts
     _prepare_option_scan_batch = _prepare_option_scan_batch
     _evaluate_option_entry = _evaluate_option_entry
     _evaluate_option_exit = _evaluate_option_exit

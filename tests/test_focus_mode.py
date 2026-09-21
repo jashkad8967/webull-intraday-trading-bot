@@ -477,6 +477,80 @@ class EmptyResultRetryTests(unittest.TestCase):
         self.assertEqual(bot.focus_symbol_date, self.moment(15, 50).date())
 
 
+class EnsureFocusSymbolContractsTests(unittest.TestCase):
+    """By request: "you should be able to request contract by stock
+    in webull openapi" - the locked symbol's option chain must exist
+    immediately, not depend on the generic discovery rotation ever
+    reaching it.
+    """
+
+    def bot(self, focus_symbol="MRNA", existing_contracts=None, price=Decimal("168")):
+        placed = []
+
+        class FakeApi:
+            @staticmethod
+            def select_atm_options(underlying, price, max_contract_cost=None):
+                placed.append((underlying, price, max_contract_cost))
+                return [{"underlying_symbol": underlying, "symbol": f"{underlying}C"}]
+
+        bot = SimpleNamespace(
+            config=focus_config(),
+            focus_symbol=focus_symbol,
+            option_contracts=existing_contracts or [],
+            option_discovery_attempted=set(),
+            option_average_down_count={},
+            option_last_buy_price={},
+            cached_option_buying_power=Decimal("300"),
+            api=FakeApi(),
+            option_contracts_state=SimpleNamespace(save=lambda *a, **k: None),
+            strategy=SimpleNamespace(prices={focus_symbol: price} if price else {}),
+        )
+        bot.ensure_focus_symbol_contracts = (
+            AutoTrader.ensure_focus_symbol_contracts.__get__(bot)
+        )
+        return bot, placed
+
+    def test_discovers_contracts_for_a_newly_locked_symbol(self):
+        bot, placed = self.bot()
+        bot.ensure_focus_symbol_contracts()
+        self.assertEqual(placed, [("MRNA", Decimal("168"), Decimal("300"))])
+        self.assertEqual(len(bot.option_contracts), 1)
+        self.assertEqual(bot.option_contracts[0]["underlying_symbol"], "MRNA")
+
+    def test_is_a_no_op_when_the_chain_already_exists(self):
+        bot, placed = self.bot(
+            existing_contracts=[{"underlying_symbol": "MRNA", "symbol": "MRNAC"}]
+        )
+        bot.ensure_focus_symbol_contracts()
+        self.assertEqual(placed, [])
+
+    def test_does_nothing_without_a_focus_symbol(self):
+        bot, placed = self.bot(focus_symbol=None)
+        bot.ensure_focus_symbol_contracts()
+        self.assertEqual(placed, [])
+
+    def test_retries_next_cycle_when_price_is_not_yet_known(self):
+        bot, placed = self.bot(price=None)
+        bot.ensure_focus_symbol_contracts()
+        self.assertEqual(placed, [])
+
+    def test_disabled_focus_mode_never_calls_the_api(self):
+        bot, placed = self.bot()
+        bot.config = focus_config(focus_mode_enabled=False)
+        bot.ensure_focus_symbol_contracts()
+        self.assertEqual(placed, [])
+
+    def test_an_api_failure_does_not_raise(self):
+        bot, placed = self.bot()
+
+        def boom(*a, **k):
+            raise RuntimeError("no chain listed")
+
+        bot.api.select_atm_options = boom
+        bot.ensure_focus_symbol_contracts()  # must not raise
+        self.assertEqual(bot.option_contracts, [])
+
+
 class StockSuspensionTests(unittest.TestCase):
     def test_focus_mode_suspends_new_stock_entries(self):
         bot = SimpleNamespace(config=focus_config())
