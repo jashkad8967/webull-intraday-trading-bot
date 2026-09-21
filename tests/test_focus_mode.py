@@ -568,6 +568,115 @@ def _fake_contract(underlying, symbol, option_type, strike, dte=20):
     }
 
 
+class FocusSymbolIsAffordableDiscoveryTests(unittest.TestCase):
+    """By explicit request ("its options should all be discovered and
+    analyzed... I want the first order to go out at 9:45, not
+    later"): the wide contract set fetched here to answer the
+    affordability question is persisted for every candidate checked,
+    not just the eventual winner - so the whole daily batch is
+    genuinely discovered before the lock, and the winner needs zero
+    post-lock discovery latency.
+    """
+
+    def bot(self, price=Decimal("168"), existing_contracts=None, fail=False):
+        calls = {"option_contracts": []}
+        contracts = [
+            _fake_contract("MRNA", "MRNAC", "CALL", 170),
+            _fake_contract("MRNA", "MRNAP", "PUT", 166),
+        ]
+        quotes = {
+            "MRNAC": {"symbol": "MRNAC", "bid": "1.90", "ask": "2.00"},
+            "MRNAP": {"symbol": "MRNAP", "bid": "1.80", "ask": "1.90"},
+        }
+
+        class FakeApi:
+            @staticmethod
+            def option_contracts(underlying=None, option_symbol=None):
+                calls["option_contracts"].append(underlying)
+                if fail:
+                    raise RuntimeError("no chain listed")
+                return [c for c in contracts if c["underlying_symbol"] == underlying]
+
+            @staticmethod
+            def option_quotes(symbols):
+                return [quotes[s] for s in symbols if s in quotes]
+
+            @staticmethod
+            def option_limit_price(quote, side):
+                bid, ask = quote.get("bid"), quote.get("ask")
+                if bid is None or ask is None:
+                    return None
+                return (Decimal(str(bid)) + Decimal(str(ask))) / 2
+
+        def order_quantity(limit_price, bp):
+            cost = limit_price * 100
+            return (int(bp // cost), cost) if cost > 0 else (0, cost)
+
+        bot = SimpleNamespace(
+            config=focus_config(),
+            option_contracts=existing_contracts or [],
+            option_discovery_attempted=set(),
+            option_average_down_count={},
+            option_last_buy_price={},
+            cached_option_buying_power=Decimal("300"),
+            api=FakeApi(),
+            option_contracts_state=SimpleNamespace(save=lambda *a, **k: None),
+            strategy=SimpleNamespace(
+                prices={"MRNA": price} if price else {},
+                option_order_quantity=order_quantity,
+            ),
+        )
+        bot.focus_symbol_is_affordable = AutoTrader.focus_symbol_is_affordable.__get__(bot)
+        return bot, calls
+
+    def test_discovers_and_persists_contracts_for_a_candidate(self):
+        bot, calls = self.bot()
+        result = bot.focus_symbol_is_affordable("MRNA")
+        self.assertTrue(result)
+        self.assertEqual(calls["option_contracts"], ["MRNA"])
+        self.assertEqual(
+            {c["symbol"] for c in bot.option_contracts}, {"MRNAC", "MRNAP"}
+        )
+
+    def test_a_second_check_of_the_same_candidate_does_not_refetch(self):
+        """select_focus_symbol retries every cycle until something
+        locks - re-fetching an already-discovered candidate's chain
+        from the API on every retry would be pure repeated cost.
+        """
+        bot, calls = self.bot()
+        bot.focus_symbol_is_affordable("MRNA")
+        bot.focus_symbol_is_affordable("MRNA")
+        bot.focus_symbol_is_affordable("MRNA")
+        self.assertEqual(calls["option_contracts"], ["MRNA"])
+
+    def test_does_not_duplicate_contracts_already_known_from_elsewhere(self):
+        bot, calls = self.bot(
+            existing_contracts=[_fake_contract("MRNA", "MRNAC", "CALL", 170)]
+        )
+        bot.focus_symbol_is_affordable("MRNA")
+        symbols = [c["symbol"] for c in bot.option_contracts]
+        self.assertEqual(symbols.count("MRNAC"), 1)
+
+    def test_fails_open_when_no_price_is_known_yet(self):
+        bot, calls = self.bot(price=None)
+        self.assertTrue(bot.focus_symbol_is_affordable("MRNA"))
+        self.assertEqual(calls["option_contracts"], [])
+
+    def test_fails_open_on_a_discovery_error(self):
+        bot, calls = self.bot(fail=True)
+        self.assertTrue(bot.focus_symbol_is_affordable("MRNA"))
+
+    def test_correctly_reports_unaffordable_without_losing_the_discovery(self):
+        bot, calls = self.bot()
+        bot.cached_option_buying_power = Decimal("1")  # can't afford even 1 contract
+        result = bot.focus_symbol_is_affordable("MRNA")
+        self.assertFalse(result)
+        # Still discovered and persisted, even though it's unaffordable -
+        # "all discovered and analyzed" doesn't mean "only the
+        # affordable ones."
+        self.assertEqual(len(bot.option_contracts), 2)
+
+
 class EnsureFocusSymbolContractsTests(unittest.TestCase):
     """By request: "you should be able to request contract by stock
     in webull openapi" - the locked symbol's option chain must exist

@@ -126,6 +126,19 @@ def focus_symbol_is_affordable(self, symbol: str) -> bool:
     the primary defense - locking then immediately re-picking wastes
     real trading time, confirmed live with GOOGL).
 
+    By explicit request ("its options should all be discovered and
+    analyzed [by 9:45]... I want the first order to go out at 9:45,
+    not later"): the wide contract set this fetches to answer the
+    affordability question is now PERSISTED into self.option_contracts
+    for every candidate checked, not just the eventual winner. Two
+    effects: every daily-batch candidate's options are genuinely
+    discovered and analyzed before the lock, not only the one that
+    wins; and whichever one DOES win already has its chain sitting in
+    self.option_contracts the instant it locks, so ensure_focus_
+    symbol_contracts' post-lock discovery becomes a same-cycle no-op
+    instead of a fresh, separate discovery call adding its own delay
+    right when the account most needs to start trading.
+
     Fails OPEN (True) on missing price/quote data or an API hiccup -
     same "no data, don't block" convention as every other gate in
     this codebase; a transient failure here should not eliminate a
@@ -134,12 +147,49 @@ def focus_symbol_is_affordable(self, symbol: str) -> bool:
     price = self.strategy.prices.get(symbol)
     if price is None or price <= 0:
         return True
+    # select_focus_symbol retries every cycle until something locks -
+    # once a candidate's chain is already discovered and persisted
+    # (this call, or a prior retry), re-fetching it from the API every
+    # single cycle until lock is pure repeated cost. Re-check
+    # affordability freshly each time (buying power can shift) but
+    # only ever do the real discovery fetch once per candidate.
+    existing = [
+        item for item in self.option_contracts if item["underlying_symbol"] == symbol
+    ]
+    if existing:
+        buying_power = self.cached_option_buying_power or 0
+        affordable, _ = _cheapest_affordable(self, existing, buying_power)
+        return affordable
     try:
         contracts = _wide_focus_contracts(self, symbol, price)
     except Exception:
         return True
     if not contracts:
         return True
+    already_known = {item["symbol"] for item in self.option_contracts}
+    new_contracts = [c for c in contracts if c["symbol"] not in already_known]
+    if new_contracts:
+        self.option_contracts.extend(new_contracts)
+        self.option_discovery_attempted.add(symbol)
+        self.option_contracts_state.save(
+            self.option_contracts,
+            self.option_discovery_attempted,
+            {
+                sym: {
+                    "count": count,
+                    "last_buy_price": self.option_last_buy_price[sym],
+                }
+                for sym, count in self.option_average_down_count.items()
+                if count > 0 and sym in self.option_last_buy_price
+            },
+        )
+        log.info(
+            "OPTIONS | %s | candidate contracts discovered | found=%s "
+            "across %s expiration(s)",
+            symbol,
+            len(new_contracts),
+            len({c["expiration_date"] for c in new_contracts}),
+        )
     buying_power = self.cached_option_buying_power or 0
     affordable, _ = _cheapest_affordable(self, contracts, buying_power)
     return affordable
