@@ -211,7 +211,26 @@ def _evaluate_option_entry(
         # stock trend-entry side, checked against the underlying (the
         # option contract itself has no comparable volume-delta
         # tracking of its own).
-        if not self.strategy.relative_volume_ok(underlying):
+        #
+        # Same focus-mode carve-out as is_volatility_scalp_eligible
+        # above, and for the identical reason - live incident: NVDA,
+        # already showing 72M shares of real volume and a genuine
+        # daily move, was still rejected here immediately after the
+        # stdev fix landed. relative_volume_ok asks for a BURSTY
+        # spike over the underlying's own recent baseline at THIS
+        # exact moment - a real, useful signal for screening a wide,
+        # unvetted pool, but a heavily-traded large-cap can be
+        # fundamentally active without ticking through frequent
+        # relative spikes, for the same reason it can read "calm" on
+        # tick-to-tick stdev: it's liquid, so its own volume trades
+        # more steadily rather than in bursts. Focus mode's selection
+        # pipeline already established this underlying is genuinely
+        # active by gap%/volume/spread and the established-symbols
+        # filter - re-stacking a moment-specific burst requirement on
+        # top was blocking the same already-vetted setup again.
+        if not self.config.focus_mode_enabled and not self.strategy.relative_volume_ok(
+            underlying
+        ):
             self.option_gate_rejections[
                 "underlying move not backed by above-average volume"
             ] += 1
