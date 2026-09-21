@@ -164,8 +164,23 @@ def refresh_daily_batch(self, moment: datetime) -> None:
         elapsed_minutes = (
             time.monotonic() - self.daily_batch_first_attempt_at
         ) / 60
+        # The elapsed-time give-up must not be able to fire BEFORE the
+        # focus lock, or the retry window silently kills the whole
+        # session it exists to protect: the batch's first attempt is at
+        # daily_batch_refresh_time, a full hour before focus_lock_time,
+        # and the default retry window is 20 minutes - so a quiet
+        # pre-market stretch would mark the day done ~40 minutes before
+        # the lock and ~25 minutes before the opening bell had even
+        # printed the regular-session gaps this screens on. Nothing
+        # could then trade for the rest of the day. Gaps are measured
+        # pre-market but only become reliable once real volume arrives,
+        # so "nothing qualifies yet at 07:45" is the normal morning
+        # state, not a reason to stop looking.
+        past_lock = moment >= self.session_moment(
+            moment, self.config.focus_lock_time
+        )
         give_up = (
-            elapsed_minutes >= self.config.daily_batch_retry_minutes
+            (elapsed_minutes >= self.config.daily_batch_retry_minutes and past_lock)
             or moment >= self.session_moment(
                 moment, self.config.option_eod_close_time
             )

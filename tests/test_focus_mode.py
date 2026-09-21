@@ -463,6 +463,41 @@ class EmptyResultRetryTests(unittest.TestCase):
             bot.refresh_daily_batch(self.moment(10, 31))
         self.assertEqual(bot.daily_batch_date, self.moment(10, 31).date())
 
+    def test_a_quiet_premarket_never_kills_the_day_before_the_lock(self):
+        # The batch's first attempt is a full hour before focus_lock_
+        # time, and the retry window is 20 minutes, so an elapsed-only
+        # give-up marked the whole day done ~40 minutes BEFORE the lock
+        # - and ~25 minutes before the opening bell had even printed
+        # the regular-session gaps this screens on. Nothing could trade
+        # for the rest of that session. "Nothing qualifies yet at
+        # 08:45" is the normal quiet-pre-market state, not a verdict.
+        bot = self.bot(self.moment(8, 45))
+        with unittest.mock.patch("time.monotonic", return_value=1000.0):
+            bot.refresh_daily_batch(self.moment(8, 45))
+        retry_seconds = bot.config.daily_batch_retry_minutes * 60
+        with unittest.mock.patch(
+            "time.monotonic", return_value=1000.0 + retry_seconds + 1
+        ):
+            bot.refresh_daily_batch(self.moment(9, 6))
+        self.assertIsNone(
+            bot.daily_batch_date,
+            "the retry window must not be able to end the day before "
+            "focus_lock_time - the batch exists to feed that lock",
+        )
+
+    def test_the_retry_window_still_gives_up_once_the_lock_has_passed(self):
+        # The elapsed timer's real job - stopping a mid-session restart
+        # from retrying forever - must survive the pre-lock guard.
+        bot = self.bot(self.moment(8, 45))
+        with unittest.mock.patch("time.monotonic", return_value=1000.0):
+            bot.refresh_daily_batch(self.moment(8, 45))
+        retry_seconds = bot.config.daily_batch_retry_minutes * 60
+        with unittest.mock.patch(
+            "time.monotonic", return_value=1000.0 + retry_seconds + 1
+        ):
+            bot.refresh_daily_batch(self.moment(9, 46))
+        self.assertEqual(bot.daily_batch_date, self.moment(9, 46).date())
+
     def test_the_eod_close_backstop_overrides_the_retry_window(self):
         # Even a first attempt gives up once there is no real session
         # left to trade a batch built now.
