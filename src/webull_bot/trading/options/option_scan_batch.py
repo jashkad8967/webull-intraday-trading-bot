@@ -172,10 +172,15 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
         # real history to produce anything but HOLD, so the account
         # could sit signal-less for several minutes past the lock no
         # matter how fast everything else ran. Pre-warming every daily-
-        # batch candidate's direction-signal history from the moment
-        # the batch exists (daily_batch_refresh_time, a full hour
-        # before focus_lock_time) means whichever one wins already has
-        # a fully warm EMA the instant it's picked.
+        # batch candidate instead means whichever one wins already has
+        # a warm EMA the instant it's picked. Note the warm-up window
+        # is the bell to the lock, NOT the whole time the batch has
+        # existed: main_loop only calls trade_options once
+        # option_market_open_time has passed, so nothing here samples
+        # anything during the pre-market stretch after the batch is
+        # built. That window (15 minutes at the shipped defaults) is
+        # many scan cycles, so an EMA(3/8) is warm well before the
+        # lock - but shrinking the open-to-lock gap would eat into it.
         underlyings = sorted(set(self.daily_batch))
         quote_symbols = underlyings
     else:
