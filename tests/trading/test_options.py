@@ -11,6 +11,99 @@ from types import SimpleNamespace
 from webull_bot.webull_api import WebullAPI
 
 
+class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
+    """By explicit request ("i want this to be faster more high
+    frequency trades"): with focus mode locked onto one symbol, every
+    OTHER discovered underlying's direction signal is provably
+    unusable - option entry already rejects anything that isn't the
+    focus symbol before direction is even checked - yet this quote
+    batch kept fetching all of them anyway (confirmed live:
+    quoted=69/69 and climbing), directly slowing how often the ONE
+    signal that matters refreshed.
+    """
+
+    def _fake_bot(self, focus_symbol, focus_mode_enabled, contracts):
+        from webull_bot.strategy_logic.market_state.snapshot import rotating_batch
+
+        requested: list[list[str]] = []
+
+        class FakeApi:
+            @staticmethod
+            def stock_quotes_resilient(symbols, category):
+                requested.append(list(symbols))
+                return (
+                    [{"symbol": s, "price": "50.00"} for s in symbols],
+                    set(),
+                )
+
+            @staticmethod
+            def quote_price(quote):
+                return Decimal(str(quote["price"]))
+
+            @staticmethod
+            def option_quotes(symbols):
+                return []
+
+        fake_bot = SimpleNamespace(
+            option_contracts=list(contracts),
+            option_cursor=0,
+            vixy_history=deque(maxlen=30),
+            api=FakeApi(),
+            strategy=SimpleNamespace(
+                open_position_count=lambda positions: 0,
+                option_direction_signal=lambda key, price: "HOLD",
+                rotating_batch=rotating_batch,
+            ),
+            stop_loss_guard_active=lambda: False,
+            focus_symbol=focus_symbol,
+            config=SimpleNamespace(
+                option_batch_size=20, focus_mode_enabled=focus_mode_enabled
+            ),
+        )
+        return fake_bot, requested
+
+    def _contracts(self):
+        return [
+            {
+                "symbol": f"{sym}260925C00075000",
+                "underlying_symbol": sym,
+                "strike_price": "75",
+                "expiration_date": "2026-09-25",
+                "option_type": "CALL",
+            }
+            for sym in ("NVDA", "AAPL", "MSFT")
+        ]
+
+    def test_focus_mode_only_quotes_the_locked_symbol(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, requested = self._fake_bot("NVDA", True, self._contracts())
+        prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
+        prepare([])
+        self.assertEqual(requested, [["NVDA"]])
+
+    def test_focus_mode_without_a_lock_yet_falls_back_to_the_full_board(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, requested = self._fake_bot(None, True, self._contracts())
+        prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
+        prepare([])
+        self.assertIn("AAPL", requested[0])
+        self.assertIn("MSFT", requested[0])
+        self.assertIn("NVDA", requested[0])
+        self.assertIn("VIXY", requested[0])
+
+    def test_disabled_focus_mode_quotes_every_underlying_plus_vixy(self):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, requested = self._fake_bot("NVDA", False, self._contracts())
+        prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
+        prepare([])
+        self.assertIn("AAPL", requested[0])
+        self.assertIn("MSFT", requested[0])
+        self.assertIn("VIXY", requested[0])
+
+
 class PrepareOptionScanBatchHeldPositionTests(unittest.TestCase):
     """By request: "why is UBER not averaging down." Live incident: a
     restart re-discovered a DIFFERENT UBER strike than the one
@@ -58,7 +151,10 @@ class PrepareOptionScanBatchHeldPositionTests(unittest.TestCase):
                 rotating_batch=rotating_batch,
             ),
             stop_loss_guard_active=lambda: False,
-            config=SimpleNamespace(option_batch_size=20),
+            focus_symbol=None,
+            config=SimpleNamespace(
+                option_batch_size=20, focus_mode_enabled=False
+            ),
         )
         return fake_bot, [held_position]
 
