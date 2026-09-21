@@ -1,7 +1,148 @@
 import logging
 import time
+from datetime import date, timedelta
+from decimal import Decimal
 
 log = logging.getLogger("webull-bot")
+
+
+def _wide_focus_contracts(self, underlying: str, stock_price: Decimal) -> list[dict]:
+    """By explicit request, after a live incident where the focus
+    symbol only ever had ONE call and ONE put discovered all session:
+    "it should have found a lot more... at each price tick for
+    different dates... regardless of affordability" and "my
+    requirements were at least 2 weeks out, not only 2 weeks out."
+
+    select_atm_options (the old discovery path here) deliberately
+    narrows to a single best-guess CALL and PUT per underlying, driven
+    by affordability AT DISCOVERY TIME - by its own docstring, when
+    nothing near-ATM fits the budget it falls back to "the cheapest
+    one quoted" rather than surfacing the rest of the board.
+    option_min_dte (14 days) is a FLOOR, not a target - the real
+    search window is the full [option_min_dte, option_max_dte] range
+    (14-45 days by default), every valid strike within the existing
+    moneyness cap.
+
+    This returns ALL of them - regardless of affordability, which is
+    correctly decided per-contract at ENTRY time (option_order_
+    quantity) or by the proactive/reactive affordability checks below,
+    not by narrowing what gets discovered down to one guess. A
+    broader set gives trade_options' per-contract loop many more
+    chances each cycle to find a strike/expiration combination that
+    is both directionally right and actually affordable.
+
+    Reuses the exact same moneyness cap, DTE window, tradable-status
+    and symbol-prefix-sanity filters select_atm_options applies (see
+    its own docstring for why each exists) - only the "narrow to one
+    per type" step is removed.
+    """
+    minimum = date.today() + timedelta(days=self.config.option_min_dte)
+    maximum = date.today() + timedelta(days=self.config.option_max_dte)
+    option_types = (
+        ("CALL", "PUT")
+        if self.config.option_type == "BOTH"
+        else (self.config.option_type,)
+    )
+    moneyness_cap = stock_price * self.config.option_max_moneyness_percent
+    found = []
+    for item in self.api.option_contracts(underlying=underlying):
+        if not str(item.get("symbol", "")).startswith(underlying):
+            continue
+        if item.get("option_type") not in option_types:
+            continue
+        if item.get("tradable_status") != "OC":
+            continue
+        try:
+            expiration = date.fromisoformat(item["expiration_date"])
+        except (KeyError, ValueError):
+            continue
+        if not (minimum <= expiration <= maximum):
+            continue
+        try:
+            strike = Decimal(str(item["strike_price"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if abs(strike - stock_price) > moneyness_cap:
+            continue
+        found.append(item)
+    found.sort(
+        key=lambda item: (
+            date.fromisoformat(item["expiration_date"]),
+            abs(Decimal(str(item["strike_price"])) - stock_price),
+        )
+    )
+    return found
+
+
+def _cheapest_affordable(
+    self, contracts: list[dict], buying_power
+) -> tuple[bool, Decimal | None]:
+    """Shared by the proactive (pre-lock) and reactive (post-lock)
+    affordability checks below. Quotes up to 40 contracts (2 Webull
+    batches of 20) - the list passed in is already sorted nearest-
+    expiration/nearest-ATM first by _wide_focus_contracts, so this
+    samples the most realistic candidates rather than an arbitrary
+    slice. Returns (True, price) for the first contract that sizes to
+    at least 1 contract at the given buying power, else (False,
+    cheapest price seen) for diagnostics.
+    """
+    if not contracts:
+        return False, None
+    symbols = [item["symbol"] for item in contracts[:40]]
+    quotes: dict[str, dict] = {}
+    for start in range(0, len(symbols), 20):
+        chunk = symbols[start : start + 20]
+        try:
+            for row in self.api.option_quotes(chunk):
+                quotes[str(row.get("symbol", ""))] = row
+        except Exception:
+            continue
+    cheapest = None
+    for contract in contracts[:40]:
+        quote = quotes.get(contract["symbol"])
+        if quote is None:
+            continue
+        try:
+            limit_price = self.api.option_limit_price(quote, "BUY")
+        except Exception:
+            continue
+        if limit_price is None:
+            continue
+        if cheapest is None or limit_price < cheapest:
+            cheapest = limit_price
+        quantity, _ = self.strategy.option_order_quantity(limit_price, buying_power)
+        if quantity >= 1:
+            return True, limit_price
+    return False, cheapest
+
+
+def focus_symbol_is_affordable(self, symbol: str) -> bool:
+    """By explicit request: "we want affordable options only so the
+    stocks should also be focused like that" - checked proactively,
+    inside select_focus_symbol's candidate loop, so an established/
+    liquid name whose cheapest realistic contract still exceeds
+    buying power never locks in the first place (the reactive check
+    below is the backstop for buying power changing mid-session, not
+    the primary defense - locking then immediately re-picking wastes
+    real trading time, confirmed live with GOOGL).
+
+    Fails OPEN (True) on missing price/quote data or an API hiccup -
+    same "no data, don't block" convention as every other gate in
+    this codebase; a transient failure here should not eliminate a
+    candidate that may well be perfectly affordable.
+    """
+    price = self.strategy.prices.get(symbol)
+    if price is None or price <= 0:
+        return True
+    try:
+        contracts = _wide_focus_contracts(self, symbol, price)
+    except Exception:
+        return True
+    if not contracts:
+        return True
+    buying_power = self.cached_option_buying_power or 0
+    affordable, _ = _cheapest_affordable(self, contracts, buying_power)
+    return affordable
 
 
 def ensure_focus_symbol_contracts(self) -> None:
@@ -24,11 +165,12 @@ def ensure_focus_symbol_contracts(self) -> None:
     awareness that the symbol has since become the one thing the
     account needs to trade.
 
-    Directly calls the same select_atm_options OpenAPI lookup
-    discover_option_contracts uses per-candidate, just targeted and
-    immediate instead of part of the rotation. A cheap no-op once the
-    chain already exists (checked first) or on a symbol with no price
-    yet (retries next cycle, same as everything else in focus mode).
+    Uses _wide_focus_contracts (every valid strike/expiration in the
+    configured window, not select_atm_options' single best-guess CALL
+    and PUT) - see that function's docstring for why. A cheap no-op
+    once the chain already exists (checked first) or on a symbol with
+    no price yet (retries next cycle, same as everything else in
+    focus mode).
     """
     if not self.config.focus_mode_enabled or not self.focus_symbol:
         return
@@ -37,20 +179,16 @@ def ensure_focus_symbol_contracts(self) -> None:
         item["underlying_symbol"] == underlying for item in self.option_contracts
     ):
         self.focus_contract_discovery_failures = 0
+        _check_focus_symbol_affordable(self, underlying)
         return
     if underlying not in self.strategy.prices:
         return
     try:
-        max_contract_cost = (
-            self.cached_option_buying_power
-            if self.cached_option_buying_power
-            else None
+        contracts = _wide_focus_contracts(
+            self, underlying, self.strategy.prices[underlying]
         )
-        contracts = self.api.select_atm_options(
-            underlying,
-            self.strategy.prices[underlying],
-            max_contract_cost=max_contract_cost,
-        )
+        if not contracts:
+            raise RuntimeError(f"No matching options found for {underlying}")
         self.option_contracts.extend(contracts)
         self.option_discovery_attempted.add(underlying)
         self.focus_contract_discovery_failures = 0
@@ -67,10 +205,13 @@ def ensure_focus_symbol_contracts(self) -> None:
             },
         )
         log.info(
-            "OPTIONS | %s | focus-symbol contracts discovered | found=%s",
+            "OPTIONS | %s | focus-symbol contracts discovered | found=%s "
+            "across %s expiration(s)",
             underlying,
-            ",".join(contract["symbol"] for contract in contracts) or "none",
+            len(contracts),
+            len({c["expiration_date"] for c in contracts}),
         )
+        _check_focus_symbol_affordable(self, underlying)
     except Exception as exc:
         # By request ("if discovery failed why is it still on that
         # stock") - live incident: GRML (a 286.7% gapper with no
@@ -106,6 +247,58 @@ def ensure_focus_symbol_contracts(self) -> None:
             self.focus_symbol_no_chain.add(underlying)
             self.focus_symbol = None
             self.focus_contract_discovery_failures = 0
+
+
+def _check_focus_symbol_affordable(self, underlying: str) -> None:
+    """By explicit request, after a live incident: "it is your
+    responsibility to make sure the stock was chosen correctly so
+    that option trades go through throughout the day." GOOGL locked
+    as the established, liquid focus symbol and NOTHING traded all
+    session - confirmed live by pulling its actual quote directly:
+    bid $7.55/ask $7.90 (a genuinely tight, liquid market - open
+    interest 711, real volume), but at ~$790/contract against a $363
+    account, option_order_quantity silently sizes it to ZERO
+    contracts every single cycle, regardless of how good direction/
+    momentum look.
+
+    This is now the BACKSTOP, not the primary defense -
+    focus_symbol_is_affordable (above) checks this proactively before
+    a symbol ever locks. This still matters because buying power can
+    shrink mid-session (a loss elsewhere, an averaging-down buy) after
+    a symbol already locked affordable.
+
+    Runs once per lock (not every cycle - an extra option_quotes call
+    each cycle for a symbol already confirmed affordable is pure
+    waste) via focus_symbol_affordability_checked. If not even one
+    discovered contract sizes to >=1 contract at current buying
+    power, disqualifies the symbol exactly like "no chain" (same
+    focus_symbol_no_chain set, same re-pick path) - unaffordable
+    today is just as untradeable as nonexistent.
+    """
+    if self.focus_symbol_affordability_checked == underlying:
+        return
+    contracts = [
+        item
+        for item in self.option_contracts
+        if item["underlying_symbol"] == underlying
+    ]
+    if not contracts:
+        return
+    buying_power = self.cached_option_buying_power or 0
+    affordable, cheapest = _cheapest_affordable(self, contracts, buying_power)
+    self.focus_symbol_affordability_checked = underlying
+    if affordable:
+        return
+    log.warning(
+        "OPTIONS | %s | no affordable contract | cheapest=$%s vs "
+        "buying_power=$%s | disqualifying and re-picking the focus "
+        "symbol",
+        underlying,
+        cheapest,
+        buying_power,
+    )
+    self.focus_symbol_no_chain.add(underlying)
+    self.focus_symbol = None
 
 
 def discover_option_contracts(self) -> None:
