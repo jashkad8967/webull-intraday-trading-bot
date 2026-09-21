@@ -22,7 +22,6 @@ def focus_config(**overrides):
         daily_batch_size=8,
         daily_batch_min_gap_percent=Decimal("2"),
         daily_batch_retry_minutes=20,
-        focus_min_rvol=Decimal("2.0"),
         focus_min_price=Decimal("10"),
         focus_max_price=Decimal("600"),
         focus_repick_when_blocked=True,
