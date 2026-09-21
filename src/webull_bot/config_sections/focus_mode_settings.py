@@ -236,3 +236,17 @@ class FocusModeSettings(BaseSettings):
     # re-pick. Not 1, so a genuine transient API error doesn't falsely
     # burn a good symbol on its first hiccup.
     focus_contract_discovery_max_failures: int = Field(default=3, ge=1, le=20)
+    # By explicit request ("i want this to be faster more high
+    # frequency trades"): the general stock-scan batch defaults to
+    # 100 symbols quoted every cycle (stock_batch_size), sized for
+    # feeding the multi-symbol strategy that focus mode suspends.
+    # Live evidence showed the option entry-timing signal refreshing
+    # only every 40-90+ seconds despite a 0.25s poll interval - real
+    # per-cycle wall-clock time, not signal logic, was the gate. Only
+    # the locked focus symbol (guaranteed into every scan regardless
+    # of this cap - see prioritized_stock_batch's force_include) and
+    # a handful of daily-batch candidates need to stay fresh while
+    # entries are suspended; this caps the batch to that instead of
+    # paying for 100 quotes nothing can currently act on, freeing
+    # real cycle time for the option pipeline to run again sooner.
+    focus_mode_stock_batch_size: int = Field(default=20, ge=1, le=100)

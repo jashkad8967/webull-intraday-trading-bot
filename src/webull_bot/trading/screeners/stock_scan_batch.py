@@ -214,8 +214,11 @@ def _prepare_stock_scan_batch(
     scan_watch_symbols = (
         self.seed_popular_symbols | self.agent_popular_symbols | self.user_watchlist
     )
+    focus_entries_suspended = self.stock_entries_suspended()
     concurrent_batches = self.strategy.stock_scan_concurrent_batches(
-        len(self.stock_symbols), core_session_active
+        len(self.stock_symbols),
+        core_session_active,
+        focus_entries_suspended,
     )
     batch = []
     seen_in_batch: set[str] = set()
@@ -226,6 +229,10 @@ def _prepare_stock_scan_batch(
             positions,
             self.agent_assessment,
             scan_watch_symbols,
+            {self.focus_symbol} if self.focus_symbol else None,
+            self.config.focus_mode_stock_batch_size
+            if focus_entries_suspended
+            else None,
         )
         if not rotation:
             break

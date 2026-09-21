@@ -40,6 +40,55 @@ class StrategySelectionTests(StrategyConfigMixin, unittest.TestCase):
         self.assertIn("CHEAP", batch)
         self.assertIn("NEXT", batch)
 
+    def test_force_include_guarantees_the_focus_symbol_every_cycle(self):
+        """By request ("i want this to be faster more high frequency
+        trades"): the locked focus symbol usually holds no EQUITY
+        position (the bot trades the option contract, not the
+        stock), so it was getting diluted into the same rotation as
+        every other candidate - its price/EMA history only refreshed
+        once every several cycles instead of every single one.
+        """
+        strategy = TradingStrategy(self.config())
+        symbols = [f"S{i}" for i in range(50)]
+        strategy.prices.update({s: Decimal("10") for s in symbols})
+        batch, _ = strategy.prioritized_stock_batch(
+            symbols, 0, [], lambda symbol: None, force_include={"S49"}
+        )
+        self.assertIn("S49", batch)
+
+    def test_force_include_does_not_duplicate_an_already_held_symbol(self):
+        strategy = TradingStrategy(self.config())
+        symbols = ["AAPL"]
+        strategy.prices["AAPL"] = Decimal("200")
+        positions = [{"instrument_type": "EQUITY", "symbol": "AAPL", "quantity": "1"}]
+        batch, _ = strategy.prioritized_stock_batch(
+            symbols, 0, positions, lambda symbol: None, force_include={"AAPL"}
+        )
+        self.assertEqual(batch.count("AAPL"), 1)
+
+    def test_max_size_shrinks_the_batch_below_the_configured_default(self):
+        """By request: shrinking the per-cycle quote fetch when focus
+        mode has suspended general entries frees real wall-clock time
+        for the option pipeline to run more often, without touching
+        any trading decision.
+        """
+        strategy = TradingStrategy(self.config())
+        symbols = [f"S{i}" for i in range(50)]
+        strategy.prices.update({s: Decimal("10") for s in symbols})
+        batch, _ = strategy.prioritized_stock_batch(
+            symbols, 0, [], lambda symbol: None, max_size=5
+        )
+        self.assertLessEqual(len(batch), 5)
+
+    def test_max_size_none_keeps_the_configured_default(self):
+        strategy = TradingStrategy(self.config())
+        symbols = [f"S{i}" for i in range(50)]
+        strategy.prices.update({s: Decimal("10") for s in symbols})
+        batch, _ = strategy.prioritized_stock_batch(
+            symbols, 0, [], lambda symbol: None
+        )
+        self.assertEqual(len(batch), min(self.config().stock_batch_size, 50))
+
     def test_priority_score_boosts_a_symbol_on_the_most_active_screener(self):
         strategy = TradingStrategy(self.config())
         strategy.activity["TSLA"] = 5.0
@@ -255,4 +304,31 @@ class StockScanConcurrentBatchesTests(unittest.TestCase):
         strategy = self._strategy()
         self.assertEqual(
             strategy.stock_scan_concurrent_batches(0, core_session_active=True), 1
+        )
+
+    def test_pinned_to_one_batch_when_focus_mode_suppresses_entries(self):
+        """By request ("i want this to be faster more high frequency
+        trades"): the option entry-timing signal was refreshing only
+        every 40-90+ seconds despite a 0.25s poll interval - real
+        per-cycle wall-clock time, spent on full multi-batch universe
+        coverage for a general strategy focus mode had suspended, was
+        the actual gate. A huge universe would otherwise need several
+        concurrent batches (per test_scales_up_for_a_large_universe);
+        with entries suspended it must always collapse to 1.
+        """
+        strategy = self._strategy()
+        self.assertEqual(
+            strategy.stock_scan_concurrent_batches(
+                5000, core_session_active=True, focus_mode_suppressing_entries=True
+            ),
+            1,
+        )
+
+    def test_not_suppressed_still_scales_normally(self):
+        strategy = self._strategy()
+        self.assertEqual(
+            strategy.stock_scan_concurrent_batches(
+                5000, core_session_active=True, focus_mode_suppressing_entries=False
+            ),
+            3,
         )
