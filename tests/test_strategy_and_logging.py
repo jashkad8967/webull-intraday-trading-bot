@@ -14,7 +14,6 @@ from datetime import time as datetime_time
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from zoneinfo import ZoneInfo
 
 from webull_bot.commands import CommandQueue
 from webull_bot.config import Settings
@@ -5336,7 +5335,6 @@ class PrepareOptionScanBatchHeldPositionTests(unittest.TestCase):
     """
 
     def _fake_bot(self, option_contracts, held_position, backfilled_contract):
-        from webull_bot.strategy import TradingStrategy
         from webull_bot.strategy_logic.market_state.snapshot import rotating_batch
 
         underlying_quote = {"symbol": "UBER", "price": "50.00"}
@@ -14691,7 +14689,6 @@ class ProgressiveUniverseLoadingTests(unittest.TestCase):
         fake_bot.resolved_date = moment.date()
 
         call_count = {"n": 0}
-        original_sleep = fake_bot._grow_stock_universe
 
         def sleep_and_flip(*a, **k):
             call_count["n"] += 1
@@ -15406,7 +15403,6 @@ class RefreshMultiDayMomentumColdStartTests(unittest.TestCase):
 
     def _fake_bot(self, daily_closes=None, last_refresh=0.0, fetch_calls=None):
         from webull_bot.bot import AutoTrader
-        from webull_bot.strategy import TradingStrategy
 
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(

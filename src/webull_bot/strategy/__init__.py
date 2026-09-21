@@ -1,6 +1,5 @@
-import math
 from collections import defaultdict, deque
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 
 from webull_bot.strategy_logic.decision.stock_option_decision import (
     _exit_bias,
@@ -24,14 +23,7 @@ from webull_bot.strategy_logic.sizing.order_quantity import (
     stock_order_quantity,
 )
 from webull_bot.strategy_logic.constants import (
-    OBI_BUY_THRESHOLD,
     OBI_DEPTH_LEVELS,
-    OBI_ENABLED,
-    OPTION_DELTA_MAX,
-    OPTION_DELTA_MIN,
-    OPTION_IV_PERCENTILE_MIN_SAMPLES,
-    OPTION_IV_REJECT_PERCENTILE,
-    OPTION_VIXY_REJECT_PERCENTILE,
     OPTION_VIXY_SYMBOL,
 )
 from webull_bot.strategy_logic.momentum.relative_volume import relative_volume_ok
@@ -120,7 +112,7 @@ from webull_bot.strategy_logic.regime.trend_signals import (
     tick_direction_score,
     trend_signal,
 )
-from webull_bot.strategy_logic.types import Decision, PortfolioDecision
+from webull_bot.strategy_logic.types import Decision
 
 
 class TradingStrategy:
