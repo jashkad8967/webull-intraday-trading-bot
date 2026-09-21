@@ -485,9 +485,11 @@ class EmptyResultRetryTests(unittest.TestCase):
             "focus_lock_time - the batch exists to feed that lock",
         )
 
-    def test_the_retry_window_still_gives_up_once_the_lock_has_passed(self):
-        # The elapsed timer's real job - stopping a mid-session restart
-        # from retrying forever - must survive the pre-lock guard.
+    def test_the_retry_window_is_anchored_at_the_lock_not_the_first_try(self):
+        # An hour of pre-market attempts must not spend the window, or
+        # the batch quits at the very instant the post-bell data it
+        # needs arrives. The clock starts at the first at-or-after-lock
+        # attempt, so a full window is still available then.
         bot = self.bot(self.moment(8, 45))
         with unittest.mock.patch("time.monotonic", return_value=1000.0):
             bot.refresh_daily_batch(self.moment(8, 45))
@@ -496,7 +498,21 @@ class EmptyResultRetryTests(unittest.TestCase):
             "time.monotonic", return_value=1000.0 + retry_seconds + 1
         ):
             bot.refresh_daily_batch(self.moment(9, 46))
-        self.assertEqual(bot.daily_batch_date, self.moment(9, 46).date())
+        self.assertIsNone(
+            bot.daily_batch_date,
+            "the first attempt after the lock must still get a full "
+            "retry window, not one already spent pre-market",
+        )
+        with unittest.mock.patch(
+            "time.monotonic", return_value=1000.0 + (retry_seconds * 2) + 2
+        ):
+            bot.refresh_daily_batch(self.moment(10, 7))
+        self.assertEqual(
+            bot.daily_batch_date,
+            self.moment(10, 7).date(),
+            "the elapsed timer's real job - stopping a mid-session "
+            "restart retrying forever - must still work",
+        )
 
     def test_the_eod_close_backstop_overrides_the_retry_window(self):
         # Even a first attempt gives up once there is no real session
