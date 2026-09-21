@@ -219,21 +219,27 @@ def _evaluate_option_entry(
                 "buy/sell pressure does not support this direction"
             ] += 1
             return open_count, buying_power
-        # By explicit request ("you are buying calls at daily
-        # peaks... same mistakes as you did in stocks"): the stock-
-        # side general strategy already refuses to chase a name still
-        # actively racing toward today's high/low (entry_extension_
-        # ok) - options had no equivalent at all, so a CALL could
-        # fire right as the underlying topped out for the day, and a
-        # PUT right as it bottomed. Reuses that exact same check
-        # against the underlying, direction-mapped (CALL behaves like
-        # a BUY - blocked near today's high; PUT behaves like a
-        # SHORT - blocked near today's low).
+        # By explicit request ("there should not be too much quality
+        # gate on the contract other than volume and volatility after
+        # the momentum has been identified"): entry_extension_ok is a
+        # chase/timing filter tuned for a broad multi-symbol
+        # candidate pool. Focus mode already pre-vets a single
+        # established underlying (large-cap, liquid, real volume -
+        # see refresh_daily_batch), so once the direction/pressure
+        # signals below confirm real momentum, an extra "is it too
+        # close to today's high/low" veto stacks caution on top of
+        # caution rather than screening out a genuinely bad pick.
+        # Skipped only in focus mode; the non-focus path (disabled by
+        # default) keeps it.
         underlying_price = self.strategy.prices.get(underlying)
-        if underlying_price is not None and not self.strategy.entry_extension_ok(
-            underlying,
-            underlying_price,
-            direction="SHORT" if contract_type == "PUT" else "BUY",
+        if (
+            not self.config.focus_mode_enabled
+            and underlying_price is not None
+            and not self.strategy.entry_extension_ok(
+                underlying,
+                underlying_price,
+                direction="SHORT" if contract_type == "PUT" else "BUY",
+            )
         ):
             self.option_gate_rejections[
                 "underlying still jumping toward today's high/low"
@@ -336,18 +342,30 @@ def _evaluate_option_entry(
         ):
             self.option_gate_rejections["delta out of range"] += 1
             return open_count, buying_power
-        if not self.strategy.option_iv_percentile_ok(
-            self.option_iv_history[option_symbol], current_iv
-        ):
-            self.option_gate_rejections["IV percentile failed"] += 1
-            return open_count, buying_power
-        if not self.strategy.option_market_regime_ok(
-            self.vixy_history, current_vixy
-        ):
-            self.option_gate_rejections[
-                "market regime (VIXY) gate active"
-            ] += 1
-            return open_count, buying_power
+        # By explicit request ("there should not be too much quality
+        # gate on the contract other than volume and volatility after
+        # the momentum has been identified"): IV percentile and the
+        # broad VIXY market-regime gate are pricing-quality/market-wide
+        # heuristics, not the underlying's own volume/volatility/
+        # momentum - the three things focus mode already established
+        # by selection (large-cap/liquid) and the gates above
+        # (is_volatility_scalp_eligible, realized_volatility_percent,
+        # relative_volume_ok, pressure_supports_entry, direction
+        # match). Skipped only in focus mode; the non-focus path
+        # (disabled by default) keeps both.
+        if not self.config.focus_mode_enabled:
+            if not self.strategy.option_iv_percentile_ok(
+                self.option_iv_history[option_symbol], current_iv
+            ):
+                self.option_gate_rejections["IV percentile failed"] += 1
+                return open_count, buying_power
+            if not self.strategy.option_market_regime_ok(
+                self.vixy_history, current_vixy
+            ):
+                self.option_gate_rejections[
+                    "market regime (VIXY) gate active"
+                ] += 1
+                return open_count, buying_power
         # By request: "you can constantly buy puts and
         # calls on the same stock as it dips and rises" -
         # scoped to underlying+direction (see the
