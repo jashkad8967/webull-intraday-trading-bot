@@ -827,6 +827,12 @@ class AutoTrader:
         # re-logging the same "nothing qualified" line every cycle.
         self.daily_batch_logged_empty_date = None
         self.focus_logged_empty_date = None
+        # Symbols confirmed this session to have no discoverable
+        # option chain (see ensure_focus_symbol_contracts) - excluded
+        # from every future focus pick today, since a listed chain
+        # does not appear mid-session.
+        self.focus_symbol_no_chain: set[str] = set()
+        self.focus_contract_discovery_failures = 0
         # Equity captured on the first cycle of the day, the
         # denominator for the daily profit throttle - see
         # focus_daily_profit_target_fraction.

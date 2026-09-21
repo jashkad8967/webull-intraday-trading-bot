@@ -63,23 +63,29 @@ def select_focus_symbol(self, moment: datetime) -> None:
     if moment < self.session_moment(moment, self.config.focus_lock_time):
         return
     if self.focus_symbol_date == moment.date():
-        # Already locked today. The ONE sanctioned re-pick: the
-        # current symbol has become untradeable in BOTH directions
-        # (see focus_repick_when_blocked). Wash-sale blocks are left
-        # fully intact by explicit request, so the only way to keep
-        # trading is to move to another name rather than sit idle
-        # with a dead symbol for the rest of the session.
-        if not self.config.focus_repick_when_blocked:
-            return
         if self.focus_symbol is None:
+            # Live incident ("if discovery failed why is it still on
+            # that stock") - ensure_focus_symbol_contracts clears
+            # focus_symbol (but NOT focus_symbol_date) when a locked
+            # symbol turns out to have no discoverable option chain
+            # at all (GRML: a 286.7% gapper with no listed options).
+            # That is a disqualification, not "nothing to do" - fall
+            # through and pick a replacement instead of leaving the
+            # account stuck with no symbol for the rest of the day.
+            pass
+        elif not self.config.focus_repick_when_blocked:
+            # Already locked today with a live symbol, and the ONE
+            # OTHER sanctioned re-pick (wash-blocked both directions)
+            # is turned off - nothing to do.
             return
-        if not _both_directions_blocked(self, self.focus_symbol):
+        elif not _both_directions_blocked(self, self.focus_symbol):
             return
-        log.info(
-            "FOCUS  | %s is wash-blocked on both CALL and PUT - "
-            "re-picking a replacement for the rest of the session",
-            self.focus_symbol,
-        )
+        else:
+            log.info(
+                "FOCUS  | %s is wash-blocked on both CALL and PUT - "
+                "re-picking a replacement for the rest of the session",
+                self.focus_symbol,
+            )
     # Deliberately NOT date-stamped until a symbol is actually
     # locked - a container that starts near focus_lock_time (every
     # mid-session restart) has no price data at all for the first
@@ -87,6 +93,11 @@ def select_focus_symbol(self, moment: datetime) -> None:
     # real pick was ever possible.
     scored: list[tuple[float, str]] = []
     for symbol in self.daily_batch:
+        # Confirmed this session to have no discoverable option chain
+        # at all - see ensure_focus_symbol_contracts. Permanent for
+        # today: a listed chain does not appear mid-session.
+        if symbol in self.focus_symbol_no_chain:
+            continue
         price = self.strategy.prices.get(symbol)
         if price is None or price <= 0:
             continue

@@ -25,6 +25,7 @@ def focus_config(**overrides):
         focus_min_price=Decimal("10"),
         focus_max_price=Decimal("600"),
         focus_repick_when_blocked=True,
+        focus_contract_discovery_max_failures=3,
         focus_daily_profit_target_fraction=Decimal("0.05"),
         profit_throttle_confirm_readings=3,
         popular_stock_min_volume=1_000_000,
@@ -373,6 +374,7 @@ class EmptyResultRetryTests(unittest.TestCase):
             focus_symbol=None,
             focus_symbol_date=None,
             focus_logged_empty_date=None,
+            focus_symbol_no_chain=set(),
             premarket_gainers=set(),
             agent_predicted_gainers=set(),
             seed_popular_symbols=set(),
@@ -504,6 +506,8 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
             api=FakeApi(),
             option_contracts_state=SimpleNamespace(save=lambda *a, **k: None),
             strategy=SimpleNamespace(prices={focus_symbol: price} if price else {}),
+            focus_symbol_no_chain=set(),
+            focus_contract_discovery_failures=0,
         )
         bot.ensure_focus_symbol_contracts = (
             AutoTrader.ensure_focus_symbol_contracts.__get__(bot)
@@ -549,6 +553,104 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
         bot.api.select_atm_options = boom
         bot.ensure_focus_symbol_contracts()  # must not raise
         self.assertEqual(bot.option_contracts, [])
+
+    def test_repeated_failure_disqualifies_and_clears_the_symbol(self):
+        """Live incident ("grml has no contracts why is it in the
+        batch" / "if discovery failed why is it still on that
+        stock"): GRML locked with no listed option chain and the
+        account sat stuck on it, retrying forever. A symbol with no
+        chain will not develop one later today, so repeated failure
+        must disqualify it and free the account to re-pick.
+        """
+        bot, placed = self.bot()
+
+        def boom(*a, **k):
+            raise RuntimeError("No option chain for GRML")
+
+        bot.api.select_atm_options = boom
+        max_failures = bot.config.focus_contract_discovery_max_failures
+        for _ in range(max_failures - 1):
+            bot.ensure_focus_symbol_contracts()
+            self.assertEqual(bot.focus_symbol, "MRNA")  # not yet disqualified
+        bot.ensure_focus_symbol_contracts()
+        self.assertIn("MRNA", bot.focus_symbol_no_chain)
+        self.assertIsNone(bot.focus_symbol)
+
+    def test_a_transient_failure_does_not_disqualify_on_its_own(self):
+        bot, placed = self.bot()
+
+        def boom(*a, **k):
+            raise RuntimeError("temporary network blip")
+
+        bot.api.select_atm_options = boom
+        bot.ensure_focus_symbol_contracts()
+        self.assertNotIn("MRNA", bot.focus_symbol_no_chain)
+        self.assertEqual(bot.focus_symbol, "MRNA")
+
+    def test_a_success_resets_the_failure_streak(self):
+        bot, placed = self.bot()
+        calls = {"n": 0}
+
+        def flaky(underlying, price, max_contract_cost=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("temporary blip")
+            return [{"underlying_symbol": underlying, "symbol": f"{underlying}C"}]
+
+        bot.api.select_atm_options = flaky
+        bot.ensure_focus_symbol_contracts()
+        self.assertEqual(bot.focus_contract_discovery_failures, 1)
+        bot.ensure_focus_symbol_contracts()
+        self.assertEqual(bot.focus_contract_discovery_failures, 0)
+        self.assertEqual(bot.focus_symbol, "MRNA")
+
+
+class RepickOnNoChainTests(unittest.TestCase):
+    """select_focus_symbol's side of the same incident: when
+    ensure_focus_symbol_contracts disqualifies the locked symbol (sets
+    focus_symbol to None but leaves focus_symbol_date stamped for
+    today), the account must not get stuck with no symbol - it must
+    fall through and pick a replacement, excluding the disqualified
+    name.
+    """
+
+    def bot(self, now):
+        tz = ZoneInfo("America/New_York")
+        bot = SimpleNamespace(
+            config=focus_config(),
+            daily_batch=["GRML", "MRNA"],
+            focus_symbol=None,
+            focus_symbol_date=now.date(),
+            focus_logged_empty_date=None,
+            focus_symbol_no_chain={"GRML"},
+            wash_sales=SimpleNamespace(blocked_until=lambda key: None),
+            agent_assessment=lambda symbol: None,
+            strategy=SimpleNamespace(
+                metrics={
+                    "GRML": {"volume": 5_000_000},
+                    "MRNA": {"volume": 5_000_000},
+                },
+                prices={"GRML": Decimal("2"), "MRNA": Decimal("168")},
+                priority_score=lambda s, a: 999.0 if s == "GRML" else 1.0,
+            ),
+            timezone=tz,
+        )
+        bot.session_moment = AutoTrader.session_moment.__get__(bot)
+        bot.select_focus_symbol = AutoTrader.select_focus_symbol.__get__(bot)
+        return bot
+
+    def moment(self, hh, mm):
+        return datetime(2026, 9, 21, hh, mm, tzinfo=ZoneInfo("America/New_York"))
+
+    def test_repicks_a_replacement_after_disqualification(self):
+        bot = self.bot(self.moment(11, 0))
+        bot.select_focus_symbol(self.moment(11, 0))
+        self.assertEqual(bot.focus_symbol, "MRNA")
+
+    def test_never_repicks_the_disqualified_symbol_even_though_it_scores_higher(self):
+        bot = self.bot(self.moment(11, 0))
+        bot.select_focus_symbol(self.moment(11, 0))
+        self.assertNotEqual(bot.focus_symbol, "GRML")
 
 
 class StockSuspensionTests(unittest.TestCase):

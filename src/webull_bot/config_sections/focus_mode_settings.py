@@ -213,3 +213,15 @@ class FocusModeSettings(BaseSettings):
     # Note the block only fires on STOP-LOSS exits - a session that
     # exits at a profit accrues no blocks at all.
     focus_repick_when_blocked: bool = True
+    # Live incident ("grml has no contracts why is it in the batch" /
+    # "if discovery failed why is it still on that stock"): GRML, a
+    # 286.7% gapper with no listed option chain at all, locked as the
+    # focus symbol and the account sat stuck on it - unable to trade
+    # anything else, since focus mode rejects every other underlying
+    # and suspends new stock entries - with ensure_focus_symbol_
+    # contracts retrying forever. "No options chain" is a PERMANENT
+    # condition for a symbol (it will not develop one later today),
+    # so repeated discovery failure disqualifies it and triggers a
+    # re-pick. Not 1, so a genuine transient API error doesn't falsely
+    # burn a good symbol on its first hiccup.
+    focus_contract_discovery_max_failures: int = Field(default=3, ge=1, le=20)

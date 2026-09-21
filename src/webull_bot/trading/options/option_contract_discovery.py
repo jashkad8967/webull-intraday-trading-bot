@@ -36,6 +36,7 @@ def ensure_focus_symbol_contracts(self) -> None:
     if any(
         item["underlying_symbol"] == underlying for item in self.option_contracts
     ):
+        self.focus_contract_discovery_failures = 0
         return
     if underlying not in self.strategy.prices:
         return
@@ -52,6 +53,7 @@ def ensure_focus_symbol_contracts(self) -> None:
         )
         self.option_contracts.extend(contracts)
         self.option_discovery_attempted.add(underlying)
+        self.focus_contract_discovery_failures = 0
         self.option_contracts_state.save(
             self.option_contracts,
             self.option_discovery_attempted,
@@ -70,11 +72,40 @@ def ensure_focus_symbol_contracts(self) -> None:
             ",".join(contract["symbol"] for contract in contracts) or "none",
         )
     except Exception as exc:
+        # By request ("if discovery failed why is it still on that
+        # stock") - live incident: GRML (a 286.7% gapper with no
+        # listed option chain at all) locked as the focus symbol and
+        # the account sat stuck on it, retrying forever, unable to
+        # trade anything else for the rest of the session (focus mode
+        # rejects every other underlying and suspends new stock
+        # entries). "No options chain" is a PERMANENT condition for a
+        # symbol - it will not develop one later today - so repeated
+        # failure is disqualifying, not a transient blip to keep
+        # waiting out. A small streak (not 1) still absorbs a genuine
+        # transient API error without falsely burning a good symbol.
+        self.focus_contract_discovery_failures += 1
         log.error(
-            "OPTIONS | %s | focus-symbol contract discovery failed | %s",
+            "OPTIONS | %s | focus-symbol contract discovery failed "
+            "(%s/%s) | %s",
             underlying,
+            self.focus_contract_discovery_failures,
+            self.config.focus_contract_discovery_max_failures,
             exc,
         )
+        if (
+            self.focus_contract_discovery_failures
+            >= self.config.focus_contract_discovery_max_failures
+        ):
+            log.warning(
+                "OPTIONS | %s | no discoverable option chain after %s "
+                "attempts - disqualifying and re-picking the focus "
+                "symbol",
+                underlying,
+                self.focus_contract_discovery_failures,
+            )
+            self.focus_symbol_no_chain.add(underlying)
+            self.focus_symbol = None
+            self.focus_contract_discovery_failures = 0
 
 
 def discover_option_contracts(self) -> None:
