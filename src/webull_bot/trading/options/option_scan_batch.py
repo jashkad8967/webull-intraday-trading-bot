@@ -173,9 +173,9 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
         # could sit signal-less for several minutes past the lock no
         # matter how fast everything else ran. Pre-warming every daily-
         # batch candidate's direction-signal history from the moment
-        # the batch exists (08:45, a full hour before the 09:45 lock)
-        # means whichever one wins already has a fully warm EMA the
-        # instant it's picked.
+        # the batch exists (daily_batch_refresh_time, a full hour
+        # before focus_lock_time) means whichever one wins already has
+        # a fully warm EMA the instant it's picked.
         underlyings = sorted(set(self.daily_batch))
         quote_symbols = underlyings
     else:

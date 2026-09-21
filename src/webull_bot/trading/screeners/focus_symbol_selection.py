@@ -30,8 +30,8 @@ def select_focus_symbol(self, moment: datetime) -> None:
     this morning's researched shortlist to the ONE name the whole
     account will trade options on today.
 
-    Runs at focus_lock_time (09:45 by default) rather than at the
-    bell, since 09:30-09:45 is where opening-range fakeouts
+    Runs at focus_lock_time (08:45 CT / 09:45 ET by default) rather
+    than at the bell, since the first 15 minutes is where opening-range fakeouts
     concentrate.
 
     Picks the top-scored survivor of the daily batch, gated only on

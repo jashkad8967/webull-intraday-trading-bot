@@ -36,11 +36,14 @@ class FocusModeSettings(BaseSettings):
     # the documented result is analysis paralysis and poor execution.
     # 8 sits in the middle of that 5-10 band.
     daily_batch_size: int = Field(default=8, ge=1, le=50)
-    # 08:45 ET, inside the 08:30-09:30 window where pre-market volume
-    # and catalyst releases (earnings, guidance, FDA, upgrades) actually
-    # cluster - early enough to have a batch ready before the bell,
-    # late enough that the pre-market tape is meaningful.
-    daily_batch_refresh_time: str = "08:45"
+    # 07:45 CT (08:45 ET), inside the 08:30-09:30 ET window where
+    # pre-market volume and catalyst releases (earnings, guidance,
+    # FDA, upgrades) actually cluster - early enough to have a batch
+    # ready before the bell, late enough that the pre-market tape is
+    # meaningful. By explicit request ("change everything to central
+    # time") - see trading_timezone's own comment for why this had to
+    # shift together with the zone, not just the zone alone.
+    daily_batch_refresh_time: str = "07:45"
     # Minimum overnight gap for a name to make the batch. A gap is the
     # cheapest available proxy for "something happened" on an API that
     # exposes no news feed - a stock gapping on real volume is gapping
@@ -61,7 +64,7 @@ class FocusModeSettings(BaseSettings):
     # unrestricted screener union.
     daily_batch_require_established_symbols: bool = True
     # Live incident: refresh_daily_batch's give-up used to fire the
-    # moment `moment` crossed focus_lock_time (09:45) directly - which
+    # moment `moment` crossed focus_lock_time directly - which
     # meant any restart landing AFTER 09:45 (every mid-session
     # redeploy) gave up with zero real retries, since the first
     # attempt was already past the cutoff. How long, in real elapsed
@@ -70,13 +73,16 @@ class FocusModeSettings(BaseSettings):
     # before giving up for the day. option_eod_close_time remains a
     # hard backstop regardless of this value.
     daily_batch_retry_minutes: int = Field(default=20, ge=1, le=180)
-    # 09:45 ET: after the opening range resolves. The first hour has
-    # the best setups, but 09:30-09:45 is also where opening-range
-    # fakeouts concentrate - committing the entire account at the bell
-    # on pre-market ranking alone is exactly the trap this avoids.
-    # Pre-market ranking frequently does not survive the open, so the
-    # batch is re-measured on regular-session data before the pick.
-    focus_lock_time: str = "09:45"
+    # 08:45 CT (09:45 ET): after the opening range resolves. The first
+    # hour has the best setups, but 09:30-09:45 ET is also where
+    # opening-range fakeouts concentrate - committing the entire
+    # account at the bell on pre-market ranking alone is exactly the
+    # trap this avoids. Pre-market ranking frequently does not survive
+    # the open, so the batch is re-measured on regular-session data
+    # before the pick. By explicit request ("change everything to
+    # central time") - see trading_timezone's own comment for the
+    # shift reasoning.
+    focus_lock_time: str = "08:45"
     # NOTE: there is deliberately no live-RVOL gate ON THE FOCUS PICK
     # itself, though the underlying research is real (below-average
     # RVOL averaged -0.02R per trade, above-average +0.08R). An
