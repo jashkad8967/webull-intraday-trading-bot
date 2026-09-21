@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime
 from decimal import Decimal
 
@@ -47,6 +48,14 @@ def refresh_daily_batch(self, moment: datetime) -> None:
         return
     if not self.config.focus_mode_enabled:
         return
+    if self.daily_batch_first_attempt_date != moment.date():
+        # A new day - a leftover attempt timestamp from a prior day's
+        # give-up would otherwise make time.monotonic()'s elapsed
+        # value look enormous (monotonic time never resets), which
+        # would trip the retry-minutes give-up on literally the first
+        # attempt of the new day.
+        self.daily_batch_first_attempt_date = moment.date()
+        self.daily_batch_first_attempt_at = None
     if moment < self.session_moment(moment, self.config.daily_batch_refresh_time):
         # Not yet - the pre-market tape this reads isn't meaningful
         # until the 08:30-09:30 window where volume and catalyst
@@ -113,12 +122,28 @@ def refresh_daily_batch(self, moment: datetime) -> None:
     selected = scored[: self.config.daily_batch_size]
     self.daily_batch = [symbol for _, symbol, _ in selected]
     if not self.daily_batch:
-        # Keep retrying while there is still time for a pick to
-        # matter; give up (and stamp) once focus_lock_time has
-        # passed, so a genuinely weak morning stops re-scanning
-        # every cycle for the rest of the day.
-        give_up = moment >= self.session_moment(
-            moment, self.config.focus_lock_time
+        # Live incident: give-up was originally tied to focus_lock_
+        # time (09:45) directly against wall-clock `moment`. That
+        # silently broke on any restart landing after 09:45 - which
+        # covers every mid-session redeploy, exactly the case this
+        # whole retry mechanism exists for - because the FIRST
+        # attempt post-restart was already past the cutoff, giving up
+        # permanently with zero real retries. Track elapsed time
+        # since THIS attempt-loop's own first try instead, so a late
+        # restart still gets a real warm-up window regardless of what
+        # the wall clock already says. option_eod_close_time remains
+        # a hard backstop - a batch built with no real session left
+        # to trade it in is pointless regardless of elapsed time.
+        if self.daily_batch_first_attempt_at is None:
+            self.daily_batch_first_attempt_at = time.monotonic()
+        elapsed_minutes = (
+            time.monotonic() - self.daily_batch_first_attempt_at
+        ) / 60
+        give_up = (
+            elapsed_minutes >= self.config.daily_batch_retry_minutes
+            or moment >= self.session_moment(
+                moment, self.config.option_eod_close_time
+            )
         )
         if give_up:
             self.daily_batch_date = moment.date()
@@ -138,6 +163,7 @@ def refresh_daily_batch(self, moment: datetime) -> None:
             )
         return
     self.daily_batch_date = moment.date()
+    self.daily_batch_first_attempt_at = None
     log.info(
         "BATCH  | %s of %s candidates | %s",
         len(self.daily_batch),

@@ -1,5 +1,6 @@
 import time
 import unittest
+import unittest.mock
 from collections import defaultdict, deque
 from datetime import datetime
 from datetime import time as dt_time
@@ -20,6 +21,7 @@ def focus_config(**overrides):
         daily_batch_refresh_time="08:45",
         daily_batch_size=8,
         daily_batch_min_gap_percent=Decimal("2"),
+        daily_batch_retry_minutes=20,
         focus_min_rvol=Decimal("2.0"),
         focus_min_price=Decimal("10"),
         focus_max_price=Decimal("600"),
@@ -366,6 +368,8 @@ class EmptyResultRetryTests(unittest.TestCase):
             config=focus_config(option_eod_close_time="15:50"),
             daily_batch=[],
             daily_batch_date=None,
+            daily_batch_first_attempt_at=None,
+            daily_batch_first_attempt_date=None,
             daily_batch_logged_empty_date=None,
             focus_symbol=None,
             focus_symbol_date=None,
@@ -396,18 +400,52 @@ class EmptyResultRetryTests(unittest.TestCase):
     def moment(self, hh, mm):
         return datetime(2026, 9, 21, hh, mm, tzinfo=ZoneInfo("America/New_York"))
 
-    def test_empty_batch_before_the_lock_retries_instead_of_ending_the_day(self):
-        bot = self.bot(self.moment(9, 20))
-        bot.refresh_daily_batch(self.moment(9, 20))
-        self.assertIsNone(
-            bot.daily_batch_date,
-            "an empty batch before focus_lock_time must stay retryable",
-        )
-
-    def test_empty_batch_after_the_lock_gives_up_for_the_day(self):
+    def test_empty_batch_on_the_first_attempt_never_gives_up_immediately(self):
+        # The actual live bug this regresses: give-up used to compare
+        # wall-clock `moment` directly against focus_lock_time, so a
+        # restart landing after 09:45 - this account's actual restart
+        # landed at 10:16 - gave up on its very FIRST attempt with
+        # zero real retries. Give-up is now elapsed-attempt-time
+        # based, so a single call, no matter how late in the morning,
+        # must never give up immediately.
         bot = self.bot(self.moment(10, 30))
         bot.refresh_daily_batch(self.moment(10, 30))
-        self.assertEqual(bot.daily_batch_date, self.moment(10, 30).date())
+        self.assertIsNone(
+            bot.daily_batch_date,
+            "a first attempt must always get a real retry window, "
+            "regardless of wall-clock time",
+        )
+
+    def test_gives_up_after_the_retry_window_elapses(self):
+        bot = self.bot(self.moment(10, 30))
+        with unittest.mock.patch("time.monotonic", return_value=1000.0):
+            bot.refresh_daily_batch(self.moment(10, 30))
+        self.assertIsNone(bot.daily_batch_date)
+        retry_seconds = bot.config.daily_batch_retry_minutes * 60
+        with unittest.mock.patch(
+            "time.monotonic", return_value=1000.0 + retry_seconds + 1
+        ):
+            bot.refresh_daily_batch(self.moment(10, 31))
+        self.assertEqual(bot.daily_batch_date, self.moment(10, 31).date())
+
+    def test_the_eod_close_backstop_overrides_the_retry_window(self):
+        # Even a first attempt gives up once there is no real session
+        # left to trade a batch built now.
+        bot = self.bot(self.moment(15, 55))
+        bot.refresh_daily_batch(self.moment(15, 55))
+        self.assertEqual(bot.daily_batch_date, self.moment(15, 55).date())
+
+    def test_a_stale_attempt_timestamp_does_not_bleed_into_a_new_day(self):
+        # time.monotonic() never resets, so a leftover timestamp from
+        # a prior day's give-up must not make day 2 look instantly
+        # expired.
+        bot = self.bot(self.moment(10, 30))
+        bot.daily_batch_first_attempt_date = self.moment(10, 30).date()
+        bot.daily_batch_first_attempt_at = 100.0
+        tomorrow = datetime(2026, 9, 22, 10, 30, tzinfo=ZoneInfo("America/New_York"))
+        with unittest.mock.patch("time.monotonic", return_value=100000.0):
+            bot.refresh_daily_batch(tomorrow)
+        self.assertIsNone(bot.daily_batch_date)
 
     def test_a_real_batch_stamps_the_day(self):
         metrics = {

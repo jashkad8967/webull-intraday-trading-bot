@@ -49,6 +49,16 @@ class FocusModeSettings(BaseSettings):
     daily_batch_min_gap_percent: Decimal = Field(
         default=Decimal("2"), gt=0, le=100
     )
+    # Live incident: refresh_daily_batch's give-up used to fire the
+    # moment `moment` crossed focus_lock_time (09:45) directly - which
+    # meant any restart landing AFTER 09:45 (every mid-session
+    # redeploy) gave up with zero real retries, since the first
+    # attempt was already past the cutoff. How long, in real elapsed
+    # minutes since this attempt-loop's own first try (not wall-clock
+    # proximity to any fixed time), to keep retrying an empty batch
+    # before giving up for the day. option_eod_close_time remains a
+    # hard backstop regardless of this value.
+    daily_batch_retry_minutes: int = Field(default=20, ge=1, le=180)
     # 09:45 ET: after the opening range resolves. The first hour has
     # the best setups, but 09:30-09:45 is also where opening-range
     # fakeouts concentrate - committing the entire account at the bell

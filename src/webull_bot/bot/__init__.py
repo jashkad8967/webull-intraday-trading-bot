@@ -807,6 +807,15 @@ class AutoTrader:
         # survive a mid-session restart without re-picking.
         self.daily_batch: list[str] = []
         self.daily_batch_date = None
+        # Live incident: the batch's give-up used to compare `moment`
+        # directly against focus_lock_time, which broke on any
+        # restart landing after 09:45 (every mid-session redeploy) -
+        # the very first attempt was already past the cutoff, giving
+        # up with zero real retries. These track elapsed real time
+        # since THIS attempt-loop's own first try instead - see
+        # refresh_daily_batch.
+        self.daily_batch_first_attempt_at: float | None = None
+        self.daily_batch_first_attempt_date = None
         self.focus_symbol: str | None = None
         self.focus_symbol_date = None
         # Both routines retry until their cutoff rather than marking
