@@ -11,13 +11,27 @@ class SessionScheduleSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    trading_timezone: str = "America/New_York"
-    market_open_time: str = "04:00"
-    eod_close_time: str = "19:50"
-    market_close_time: str = "20:00"
-    option_market_open_time: str = "09:30"
-    option_eod_close_time: str = "15:50"
-    option_market_close_time: str = "16:00"
+    # By explicit request ("can you change everything to central
+    # time"): every session time below is a bare wall-clock HH:MM
+    # string, interpreted directly in THIS zone (see AutoTrader.now/
+    # session_moment - self.timezone comes straight from this field).
+    # The real market itself trades on Eastern hours no matter what
+    # zone this bot's clock uses, so switching the zone WITHOUT also
+    # shifting every one of these strings would silently move every
+    # session boundary an hour later relative to the real market
+    # (Central is exactly 1 hour behind Eastern year-round - both
+    # zones shift DST on the same dates in the US, so this offset
+    # never varies). Every time below is shifted back exactly 1 hour
+    # from its prior Eastern value so the real-world trading windows
+    # are byte-for-byte unchanged - only the zone they're expressed
+    # and logged in is different.
+    trading_timezone: str = "America/Chicago"
+    market_open_time: str = "03:00"
+    eod_close_time: str = "18:50"
+    market_close_time: str = "19:00"
+    option_market_open_time: str = "08:30"
+    option_eod_close_time: str = "14:50"
+    option_market_close_time: str = "15:00"
     eod_retry_seconds: int = Field(default=10, ge=2, le=120)
     # By request, after pre-market losses: "capturing any profits to
     # close out the day as much as possible" outside core hours - how

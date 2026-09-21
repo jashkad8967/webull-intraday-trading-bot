@@ -58,8 +58,9 @@ def refresh_daily_batch(self, moment: datetime) -> None:
 
     Note what is NOT gated here: relative volume. RVOL is derived
     from volume_delta_latest/volume_delta_ema, which are built by
-    diffing consecutive intraday snapshots - at 08:45 there simply
-    aren't enough regular-session samples for that to mean anything.
+    diffing consecutive intraday snapshots - at daily_batch_refresh_
+    time there simply aren't enough regular-session samples for that
+    to mean anything.
     RVOL is therefore enforced at focus-lock time instead, where it
     is real. This stage gates on the gap, which IS meaningful
     pre-market.
@@ -78,8 +79,10 @@ def refresh_daily_batch(self, moment: datetime) -> None:
         self.daily_batch_first_attempt_at = None
     if moment < self.session_moment(moment, self.config.daily_batch_refresh_time):
         # Not yet - the pre-market tape this reads isn't meaningful
-        # until the 08:30-09:30 window where volume and catalyst
-        # releases actually cluster. Deliberately NOT date-stamped on
+        # until the 08:30-09:30 ET window (a real market-structure
+        # fact, independent of whatever zone this bot's own clock
+        # runs on) where volume and catalyst releases actually
+        # cluster. Deliberately NOT date-stamped on
         # this branch, so it retries on the next cycle instead of
         # marking the day done before the batch was ever built.
         return
