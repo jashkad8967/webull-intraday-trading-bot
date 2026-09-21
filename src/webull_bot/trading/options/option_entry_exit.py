@@ -168,34 +168,43 @@ def _evaluate_option_entry(
         # direction (dip/rip) path had this floor. Applied here,
         # before either path, so a boring name can qualify for
         # NEITHER a trend entry nor a scalp entry, uniformly.
-        if not self.strategy.is_volatility_scalp_eligible(underlying):
-            self.option_gate_rejections[
-                "underlying not volatile/high-volume enough"
-            ] += 1
-            return open_count, buying_power
-        # By explicit request ("the options chosen are not as
-        # volatile... nike again is failing"): is_volatility_scalp_
-        # eligible's stdev floor (0.8%) was tuned for the STOCK-side
-        # cohort, which also lowered it once already ("if the bar for
-        # entry is too restrictive, lower the bar"). Reused as-is for
-        # options, it was letting SPY - a broad index ETF, inherently
-        # dampened relative to a single stock by construction - and
-        # NKE - a large, historically calm blue-chip - both through
-        # repeatedly. Options need a genuinely bigger real move to be
-        # worth the premium risked; this is a strictly higher,
-        # option-specific floor on top of (not instead of) the
-        # existing eligibility check above.
-        underlying_volatility = self.strategy.realized_volatility_percent(
-            underlying
-        )
-        if (
-            underlying_volatility is None
-            or underlying_volatility < self.config.option_min_volatility_percent
-        ):
-            self.option_gate_rejections[
-                "underlying volatility below the option-specific floor"
-            ] += 1
-            return open_count, buying_power
+        # By explicit request ("do you think this was supposed to
+        # happen, not one single trade happened"): live incident -
+        # NVDA, the locked focus symbol, was rejected here every
+        # cycle for 2.5+ minutes straight. Confirmed live it was
+        # genuinely active (72M share volume, +2.37% on the day,
+        # 0.0044% spread), just moving SMOOTHLY tick-to-tick rather
+        # than choppily - is_volatility_scalp_eligible/realized_
+        # volatility_percent measure tick-to-tick stdev, which was
+        # tuned to screen boring names (KO, SPY, NKE) OUT of a wide,
+        # unvetted multi-thousand-symbol pool. Focus mode's own
+        # selection pipeline already proves the underlying is
+        # genuinely active by a DIFFERENT, no less real signal -
+        # refresh_daily_batch's gap%/volume/spread gates plus the
+        # established-symbols filter - and a heavily-traded,
+        # efficiently-priced large-cap can clear all of that while
+        # still reading "calm" on tick-to-tick stdev, exactly because
+        # it IS liquid. Re-applying a gate built for a different
+        # population onto an already-vetted one was blocking real,
+        # tradeable setups outright. Skipped only in focus mode; the
+        # non-focus path (disabled by default) keeps both checks.
+        if not self.config.focus_mode_enabled:
+            if not self.strategy.is_volatility_scalp_eligible(underlying):
+                self.option_gate_rejections[
+                    "underlying not volatile/high-volume enough"
+                ] += 1
+                return open_count, buying_power
+            underlying_volatility = self.strategy.realized_volatility_percent(
+                underlying
+            )
+            if (
+                underlying_volatility is None
+                or underlying_volatility < self.config.option_min_volatility_percent
+            ):
+                self.option_gate_rejections[
+                    "underlying volatility below the option-specific floor"
+                ] += 1
+                return open_count, buying_power
         # By request (momentum-shift overview): general entry-quality
         # filter - is this candidate's move actually backed by real
         # volume? Same TradingStrategy.relative_volume_ok used on the
@@ -261,8 +270,14 @@ def _evaluate_option_entry(
         # already clear the same bar the stock cohort does,
         # not every quiet name in the candidate pool.
         scalp_direction = "HOLD"
-        if self.config.option_scalp_enabled and self.strategy.is_volatility_scalp_eligible(
-            underlying
+        # Same focus-mode carve-out as the entry-quality gate above -
+        # is_volatility_scalp_eligible was blocking the dip/rip
+        # momentum-flip signal on an already-vetted focus symbol for
+        # the same "smooth tick-to-tick, still genuinely active"
+        # reason.
+        if self.config.option_scalp_enabled and (
+            self.config.focus_mode_enabled
+            or self.strategy.is_volatility_scalp_eligible(underlying)
         ):
             underlying_price = self.strategy.prices.get(underlying)
             if underlying_price is not None:
