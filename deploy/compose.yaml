@@ -17,7 +17,13 @@ services:
       OPTION_CONTRACTS_STATE_FILE: /var/data/conf/option_contracts.json
       STATUS_FILE: /var/data/status.json
       COMMAND_FILE: /var/commands/commands.json
-      TZ: America/New_York
+      # Keep this in step with TRADING_TIMEZONE: the option DTE window
+      # and contract pruning call date.today(), which reads the
+      # container's system zone, not the configured trading zone. The
+      # two only disagree across a midnight boundary, but leaving them
+      # mismatched means "today" means two different things inside one
+      # process. Console log timestamps follow this too.
+      TZ: America/Chicago
     volumes:
       - trading-data:/var/data
       - command-data:/var/commands
@@ -38,10 +44,10 @@ services:
     environment:
       STATUS_FILE: /var/data/status.json
       LOG_DIRECTORY: /var/data/logs
-      TRADING_TIMEZONE: America/New_York
+      TRADING_TIMEZONE: America/Chicago
       COMMAND_FILE: /var/commands/commands.json
       GIT_SHA: ${BOT_IMAGE_TAG:-local}
-      TZ: America/New_York
+      TZ: America/Chicago
     volumes:
       - trading-data:/var/data:ro
       - command-data:/var/commands

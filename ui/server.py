@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 STATUS_FILE = Path(os.environ.get("STATUS_FILE", "status.json"))
 LOG_DIRECTORY = Path(os.environ.get("LOG_DIRECTORY", "logs"))
-TRADING_TIMEZONE = os.environ.get("TRADING_TIMEZONE", "America/New_York")
+TRADING_TIMEZONE = os.environ.get("TRADING_TIMEZONE", "America/Chicago")
 COMMAND_FILE = Path(os.environ.get("COMMAND_FILE", "commands.json"))
 GIT_SHA = os.environ.get("GIT_SHA", "local")[:8]
 STATIC_DIR = Path(__file__).parent / "static"

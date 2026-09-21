@@ -1169,16 +1169,23 @@ when the bot starts are adopted and timed from when the bot first observes them.
 ## 8. Configure daily closeout
 
 ```dotenv
-TRADING_TIMEZONE=America/New_York
-MARKET_OPEN_TIME=04:00
-EOD_CLOSE_TIME=19:50
-MARKET_CLOSE_TIME=20:00
-OPTION_MARKET_OPEN_TIME=09:30
-OPTION_EOD_CLOSE_TIME=15:50
-OPTION_MARKET_CLOSE_TIME=16:00
+TRADING_TIMEZONE=America/Chicago
+MARKET_OPEN_TIME=03:00
+EOD_CLOSE_TIME=18:50
+MARKET_CLOSE_TIME=19:00
+OPTION_MARKET_OPEN_TIME=08:30
+OPTION_EOD_CLOSE_TIME=14:50
+OPTION_MARKET_CLOSE_TIME=15:00
 STOCK_LIMIT_OFFSET=0.005
 EOD_RETRY_SECONDS=10
 ```
+
+Every time above is a bare wall-clock `HH:MM` interpreted in
+`TRADING_TIMEZONE`. These defaults are Central, and cover the same
+real-world windows the Eastern values used to (`08:30` CT is the
+`09:30` ET opening bell). If you change `TRADING_TIMEZONE`, shift
+every one of these by the same offset or the session boundaries will
+move relative to the actual market.
 
 Stocks run in Webull's `ALL` session from 4:00 AM through 8:00 PM New York
 time. All stock entries and exits use limit orders because market orders are
@@ -1650,13 +1657,13 @@ TIME_AWARE_STOP_WIDEN_MULTIPLIER=1.5
 REGIME_GATE_ENABLED=false
 REGIME_GATE_REJECT_PERCENTILE=0.85
 
-TRADING_TIMEZONE=America/New_York
-MARKET_OPEN_TIME=04:00
-EOD_CLOSE_TIME=19:50
-MARKET_CLOSE_TIME=20:00
-OPTION_MARKET_OPEN_TIME=09:30
-OPTION_EOD_CLOSE_TIME=15:50
-OPTION_MARKET_CLOSE_TIME=16:00
+TRADING_TIMEZONE=America/Chicago
+MARKET_OPEN_TIME=03:00
+EOD_CLOSE_TIME=18:50
+MARKET_CLOSE_TIME=19:00
+OPTION_MARKET_OPEN_TIME=08:30
+OPTION_EOD_CLOSE_TIME=14:50
+OPTION_MARKET_CLOSE_TIME=15:00
 EOD_RETRY_SECONDS=10
 MARKET_HOLIDAYS=
 WASH_SALE_BLOCK_DAYS=31

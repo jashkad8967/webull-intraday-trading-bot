@@ -1033,5 +1033,98 @@ class StockSuspensionTests(unittest.TestCase):
         self.assertFalse(suspended())
 
 
+class RealSessionScheduleAlignmentTests(unittest.TestCase):
+    """The shipped defaults must land on the REAL market session.
+
+    Every session field is a bare HH:MM read in trading_timezone, so a
+    zone change that doesn't shift all of them moves every boundary by
+    the zone offset - the bot would start trading options an hour late
+    and flatten an hour after the close. These assertions are written
+    against absolute instants (anchored to Eastern, where the exchange
+    actually is) rather than against the literal strings, so they hold
+    for whatever zone the config names and fail the moment the zone
+    and the times disagree.
+    """
+
+    EXCHANGE = ZoneInfo("America/New_York")
+    # A normal Tuesday, both zones on daylight time.
+    TRADING_DAY = date(2026, 9, 22)
+
+    def setUp(self):
+        from webull_bot.config import Settings
+
+        self.config = Settings()
+        self.zone = ZoneInfo(self.config.trading_timezone)
+
+    def instant(self, value: str) -> datetime:
+        """The absolute moment a config HH:MM names, as the bot reads it."""
+        return datetime.combine(
+            self.TRADING_DAY,
+            self.config.session_time(value),
+            tzinfo=self.zone,
+        )
+
+    def exchange_instant(self, hour: int, minute: int) -> datetime:
+        return datetime(
+            self.TRADING_DAY.year,
+            self.TRADING_DAY.month,
+            self.TRADING_DAY.day,
+            hour,
+            minute,
+            tzinfo=self.EXCHANGE,
+        )
+
+    def assert_lands_on(self, value: str, hour: int, minute: int, label: str):
+        self.assertEqual(
+            self.instant(value),
+            self.exchange_instant(hour, minute),
+            f"{label} resolves to {self.instant(value).astimezone(self.EXCHANGE)} "
+            f"Eastern, expected {hour:02d}:{minute:02d} Eastern - the configured "
+            f"zone ({self.config.trading_timezone}) and the HH:MM values disagree",
+        )
+
+    def test_option_session_matches_the_real_opening_and_closing_bell(self):
+        self.assert_lands_on(
+            self.config.option_market_open_time, 9, 30, "option_market_open_time"
+        )
+        self.assert_lands_on(
+            self.config.option_market_close_time, 16, 0, "option_market_close_time"
+        )
+        self.assert_lands_on(
+            self.config.option_eod_close_time, 15, 50, "option_eod_close_time"
+        )
+
+    def test_extended_hours_stock_session_matches_the_real_window(self):
+        self.assert_lands_on(self.config.market_open_time, 4, 0, "market_open_time")
+        self.assert_lands_on(self.config.market_close_time, 20, 0, "market_close_time")
+        self.assert_lands_on(self.config.eod_close_time, 19, 50, "eod_close_time")
+
+    def test_focus_funnel_lands_on_its_intended_eastern_moments(self):
+        # By explicit request: the batch is built inside the 08:30-09:30
+        # ET pre-market window, and the focus symbol locks at 09:45 ET
+        # ("at 9:45am the stock needs to be selected... I want the first
+        # order to go out at 9:45, not later").
+        self.assert_lands_on(
+            self.config.daily_batch_refresh_time, 8, 45, "daily_batch_refresh_time"
+        )
+        self.assert_lands_on(self.config.focus_lock_time, 9, 45, "focus_lock_time")
+
+    def test_the_funnel_runs_in_the_right_order_within_the_session(self):
+        batch = self.instant(self.config.daily_batch_refresh_time)
+        opening = self.instant(self.config.option_market_open_time)
+        lock = self.instant(self.config.focus_lock_time)
+        flatten = self.instant(self.config.option_eod_close_time)
+        close = self.instant(self.config.option_market_close_time)
+        self.assertLess(batch, opening, "batch must be built before the bell")
+        self.assertLess(opening, lock, "focus locks after the opening range")
+        self.assertLess(lock, flatten, "a locked symbol needs session left to trade")
+        self.assertLess(flatten, close, "closeout must begin before the close")
+
+    def test_the_configured_zone_is_a_real_zone_the_clock_can_use(self):
+        moment = datetime.now(self.zone)
+        self.assertIsNotNone(moment.tzinfo)
+        self.assertIsNotNone(moment.utcoffset())
+
+
 if __name__ == "__main__":
     unittest.main()
