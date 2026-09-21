@@ -615,7 +615,7 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
             focus_symbol_no_chain=set(),
             focus_contract_discovery_failures=0,
             focus_symbol_affordability_checked=None,
-            last_stale_contract_prune=0.0,
+            last_stale_contract_prune=None,
         )
         bot.ensure_focus_symbol_contracts = (
             AutoTrader.ensure_focus_symbol_contracts.__get__(bot)
@@ -750,6 +750,22 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
         self.assertTrue(
             any(c["underlying_symbol"] == "MRNA" for c in bot.option_contracts)
         )
+
+    def test_pruning_still_runs_on_a_low_uptime_machine(self):
+        """Regression: time.monotonic() is seconds since an arbitrary
+        epoch (system/process boot), not wall-clock time - it can
+        genuinely be small on a fresh CI runner or this bot's own
+        deploy host right after a restart. The old 0.0 sentinel for
+        "never pruned yet" was indistinguishable from "pruned moments
+        ago" on such a machine, so the very first prune attempt
+        silently skipped. Caught by a real CI run that failed the
+        exact same test the local (long-uptime) machine passed.
+        """
+        stale = _fake_contract("MRNA", "MRNAC-OLD", "CALL", 170, dte=4)
+        bot, calls = self.bot(existing_contracts=[stale])
+        with unittest.mock.patch("time.monotonic", return_value=5.0):
+            bot.ensure_focus_symbol_contracts()
+        self.assertNotIn(stale, bot.option_contracts)
 
     def test_a_fresh_persisted_contract_is_left_alone(self):
         fresh = _fake_contract("MRNA", "MRNAC-OLD", "CALL", 170, dte=20)

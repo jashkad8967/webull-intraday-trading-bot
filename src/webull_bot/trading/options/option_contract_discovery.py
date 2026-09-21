@@ -165,10 +165,23 @@ def _prune_stale_contracts(self) -> None:
     Throttled to once per option_discovery_seconds (the same cadence
     discover_option_contracts already uses) - this is a full scan of
     self.option_contracts, not worth repeating every single cycle.
+
+    last_stale_contract_prune's "never run yet" sentinel is None, not
+    0.0 - time.monotonic() is seconds since an arbitrary epoch
+    (typically system/process boot), not wall-clock time, so it can
+    genuinely be small on a machine with low uptime (a fresh CI
+    runner, or this bot's own deploy host right after a restart -
+    which happened several times the same day this bug was found).
+    Comparing against a hardcoded 0.0 would then read as "already
+    pruned moments ago" and skip pruning entirely on the very first
+    call - caught by a CI run that failed where the same test passed
+    locally on a longer-uptime machine.
     """
     now = time.monotonic()
-    if now - self.last_stale_contract_prune < float(
-        self.config.option_discovery_seconds
+    if (
+        self.last_stale_contract_prune is not None
+        and now - self.last_stale_contract_prune
+        < float(self.config.option_discovery_seconds)
     ):
         return
     self.last_stale_contract_prune = now

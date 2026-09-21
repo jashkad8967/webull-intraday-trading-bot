@@ -685,7 +685,7 @@ class AutoTrader:
         self.last_status_log = 0.0
         self.opening_grace_logged_date = None
         self.last_option_discovery = 0.0
-        self.last_stale_contract_prune = 0.0
+        self.last_stale_contract_prune: float | None = None
         self.last_account_refresh = 0.0
         self.last_order_monitor = 0.0
         self.last_reprice = 0.0
