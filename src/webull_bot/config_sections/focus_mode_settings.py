@@ -95,6 +95,26 @@ class FocusModeSettings(BaseSettings):
     focus_daily_profit_target_fraction: Decimal = Field(
         default=Decimal("0.05"), gt=0, le=1
     )
+    # How many CONSECUTIVE equity readings must clear the target
+    # before the throttle actually arms.
+    #
+    # Live incident, first session this shipped: the bot recorded
+    # equity of $409.54 (+12.52%) and armed the throttle four minutes
+    # into the open, disabling new entries for the whole day - while
+    # the broker showed $363 flat with zero open positions. The cause
+    # is settlement timing, as described by the account owner: "when a
+    # trade goes through for a second the calculations occur and the
+    # account spikes, but that doesn't mean anything." For a moment
+    # after a closing fill, the sale proceeds are ALREADY in
+    # buying_power while the position is STILL present in the
+    # positions list, so buying_power + market value double-counts it.
+    #
+    # A spike like that lasts a reading or two. Requiring several
+    # consecutive confirmations (write_status_snapshot refreshes
+    # equity about every 20s, so 3 readings is roughly a minute of
+    # sustained gain) makes the throttle respond to real P&L only.
+    # Any single reading below the target resets the streak.
+    profit_throttle_confirm_readings: int = Field(default=3, ge=1, le=20)
     # By request: "make sure when there is a profit to not let on too
     # much loss" - don't let a winner round-trip into a loser.
     #

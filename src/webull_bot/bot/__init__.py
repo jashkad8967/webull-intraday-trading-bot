@@ -822,6 +822,10 @@ class AutoTrader:
         self.day_start_equity: Decimal | None = None
         self.day_start_equity_date = None
         self.profit_throttle_armed = False
+        # Consecutive equity readings currently above the daily
+        # target - see profit_throttle_confirm_readings for the
+        # settlement-spike incident this exists to filter out.
+        self.profit_throttle_streak = 0
         self.cached_total_equity: Decimal | None = None
         # Peak premium seen on each open option position, the high-
         # water mark the profit-lock trail rides - by request, "make
