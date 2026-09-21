@@ -2,7 +2,7 @@ import time
 import unittest
 import unittest.mock
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 from decimal import Decimal
 from types import SimpleNamespace
@@ -45,6 +45,11 @@ def focus_config(**overrides):
         sell_fee_dollars=Decimal("0.02"),
         option_take_profit_percent=Decimal("0.15"),
         option_stop_loss_percent=Decimal("0.50"),
+        option_min_dte=14,
+        option_max_dte=45,
+        option_type="BOTH",
+        option_max_moneyness_percent=Decimal("0.15"),
+        option_eod_close_time="15:50",
         option_min_hold_dte=7,
         time_aware_stop_enabled=False,
         time_aware_stop_widen_seconds=60,
@@ -524,21 +529,73 @@ class EmptyResultRetryTests(unittest.TestCase):
         self.assertEqual(bot.focus_symbol_date, self.moment(15, 50).date())
 
 
+def _fake_contract(underlying, symbol, option_type, strike, dte=20):
+    expiration = (date.today() + timedelta(days=dte)).isoformat()
+    return {
+        "underlying_symbol": underlying,
+        "symbol": symbol,
+        "option_type": option_type,
+        "tradable_status": "OC",
+        "expiration_date": expiration,
+        "strike_price": str(strike),
+    }
+
+
 class EnsureFocusSymbolContractsTests(unittest.TestCase):
     """By request: "you should be able to request contract by stock
     in webull openapi" - the locked symbol's option chain must exist
     immediately, not depend on the generic discovery rotation ever
-    reaching it.
+    reaching it. By request ("it should have found a lot more...
+    regardless of affordability"): discovery pulls the WIDE board
+    (every valid strike/expiration), not select_atm_options' single
+    best-guess CALL and PUT.
     """
 
-    def bot(self, focus_symbol="MRNA", existing_contracts=None, price=Decimal("168")):
-        placed = []
+    def bot(
+        self,
+        focus_symbol="MRNA",
+        existing_contracts=None,
+        price=Decimal("168"),
+        contracts=None,
+        quotes=None,
+        fail=False,
+        buying_power=Decimal("300"),
+    ):
+        calls = {"option_contracts": [], "option_quotes": []}
+        default_contracts = contracts or [
+            _fake_contract("MRNA", "MRNAC", "CALL", 170),
+            _fake_contract("MRNA", "MRNAP", "PUT", 166),
+        ]
+        default_quotes = quotes or {
+            "MRNAC": {"symbol": "MRNAC", "bid": "1.90", "ask": "2.00"},
+            "MRNAP": {"symbol": "MRNAP", "bid": "1.80", "ask": "1.90"},
+        }
 
         class FakeApi:
             @staticmethod
-            def select_atm_options(underlying, price, max_contract_cost=None):
-                placed.append((underlying, price, max_contract_cost))
-                return [{"underlying_symbol": underlying, "symbol": f"{underlying}C"}]
+            def option_contracts(underlying=None, option_symbol=None):
+                calls["option_contracts"].append(underlying)
+                if fail:
+                    raise RuntimeError("no chain listed")
+                return [c for c in default_contracts if c["underlying_symbol"] == underlying]
+
+            @staticmethod
+            def option_quotes(symbols):
+                calls["option_quotes"].append(list(symbols))
+                return [default_quotes[s] for s in symbols if s in default_quotes]
+
+            @staticmethod
+            def option_limit_price(quote, side):
+                bid, ask = quote.get("bid"), quote.get("ask")
+                if bid is None or ask is None:
+                    return None
+                return (Decimal(str(bid)) + Decimal(str(ask))) / 2
+
+        def order_quantity(limit_price, bp):
+            cost = limit_price * 100
+            if cost <= 0:
+                return 0, cost
+            return int(bp // cost), cost
 
         bot = SimpleNamespace(
             config=focus_config(),
@@ -547,55 +604,58 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
             option_discovery_attempted=set(),
             option_average_down_count={},
             option_last_buy_price={},
-            cached_option_buying_power=Decimal("300"),
+            cached_option_buying_power=buying_power,
             api=FakeApi(),
             option_contracts_state=SimpleNamespace(save=lambda *a, **k: None),
-            strategy=SimpleNamespace(prices={focus_symbol: price} if price else {}),
+            strategy=SimpleNamespace(
+                prices={focus_symbol: price} if price else {},
+                option_order_quantity=order_quantity,
+            ),
             focus_symbol_no_chain=set(),
             focus_contract_discovery_failures=0,
+            focus_symbol_affordability_checked=None,
         )
         bot.ensure_focus_symbol_contracts = (
             AutoTrader.ensure_focus_symbol_contracts.__get__(bot)
         )
-        return bot, placed
+        return bot, calls
 
-    def test_discovers_contracts_for_a_newly_locked_symbol(self):
-        bot, placed = self.bot()
+    def test_discovers_the_wide_board_for_a_newly_locked_symbol(self):
+        bot, calls = self.bot()
         bot.ensure_focus_symbol_contracts()
-        self.assertEqual(placed, [("MRNA", Decimal("168"), Decimal("300"))])
-        self.assertEqual(len(bot.option_contracts), 1)
-        self.assertEqual(bot.option_contracts[0]["underlying_symbol"], "MRNA")
+        self.assertEqual(calls["option_contracts"], ["MRNA"])
+        self.assertEqual(len(bot.option_contracts), 2)
+        self.assertEqual(
+            {c["symbol"] for c in bot.option_contracts}, {"MRNAC", "MRNAP"}
+        )
 
     def test_is_a_no_op_when_the_chain_already_exists(self):
-        bot, placed = self.bot(
-            existing_contracts=[{"underlying_symbol": "MRNA", "symbol": "MRNAC"}]
+        bot, calls = self.bot(
+            existing_contracts=[
+                _fake_contract("MRNA", "MRNAC", "CALL", 170)
+            ]
         )
         bot.ensure_focus_symbol_contracts()
-        self.assertEqual(placed, [])
+        self.assertEqual(calls["option_contracts"], [])
 
     def test_does_nothing_without_a_focus_symbol(self):
-        bot, placed = self.bot(focus_symbol=None)
+        bot, calls = self.bot(focus_symbol=None)
         bot.ensure_focus_symbol_contracts()
-        self.assertEqual(placed, [])
+        self.assertEqual(calls["option_contracts"], [])
 
     def test_retries_next_cycle_when_price_is_not_yet_known(self):
-        bot, placed = self.bot(price=None)
+        bot, calls = self.bot(price=None)
         bot.ensure_focus_symbol_contracts()
-        self.assertEqual(placed, [])
+        self.assertEqual(calls["option_contracts"], [])
 
     def test_disabled_focus_mode_never_calls_the_api(self):
-        bot, placed = self.bot()
+        bot, calls = self.bot()
         bot.config = focus_config(focus_mode_enabled=False)
         bot.ensure_focus_symbol_contracts()
-        self.assertEqual(placed, [])
+        self.assertEqual(calls["option_contracts"], [])
 
     def test_an_api_failure_does_not_raise(self):
-        bot, placed = self.bot()
-
-        def boom(*a, **k):
-            raise RuntimeError("no chain listed")
-
-        bot.api.select_atm_options = boom
+        bot, calls = self.bot(fail=True)
         bot.ensure_focus_symbol_contracts()  # must not raise
         self.assertEqual(bot.option_contracts, [])
 
@@ -607,12 +667,7 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
         chain will not develop one later today, so repeated failure
         must disqualify it and free the account to re-pick.
         """
-        bot, placed = self.bot()
-
-        def boom(*a, **k):
-            raise RuntimeError("No option chain for GRML")
-
-        bot.api.select_atm_options = boom
+        bot, calls = self.bot(fail=True)
         max_failures = bot.config.focus_contract_discovery_max_failures
         for _ in range(max_failures - 1):
             bot.ensure_focus_symbol_contracts()
@@ -622,32 +677,57 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
         self.assertIsNone(bot.focus_symbol)
 
     def test_a_transient_failure_does_not_disqualify_on_its_own(self):
-        bot, placed = self.bot()
-
-        def boom(*a, **k):
-            raise RuntimeError("temporary network blip")
-
-        bot.api.select_atm_options = boom
+        bot, calls = self.bot(fail=True)
         bot.ensure_focus_symbol_contracts()
         self.assertNotIn("MRNA", bot.focus_symbol_no_chain)
         self.assertEqual(bot.focus_symbol, "MRNA")
 
     def test_a_success_resets_the_failure_streak(self):
-        bot, placed = self.bot()
-        calls = {"n": 0}
+        bot, calls = self.bot()
+        real_fetch = bot.api.option_contracts
+        state = {"n": 0}
 
-        def flaky(underlying, price, max_contract_cost=None):
-            calls["n"] += 1
-            if calls["n"] == 1:
+        def flaky(underlying=None, option_symbol=None):
+            state["n"] += 1
+            if state["n"] == 1:
                 raise RuntimeError("temporary blip")
-            return [{"underlying_symbol": underlying, "symbol": f"{underlying}C"}]
+            return real_fetch(underlying=underlying)
 
-        bot.api.select_atm_options = flaky
+        bot.api.option_contracts = flaky
         bot.ensure_focus_symbol_contracts()
         self.assertEqual(bot.focus_contract_discovery_failures, 1)
         bot.ensure_focus_symbol_contracts()
         self.assertEqual(bot.focus_contract_discovery_failures, 0)
         self.assertEqual(bot.focus_symbol, "MRNA")
+
+    def test_disqualifies_when_nothing_discovered_is_affordable(self):
+        """Live incident: GOOGL locked, its own liquid $7.55/$7.90
+        quote confirmed real, but at ~$790/contract against a $363
+        account nothing was ever affordable and the account sat
+        stuck. option_order_quantity sizing to 0 for every discovered
+        contract must disqualify the symbol exactly like no chain.
+        """
+        bot, calls = self.bot(
+            contracts=[_fake_contract("MRNA", "MRNAC", "CALL", 170)],
+            quotes={"MRNAC": {"symbol": "MRNAC", "bid": "7.55", "ask": "7.90"}},
+            buying_power=Decimal("363"),
+        )
+        bot.ensure_focus_symbol_contracts()
+        self.assertIn("MRNA", bot.focus_symbol_no_chain)
+        self.assertIsNone(bot.focus_symbol)
+
+    def test_stays_locked_when_at_least_one_contract_is_affordable(self):
+        bot, calls = self.bot(buying_power=Decimal("300"))
+        bot.ensure_focus_symbol_contracts()
+        self.assertEqual(bot.focus_symbol, "MRNA")
+        self.assertNotIn("MRNA", bot.focus_symbol_no_chain)
+
+    def test_affordability_is_checked_once_per_lock_not_every_cycle(self):
+        bot, calls = self.bot(buying_power=Decimal("300"))
+        bot.ensure_focus_symbol_contracts()
+        quote_calls_after_first = len(calls["option_quotes"])
+        bot.ensure_focus_symbol_contracts()
+        self.assertEqual(len(calls["option_quotes"]), quote_calls_after_first)
 
 
 class RepickOnNoChainTests(unittest.TestCase):
@@ -679,6 +759,12 @@ class RepickOnNoChainTests(unittest.TestCase):
                 priority_score=lambda s, a: 999.0 if s == "GRML" else 1.0,
             ),
             timezone=tz,
+            # Affordability is exercised separately (see
+            # EnsureFocusSymbolContractsTests /
+            # FocusSymbolIsAffordableTests) - this class is about the
+            # wash-sale/no-chain re-pick path, so every candidate is
+            # affordable here.
+            focus_symbol_is_affordable=lambda symbol: True,
         )
         bot.session_moment = AutoTrader.session_moment.__get__(bot)
         bot.select_focus_symbol = AutoTrader.select_focus_symbol.__get__(bot)
@@ -696,6 +782,63 @@ class RepickOnNoChainTests(unittest.TestCase):
         bot = self.bot(self.moment(11, 0))
         bot.select_focus_symbol(self.moment(11, 0))
         self.assertNotEqual(bot.focus_symbol, "GRML")
+
+
+class ProactiveAffordabilityInSelectionTests(unittest.TestCase):
+    """By request: "we want affordable options only so the stocks
+    should also be focused like that" - checked proactively inside
+    select_focus_symbol's candidate loop, so an established/liquid
+    name whose cheapest contract still exceeds buying power never
+    locks in the first place (live incident: GOOGL locked, then had
+    to be reactively disqualified, wasting real trading time).
+    """
+
+    def bot(self, now, affordable):
+        tz = ZoneInfo("America/New_York")
+        bot = SimpleNamespace(
+            config=focus_config(),
+            daily_batch=["GOOGL", "MRNA"],
+            focus_symbol=None,
+            focus_symbol_date=None,
+            focus_logged_empty_date=None,
+            focus_symbol_no_chain=set(),
+            wash_sales=SimpleNamespace(blocked_until=lambda key: None),
+            agent_assessment=lambda symbol: None,
+            strategy=SimpleNamespace(
+                metrics={
+                    "GOOGL": {"volume": 20_000_000},
+                    "MRNA": {"volume": 5_000_000},
+                },
+                prices={"GOOGL": Decimal("256"), "MRNA": Decimal("168")},
+                # A big real-money mega-cap should naturally score
+                # higher than a mid-cap - the point of this test is
+                # that affordability overrides that anyway.
+                priority_score=lambda s, a: 500.0 if s == "GOOGL" else 1.0,
+            ),
+            timezone=tz,
+            focus_symbol_is_affordable=lambda symbol: affordable.get(symbol, True),
+        )
+        bot.session_moment = AutoTrader.session_moment.__get__(bot)
+        bot.select_focus_symbol = AutoTrader.select_focus_symbol.__get__(bot)
+        return bot
+
+    def moment(self, hh, mm):
+        return datetime(2026, 9, 21, hh, mm, tzinfo=ZoneInfo("America/New_York"))
+
+    def test_an_unaffordable_higher_scoring_symbol_is_skipped(self):
+        bot = self.bot(self.moment(9, 45), affordable={"GOOGL": False, "MRNA": True})
+        bot.select_focus_symbol(self.moment(9, 45))
+        self.assertEqual(bot.focus_symbol, "MRNA")
+
+    def test_an_affordable_symbol_still_locks_normally(self):
+        bot = self.bot(self.moment(9, 45), affordable={"GOOGL": True, "MRNA": True})
+        bot.select_focus_symbol(self.moment(9, 45))
+        self.assertEqual(bot.focus_symbol, "GOOGL")  # higher score wins when both fit
+
+    def test_nothing_locks_when_every_candidate_is_unaffordable(self):
+        bot = self.bot(self.moment(9, 45), affordable={"GOOGL": False, "MRNA": False})
+        bot.select_focus_symbol(self.moment(9, 45))
+        self.assertIsNone(bot.focus_symbol)
 
 
 class StockSuspensionTests(unittest.TestCase):

@@ -108,6 +108,16 @@ def select_focus_symbol(self, moment: datetime) -> None:
         metrics = self.strategy.metrics.get(symbol, {})
         if metrics.get("volume", 0) < self.config.popular_stock_min_volume:
             continue
+        # By explicit request ("we want affordable options only so
+        # the stocks should also be focused like that"): checked here
+        # (last, after every free structural gate) rather than only
+        # reactively after a lock - locking onto an established name
+        # whose cheapest contract still exceeds buying power (GOOGL:
+        # $790/contract against $363) and then immediately having to
+        # disqualify and re-pick wastes real trading time. See
+        # focus_symbol_is_affordable's own docstring.
+        if not self.focus_symbol_is_affordable(symbol):
+            continue
         score = self.strategy.priority_score(symbol, self.agent_assessment(symbol))
         scored.append((score, symbol))
     if not scored:

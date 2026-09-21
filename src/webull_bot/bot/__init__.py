@@ -95,6 +95,7 @@ from webull_bot.trading.momentum.volatility_window_seeding import (
 from webull_bot.trading.options.option_contract_discovery import (
     discover_option_contracts,
     ensure_focus_symbol_contracts,
+    focus_symbol_is_affordable,
 )
 from webull_bot.trading.options.option_entry_exit import (
     _evaluate_option_entry,
@@ -457,6 +458,7 @@ class AutoTrader:
     # Options-chain discovery - moved out to trading/options/.
     discover_option_contracts = discover_option_contracts
     ensure_focus_symbol_contracts = ensure_focus_symbol_contracts
+    focus_symbol_is_affordable = focus_symbol_is_affordable
     _prepare_option_scan_batch = _prepare_option_scan_batch
     _evaluate_option_entry = _evaluate_option_entry
     _evaluate_option_exit = _evaluate_option_exit
@@ -833,6 +835,10 @@ class AutoTrader:
         # does not appear mid-session.
         self.focus_symbol_no_chain: set[str] = set()
         self.focus_contract_discovery_failures = 0
+        # Underlying whose affordability was last confirmed by
+        # _check_focus_symbol_affordable - avoids re-quoting a symbol
+        # already known affordable on every single cycle.
+        self.focus_symbol_affordability_checked: str | None = None
         # Equity captured on the first cycle of the day, the
         # denominator for the daily profit throttle - see
         # focus_daily_profit_target_fraction.
