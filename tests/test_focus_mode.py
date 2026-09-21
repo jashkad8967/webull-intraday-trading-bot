@@ -25,6 +25,7 @@ def focus_config(**overrides):
         focus_max_price=Decimal("600"),
         focus_repick_when_blocked=True,
         focus_daily_profit_target_fraction=Decimal("0.05"),
+        profit_throttle_confirm_readings=3,
         popular_stock_min_volume=1_000_000,
         popular_stock_max_spread_percent=Decimal("0.50"),
         option_min_volatility_percent=Decimal("0.02"),
@@ -261,6 +262,7 @@ class ProfitThrottleTests(unittest.TestCase):
             day_start_equity=None,
             day_start_equity_date=None,
             profit_throttle_armed=False,
+            profit_throttle_streak=0,
             cached_total_equity=None,
             now=lambda: datetime(2026, 9, 21, 10, 0, tzinfo=ZoneInfo("UTC")),
         )
@@ -282,18 +284,54 @@ class ProfitThrottleTests(unittest.TestCase):
         bot.update_profit_throttle(Decimal("415"))
         self.assertFalse(bot.new_entries_blocked())
 
-    def test_arms_once_the_daily_target_is_reached(self):
+    def test_arms_once_the_target_holds_for_enough_readings(self):
         bot = self.bot()
         bot.update_profit_throttle(Decimal("400"))
+        for _ in range(3):
+            bot.update_profit_throttle(Decimal("420"))
+        self.assertTrue(bot.new_entries_blocked())
+
+    def test_a_single_settlement_spike_does_not_arm_the_throttle(self):
+        """Live incident, first session this shipped: the bot booked
+        equity of $409.54 (+12.52%) four minutes into the open and
+        armed the throttle, disabling new entries for the whole day,
+        while the broker showed $363 flat with NO open positions.
+
+        Right after a closing fill the sale proceeds are already in
+        buying_power while the position is still in the positions
+        list, so equity double-counts it for a reading or two - as
+        the account owner put it, "when a trade goes through for a
+        second the calculations occur and the account spikes, but
+        that doesn't mean anything."
+        """
+        bot = self.bot()
+        bot.update_profit_throttle(Decimal("363.96"))
+        bot.update_profit_throttle(Decimal("409.54"))  # the phantom
+        bot.update_profit_throttle(Decimal("363.96"))  # settled again
+        self.assertFalse(
+            bot.new_entries_blocked(),
+            "a one-reading settlement artifact must not stop the day",
+        )
+
+    def test_a_broken_streak_has_to_start_over(self):
+        bot = self.bot()
+        bot.update_profit_throttle(Decimal("400"))
+        bot.update_profit_throttle(Decimal("420"))
+        bot.update_profit_throttle(Decimal("420"))
+        bot.update_profit_throttle(Decimal("401"))  # back under target
+        bot.update_profit_throttle(Decimal("420"))
+        bot.update_profit_throttle(Decimal("420"))
+        self.assertFalse(bot.new_entries_blocked())
         bot.update_profit_throttle(Decimal("420"))
         self.assertTrue(bot.new_entries_blocked())
 
     def test_stays_armed_after_a_pullback(self):
-        # One-way on purpose: disarming on a dip would re-open size
+        # One-way once ARMED: disarming on a dip would re-open size
         # into the exact give-back the throttle exists to prevent.
         bot = self.bot()
         bot.update_profit_throttle(Decimal("400"))
-        bot.update_profit_throttle(Decimal("420"))
+        for _ in range(3):
+            bot.update_profit_throttle(Decimal("420"))
         bot.update_profit_throttle(Decimal("405"))
         self.assertTrue(bot.new_entries_blocked())
 

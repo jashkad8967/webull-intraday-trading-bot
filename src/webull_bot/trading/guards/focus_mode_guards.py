@@ -52,6 +52,7 @@ def update_profit_throttle(self, total_equity: Decimal) -> None:
         self.day_start_equity_date = today
         self.day_start_equity = total_equity
         self.profit_throttle_armed = False
+        self.profit_throttle_streak = 0
         log.info(
             "THROTTLE| day-start equity $%s | slowing down at +%s%% "
             "($%s)",
@@ -70,18 +71,38 @@ def update_profit_throttle(self, total_equity: Decimal) -> None:
     target = self.day_start_equity * (
         Decimal("1") + self.config.focus_daily_profit_target_fraction
     )
-    if total_equity >= target:
-        self.profit_throttle_armed = True
-        gain = total_equity - self.day_start_equity
-        log.info(
-            "THROTTLE| armed | equity $%s (+$%s, +%s%%) reached the daily "
-            "target - no new entries or averaging down for the rest of "
-            "the session; exits, the profit-lock trail and the EOD close "
-            "stay active",
+    if total_equity < target:
+        # Any reading back under the target breaks the streak - a
+        # transient settlement spike cannot accumulate across the
+        # dips between its own occurrences.
+        self.profit_throttle_streak = 0
+        return
+    self.profit_throttle_streak += 1
+    needed = self.config.profit_throttle_confirm_readings
+    if self.profit_throttle_streak < needed:
+        # Not confirmed yet. Deliberately quiet at INFO - a real
+        # target crossing logs once, below, and a phantom spike
+        # should not announce itself at all.
+        log.debug(
+            "THROTTLE| equity $%s is above target but unconfirmed "
+            "(%s/%s consecutive readings)",
             total_equity.quantize(Decimal("0.01")),
-            gain.quantize(Decimal("0.01")),
-            (gain / self.day_start_equity * 100).quantize(Decimal("0.01")),
+            self.profit_throttle_streak,
+            needed,
         )
+        return
+    self.profit_throttle_armed = True
+    gain = total_equity - self.day_start_equity
+    log.info(
+        "THROTTLE| armed | equity $%s (+$%s, +%s%%) held above the daily "
+        "target for %s consecutive readings - no new entries for the rest "
+        "of the session; exits, averaging down, the profit-lock trail and "
+        "the EOD close stay active",
+        total_equity.quantize(Decimal("0.01")),
+        gain.quantize(Decimal("0.01")),
+        (gain / self.day_start_equity * 100).quantize(Decimal("0.01")),
+        needed,
+    )
 
 
 def new_entries_blocked(self) -> bool:
