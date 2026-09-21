@@ -49,6 +49,17 @@ class FocusModeSettings(BaseSettings):
     daily_batch_min_gap_percent: Decimal = Field(
         default=Decimal("2"), gt=0, le=100
     )
+    # By explicit request, after two live incidents (GRML at 286.7%
+    # gap, GRAL) both locked as the focus symbol with no real options
+    # market: "the stocks we pick should be like fortune 500, or snp,
+    # or dow stocks, popular, known, established." When on (the
+    # default), the daily batch is intersected with config.option_
+    # candidates() - the same curated large-cap list discover_
+    # option_contracts already trusts - before gap/volume/spread
+    # scoring runs, so an obscure thin mover can no longer dominate
+    # purely on a large percentage move. Off switches back to the
+    # unrestricted screener union.
+    daily_batch_require_established_symbols: bool = True
     # Live incident: refresh_daily_batch's give-up used to fire the
     # moment `moment` crossed focus_lock_time (09:45) directly - which
     # meant any restart landing AFTER 09:45 (every mid-session

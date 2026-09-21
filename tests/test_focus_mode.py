@@ -22,6 +22,8 @@ def focus_config(**overrides):
         daily_batch_size=8,
         daily_batch_min_gap_percent=Decimal("2"),
         daily_batch_retry_minutes=20,
+        daily_batch_require_established_symbols=True,
+        option_candidates=lambda: ["AAPL", "MSFT", "MRNA", "AMD", "TSLA"],
         focus_min_price=Decimal("10"),
         focus_max_price=Decimal("600"),
         focus_repick_when_blocked=True,
@@ -450,18 +452,61 @@ class EmptyResultRetryTests(unittest.TestCase):
 
     def test_a_real_batch_stamps_the_day(self):
         metrics = {
-            "AAA": {
+            "MRNA": {
                 "volume": 5_000_000,
                 "spread_percent": 0.1,
                 "change_ratio": 0.05,
             }
         }
         bot = self.bot(self.moment(9, 0), metrics=metrics)
-        bot.premarket_gainers = {"AAA"}
-        bot.strategy.prices = {"AAA": Decimal("50")}
+        bot.premarket_gainers = {"MRNA"}
+        bot.strategy.prices = {"MRNA": Decimal("50")}
         bot.refresh_daily_batch(self.moment(9, 0))
-        self.assertEqual(bot.daily_batch, ["AAA"])
+        self.assertEqual(bot.daily_batch, ["MRNA"])
         self.assertEqual(bot.daily_batch_date, self.moment(9, 0).date())
+
+    def test_excludes_a_non_established_symbol_even_with_a_huge_gap(self):
+        """Live incident: GRML (286.7% gap) and GRAL both cleared
+        gap/volume/spread and locked as the focus symbol, but neither
+        carries a real options market - "the stocks we pick should be
+        like fortune 500, or snp, or dow stocks, popular, known,
+        established."
+        """
+        metrics = {
+            "GRML": {
+                "volume": 5_000_000,
+                "spread_percent": 0.19,
+                "change_ratio": 2.767,
+            },
+            "MRNA": {
+                "volume": 5_000_000,
+                "spread_percent": 0.1,
+                "change_ratio": 0.05,
+            },
+        }
+        bot = self.bot(self.moment(9, 0), metrics=metrics)
+        bot.premarket_gainers = {"GRML", "MRNA"}
+        bot.strategy.prices = {"GRML": Decimal("12"), "MRNA": Decimal("50")}
+        bot.refresh_daily_batch(self.moment(9, 0))
+        self.assertEqual(bot.daily_batch, ["MRNA"])
+
+    def test_the_established_filter_can_be_turned_off(self):
+        metrics = {
+            "GRML": {
+                "volume": 5_000_000,
+                "spread_percent": 0.19,
+                "change_ratio": 2.767,
+            },
+        }
+        bot = self.bot(self.moment(9, 0), metrics=metrics)
+        bot.config = focus_config(
+            option_eod_close_time="15:50",
+            daily_batch_require_established_symbols=False,
+        )
+        bot.premarket_gainers = {"GRML"}
+        bot.strategy.prices = {"GRML": Decimal("12")}
+        bot.refresh_daily_batch(self.moment(9, 0))
+        self.assertEqual(bot.daily_batch, ["GRML"])
 
     def test_no_focus_pick_mid_session_retries(self):
         bot = self.bot(self.moment(9, 50))

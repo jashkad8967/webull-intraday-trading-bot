@@ -36,6 +36,26 @@ def refresh_daily_batch(self, moment: datetime) -> None:
     against an 83-request/day budget. The agent keeps its current,
     working role: scoring and ranking this state via priority_score.
 
+    By explicit request, restated in full after two live incidents
+    picked names with no real option market: "the stocks we pick
+    should be like fortune 500, or snp, or dow stocks, popular,
+    known, established, and then look for volume, volatility,
+    momentum, news, and make the pick, then scan contracts for the
+    pick that are also volatile and popular, but within account
+    buying power." GRML (286.7% gap) and GRAL both cleared the gap/
+    volume/spread gates below - genuinely unusual moves - but neither
+    is the kind of name that carries a real, liquid options market;
+    the gates measured whether the STOCK looked interesting, not
+    whether it was a name any options desk would recognize. The
+    candidate pool is therefore intersected with config.option_
+    candidates() - the same curated, large-cap-heavy S&P/Dow-style
+    list discover_option_contracts already uses, established and
+    liquid by construction - rather than the raw union of every
+    gainer/mover screener, which includes any thinly-traded name that
+    happened to move today regardless of whether it has options at
+    all. daily_batch_require_established_symbols is the off switch,
+    default on.
+
     Note what is NOT gated here: relative volume. RVOL is derived
     from volume_delta_latest/volume_delta_ema, which are built by
     diffing consecutive intraday snapshots - at 08:45 there simply
@@ -86,6 +106,8 @@ def refresh_daily_batch(self, moment: datetime) -> None:
             symbol = str(row.get("symbol", "")).upper()
             if symbol:
                 candidates.add(symbol)
+    if self.config.daily_batch_require_established_symbols:
+        candidates &= set(self.config.option_candidates())
     scored: list[tuple[float, str, dict]] = []
     for symbol in candidates:
         metrics = self.strategy.metrics.get(symbol)
