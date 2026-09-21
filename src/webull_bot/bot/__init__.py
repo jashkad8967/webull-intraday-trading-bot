@@ -184,6 +184,13 @@ from webull_bot.trading.screeners.agent_discoveries import refresh_agent_discove
 from webull_bot.trading.screeners.agent_predicted_gainers_refresh import (
     refresh_agent_predicted_gainers,
 )
+from webull_bot.trading.guards.focus_mode_guards import (
+    new_entries_blocked,
+    stock_entries_suspended,
+    update_profit_throttle,
+)
+from webull_bot.trading.screeners.daily_batch_refresh import refresh_daily_batch
+from webull_bot.trading.screeners.focus_symbol_selection import select_focus_symbol
 from webull_bot.trading.screeners.market_pulse_entries import _market_pulse_entries
 from webull_bot.trading.screeners.market_pulse_refresh import refresh_market_pulse
 from webull_bot.trading.screeners.premarket_gainers_refresh import (
@@ -382,6 +389,11 @@ class AutoTrader:
     refresh_market_pulse = refresh_market_pulse
     refresh_premarket_gainers = refresh_premarket_gainers
     refresh_agent_predicted_gainers = refresh_agent_predicted_gainers
+    refresh_daily_batch = refresh_daily_batch
+    select_focus_symbol = select_focus_symbol
+    stock_entries_suspended = stock_entries_suspended
+    update_profit_throttle = update_profit_throttle
+    new_entries_blocked = new_entries_blocked
     stop_loss_guard_active = stop_loss_guard_active
     symbol_quarantined = symbol_quarantined
     close_instruments = close_instruments
@@ -795,6 +807,29 @@ class AutoTrader:
         # own speculative once/day pre-market gainer predictions.
         self.agent_predicted_gainers: set[str] = set()
         self.agent_predicted_gainers_date = None
+        # Focus mode (see screeners/daily_batch_refresh.py and
+        # selection/focus_symbol.py) - by request, "only take a good
+        # batch of stocks to look out for everyday" then "go all in"
+        # on the single best one. daily_batch is the researched
+        # morning shortlist; focus_symbol is the one name picked out
+        # of it once the opening range has resolved. Both are
+        # date-stamped so they rebuild exactly once per session and
+        # survive a mid-session restart without re-picking.
+        self.daily_batch: list[str] = []
+        self.daily_batch_date = None
+        self.focus_symbol: str | None = None
+        self.focus_symbol_date = None
+        # Equity captured on the first cycle of the day, the
+        # denominator for the daily profit throttle - see
+        # focus_daily_profit_target_fraction.
+        self.day_start_equity: Decimal | None = None
+        self.day_start_equity_date = None
+        self.profit_throttle_armed = False
+        self.cached_total_equity: Decimal | None = None
+        # Peak premium seen on each open option position, the high-
+        # water mark the profit-lock trail rides - by request, "make
+        # sure when there is a profit to not let on too much loss."
+        self.option_peak_price: dict[str, Decimal] = {}
         self.market_pulse_cache: dict[str, list[dict]] = {
             "gainers": [],
             "losers": [],

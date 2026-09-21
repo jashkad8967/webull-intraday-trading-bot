@@ -98,6 +98,12 @@ def _process_stock_symbol(
             self.strategy.update_volume_delta(
                 symbol, Decimal(str(snapshot_volume))
             )
+            # By request ("see the momentum by the buys and sells") -
+            # must run AFTER update_volume_delta, since it reads the
+            # delta that call just produced and pairs it with the price
+            # at the same sample to derive a signed pressure reading.
+            if price is not None and price > 0:
+                self.strategy.update_net_pressure(symbol, price, batch_moment)
         if self.strategy.is_volatility_scalp_eligible(symbol):
             self.volatility_scalp_recently_eligible.add(symbol)
         else:
@@ -441,6 +447,10 @@ def _process_stock_symbol(
                     fractional = True
             if (
                 state.open_count < self.config.max_open_positions
+                # Focus mode reserves the whole account for one
+                # option underlying - see stock_entries_suspended.
+                and not self.stock_entries_suspended()
+                and not self.new_entries_blocked()
                 and state.bucket_position_counts.get(bucket, 0)
                 < bucket_slot_limits.get(bucket, 0)
                 and buy_quantity > 0
@@ -589,6 +599,10 @@ def _process_stock_symbol(
             if (
                 self.short_selling_supported
                 and state.open_count < self.config.max_open_positions
+                # Focus mode reserves the whole account for one
+                # option underlying - see stock_entries_suspended.
+                and not self.stock_entries_suspended()
+                and not self.new_entries_blocked()
                 and state.bucket_position_counts.get(bucket, 0)
                 < bucket_slot_limits.get(bucket, 0)
                 and short_quantity > 0

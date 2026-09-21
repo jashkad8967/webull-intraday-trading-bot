@@ -82,6 +82,20 @@ class StrategyConfigMixin:
             extended_hours_spread_multiplier=Decimal("3"),
             option_take_profit_percent=Decimal("0.75"),
             option_stop_loss_percent=Decimal("0.50"),
+            # Focus-mode additions: the profit-lock trail and the net
+            # buy/sell pressure read. Defaults mirror
+            # FocusModeSettings so existing expectations are
+            # unaffected - the trail cannot arm without a peak_price
+            # argument, which legacy callers don't pass.
+            profit_lock_enabled=True,
+            profit_lock_arm_percent=Decimal("0.10"),
+            profit_lock_giveback_fraction=Decimal("0.50"),
+            profit_lock_giveback_fraction_after_throttle=Decimal("0.25"),
+            pressure_enabled=True,
+            pressure_min_for_entry=Decimal("0.15"),
+            pressure_flip_exit_enabled=True,
+            pressure_flip_exit_threshold=Decimal("0.25"),
+            pressure_history_seconds=300,
             option_min_hold_dte=2,
             option_capital_fraction=Decimal("0.05"),
             option_quantity=1,
@@ -4862,6 +4876,10 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
                 poll_seconds=Decimal("0.25"),
                 price_sanity_cooldown_seconds=60,
                 option_take_profit_percent=Decimal("0.02"),
+                # A PROFIT reprice must clear cost PLUS the flat sell
+                # fee, not just cost - see the guard in
+                # reprice_resting_option_exits.
+                sell_fee_dollars=Decimal("0.02"),
             ),
             api=FakeApi(),
             status=SimpleNamespace(
@@ -4988,6 +5006,7 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
                 poll_seconds=Decimal("0.25"),
                 price_sanity_cooldown_seconds=60,
                 option_take_profit_percent=Decimal("0.15"),
+                sell_fee_dollars=Decimal("0.02"),
             ),
             api=FakeApi(),
             status=SimpleNamespace(rekey_trade=lambda old, new: None),
@@ -10545,6 +10564,12 @@ class WriteStatusSnapshotBalanceGuardTests(unittest.TestCase):
             option_contracts=[],
             working_orders={},
             status=status,
+            # write_status_snapshot feeds the daily profit throttle
+            # from here, since this is the only place equity is
+            # computed with the option multiplier applied. These
+            # tests only exercise the balance-history guard, so the
+            # throttle itself is a no-op stub.
+            update_profit_throttle=lambda total_equity: None,
         )
         return AutoTrader.write_status_snapshot.__get__(fake_bot), status
 

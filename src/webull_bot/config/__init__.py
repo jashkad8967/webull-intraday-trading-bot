@@ -6,6 +6,7 @@ from pydantic_settings import SettingsConfigDict
 from webull_bot.config_sections.connection_settings import ConnectionSettings
 from webull_bot.config_sections.entry_filter_settings import EntryFilterSettings
 from webull_bot.config_sections.entry_timing_settings import EntryTimingSettings
+from webull_bot.config_sections.focus_mode_settings import FocusModeSettings
 from webull_bot.config_sections.option_trading_settings import OptionTradingSettings
 from webull_bot.config_sections.order_execution_settings import OrderExecutionSettings
 from webull_bot.config_sections.position_sizing_settings import PositionSizingSettings
@@ -30,6 +31,7 @@ class Settings(
     EntryTimingSettings,
     StockExitSettings,
     OptionTradingSettings,
+    FocusModeSettings,
     OrderExecutionSettings,
     RateLimitSettings,
     ResearchAgentSettings,
@@ -81,6 +83,21 @@ class Settings(
             raise ValueError(
                 "Option session times must be ordered: OPTION_MARKET_OPEN_TIME, "
                 "OPTION_EOD_CLOSE_TIME, OPTION_MARKET_CLOSE_TIME"
+            )
+        if self.focus_min_price >= self.focus_max_price:
+            raise ValueError("FOCUS_MIN_PRICE must be lower than FOCUS_MAX_PRICE")
+        if self.focus_mode_enabled and not (
+            self.session_time(self.daily_batch_refresh_time)
+            < self.session_time(self.focus_lock_time)
+            < self.session_time(self.option_eod_close_time)
+        ):
+            # The batch has to be built before the symbol is picked out
+            # of it, and the pick has to land with real session left to
+            # trade - a focus lock at or after the option closeout would
+            # select a symbol the bot is already flattening.
+            raise ValueError(
+                "Focus mode times must be ordered: DAILY_BATCH_REFRESH_TIME, "
+                "FOCUS_LOCK_TIME, OPTION_EOD_CLOSE_TIME"
             )
         if not self.live_trading_enabled:
             raise ValueError("Production mode requires LIVE_TRADING_ENABLED=true")

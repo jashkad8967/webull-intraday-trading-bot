@@ -134,7 +134,14 @@ def reprice_resting_option_entries(self) -> None:
                             ROUND_UP,
                         )
                     else:
-                        target_price = ask_price
+                        # By explicit request ("play in the spread to
+                        # make sure it sells, not at the edges... or
+                        # buys"): the raw ask IS the aggressive edge,
+                        # so a missing midpoint is a reason to wait for
+                        # the next quote, not to pay the full spread.
+                        # The generic order_timeout_seconds cancel
+                        # still backstops an order that never fills.
+                        continue
                 else:
                     target_price = mid_price
             except QuoteUnavailableError:

@@ -106,6 +106,12 @@ from webull_bot.strategy_logic.market_state.vwap_trend import (
     vwap,
     vwap_supports_entry,
 )
+from webull_bot.strategy_logic.momentum.pressure import (
+    net_pressure,
+    pressure_flipped_against,
+    pressure_supports_entry,
+    update_net_pressure,
+)
 from webull_bot.strategy_logic.regime.trend_signals import (
     _ema,
     option_direction_signal,
@@ -212,6 +218,16 @@ class TradingStrategy:
         # gate, once for the log-only "why isn't this firing" summary),
         # so a stateful gate here would silently double-count every
         # cycle and corrupt the EMA.
+        # Net buy/sell pressure (see strategy_logic/momentum/pressure.py)
+        # - the price reading each volume sample is diffed against, and
+        # the rolling (moment, pressure) series built from the two.
+        # Separate from volume_delta_baseline because that one tracks
+        # cumulative VOLUME while this tracks the PRICE at the same
+        # sample, which is what supplies the direction half of the read.
+        self.pressure_price_baseline: dict[str, Decimal] = {}
+        self.pressure_history: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=50)
+        )
         self.volume_delta_baseline: dict[str, Decimal] = {}
         self.volume_delta_ema: dict[str, Decimal] = {}
         # The most recent single-cycle delta itself (a spike candidate,
@@ -264,6 +280,11 @@ class TradingStrategy:
     multi_day_momentum_supports_entry = multi_day_momentum_supports_entry
     update_recent_tick_history = update_recent_tick_history
     update_volume_delta = update_volume_delta
+
+    update_net_pressure = update_net_pressure
+    net_pressure = net_pressure
+    pressure_supports_entry = pressure_supports_entry
+    pressure_flipped_against = pressure_flipped_against
 
     volatility_scalp_micro_exhaustion_confirmed = volatility_scalp_micro_exhaustion_confirmed
 
