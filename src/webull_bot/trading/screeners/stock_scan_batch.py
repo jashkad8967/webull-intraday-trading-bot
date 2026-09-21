@@ -263,12 +263,24 @@ def _prepare_stock_scan_batch(
     # scanned every cycle instead of only via prioritized_stock_
     # batch's normal ranking, same reasoning as the volatility-
     # scalp cohort just below.
-    force_scan = (
-        self.volatility_scalp_symbols
-        | self.volatility_scalp_recently_eligible
-        | self.premarket_gainers
-        | self.agent_predicted_gainers
-    )
+    # By explicit request ("i want this to be faster more high
+    # frequency trades"): volatility_scalp_symbols/_recently_eligible
+    # exist to feed the STOCK-side scalp entry path, which focus mode
+    # itself already suspends (stock_entries_suspended) - forcing
+    # that whole accumulated-all-session cohort into every cycle's
+    # batch when nothing can act on it was real, unbounded wall-clock
+    # cost sitting outside prioritized_stock_batch's own max_size cap
+    # (confirmed live: batches still reported ~60 symbols against a
+    # focus_mode_stock_batch_size of 20). premarket_gainers/agent_
+    # predicted_gainers are kept - those still feed refresh_daily_
+    # batch/select_focus_symbol's own re-pick candidate pool.
+    force_scan = self.premarket_gainers | self.agent_predicted_gainers
+    if not focus_entries_suspended:
+        force_scan = (
+            force_scan
+            | self.volatility_scalp_symbols
+            | self.volatility_scalp_recently_eligible
+        )
     if force_scan:
         # Left to prioritized_stock_batch's normal ranking, any one
         # of these might only get re-evaluated once every several
