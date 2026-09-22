@@ -578,9 +578,23 @@ def _evaluate_option_exit(
     # and out of scope for this fix.
     sell_realizable_price = self.api.quote_bid(quote) or price
     opened_at = self.position_opened_at.get(key)
-    seconds_since_entry = (
-        time.monotonic() - opened_at if opened_at is not None else None
-    )
+    if opened_at is None:
+        # position_opened_at is in-memory only, so every restart wipes
+        # it for positions that are still open. Without this, a held
+        # position that survives a deploy has seconds_since_entry=None
+        # forever, which makes it permanently immune to the stale exit
+        # (and to the time-aware stop widening). Live 2026-09-22: three
+        # positions opened at 10:46 were still open at 13:05 when a
+        # deploy restarted the container - they would never have been
+        # closed by the timer that exists precisely for them.
+        #
+        # Seeding from first sight under-counts the true age (the clock
+        # restarts rather than resuming), which is the conservative
+        # direction: it can only ever delay a stale exit, never fire
+        # one early on a position that has not actually gone stale.
+        opened_at = time.monotonic()
+        self.position_opened_at[key] = opened_at
+    seconds_since_entry = time.monotonic() - opened_at
     # By request ("make sure when there is a profit to not let on too
     # much loss") - the high-water mark the profit-lock trail rides.
     # Tracked off sell_realizable_price (the bid, what the position

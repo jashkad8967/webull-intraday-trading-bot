@@ -478,6 +478,67 @@ class DailyProfitThrottleTests(FocusModeIntegrationTestCase):
         self.assertEqual(placed[0][1], "BUY")
 
 
+class EntryClockSurvivesRestartTests(FocusModeIntegrationTestCase):
+    """position_opened_at is in-memory only, so every restart wipes it
+    for positions that are still open.
+
+    Live 2026-09-22: three positions opened at 10:46 were still open at
+    13:05 when a deploy restarted the container. With no recorded open
+    time, seconds_since_entry was None - and None never triggers the
+    stale exit, so the positions the timer exists for were the exact
+    ones permanently immune to it.
+    """
+
+    def _bot(self):
+        from webull_bot.strategy_logic.decision.stock_option_decision import (
+            option_decision,
+        )
+
+        bot, placed = self._build()
+        bot.strategy.option_decision = option_decision.__get__(bot.strategy)
+        bot.strategy.config = bot.config
+        return bot, placed
+
+    def test_a_position_with_no_recorded_entry_time_starts_its_clock(self):
+        bot, placed = self._bot()
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        self.assertEqual(bot.position_opened_at, {})
+        bot._evaluate_option_exit(
+            contract, "NVDAC", "OPTION:NVDAC",
+            self._quote("1.00", "1.00"), Decimal("1.00"),
+            quantity=1, cost=Decimal("1.00"), days_to_expiration=20,
+            buying_power=bot.cached_option_buying_power,
+        )
+        self.assertIn(
+            "OPTION:NVDAC",
+            bot.position_opened_at,
+            "a held position seen without an entry timestamp must start "
+            "its clock, or the stale exit can never reach it",
+        )
+
+    def test_the_seeded_clock_is_not_overwritten_on_later_cycles(self):
+        """Re-seeding every cycle would hold the age at zero forever,
+        which is the same bug wearing a different hat.
+        """
+        bot, placed = self._bot()
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        for _ in range(3):
+            bot._evaluate_option_exit(
+                contract, "NVDAC", "OPTION:NVDAC",
+                self._quote("1.00", "1.00"), Decimal("1.00"),
+                quantity=1, cost=Decimal("1.00"), days_to_expiration=20,
+                buying_power=bot.cached_option_buying_power,
+            )
+        first = bot.position_opened_at["OPTION:NVDAC"]
+        bot._evaluate_option_exit(
+            contract, "NVDAC", "OPTION:NVDAC",
+            self._quote("1.00", "1.00"), Decimal("1.00"),
+            quantity=1, cost=Decimal("1.00"), days_to_expiration=20,
+            buying_power=bot.cached_option_buying_power,
+        )
+        self.assertEqual(bot.position_opened_at["OPTION:NVDAC"], first)
+
+
 class ProfitLockTrailIntegrationTests(FocusModeIntegrationTestCase):
     """By request: "make sure when there is a profit to not let on too
     much loss" - exercised through the real exit function, not just
