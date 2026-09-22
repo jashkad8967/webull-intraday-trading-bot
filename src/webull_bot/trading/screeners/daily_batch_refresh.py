@@ -67,22 +67,23 @@ def refresh_daily_batch(self, moment: datetime) -> None:
     """
     if not self.config.focus_mode_enabled:
         return
-    if self.daily_batch_date == moment.date() and moment >= self.session_moment(
-        moment, self.config.focus_lock_time
-    ):
-        # Settled: the cohort locks off this batch, so once the lock
-        # has passed there is nothing left for a rebuild to change.
-        return
-    # Deliberately KEEPS rebuilding between daily_batch_refresh_time
-    # and focus_lock_time instead of freezing on the first non-empty
-    # result. Live, 2026-09-22: the 07:45 CT pass saw only 11
-    # candidates and just one cleared the gap gate, so the cohort
-    # would have locked a single name - exactly the single-symbol
-    # behaviour the cohort exists to replace. The pool is thin that
-    # early because the sources it unions are still pre-market; by the
-    # bell the same screen sees 65-84 candidates. Freezing at the
-    # first success meant the cohort could never be richer than the
-    # thinnest reading of the morning.
+    # Deliberately rebuilds for the WHOLE session rather than freezing
+    # on the first non-empty result. Two live failures on 2026-09-22
+    # drove this:
+    #   1. The 07:45 CT pass saw 11 candidates and one cleared, so the
+    #      cohort locked a single name - the single-symbol behaviour
+    #      the cohort exists to replace. The pool is thin that early
+    #      because the sources it unions are still pre-market.
+    #   2. Freezing once the lock passed meant any mid-session restart
+    #      rebuilt exactly once, on a container whose metrics were
+    #      still cold, and then kept that thin batch for the rest of
+    #      the day - so a redeploy could permanently shrink the
+    #      tradeable universe.
+    # Rebuilding reads cached metrics and makes no API calls, so the
+    # only cost is a little CPU per cycle. The batch also feeds cohort
+    # backfill after the lock (see select_focus_cohort), which is
+    # useless if the batch can never learn about a name that only
+    # started qualifying later in the session.
     if self.daily_batch_first_attempt_date != moment.date():
         # A new day - a leftover attempt timestamp from a prior day's
         # give-up would otherwise make time.monotonic()'s elapsed
