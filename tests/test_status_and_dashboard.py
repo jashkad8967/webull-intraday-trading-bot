@@ -800,6 +800,100 @@ class DashboardCommandTests(unittest.TestCase):
         self.assertEqual(result, Decimal("42"))
         self.assertEqual(calls, [({"type": "buy", "symbol": "MSFT"}, Decimal("1000"), True)])
 
+    def test_manual_sell_closes_the_option_even_when_told_equity(self):
+        """Live incident 2026-09-22: a dashboard Sell on an OPTION
+        position was dispatched as EQUITY (the request model defaults
+        instrument_type to EQUITY, so anything missing or mistyped
+        silently becomes a stock sell). It logged
+        ORDER | STOCK | MANUAL_SELL | GME against an account holding no
+        GME shares; the real option position stayed open and had to be
+        closed in the broker app.
+
+        A sell is an unambiguous "get me out of this symbol", so when
+        exactly one open position matches, close THAT one.
+        """
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+        fake_bot = SimpleNamespace(
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+            fractional_trading_enabled=True,
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
+            api=SimpleNamespace(
+                contract_from_position=lambda position: {
+                    "symbol": "GME261009C00023000",
+                    "underlying_symbol": "GME",
+                },
+                option_quote=lambda symbol: {"bid": "1.40", "ask": "1.45"},
+                quote_ask=lambda quote: Decimal(str(quote["ask"])),
+                option_limit_price=lambda quote, side: Decimal("1.42"),
+                place_option=lambda contract, side, quantity, price, action: (
+                    placed.append((contract["symbol"], side, quantity, price))
+                    or "order-opt-1"
+                ),
+                place_stock=lambda *a, **k: placed.append(("STOCK-ORDER",)) or "bad",
+            ),
+            wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
+        )
+        fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: Decimal("1")
+        fake_bot.record_trade = lambda *a, **k: None
+        manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
+
+        positions = [
+            {
+                "instrument_type": "OPTION",
+                "symbol": "GME",
+                "quantity": "2",
+                "cost_price": "1.40",
+            }
+        ]
+        manual_sell({"symbol": "GME", "instrument_type": "EQUITY"}, positions)
+
+        self.assertEqual(len(placed), 1, "exactly one order must go out")
+        self.assertEqual(
+            placed[0][0],
+            "GME261009C00023000",
+            "the OPTION contract must be sold, not a phantom stock order",
+        )
+        self.assertNotIn(
+            ("STOCK-ORDER",), placed, "must not place a stock order"
+        )
+
+    def test_manual_sell_respects_the_declared_type_when_both_are_held(self):
+        """Ambiguity is the one case the fallback must NOT guess at -
+        holding both the stock and options on one symbol means closing
+        the wrong one is a real risk.
+        """
+        from webull_bot.bot import AutoTrader
+
+        placed = []
+        fake_bot = SimpleNamespace(
+            pending_stock_exits=set(),
+            pending_option_exits=set(),
+            fractional_trading_enabled=True,
+            is_fractional_quantity=AutoTrader.is_fractional_quantity,
+            api=SimpleNamespace(
+                stock_quote=lambda symbol: {"bid": "20.00", "ask": "20.10"},
+                quote_ask=lambda quote: Decimal(str(quote["ask"])),
+                stock_limit_price=lambda quote, side: Decimal("20.00"),
+                place_stock=lambda symbol, side, quantity, limit_price=None, fractional=False, market=False: (
+                    placed.append(("STOCK", symbol, quantity)) or "order-1"
+                ),
+            ),
+            wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
+        )
+        fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: Decimal("1")
+        fake_bot.record_trade = lambda *a, **k: None
+        manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
+
+        positions = [
+            {"instrument_type": "EQUITY", "symbol": "GME", "quantity": "5", "cost_price": "20.00"},
+            {"instrument_type": "OPTION", "symbol": "GME", "quantity": "2", "cost_price": "1.40"},
+        ]
+        manual_sell({"symbol": "GME", "instrument_type": "EQUITY"}, positions)
+        self.assertEqual(placed, [("STOCK", "GME", Decimal("5"))])
+
     def test_manual_sell_prices_at_the_ask_outside_core_session(self):
         from webull_bot.bot import AutoTrader
 

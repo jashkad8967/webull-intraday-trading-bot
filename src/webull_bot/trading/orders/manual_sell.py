@@ -23,6 +23,39 @@ def _manual_sell(
         ),
         None,
     )
+    if position is None:
+        # Live incident 2026-09-22: a dashboard "Sell" on an OPTION
+        # position was dispatched as EQUITY (the request model defaults
+        # instrument_type to EQUITY, so anything that arrives missing,
+        # empty or mistyped silently becomes a stock sell). The click
+        # logged ORDER | STOCK | MANUAL_SELL | GME against an account
+        # holding no GME shares, the real option position stayed open,
+        # and the user had to close it in the broker app instead.
+        #
+        # A sell is an unambiguous "get me out of this symbol" - if
+        # exactly one open position matches the symbol, close THAT,
+        # whatever the caller claimed the type was. Only ambiguity
+        # (holding both the stock and options on the same symbol) is
+        # left to the declared type, since guessing there could close
+        # the wrong one.
+        matches = [
+            item
+            for item in positions
+            if str(item.get("symbol", "")).upper() == symbol
+            and Decimal(str(item.get("quantity", "0"))) != 0
+        ]
+        if len(matches) == 1:
+            position = matches[0]
+            resolved = position.get("instrument_type", instrument_type)
+            if resolved != instrument_type:
+                log.warning(
+                    "CMD    | manual sell | %-8s | requested %s but the "
+                    "only open position is %s - closing that instead",
+                    symbol,
+                    instrument_type,
+                    resolved,
+                )
+                instrument_type = resolved
     if not position:
         log.info(
             "CMD    | manual sell skipped | %-8s | no matching open position",
