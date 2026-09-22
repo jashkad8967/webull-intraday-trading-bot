@@ -563,7 +563,14 @@ class EmptyResultRetryTests(unittest.TestCase):
         bot.refresh_daily_batch(self.moment(9, 30))
         self.assertEqual(bot.daily_batch, ["AAPL"])
 
-    def test_the_batch_stops_rebuilding_once_the_lock_has_passed(self):
+    def test_the_batch_keeps_learning_new_names_after_the_lock(self):
+        """Freezing at the lock meant a mid-session restart rebuilt
+        once on cold metrics and kept that thin batch all day, so a
+        redeploy could permanently shrink the tradeable universe. The
+        batch also feeds cohort backfill after the lock, which is
+        useless if it can never learn a name that started qualifying
+        later in the session.
+        """
         metrics = {
             "AAPL": {"volume": 5_000_000, "change_ratio": 0.03, "spread_percent": "0.1"}
         }
@@ -571,13 +578,14 @@ class EmptyResultRetryTests(unittest.TestCase):
         bot.strategy.prices = {"AAPL": Decimal("100"), "MSFT": Decimal("100")}
         bot.seed_popular_symbols = {"AAPL", "MSFT"}
         bot.refresh_daily_batch(self.moment(8, 45))
+        self.assertEqual(bot.daily_batch, ["AAPL"])
         bot.strategy.metrics["MSFT"] = {
             "volume": 9_000_000,
             "change_ratio": 0.05,
             "spread_percent": "0.1",
         }
         bot.refresh_daily_batch(self.moment(10, 30))
-        self.assertEqual(bot.daily_batch, ["AAPL"])
+        self.assertEqual(sorted(bot.daily_batch), ["AAPL", "MSFT"])
 
     def test_a_new_day_clears_the_previous_session_s_disqualifications(self):
         """Disqualifications are scoped to one session by design, but
