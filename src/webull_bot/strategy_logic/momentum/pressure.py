@@ -103,9 +103,35 @@ def pressure_supports_entry(self, symbol: str, option_type: str) -> bool:
     if pressure is None:
         return True
     minimum = self.config.pressure_min_for_entry
+    # This is a VETO on opposing participation, not a demand for
+    # confirming participation. The difference is what makes it
+    # usable at all.
+    #
+    # conviction = clamp(latest_delta/volume_delta_ema - 1, 0, 1), and
+    # volume_delta_ema is an EMA of that same series, so the ratio
+    # mean-reverts to 1.0 by construction and conviction sits at
+    # EXACTLY zero most of the time. Requiring pressure >= +minimum
+    # therefore demanded a volume spike landing in the same instant as
+    # the direction signal. Worse, a zero reading is a real Decimal
+    # rather than None, so the "no fresh reading -> fail open"
+    # convention every other gate here follows never triggered: the
+    # gate blocked on ABSENCE of evidence.
+    #
+    # Measured live 2026-09-22 with a cohort of 10 and signals reading
+    # CALL=2 PUT=6 HOLD=2, the counter sat at "buy/sell pressure does
+    # not support this direction=19" cycle after cycle - at 0.15 AND
+    # after dropping to 0.05. Lowering the bar could not fix a metric
+    # that is zero by design.
+    #
+    # Blocking only on pressure that actively contradicts the trade
+    # keeps what this gate is genuinely for ("a dip that nobody is
+    # buying is not a dip worth buying a call into" - real sellers in
+    # control, on real volume, veto a call) while letting the
+    # direction signal, RSI and the spread/premium gates decide when
+    # participation simply has nothing to say.
     if str(option_type).upper() == "CALL":
-        return pressure >= minimum
-    return pressure <= -minimum
+        return pressure > -minimum
+    return pressure < minimum
 
 
 def pressure_flipped_against(self, symbol: str, option_type: str) -> bool:

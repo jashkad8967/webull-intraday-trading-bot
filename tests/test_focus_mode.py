@@ -185,6 +185,59 @@ class NetPressureTests(unittest.TestCase):
         self.assertTrue(strategy.pressure_supports_entry("AAA", "CALL"))
         self.assertTrue(strategy.pressure_supports_entry("AAA", "PUT"))
 
+    def test_average_volume_does_not_veto_either_direction(self):
+        """The live 2026-09-22 blocker, in one assertion.
+
+        conviction = clamp(latest/ema - 1, 0, 1) and ema is an EMA of
+        that same series, so the ratio mean-reverts to 1.0 and
+        conviction sits at EXACTLY zero most of the time. The gate used
+        to demand pressure >= +minimum to buy a call, which meant
+        demanding a volume spike in the same instant as the direction
+        signal. A zero reading is also a real Decimal, not None, so the
+        "no fresh reading -> fail open" convention never triggered and
+        the gate blocked on ABSENCE of evidence.
+
+        Measured: a cohort of 10 with signals reading CALL=2 PUT=6
+        HOLD=2 produced "buy/sell pressure does not support this
+        direction=19" every cycle, at 0.15 AND at 0.05.
+        """
+        strategy = self.strategy()
+        # ratio exactly 1.0 -> conviction 0 -> pressure 0
+        self.prime(strategy, "AAA", "10.00", "10.10", ema="100", latest="100")
+        self.assertEqual(strategy.net_pressure("AAA"), Decimal("0"))
+        self.assertTrue(
+            strategy.pressure_supports_entry("AAA", "CALL"),
+            "no participation evidence must not veto a call",
+        )
+        self.assertTrue(
+            strategy.pressure_supports_entry("AAA", "PUT"),
+            "no participation evidence must not veto a put",
+        )
+
+    def test_real_selling_still_vetoes_a_call(self):
+        """What the gate is actually for - "a dip that nobody is
+        buying is not a dip worth buying a call into". Sellers
+        demonstrably in control, on real volume, must still block.
+        """
+        strategy = self.strategy()
+        self.prime(strategy, "AAA", "10.00", "9.90", ema="100", latest="200")
+        self.assertEqual(strategy.net_pressure("AAA"), Decimal("-1"))
+        self.assertFalse(strategy.pressure_supports_entry("AAA", "CALL"))
+        self.assertTrue(strategy.pressure_supports_entry("AAA", "PUT"))
+
+    def test_weak_participation_does_not_veto_the_side_it_favours(self):
+        strategy = self.strategy()
+        # ratio 1.02 -> conviction 0.02, below the 0.15 fixture bar but
+        # pointing the right way for a call.
+        self.prime(strategy, "AAA", "10.00", "10.10", ema="100", latest="102")
+        pressure = strategy.net_pressure("AAA")
+        self.assertGreater(pressure, Decimal("0"))
+        self.assertLess(pressure, strategy.config.pressure_min_for_entry)
+        self.assertTrue(
+            strategy.pressure_supports_entry("AAA", "CALL"),
+            "weak buying must not block a call - it agrees with it",
+        )
+
     def test_exit_signal_fires_when_pressure_turns_against_the_position(self):
         strategy = self.strategy()
         self.prime(strategy, "AAA", "10.00", "9.90", ema="100", latest="200")
