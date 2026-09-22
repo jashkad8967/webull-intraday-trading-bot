@@ -33,6 +33,30 @@ def _position_protection_loop(self) -> None:
     while True:
         started = time.monotonic()
         try:
+            # By request: "the manual sell button or cancel button or
+            # buy buttons are very slow and not working properly, they
+            # should be put on a separate thread".
+            #
+            # process_ui_commands used to run inline in the main loop,
+            # so a dashboard click was only acted on once per full scan
+            # cycle. Measured live 2026-09-22 with the cohort at 3,408
+            # discovered contracts and the host under load, consecutive
+            # SCAN lines were 13:13:02, 13:17:50, 13:24:33 - a Sell
+            # could sit queued for up to SEVEN MINUTES. For a button
+            # whose entire purpose is "get me out of this now", that is
+            # indistinguishable from broken.
+            #
+            # Run first in this tick, ahead of the repricers, so a
+            # manual action takes effect before automated order
+            # management reasons about the same position. Reads the
+            # same cached snapshots every other call here uses, and
+            # writes the post-command balance back so the next tick
+            # sizes against what is actually left.
+            self.cached_buying_power = self.process_ui_commands(
+                self.cached_positions,
+                self.cached_buying_power,
+                self.cached_core_session_active,
+            )
             self.monitor_working_orders()
             self.evaluate_held_stock_exits()
             self.reprice_resting_exits(

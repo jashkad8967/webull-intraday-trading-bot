@@ -639,6 +639,61 @@ class DashboardCommandTests(unittest.TestCase):
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
+    def test_ui_commands_run_on_the_fast_thread_not_the_slow_scan(self):
+        """By request: "the manual sell button or cancel button or buy
+        buttons are very slow and not working properly, they should be
+        put on a separate thread".
+
+        process_ui_commands used to run inline in the main loop, so a
+        click was only acted on once per full scan cycle. Measured live
+        2026-09-22 with 3,408 discovered contracts and the host under
+        load, consecutive SCAN lines were 13:13:02, 13:17:50, 13:24:33
+        - a Sell could sit queued for SEVEN MINUTES.
+
+        It must be dispatched by the 0.25s protection loop, and must
+        NOT also remain in the main loop, or one click would place two
+        orders.
+        """
+        import inspect
+
+        from webull_bot.trading.main_loop import run
+        from webull_bot.trading.orders.position_protection_loop import (
+            _position_protection_loop,
+        )
+
+        fast = inspect.getsource(_position_protection_loop)
+        slow = inspect.getsource(run)
+        self.assertIn(
+            "process_ui_commands",
+            fast,
+            "dashboard commands must be dispatched by the fast thread",
+        )
+        self.assertNotIn(
+            "self.process_ui_commands(",
+            slow,
+            "the slow scan loop must not also dispatch them - two "
+            "dispatchers means one click places two orders",
+        )
+
+    def test_ui_commands_are_dispatched_before_the_repricers(self):
+        """A manual action must take effect before automated order
+        management reasons about the same position.
+        """
+        import inspect
+
+        from webull_bot.trading.orders.position_protection_loop import (
+            _position_protection_loop,
+        )
+
+        body = inspect.getsource(_position_protection_loop)
+        # Compare the real call sites, not bare names - both appear in
+        # the surrounding comments too.
+        self.assertLess(
+            body.index("self.process_ui_commands("),
+            body.index("self.monitor_working_orders()"),
+            "manual commands must run first in the tick",
+        )
+
     def test_process_ui_commands_dispatches_close_all(self):
         from webull_bot.bot import AutoTrader
 
