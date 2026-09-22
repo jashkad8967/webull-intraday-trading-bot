@@ -130,17 +130,71 @@ class UniverseSettings(BaseSettings):
     # STOCK_SYMBOLS=ALL mode, including penny/micro-cap names) as
     # discover_option_contracts' candidate pool - see its own comment.
     # .env can override/extend this.
+    # By explicit request, after a live session locked a cohort of ONE:
+    # "we need all popular, voluminous, and volatile stocks, more than
+    # what is there, but not too many to not be able to monitor."
+    #
+    # The original list was ~123 pure mega-caps, and it was the single
+    # binding constraint on focus mode. Two independent failures,
+    # measured live on 2026-09-22:
+    #   1. Mega-caps structurally do not gap. At 08:34 CT not ONE name
+    #      here cleared the 2% batch gate - best was ADBE at 1.92% on
+    #      278k shares (failing the 1M volume floor), then GOOGL 1.57%,
+    #      AAPL 0.91%, NVDA 0.70%. The cohort locked with one name.
+    #   2. Mega-cap CONTRACTS are unaffordable on a small account. A
+    #      $900 COST or $1000 LLY contract sizes to zero against $363
+    #      no matter how well it sets up, so half this list could never
+    #      have been traded even on a perfect signal.
+    # Meanwhile SHOP, UAL, DASH, COIN, PLTR, RIVN and friends - all
+    # deeply liquid with real, cheap option chains - were excluded
+    # entirely, which is why the pool kept coming back as 7-11 names.
+    #
+    # This is NOT a relaxation of the GRML/GRAL lesson ("the stocks we
+    # pick should be like fortune 500, or snp, or dow... popular,
+    # known, established"). GRML was a 286% gapper with NO listed
+    # options at all. Every name added below is a widely held,
+    # currently listed company with a deep, actively quoted options
+    # market - the quality bar is unchanged, the universe is simply no
+    # longer restricted to the most expensive and least volatile
+    # corner of it. Deliberately dropped in exchange: the staples and
+    # utilities (DUK, SO, KO, PG, CL, MO, PM, WM, LIN, APD...) that
+    # cannot produce a momentum setup and only slowed the discovery
+    # rotation. Net ~200 names - roughly the monitoring budget asked
+    # for, and every one of them can actually move.
     option_candidate_symbols: str = (
+        # Mega-cap core (kept: still the most liquid chains on the tape)
         "AAPL,MSFT,GOOGL,GOOG,AMZN,META,NVDA,AVGO,TSLA,BRK-B,LLY,V,"
-        "UNH,JPM,XOM,MA,COST,HD,PG,NFLX,JNJ,ABBV,BAC,CRM,KO,MRK,"
-        "AMD,PEP,TMO,CSCO,WMT,ACN,ADBE,LIN,MCD,ABT,ORCL,DHR,WFC,"
-        "TXN,PM,NOW,IBM,GE,CAT,INTU,VZ,DIS,AMGN,QCOM,CMCSA,PFE,"
-        "SPGI,NEE,UNP,LOW,UBER,AMAT,HON,ISRG,BKNG,SYK,GS,MS,BLK,"
-        "T,SCHW,ELV,DE,LMT,MDT,PLD,ADP,CI,C,VRTX,TJX,MMC,SBUX,"
-        "REGN,ETN,BSX,GILD,PANW,BA,MU,ADI,SO,ZTS,CB,BX,FI,APH,"
-        "PGR,MO,DUK,KLAC,SHW,CME,EOG,ITW,SNPS,CDNS,NKE,WM,PYPL,"
-        "MCO,CSX,TGT,ORLY,MDLZ,SLB,CL,EQIX,APD,USB,PNC,NOC,GD,"
-        "COP,SPY,QQQ,DIA"
+        "UNH,JPM,XOM,MA,COST,HD,NFLX,JNJ,ABBV,BAC,CRM,MRK,AMD,PEP,"
+        "TMO,CSCO,WMT,ACN,ADBE,MCD,ORCL,DHR,WFC,TXN,NOW,IBM,GE,CAT,"
+        "INTU,VZ,DIS,AMGN,QCOM,CMCSA,PFE,UNP,LOW,UBER,AMAT,HON,ISRG,"
+        "BKNG,GS,MS,BLK,T,SCHW,DE,LMT,C,VRTX,TJX,SBUX,REGN,BSX,GILD,"
+        "PANW,BA,MU,ADI,BX,KLAC,EOG,SNPS,CDNS,NKE,PYPL,CSX,TGT,SLB,"
+        "COP,NOC,GD,MDT,ELV,CI,"
+        # Semis and hardware (high beta, deep weeklies)
+        "INTC,TSM,ASML,LRCX,MRVL,ON,SWKS,MCHP,NXPI,TER,SMCI,ARM,ANET,"
+        "MPWR,GFS,WDC,STX,DELL,HPQ,HPE,"
+        # High-growth software / internet
+        "PLTR,SHOP,SNAP,ROKU,PINS,NET,DDOG,CRWD,ZS,OKTA,MDB,SNOW,RBLX,"
+        "U,DOCU,ZM,TEAM,WDAY,HUBS,VEEV,TWLO,PATH,TTD,SPOT,RDDT,FTNT,"
+        # Fintech / crypto-linked
+        "COIN,HOOD,SOFI,AFRM,UPST,MARA,RIOT,MSTR,SQ,XYZ,"
+        # EV and autos
+        "RIVN,LCID,NIO,XPEV,LI,F,GM,"
+        # Airlines, travel and leisure
+        "UAL,DAL,AAL,LUV,ABNB,EXPE,MAR,HLT,CCL,RCL,NCLH,DKNG,PENN,"
+        "CZR,MGM,WYNN,LVS,"
+        # Consumer / retail momentum names
+        "DASH,LYFT,CHWY,ETSY,W,RH,LULU,CMG,DPZ,YUM,MNST,CVNA,GME,AMC,"
+        # Biotech and healthcare
+        "MRNA,BNTX,ILMN,BIIB,ALNY,CVS,HIMS,DXCM,GEHC,"
+        # China ADRs
+        "BABA,JD,PDD,BIDU,NTES,"
+        # Energy
+        "OXY,DVN,FANG,HAL,MRO,APA,KMI,WMB,CVX,"
+        # Media
+        "WBD,PARA,LYV,"
+        # Index and sector ETFs (cheap, deeply liquid chains)
+        "SPY,QQQ,DIA,IWM,SOXL,TQQQ,SQQQ,ARKK,XLF,XLE,XLK,GLD,SLV,TLT"
     )
     popular_stock_max_spread_percent: Decimal = Field(
         default=Decimal("0.50"),
