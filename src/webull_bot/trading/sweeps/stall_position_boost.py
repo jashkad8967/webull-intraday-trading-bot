@@ -42,6 +42,8 @@ def boost_stalled_positions(
     self.last_stall_boost = now
     min_profit = self.config.stall_breaker_min_profit
     boosted = 0
+    considered = 0
+    considered_options = 0
     quote_by_symbol = self._stall_equity_quotes(positions, core_session_active, stall_seconds, now)
     for position in positions:
         quantity = Decimal(str(position.get("quantity", "0")))
@@ -52,6 +54,9 @@ def boost_stalled_positions(
             continue
         symbol = str(position.get("symbol", "")).upper()
         instrument_type = position.get("instrument_type")
+        considered += 1
+        if instrument_type == "OPTION":
+            considered_options += 1
         try:
             if instrument_type == "EQUITY":
                 if symbol in self.pending_stock_exits:
@@ -165,10 +170,18 @@ def boost_stalled_positions(
             log.error("STALL  | %s | %s", symbol, exc)
     if boosted:
         self.last_account_refresh = 0.0
+    # Counted from the positions actually considered, NOT from
+    # quote_by_symbol - that only ever held EQUITY quotes (see
+    # _stall_equity_quotes), so an account holding nothing but options
+    # logged "checked 0 position(s)" forever while the option branch
+    # was in fact running every cycle. Live 2026-09-22 that line read
+    # 0 for over two hours with three open option positions, which
+    # actively misdirected debugging toward a non-existent bug.
     log.info(
-        "STALL  | checked %s position(s) idle %ss+ | boosted %s "
-        "profitable exit(s)",
-        len(quote_by_symbol),
+        "STALL  | checked %s position(s) (%s option) idle %ss+ | "
+        "boosted %s profitable exit(s)",
+        considered,
+        considered_options,
         self.config.stall_breaker_seconds,
         boosted,
     )

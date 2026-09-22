@@ -38,6 +38,35 @@ class OptionTradingSettings(BaseSettings):
     # default since it reuses the same already-vetted stock-side
     # dip/rip signals and eligibility bar, not a new speculative
     # mechanism.
+    # By explicit request, after three positions sat open for over two
+    # hours going nowhere: "if something is not going for much profit
+    # at all then make it sell for even cents" / "now it is in a loss,
+    # why didn't it sell".
+    #
+    # Nothing else in the exit ladder can act on a trade that simply
+    # does not work. The target needs +10%, the profit-lock trail must
+    # first arm at +2.5%, the stop needs -20%, and
+    # boost_stalled_positions is explicitly "never sells at a loss". A
+    # position that drifts a few percent negative and stalls there
+    # hits NONE of them. Live 2026-09-22: MARA (-8.3%), SOFI (-3.5%)
+    # and NFLX (-1.0%) were all opened at 10:46 and still open past
+    # 12:52, holding capital that could have funded setups that did
+    # work. On a $363 account with ~$100 positions, three dead trades
+    # is the entire account doing nothing.
+    option_stale_exit_enabled: bool = True
+    # How long a position may go nowhere before it is closed. Measured
+    # from entry, and only ever consulted for a position that never
+    # armed the trail - a trade that is genuinely working is never cut
+    # short by this clock.
+    option_stale_exit_minutes: int = Field(default=45, ge=1, le=390)
+    # The most this is willing to give up to free the capital. Past
+    # this the position is not stalled, it is losing, and
+    # option_stop_loss_percent owns it. Without this bound the timer
+    # would dump every loser at whatever the market offered the
+    # instant it expired.
+    option_stale_exit_max_loss_percent: Decimal = Field(
+        default=Decimal("0.08"), ge=0, le=1
+    )
     option_scalp_enabled: bool = True
     # Tightened 0.50 -> 0.20 by explicit request ("per contract 50%
     # loss is too much"). The old value was not a stop so much as a
