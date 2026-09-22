@@ -55,6 +55,8 @@ def focus_config(**overrides):
         option_eod_close_time="15:50",
         option_min_hold_dte=7,
         option_stale_exit_enabled=False,
+        held_option_exit_enabled=False,
+        held_option_exit_seconds=Decimal("2"),
         option_stale_exit_minutes=45,
         option_stale_exit_max_loss_percent=Decimal("0.08"),
         option_discovery_seconds=300,

@@ -106,6 +106,9 @@ from webull_bot.trading.orders.close_instruments import close_instruments
 from webull_bot.trading.orders.exit_failure_tracking import _note_exit_failure
 from webull_bot.trading.orders.force_market_exit import should_force_market_exit
 from webull_bot.trading.orders.held_exit_evaluation import evaluate_held_stock_exits
+from webull_bot.trading.orders.held_option_exit_evaluation import (
+    evaluate_held_option_exits,
+)
 from webull_bot.trading.orders.iceberg_order_processing import (
     process_iceberg_orders,
 )
@@ -421,6 +424,7 @@ class AutoTrader:
     reprice_resting_option_exits = reprice_resting_option_exits
     escalate_stalled_stop_losses = escalate_stalled_stop_losses
     evaluate_held_stock_exits = evaluate_held_stock_exits
+    evaluate_held_option_exits = evaluate_held_option_exits
     # Manual dashboard buy/sell command execution - moved out to
     # trading/orders/.
     _manual_sell = _manual_sell
@@ -694,6 +698,10 @@ class AutoTrader:
         self.last_volatility_reprice = 0.0
         self.last_volatility_entry_reprice = 0.0
         self.last_held_exit_scan = 0.0
+        # Fast-loop held-OPTION exit scan - see
+        # evaluate_held_option_exits for why this cannot live on the
+        # slow scan.
+        self.last_held_option_exit_scan = 0.0
         self.last_entry_reprice = 0.0
         self.last_recent_momentum_refresh = 0.0
         self.last_multi_day_momentum_refresh = 0.0

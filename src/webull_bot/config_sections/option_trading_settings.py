@@ -67,6 +67,22 @@ class OptionTradingSettings(BaseSettings):
     option_stale_exit_max_loss_percent: Decimal = Field(
         default=Decimal("0.08"), ge=0, le=1
     )
+    # Held-option exit management on the fast protection thread.
+    # _evaluate_option_exit computes the profit target, stop,
+    # profit-lock trail and stale exit, and records the peak the trail
+    # rides - but it was only ever called from trade_options inside
+    # the slow scan. Live 2026-09-22 consecutive SCAN lines were
+    # 13:13:02, 13:17:50 and 13:24:33, so the whole exit ladder was
+    # sampled every 5-7 minutes. A trail cannot protect a high it
+    # never observed.
+    held_option_exit_enabled: bool = True
+    # Seconds between fast-loop held-option exit scans. Not
+    # poll_seconds (0.25s): each pass costs one option_quotes call, so
+    # this is spaced enough to be cheap on a small host while still
+    # being orders of magnitude faster than the scan it replaces.
+    held_option_exit_seconds: Decimal = Field(
+        default=Decimal("2"), gt=0, le=60
+    )
     option_scalp_enabled: bool = True
     # Tightened 0.50 -> 0.20 by explicit request ("per contract 50%
     # loss is too much"). The old value was not a stop so much as a
