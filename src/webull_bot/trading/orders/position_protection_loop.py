@@ -59,6 +59,13 @@ def _position_protection_loop(self) -> None:
             )
             self.monitor_working_orders()
             self.evaluate_held_stock_exits()
+            # The exit ladder for HELD options - profit target,
+            # stop, profit-lock trail, stale exit - plus the
+            # option_peak_price the trail rides. Previously only
+            # reached from trade_options on the slow scan, so it
+            # sampled every 5-7 minutes and could not see a spike
+            # that rose and faded inside one gap.
+            self.evaluate_held_option_exits()
             self.reprice_resting_exits(
                 self.cached_positions, self.cached_core_session_active
             )

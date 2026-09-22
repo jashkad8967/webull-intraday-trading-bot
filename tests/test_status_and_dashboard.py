@@ -639,6 +639,75 @@ class DashboardCommandTests(unittest.TestCase):
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
+    def test_option_exits_are_evaluated_on_the_fast_thread(self):
+        """The single biggest reason a winner round-tripped into a
+        loser.
+
+        _evaluate_option_exit computes the profit target, the stop, the
+        profit-lock trail and the stale exit, AND records
+        option_peak_price - but it was only ever reached from
+        trade_options inside the slow scan. Measured live 2026-09-22,
+        consecutive SCAN lines were 13:13:02, 13:17:50 and 13:24:33:
+        the entire exit ladder sampled every 5-7 minutes.
+
+        A trail cannot protect a high it never observed. GME ran $1.40
+        -> $1.46 -> $1.37 between cycles, and the user had to close
+        positions by hand to capture the gains.
+        """
+        import inspect
+
+        from webull_bot.trading.orders.position_protection_loop import (
+            _position_protection_loop,
+        )
+
+        body = inspect.getsource(_position_protection_loop)
+        self.assertIn(
+            "self.evaluate_held_option_exits()",
+            body,
+            "held-option exits must be evaluated on the 0.25s thread, "
+            "not once per full universe scan",
+        )
+
+    def test_held_option_exits_skip_positions_with_a_resting_exit(self):
+        """The fast thread and the slow scan both reach
+        _evaluate_option_exit, so this must not double-submit.
+        """
+        from types import SimpleNamespace
+
+        from webull_bot.bot import AutoTrader
+
+        calls = []
+        fake = SimpleNamespace(
+            config=SimpleNamespace(
+                held_option_exit_enabled=True,
+                held_option_exit_seconds=Decimal("0"),
+            ),
+            last_held_option_exit_scan=0.0,
+            cached_positions=[
+                {
+                    "instrument_type": "OPTION",
+                    "symbol": "NFLX",
+                    "quantity": "1",
+                    "cost_price": "2.00",
+                }
+            ],
+            pending_option_exits=set(),
+            cached_option_buying_power=Decimal("100"),
+            api=SimpleNamespace(
+                contract_from_position=lambda p: {
+                    "symbol": "NFLXP", "expiration_date": "2026-10-09",
+                },
+                option_quotes=lambda syms: calls.append(syms) or [],
+            ),
+            has_pending_sell_order=lambda key: True,
+        )
+        fake._evaluate_option_exit = lambda *a, **k: calls.append("EVALUATED")
+        run = AutoTrader.evaluate_held_option_exits.__get__(fake)
+        run()
+        self.assertEqual(
+            calls, [], "a position with a resting exit must be skipped"
+        )
+
     def test_ui_commands_run_on_the_fast_thread_not_the_slow_scan(self):
         """By request: "the manual sell button or cancel button or buy
         buttons are very slow and not working properly, they should be

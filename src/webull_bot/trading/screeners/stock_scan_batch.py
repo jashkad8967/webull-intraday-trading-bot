@@ -30,8 +30,27 @@ def _focus_scan_force_include(self) -> set[str] | None:
     if not self.config.focus_mode_enabled:
         return None
     force = set(self.focus_cohort)
-    force |= daily_batch_candidates(self)
-    return force or None
+    if force:
+        # Cohort is locked: only these can be traded, so only these
+        # have to stay fresh every cycle.
+        #
+        # Force-quoting the whole candidate pool here as well cost
+        # real cycle time - up to 222 symbols is 11+ quote batches
+        # against a throttled API, every single pass, on a 2-core
+        # host. Measured live 2026-09-22: consecutive SCAN lines at
+        # 13:13:02, 13:17:50 and 13:24:33. That is catastrophic for
+        # exits, which are evaluated per cycle: a profit-lock trail
+        # that only samples every 5-7 minutes cannot see a spike that
+        # rises and fades inside one gap, which is exactly how a
+        # winner round-trips into a loser.
+        #
+        # The batch still rebuilds from whatever the normal rotation
+        # has quoted, so backfill candidates keep arriving - just not
+        # at the cost of the cohort's refresh rate. Before the lock
+        # the full pool is still forced, because that is when the
+        # batch genuinely needs everything measured at once.
+        return force
+    return daily_batch_candidates(self) or None
 
 
 def _prepare_stock_scan_batch(
