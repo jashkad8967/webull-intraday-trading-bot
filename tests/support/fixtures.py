@@ -73,6 +73,7 @@ class StrategyConfigMixin:
             option_min_hold_dte=2,
             option_stale_exit_enabled=False,
             held_option_exit_enabled=False,
+            option_time_aware_stop_enabled=False,
             held_option_exit_seconds=Decimal("2"),
             option_stale_exit_minutes=45,
             option_stale_exit_max_loss_percent=Decimal("0.08"),
