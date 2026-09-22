@@ -76,12 +76,24 @@ class OptionTradingSettings(BaseSettings):
     # sampled every 5-7 minutes. A trail cannot protect a high it
     # never observed.
     held_option_exit_enabled: bool = True
-    # Seconds between fast-loop held-option exit scans. Not
-    # poll_seconds (0.25s): each pass costs one option_quotes call, so
-    # this is spaced enough to be cheap on a small host while still
-    # being orders of magnitude faster than the scan it replaces.
+    # Seconds between fast-loop held-option exit scans. By explicit
+    # request ("it needs to be subsecond for options as well") -
+    # options move far faster than the underlying, and a trail that
+    # samples slowly cannot protect a spike it never observes.
+    #
+    # 0.5s rather than poll_seconds, and the reason is a hard budget,
+    # not caution: market_requests_per_minute is 240, i.e. 4 market
+    # calls per SECOND for the entire process. One option_quotes call
+    # covers every held position at once (the endpoint takes 20
+    # symbols), so 0.5s costs 2 calls/sec and leaves 2/sec for the
+    # scan loop's own quotes. At 0.25s this alone would consume the
+    # whole allowance and starve the scanner that finds the next
+    # trade - trading one bottleneck for another.
+    #
+    # NOTE: the fast loop cannot tick faster than poll_seconds, so
+    # this only takes effect if poll_seconds <= this value.
     held_option_exit_seconds: Decimal = Field(
-        default=Decimal("2"), gt=0, le=60
+        default=Decimal("0.5"), gt=0, le=60
     )
     option_scalp_enabled: bool = True
     # Tightened 0.50 -> 0.20 by explicit request ("per contract 50%
