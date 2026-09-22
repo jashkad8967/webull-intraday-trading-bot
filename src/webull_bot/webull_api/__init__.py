@@ -154,14 +154,37 @@ class WebullAPI:
         return intervals[group]
 
     def _throttle(self, group: str) -> None:
-        with self._lock:
-            spacing = self._request_interval(group)
-            wait = spacing - (
-                time.monotonic() - self._last_request.get(group, float("-inf"))
-            )
-            if wait > 0:
-                time.sleep(wait)
-            self._last_request[group] = time.monotonic()
+        """Space out requests per group without ever sleeping while
+        holding the shared lock.
+
+        Live incident 2026-09-22: this slept INSIDE `with self._lock`,
+        and that lock is shared by every request group. The once-daily
+        universe download runs on its own background thread (see
+        resolve_targets, which exists precisely so slow work cannot
+        block trading) but its throttle delay was taken while holding
+        the global lock - so the main trading loop, the fast position-
+        protection thread, order placement and stop-loss checks all
+        queued behind it. Measured: no SCAN line for over 6 minutes
+        while LOAD | US_LISTED paged through 7,500 symbols, during
+        which an open position went unmonitored and a filled exit went
+        unnoticed because account_state() never got to run. Being on a
+        separate thread meant nothing while the lock was held in sleep.
+
+        The slot is still reserved atomically, so two callers in the
+        same group cannot both claim it - only the waiting happens
+        outside the lock, where it belongs.
+        """
+        while True:
+            with self._lock:
+                spacing = self._request_interval(group)
+                now = time.monotonic()
+                wait = spacing - (
+                    now - self._last_request.get(group, float("-inf"))
+                )
+                if wait <= 0:
+                    self._last_request[group] = now
+                    return
+            time.sleep(wait)
 
     def _call(self, callback, group: str, retry: bool = True):
         attempts = 4 if retry else 1
