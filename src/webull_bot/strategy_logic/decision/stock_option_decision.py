@@ -570,8 +570,25 @@ def option_decision(
     # than stock_decision's adaptive_stop_percent already was before
     # its own time_aware_stop widening was added - same mechanism,
     # applied here for the first time.
+    # Gated on its own OPTION switch, defaulted OFF by explicit
+    # request after the numbers were put side by side.
+    #
+    # The widening made sense paired with the old 50% option stop. It
+    # does not against the 20% that replaced it: 1.5x turns 20% into
+    # 30% for the first 60 seconds, and focus mode sizes a position at
+    # nearly the whole balance, so a 2x$1.80 position could lose $108
+    # of a $369 account - 29% - inside the first minute, under a stop
+    # the user had deliberately set to cap losses at 20%.
+    #
+    # The NKE incident quoted above does not justify it either: that
+    # stop fired SIX MINUTES after fill, well outside this 60-second
+    # window, so the widening would not have prevented it.
+    #
+    # The stock side keeps its own time_aware_stop_enabled untouched -
+    # this only changes options, where premium leverage means the same
+    # multiplier costs far more.
     if (
-        self.config.time_aware_stop_enabled
+        self.config.option_time_aware_stop_enabled
         and seconds_since_entry is not None
         and seconds_since_entry < self.config.time_aware_stop_widen_seconds
     ):

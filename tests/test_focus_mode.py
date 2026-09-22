@@ -56,6 +56,7 @@ def focus_config(**overrides):
         option_min_hold_dte=7,
         option_stale_exit_enabled=False,
         held_option_exit_enabled=False,
+        option_time_aware_stop_enabled=False,
         held_option_exit_seconds=Decimal("2"),
         option_stale_exit_minutes=45,
         option_stale_exit_max_loss_percent=Decimal("0.08"),
@@ -446,6 +447,65 @@ class ProfitLockTrailTests(unittest.TestCase):
     def test_legacy_callers_without_a_peak_are_unaffected(self):
         decision = self.decide(price="1.05", peak=None)
         self.assertEqual(decision.action, "HOLD")
+
+
+class OptionStopIsNotWidenedOnFreshPositionsTests(unittest.TestCase):
+    """The stop must mean what it says from the first second.
+
+    time_aware_stop widening (1.5x for the first 60s) made sense
+    paired with the old 50% option stop. Against the 20% that replaced
+    it, it turned the stop into 30% for the first minute - and focus
+    mode sizes a position at nearly the whole balance, so a 2x$1.80
+    position could lose $108 of a $369 account (29%) inside 60
+    seconds, under a stop deliberately set to cap losses at 20%.
+    """
+
+    def decide(self, price, seconds, cost="1.00", **overrides):
+        strategy = SimpleNamespace(config=focus_config(**overrides))
+        return option_decision(
+            strategy, Decimal(price), 2, Decimal(cost), 30,
+            seconds_since_entry=seconds,
+        )
+
+    def test_a_fresh_position_stops_at_the_configured_percent(self):
+        # -25%: inside the widened 30% bar, past the real 20% one.
+        for age in (0, 30, 59, 61, 600):
+            decision = self.decide(
+                "0.75", age, option_stop_loss_percent=Decimal("0.20")
+            )
+            self.assertEqual(
+                decision.action,
+                "LOSS",
+                f"at {age}s a -25% position must stop on a 20% stop",
+            )
+
+    def test_the_widening_still_works_when_explicitly_enabled(self):
+        """Off by default, not deleted - the mechanism is intact for
+        anyone who wants it back.
+        """
+        decision = self.decide(
+            "0.75",
+            0,
+            option_stop_loss_percent=Decimal("0.20"),
+            option_time_aware_stop_enabled=True,
+            time_aware_stop_widen_seconds=60,
+            time_aware_stop_widen_multiplier=Decimal("1.5"),
+        )
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_the_shared_stock_switch_no_longer_affects_options(self):
+        decision = self.decide(
+            "0.75",
+            0,
+            option_stop_loss_percent=Decimal("0.20"),
+            time_aware_stop_enabled=True,
+            time_aware_stop_widen_multiplier=Decimal("1.5"),
+        )
+        self.assertEqual(
+            decision.action,
+            "LOSS",
+            "the stock-side switch must not widen an option stop",
+        )
 
 
 class StaleOptionExitTests(unittest.TestCase):

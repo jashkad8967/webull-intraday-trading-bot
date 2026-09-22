@@ -75,6 +75,26 @@ class OptionTradingSettings(BaseSettings):
     # 13:13:02, 13:17:50 and 13:24:33, so the whole exit ladder was
     # sampled every 5-7 minutes. A trail cannot protect a high it
     # never observed.
+    # Whether the time-aware stop widening applies to OPTIONS. OFF by
+    # explicit request, after the numbers were compared directly.
+    #
+    # The widening (1.5x for the first time_aware_stop_widen_seconds)
+    # made sense paired with the old 50% option stop. Against the 20%
+    # that replaced it, it turns the stop into 30% for the first
+    # minute - and focus mode sizes a position at nearly the whole
+    # balance, so a 2x$1.80 position could lose $108 of a $369 account
+    # (29%) inside 60 seconds, under a stop deliberately set to cap
+    # losses at 20%.
+    #
+    # The NKE incident that motivated widening does not justify it
+    # here either: that stop fired SIX MINUTES after fill, well
+    # outside the 60-second window, so widening would not have
+    # prevented it.
+    #
+    # The stock side keeps time_aware_stop_enabled untouched - this
+    # only changes options, where premium leverage makes the same
+    # multiplier cost far more.
+    option_time_aware_stop_enabled: bool = False
     held_option_exit_enabled: bool = True
     # Seconds between fast-loop held-option exit scans. By explicit
     # request ("it needs to be subsecond for options as well") -
