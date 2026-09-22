@@ -91,7 +91,7 @@ class FocusModeIntegrationTestCase(unittest.TestCase):
             config=config,
             api=fake_api,
             status=status,
-            focus_symbol="NVDA",
+            focus_cohort=["NVDA"],
             focus_symbol_no_chain=set(),
             option_contracts=[],
             option_discovery_attempted=set(),
@@ -266,14 +266,16 @@ class CallAndPutEntryTests(FocusModeIntegrationTestCase):
         self._enter(bot, contract, quote, directions={"NVDA": "HOLD"})
         self.assertEqual(placed, [])
 
-    def test_a_non_focus_symbol_never_enters_even_with_a_perfect_signal(self):
+    def test_a_symbol_outside_the_cohort_never_enters_even_on_a_perfect_signal(self):
         """Structural gate - the whole point of focus mode."""
         bot, placed = self._build()
         contract = _contract("AAPL", "AAPLC", "CALL")
         quote = self._quote("1.90", "2.00")
         self._enter(bot, contract, quote, directions={"AAPL": "CALL"})
         self.assertEqual(placed, [])
-        self.assertEqual(bot.option_gate_rejections["not today's focus symbol"], 1)
+        self.assertEqual(
+            bot.option_gate_rejections["not in today's focus cohort"], 1
+        )
 
     def test_dip_signal_enters_a_call_even_with_a_hold_direction(self):
         """By request: "it doesn't buy puts while there is a dip, or
