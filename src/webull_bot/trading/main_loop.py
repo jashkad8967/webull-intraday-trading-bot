@@ -132,9 +132,12 @@ def run(self) -> None:
             self.reconcile_order_history()
             self.log_trade_events()
             buying_power, positions = self.account_state()
-            buying_power = self.process_ui_commands(
-                positions, buying_power, core_session_active
-            )
+            # process_ui_commands now runs on _position_protection_loop
+            # (0.25s) instead of here - see its comment there. Removed
+            # from this body rather than duplicated, exactly like
+            # monitor_working_orders/the repricers below, so the two
+            # threads can never dispatch the same queued command twice
+            # and place two orders for one click.
             # Refreshed here (not just after trading below) so the
             # fast thread's dashboard writes never show stale
             # positions/buying_power during a circuit-breaker pause,
