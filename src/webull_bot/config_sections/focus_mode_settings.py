@@ -5,10 +5,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class FocusModeSettings(BaseSettings):
-    """Single-symbol "focus mode": the once-daily researched candidate
-    batch, the one focus symbol picked out of it, the net buy/sell
-    pressure read, the profit-lock trailing stop, and the daily
-    profit throttle."""
+    """Focus mode: the once-daily researched candidate batch, the small
+    cohort of symbols picked out of it that the account trades options
+    on, the net buy/sell pressure read, the profit-lock trailing stop,
+    and the daily profit throttle."""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -22,20 +22,46 @@ class FocusModeSettings(BaseSettings):
     # (50): buying power gets consumed first-come-first-served by
     # whatever the scanner surfaces first, so no single name ever
     # receives the account. Focus mode is a SELECTION/GATING change -
-    # once a focus symbol is locked, option entries on every other
-    # underlying are rejected and new stock entries are suspended, so
-    # the whole account is available to the one name that earned it.
+    # once the cohort is locked, option entries on every underlying
+    # outside it are rejected and new stock entries are suspended, so
+    # the whole account is available to the names that earned it.
     focus_mode_enabled: bool = True
-    # By request: "only take a good batch of stocks to look out for
-    # everyday." Two-stage funnel - research a small batch each morning
-    # (this), then pick the single focus symbol out of it at the open.
+    # By explicit request: "allow a cohort of 5-10 stocks then, that all
+    # fit the criteria so that there are more options to play with."
+    # Focus mode originally locked exactly ONE name for the session,
+    # which made the whole day contingent on that single symbol having
+    # a contract the account could actually afford - and with a small
+    # account the affordable band is narrow ($50-$363/contract here),
+    # so one unaffordable pick meant zero trades all session. A cohort
+    # widens the tradeable option universe without loosening any gate:
+    # every member clears the SAME structural checks the single pick
+    # had to (price band, share volume, affordability, not wash-blocked
+    # in both directions) - this is more candidates, not weaker ones.
     #
-    # Sized from day-trading practice rather than guessed: a daily
-    # momentum watchlist that changes every day should run 5-10 names
-    # (on top of a stable core list of 10-15 liquid ones), and past ~50
-    # the documented result is analysis paralysis and poor execution.
-    # 8 sits in the middle of that 5-10 band.
-    daily_batch_size: int = Field(default=8, ge=1, le=50)
+    # Capital is deliberately NOT divided across the cohort. At this
+    # account size that would be actively harmful: $363 split 10 ways
+    # is ~$36/slot, below the cheapest contract the premium floor
+    # allows (option_min_premium_dollars $0.50 = $50/contract), which
+    # would size EVERY entry to zero and trade nothing at all. Entries
+    # stay first-come-first-served on the full balance, exactly as the
+    # single-symbol version sized them - the cohort buys availability
+    # of setups, not simultaneous positions. As the account grows,
+    # more of the cohort can be held at once with no change here.
+    focus_cohort_size: int = Field(default=10, ge=1, le=25)
+    # By request: "only take a good batch of stocks to look out for
+    # everyday." Two-stage funnel - research a batch each morning
+    # (this), then pick the focus cohort out of it at the open.
+    #
+    # Raised 8 -> 16 when the second stage became a cohort of up to
+    # focus_cohort_size (10) rather than a single pick. This is the
+    # PRE-FILTER pool, and the lock-time gates are not free - live
+    # batches of 8 routinely left only 3-5 names standing after price/
+    # volume/affordability, which would cap the cohort well below the
+    # 5-10 that was asked for. The research ceiling that matters (past
+    # ~50 names, analysis paralysis and poor execution) is far above
+    # this; the 5-10 watchlist guidance now describes the cohort, which
+    # is the set actually traded.
+    daily_batch_size: int = Field(default=16, ge=1, le=50)
     # 07:45 CT (08:45 ET), inside the 08:30-09:30 ET window where
     # pre-market volume and catalyst releases (earnings, guidance,
     # FDA, upgrades) actually cluster - early enough to have a batch
@@ -86,7 +112,7 @@ class FocusModeSettings(BaseSettings):
     # NOTE: there is deliberately no live-RVOL gate ON THE FOCUS PICK
     # itself, though the underlying research is real (below-average
     # RVOL averaged -0.02R per trade, above-average +0.08R). An
-    # earlier version required select_focus_symbol to re-check live
+    # earlier version required select_focus_cohort to re-check live
     # RVOL on top of what the batch already filtered on - by request
     # ("it should just be scanning contracts by the momentum and
     # entering"), that was removed after it stalled the live account
@@ -218,7 +244,7 @@ class FocusModeSettings(BaseSettings):
     #
     # Resolution, in two parts, both of which LEAVE the 31-day block
     # untouched:
-    #   1. select_focus_symbol skips any candidate whose CALL and PUT
+    #   1. select_focus_cohort skips any candidate whose CALL and PUT
     #      are both already wash-blocked - never commit the day to a
     #      name that cannot be traded in either direction.
     #   2. If the live focus symbol later becomes blocked on BOTH
@@ -235,7 +261,7 @@ class FocusModeSettings(BaseSettings):
     # 286.7% gapper with no listed option chain at all, locked as the
     # focus symbol and the account sat stuck on it - unable to trade
     # anything else, since focus mode rejects every other underlying
-    # and suspends new stock entries - with ensure_focus_symbol_
+    # and suspends new stock entries - with ensure_focus_cohort_
     # contracts retrying forever. "No options chain" is a PERMANENT
     # condition for a symbol (it will not develop one later today),
     # so repeated discovery failure disqualifies it and triggers a

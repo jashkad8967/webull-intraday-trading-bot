@@ -119,7 +119,7 @@ def _cheapest_affordable(
 def focus_symbol_is_affordable(self, symbol: str) -> bool:
     """By explicit request: "we want affordable options only so the
     stocks should also be focused like that" - checked proactively,
-    inside select_focus_symbol's candidate loop, so an established/
+    inside select_focus_cohort's candidate loop, so an established/
     liquid name whose cheapest realistic contract still exceeds
     buying power never locks in the first place (the reactive check
     below is the backstop for buying power changing mid-session, not
@@ -147,7 +147,7 @@ def focus_symbol_is_affordable(self, symbol: str) -> bool:
     price = self.strategy.prices.get(symbol)
     if price is None or price <= 0:
         return True
-    # select_focus_symbol retries every cycle until something locks -
+    # select_focus_cohort retries every cycle until something locks -
     # once a candidate's chain is already discovered and persisted
     # (this call, or a prior retry), re-fetching it from the API every
     # single cycle until lock is pure repeated cost. Re-check
@@ -272,43 +272,51 @@ def _prune_stale_contracts(self) -> None:
         )
 
 
-def ensure_focus_symbol_contracts(self) -> None:
+def ensure_focus_cohort_contracts(self) -> None:
     """By request ("you should be able to request contract by stock
-    in webull openapi"): the moment a focus symbol locks, the whole
-    account is committed to trading it, so its option chain must
+    in webull openapi"): the moment the cohort locks, the account is
+    committed to trading those names, so their option chains must
     exist NOW rather than depending on discover_option_contracts'
-    generic rotation eventually reaching it.
+    generic rotation eventually reaching them.
 
     That rotation cannot be relied on here for two independent
     reasons: (1) its candidate pool is config.option_candidates()
     union agent_popular_symbols union agent_predicted_gainers, which
-    is NOT the same set select_focus_symbol picks from (the daily
+    is NOT the same set select_focus_cohort picks from (the daily
     batch draws from premarket_gainers/seed_popular_symbols too) - a
     locked symbol may simply never be in that pool; (2) even if it
     is, option_discovery_attempted is permanent per session (and
     persisted across restarts) - one prior attempt with zero results
     (common; not every name has a listed chain, or didn't clear a
     filter that day) silently forecloses it forever, with no
-    awareness that the symbol has since become the one thing the
-    account needs to trade.
+    awareness that the symbol has since become one of the few things
+    the account is allowed to trade.
 
     Uses _wide_focus_contracts (every valid strike/expiration in the
     configured window, not select_atm_options' single best-guess CALL
     and PUT) - see that function's docstring for why. A cheap no-op
-    once the chain already exists (checked first) or on a symbol with
+    once a chain already exists (checked first) or on a symbol with
     no price yet (retries next cycle, same as everything else in
     focus mode). Prunes stale (too-close-to-expiration) contracts
     first - see _prune_stale_contracts - so "already exists" means a
     genuinely tradeable chain, not a leftover from a prior session.
+
+    Failures are tracked and disqualified PER SYMBOL: one cohort
+    member with no listed chain must not consume the retry budget of
+    the others, and removing it leaves the rest of the cohort trading.
     """
-    if not self.config.focus_mode_enabled or not self.focus_symbol:
+    if not self.config.focus_mode_enabled or not self.focus_cohort:
         return
-    underlying = self.focus_symbol
     _prune_stale_contracts(self)
+    for underlying in list(self.focus_cohort):
+        _ensure_one_focus_symbol_contracts(self, underlying)
+
+
+def _ensure_one_focus_symbol_contracts(self, underlying: str) -> None:
     if any(
         item["underlying_symbol"] == underlying for item in self.option_contracts
     ):
-        self.focus_contract_discovery_failures = 0
+        self.focus_contract_discovery_failures.pop(underlying, None)
         _check_focus_symbol_affordable(self, underlying)
         return
     if underlying not in self.strategy.prices:
@@ -321,7 +329,7 @@ def ensure_focus_symbol_contracts(self) -> None:
             raise RuntimeError(f"No matching options found for {underlying}")
         self.option_contracts.extend(contracts)
         self.option_discovery_attempted.add(underlying)
-        self.focus_contract_discovery_failures = 0
+        self.focus_contract_discovery_failures.pop(underlying, None)
         self.option_contracts_state.save(
             self.option_contracts,
             self.option_discovery_attempted,
@@ -335,7 +343,7 @@ def ensure_focus_symbol_contracts(self) -> None:
             },
         )
         log.info(
-            "OPTIONS | %s | focus-symbol contracts discovered | found=%s "
+            "OPTIONS | %s | cohort contracts discovered | found=%s "
             "across %s expiration(s)",
             underlying,
             len(contracts),
@@ -354,29 +362,41 @@ def ensure_focus_symbol_contracts(self) -> None:
         # failure is disqualifying, not a transient blip to keep
         # waiting out. A small streak (not 1) still absorbs a genuine
         # transient API error without falsely burning a good symbol.
-        self.focus_contract_discovery_failures += 1
+        # Counted per symbol so one dead name cannot spend the retry
+        # budget of the rest of the cohort.
+        self.focus_contract_discovery_failures[underlying] += 1
+        failures = self.focus_contract_discovery_failures[underlying]
         log.error(
-            "OPTIONS | %s | focus-symbol contract discovery failed "
+            "OPTIONS | %s | cohort contract discovery failed "
             "(%s/%s) | %s",
             underlying,
-            self.focus_contract_discovery_failures,
+            failures,
             self.config.focus_contract_discovery_max_failures,
             exc,
         )
-        if (
-            self.focus_contract_discovery_failures
-            >= self.config.focus_contract_discovery_max_failures
-        ):
+        if failures >= self.config.focus_contract_discovery_max_failures:
             log.warning(
                 "OPTIONS | %s | no discoverable option chain after %s "
-                "attempts - disqualifying and re-picking the focus "
-                "symbol",
+                "attempts - dropping it from today's cohort",
                 underlying,
-                self.focus_contract_discovery_failures,
+                failures,
             )
-            self.focus_symbol_no_chain.add(underlying)
-            self.focus_symbol = None
-            self.focus_contract_discovery_failures = 0
+            _disqualify_from_cohort(self, underlying)
+            self.focus_contract_discovery_failures.pop(underlying, None)
+
+
+def _disqualify_from_cohort(self, underlying: str) -> None:
+    """Remove one name from today's cohort permanently.
+
+    The rest of the cohort keeps trading - that is the whole point of
+    holding more than one name. select_focus_cohort backfills from the
+    daily batch on its next pass, and focus_symbol_no_chain keeps this
+    symbol out of that backfill for the remainder of the session.
+    """
+    self.focus_symbol_no_chain.add(underlying)
+    self.focus_cohort = [
+        symbol for symbol in self.focus_cohort if symbol != underlying
+    ]
 
 
 def _check_focus_symbol_affordable(self, underlying: str) -> None:
@@ -393,19 +413,29 @@ def _check_focus_symbol_affordable(self, underlying: str) -> None:
 
     This is now the BACKSTOP, not the primary defense -
     focus_symbol_is_affordable (above) checks this proactively before
-    a symbol ever locks. This still matters because buying power can
-    shrink mid-session (a loss elsewhere, an averaging-down buy) after
-    a symbol already locked affordable.
+    a symbol ever joins the cohort. This still matters because buying
+    power can shrink mid-session (a realized loss, an averaging-down
+    buy) after a symbol already qualified.
 
-    Runs once per lock (not every cycle - an extra option_quotes call
-    each cycle for a symbol already confirmed affordable is pure
+    Runs once per symbol (not every cycle - an extra option_quotes
+    call each cycle for a symbol already confirmed affordable is pure
     waste) via focus_symbol_affordability_checked. If not even one
-    discovered contract sizes to >=1 contract at current buying
-    power, disqualifies the symbol exactly like "no chain" (same
-    focus_symbol_no_chain set, same re-pick path) - unaffordable
+    discovered contract sizes to >=1 contract at current buying power,
+    drops it from the cohort exactly like "no chain" - unaffordable
     today is just as untradeable as nonexistent.
+
+    CRITICAL, and the reason for the open-position guard below: with a
+    cohort, capital is first-come-first-served, so the moment one
+    member's contract is bought the remaining buying power falls -
+    often below what every OTHER member costs. Disqualifying on that
+    reading would permanently delete the rest of the cohort as a
+    side effect of successfully trading, collapsing it to nothing
+    after the first fill. Deployed capital comes back when the
+    position closes, so "unaffordable while money is at work" is
+    transient and must not be treated as a verdict. Only a symbol that
+    is unaffordable with NOTHING deployed is genuinely out of reach.
     """
-    if self.focus_symbol_affordability_checked == underlying:
+    if underlying in self.focus_symbol_affordability_checked:
         return
     contracts = [
         item
@@ -416,19 +446,26 @@ def _check_focus_symbol_affordable(self, underlying: str) -> None:
         return
     buying_power = self.cached_option_buying_power or 0
     affordable, cheapest = _cheapest_affordable(self, contracts, buying_power)
-    self.focus_symbol_affordability_checked = underlying
     if affordable:
+        self.focus_symbol_affordability_checked.add(underlying)
         return
+    if any(
+        position.get("instrument_type") == "OPTION"
+        for position in (self.cached_positions or [])
+    ):
+        # Capital is deployed, not missing. Deliberately NOT memoised
+        # as checked, so this is re-evaluated for real once positions
+        # close and the money comes back.
+        return
+    self.focus_symbol_affordability_checked.add(underlying)
     log.warning(
         "OPTIONS | %s | no affordable contract | cheapest=$%s vs "
-        "buying_power=$%s | disqualifying and re-picking the focus "
-        "symbol",
+        "buying_power=$%s | dropping it from today's cohort",
         underlying,
         cheapest,
         buying_power,
     )
-    self.focus_symbol_no_chain.add(underlying)
-    self.focus_symbol = None
+    _disqualify_from_cohort(self, underlying)
 
 
 def discover_option_contracts(self) -> None:

@@ -229,7 +229,7 @@ def _prepare_stock_scan_batch(
             positions,
             self.agent_assessment,
             scan_watch_symbols,
-            {self.focus_symbol} if self.focus_symbol else None,
+            set(self.focus_cohort) if self.focus_cohort else None,
             self.config.focus_mode_stock_batch_size
             if focus_entries_suspended
             else None,
@@ -273,7 +273,7 @@ def _prepare_stock_scan_batch(
     # (confirmed live: batches still reported ~60 symbols against a
     # focus_mode_stock_batch_size of 20). premarket_gainers/agent_
     # predicted_gainers are kept - those still feed refresh_daily_
-    # batch/select_focus_symbol's own re-pick candidate pool.
+    # batch/select_focus_cohort's own re-pick candidate pool.
     # By explicit request ("i want this to be faster more high
     # frequency trades"): premarket_gainers/agent_predicted_gainers
     # can each hold up to their own configured limit (confirmed live:

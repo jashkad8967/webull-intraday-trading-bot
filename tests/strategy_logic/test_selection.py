@@ -40,7 +40,7 @@ class StrategySelectionTests(StrategyConfigMixin, unittest.TestCase):
         self.assertIn("CHEAP", batch)
         self.assertIn("NEXT", batch)
 
-    def test_force_include_guarantees_the_focus_symbol_every_cycle(self):
+    def test_force_include_guarantees_the_cohort_every_cycle(self):
         """By request ("i want this to be faster more high frequency
         trades"): the locked focus symbol usually holds no EQUITY
         position (the bot trades the option contract, not the

@@ -94,7 +94,7 @@ from webull_bot.trading.momentum.volatility_window_seeding import (
 )
 from webull_bot.trading.options.option_contract_discovery import (
     discover_option_contracts,
-    ensure_focus_symbol_contracts,
+    ensure_focus_cohort_contracts,
     focus_symbol_is_affordable,
 )
 from webull_bot.trading.options.option_entry_exit import (
@@ -186,7 +186,7 @@ from webull_bot.trading.guards.focus_mode_guards import (
     update_profit_throttle,
 )
 from webull_bot.trading.screeners.daily_batch_refresh import refresh_daily_batch
-from webull_bot.trading.screeners.focus_symbol_selection import select_focus_symbol
+from webull_bot.trading.screeners.focus_cohort_selection import select_focus_cohort
 from webull_bot.trading.screeners.market_pulse_entries import _market_pulse_entries
 from webull_bot.trading.screeners.market_pulse_refresh import refresh_market_pulse
 from webull_bot.trading.screeners.premarket_gainers_refresh import (
@@ -382,7 +382,7 @@ class AutoTrader:
     refresh_premarket_gainers = refresh_premarket_gainers
     refresh_agent_predicted_gainers = refresh_agent_predicted_gainers
     refresh_daily_batch = refresh_daily_batch
-    select_focus_symbol = select_focus_symbol
+    select_focus_cohort = select_focus_cohort
     stock_entries_suspended = stock_entries_suspended
     update_profit_throttle = update_profit_throttle
     new_entries_blocked = new_entries_blocked
@@ -457,7 +457,7 @@ class AutoTrader:
     trade_pairs = trade_pairs
     # Options-chain discovery - moved out to trading/options/.
     discover_option_contracts = discover_option_contracts
-    ensure_focus_symbol_contracts = ensure_focus_symbol_contracts
+    ensure_focus_cohort_contracts = ensure_focus_cohort_contracts
     focus_symbol_is_affordable = focus_symbol_is_affordable
     _prepare_option_scan_batch = _prepare_option_scan_batch
     _evaluate_option_entry = _evaluate_option_entry
@@ -803,13 +803,15 @@ class AutoTrader:
         self.agent_predicted_gainers: set[str] = set()
         self.agent_predicted_gainers_date = None
         # Focus mode (see screeners/daily_batch_refresh.py and
-        # selection/focus_symbol.py) - by request, "only take a good
-        # batch of stocks to look out for everyday" then "go all in"
-        # on the single best one. daily_batch is the researched
-        # morning shortlist; focus_symbol is the one name picked out
-        # of it once the opening range has resolved. Both are
-        # date-stamped so they rebuild exactly once per session and
-        # survive a mid-session restart without re-picking.
+        # screeners/focus_cohort_selection.py) - by request, "only take
+        # a good batch of stocks to look out for everyday" then "allow
+        # a cohort of 5-10 stocks... so that there are more options to
+        # play with". daily_batch is the researched morning shortlist;
+        # focus_cohort is the set picked out of it once the opening
+        # range has resolved, and is the only universe option entries
+        # are allowed on. Both are date-stamped so they rebuild exactly
+        # once per session and survive a mid-session restart without
+        # re-picking.
         self.daily_batch: list[str] = []
         self.daily_batch_date = None
         # Live incident: the batch's give-up used to compare `moment`
@@ -821,8 +823,8 @@ class AutoTrader:
         # refresh_daily_batch.
         self.daily_batch_first_attempt_at: float | None = None
         self.daily_batch_first_attempt_date = None
-        self.focus_symbol: str | None = None
-        self.focus_symbol_date = None
+        self.focus_cohort: list[str] = []
+        self.focus_cohort_date = None
         # Both routines retry until their cutoff rather than marking
         # the day done on an empty result (a mid-session restart
         # starts with no scan history, so the first attempt legitimately
@@ -831,15 +833,19 @@ class AutoTrader:
         self.daily_batch_logged_empty_date = None
         self.focus_logged_empty_date = None
         # Symbols confirmed this session to have no discoverable
-        # option chain (see ensure_focus_symbol_contracts) - excluded
-        # from every future focus pick today, since a listed chain
+        # option chain (see ensure_focus_cohort_contracts) - excluded
+        # from every future cohort pick today, since a listed chain
         # does not appear mid-session.
         self.focus_symbol_no_chain: set[str] = set()
-        self.focus_contract_discovery_failures = 0
-        # Underlying whose affordability was last confirmed by
+        # Per-underlying discovery failure streaks. Keyed by symbol
+        # (not a single counter) so one bad name in the cohort can be
+        # disqualified on its own streak without a transient error on
+        # it counting against everyone else.
+        self.focus_contract_discovery_failures: dict[str, int] = defaultdict(int)
+        # Underlyings whose affordability was confirmed by
         # _check_focus_symbol_affordable - avoids re-quoting a symbol
         # already known affordable on every single cycle.
-        self.focus_symbol_affordability_checked: str | None = None
+        self.focus_symbol_affordability_checked: set[str] = set()
         # Equity captured on the first cycle of the day, the
         # denominator for the daily profit throttle - see
         # focus_daily_profit_target_fraction.

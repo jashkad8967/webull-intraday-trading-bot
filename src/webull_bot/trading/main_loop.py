@@ -111,14 +111,14 @@ def run(self) -> None:
             # locked. Both are internally date- and time-guarded, so
             # they're no-ops on every cycle after the first.
             self.refresh_daily_batch(moment)
-            self.select_focus_symbol(moment)
+            self.select_focus_cohort(moment)
             # By request ("you should be able to request contract by
             # stock in webull openapi") - guarantees the locked
             # symbol's option chain exists immediately rather than
             # depending on discover_option_contracts' generic
             # rotation, which may never reach it. Cheap no-op once
             # the chain already exists.
-            self.ensure_focus_symbol_contracts()
+            self.ensure_focus_cohort_contracts()
             # monitor_working_orders/the repricers/escalate_stalled_
             # stop_losses now run on their own fast, dedicated
             # thread (see _position_protection_loop, started once

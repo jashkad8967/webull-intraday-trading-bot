@@ -22,7 +22,7 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
     signal that matters refreshed.
     """
 
-    def _fake_bot(self, focus_symbol, focus_mode_enabled, contracts, daily_batch=None):
+    def _fake_bot(self, focus_cohort, focus_mode_enabled, contracts, daily_batch=None):
         from webull_bot.strategy_logic.market_state.snapshot import rotating_batch
 
         requested: list[list[str]] = []
@@ -55,7 +55,7 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
                 rotating_batch=rotating_batch,
             ),
             stop_loss_guard_active=lambda: False,
-            focus_symbol=focus_symbol,
+            focus_cohort=list(focus_cohort or []),
             daily_batch=daily_batch or [],
             config=SimpleNamespace(
                 option_batch_size=20, focus_mode_enabled=focus_mode_enabled
@@ -78,7 +78,7 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
     def test_focus_mode_only_quotes_the_locked_symbol(self):
         from webull_bot.bot import AutoTrader
 
-        fake_bot, requested = self._fake_bot("NVDA", True, self._contracts())
+        fake_bot, requested = self._fake_bot(["NVDA"], True, self._contracts())
         prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
         prepare([])
         self.assertEqual(requested, [["NVDA"]])
@@ -126,7 +126,7 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
     def test_disabled_focus_mode_quotes_every_underlying_plus_vixy(self):
         from webull_bot.bot import AutoTrader
 
-        fake_bot, requested = self._fake_bot("NVDA", False, self._contracts())
+        fake_bot, requested = self._fake_bot(["NVDA"], False, self._contracts())
         prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
         prepare([])
         self.assertIn("AAPL", requested[0])
@@ -181,7 +181,7 @@ class PrepareOptionScanBatchHeldPositionTests(unittest.TestCase):
                 rotating_batch=rotating_batch,
             ),
             stop_loss_guard_active=lambda: False,
-            focus_symbol=None,
+            focus_cohort=[],
             config=SimpleNamespace(
                 option_batch_size=20, focus_mode_enabled=False
             ),

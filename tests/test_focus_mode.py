@@ -27,6 +27,7 @@ def focus_config(**overrides):
         focus_min_price=Decimal("10"),
         focus_max_price=Decimal("600"),
         focus_repick_when_blocked=True,
+        focus_cohort_size=10,
         focus_contract_discovery_max_failures=3,
         focus_daily_profit_target_fraction=Decimal("0.05"),
         profit_throttle_confirm_readings=3,
@@ -405,10 +406,12 @@ class EmptyResultRetryTests(unittest.TestCase):
             daily_batch_first_attempt_at=None,
             daily_batch_first_attempt_date=None,
             daily_batch_logged_empty_date=None,
-            focus_symbol=None,
-            focus_symbol_date=None,
+            focus_cohort=[],
+            focus_cohort_date=None,
             focus_logged_empty_date=None,
             focus_symbol_no_chain=set(),
+            focus_contract_discovery_failures=defaultdict(int),
+            focus_symbol_affordability_checked=set(),
             premarket_gainers=set(),
             agent_predicted_gainers=set(),
             seed_popular_symbols=set(),
@@ -428,7 +431,7 @@ class EmptyResultRetryTests(unittest.TestCase):
         )
         bot.session_moment = AutoTrader.session_moment.__get__(bot)
         bot.refresh_daily_batch = AutoTrader.refresh_daily_batch.__get__(bot)
-        bot.select_focus_symbol = AutoTrader.select_focus_symbol.__get__(bot)
+        bot.select_focus_cohort = AutoTrader.select_focus_cohort.__get__(bot)
         bot._now = now
         return bot
 
@@ -521,6 +524,30 @@ class EmptyResultRetryTests(unittest.TestCase):
         bot.refresh_daily_batch(self.moment(15, 55))
         self.assertEqual(bot.daily_batch_date, self.moment(15, 55).date())
 
+    def test_a_new_day_clears_the_previous_session_s_disqualifications(self):
+        """Disqualifications are scoped to one session by design, but
+        the sets live for the life of the process - so a long-running
+        container would bar a name forever over a single bad day. The
+        cohort retires up to focus_cohort_size names a session instead
+        of one, so this leaks an order of magnitude faster.
+        """
+        bot = self.bot(self.moment(10, 30))
+        bot.focus_symbol_no_chain.add("MRNA")
+        bot.focus_contract_discovery_failures["MRNA"] = 2
+        bot.focus_symbol_affordability_checked.add("MRNA")
+        tomorrow = datetime(2026, 9, 22, 10, 30, tzinfo=ZoneInfo("America/New_York"))
+        bot.refresh_daily_batch(tomorrow)
+        self.assertEqual(bot.focus_symbol_no_chain, set())
+        self.assertEqual(dict(bot.focus_contract_discovery_failures), {})
+        self.assertEqual(bot.focus_symbol_affordability_checked, set())
+
+    def test_disqualifications_survive_within_the_same_session(self):
+        bot = self.bot(self.moment(10, 30))
+        bot.refresh_daily_batch(self.moment(10, 30))
+        bot.focus_symbol_no_chain.add("MRNA")
+        bot.refresh_daily_batch(self.moment(10, 31))
+        self.assertIn("MRNA", bot.focus_symbol_no_chain)
+
     def test_a_stale_attempt_timestamp_does_not_bleed_into_a_new_day(self):
         # time.monotonic() never resets, so a leftover timestamp from
         # a prior day's give-up must not make day 2 look instantly
@@ -594,17 +621,17 @@ class EmptyResultRetryTests(unittest.TestCase):
     def test_no_focus_pick_mid_session_retries(self):
         bot = self.bot(self.moment(9, 50))
         bot.daily_batch = ["AAA"]
-        bot.select_focus_symbol(self.moment(9, 50))
+        bot.select_focus_cohort(self.moment(9, 50))
         self.assertIsNone(
-            bot.focus_symbol_date,
+            bot.focus_cohort_date,
             "an unwarmed field at the lock time must stay retryable",
         )
 
     def test_no_focus_pick_at_closeout_gives_up(self):
         bot = self.bot(self.moment(15, 50))
         bot.daily_batch = ["AAA"]
-        bot.select_focus_symbol(self.moment(15, 50))
-        self.assertEqual(bot.focus_symbol_date, self.moment(15, 50).date())
+        bot.select_focus_cohort(self.moment(15, 50))
+        self.assertEqual(bot.focus_cohort_date, self.moment(15, 50).date())
 
 
 def _fake_contract(underlying, symbol, option_type, strike, dte=20):
@@ -690,7 +717,7 @@ class FocusSymbolIsAffordableDiscoveryTests(unittest.TestCase):
         )
 
     def test_a_second_check_of_the_same_candidate_does_not_refetch(self):
-        """select_focus_symbol retries every cycle until something
+        """select_focus_cohort retries every cycle until something
         locks - re-fetching an already-discovered candidate's chain
         from the API on every retry would be pure repeated cost.
         """
@@ -740,13 +767,14 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
 
     def bot(
         self,
-        focus_symbol="MRNA",
+        focus_cohort=("MRNA",),
         existing_contracts=None,
         price=Decimal("168"),
         contracts=None,
         quotes=None,
         fail=False,
         buying_power=Decimal("300"),
+        open_positions=None,
     ):
         calls = {"option_contracts": [], "option_quotes": []}
         default_contracts = contracts or [
@@ -786,31 +814,32 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
 
         bot = SimpleNamespace(
             config=focus_config(),
-            focus_symbol=focus_symbol,
+            focus_cohort=list(focus_cohort),
             option_contracts=existing_contracts or [],
             option_discovery_attempted=set(),
             option_average_down_count={},
             option_last_buy_price={},
             cached_option_buying_power=buying_power,
+            cached_positions=list(open_positions or []),
             api=FakeApi(),
             option_contracts_state=SimpleNamespace(save=lambda *a, **k: None),
             strategy=SimpleNamespace(
-                prices={focus_symbol: price} if price else {},
+                prices={focus_cohort[0]: price} if price and focus_cohort else {},
                 option_order_quantity=order_quantity,
             ),
             focus_symbol_no_chain=set(),
-            focus_contract_discovery_failures=0,
-            focus_symbol_affordability_checked=None,
+            focus_contract_discovery_failures=defaultdict(int),
+            focus_symbol_affordability_checked=set(),
             last_stale_contract_prune=None,
         )
-        bot.ensure_focus_symbol_contracts = (
-            AutoTrader.ensure_focus_symbol_contracts.__get__(bot)
+        bot.ensure_focus_cohort_contracts = (
+            AutoTrader.ensure_focus_cohort_contracts.__get__(bot)
         )
         return bot, calls
 
     def test_discovers_the_wide_board_for_a_newly_locked_symbol(self):
         bot, calls = self.bot()
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         self.assertEqual(calls["option_contracts"], ["MRNA"])
         self.assertEqual(len(bot.option_contracts), 2)
         self.assertEqual(
@@ -823,28 +852,28 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
                 _fake_contract("MRNA", "MRNAC", "CALL", 170)
             ]
         )
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         self.assertEqual(calls["option_contracts"], [])
 
-    def test_does_nothing_without_a_focus_symbol(self):
-        bot, calls = self.bot(focus_symbol=None)
-        bot.ensure_focus_symbol_contracts()
+    def test_does_nothing_without_a_cohort(self):
+        bot, calls = self.bot(focus_cohort=[])
+        bot.ensure_focus_cohort_contracts()
         self.assertEqual(calls["option_contracts"], [])
 
     def test_retries_next_cycle_when_price_is_not_yet_known(self):
         bot, calls = self.bot(price=None)
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         self.assertEqual(calls["option_contracts"], [])
 
     def test_disabled_focus_mode_never_calls_the_api(self):
         bot, calls = self.bot()
         bot.config = focus_config(focus_mode_enabled=False)
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         self.assertEqual(calls["option_contracts"], [])
 
     def test_an_api_failure_does_not_raise(self):
         bot, calls = self.bot(fail=True)
-        bot.ensure_focus_symbol_contracts()  # must not raise
+        bot.ensure_focus_cohort_contracts()  # must not raise
         self.assertEqual(bot.option_contracts, [])
 
     def test_repeated_failure_disqualifies_and_clears_the_symbol(self):
@@ -858,17 +887,17 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
         bot, calls = self.bot(fail=True)
         max_failures = bot.config.focus_contract_discovery_max_failures
         for _ in range(max_failures - 1):
-            bot.ensure_focus_symbol_contracts()
-            self.assertEqual(bot.focus_symbol, "MRNA")  # not yet disqualified
-        bot.ensure_focus_symbol_contracts()
+            bot.ensure_focus_cohort_contracts()
+            self.assertEqual(bot.focus_cohort, ["MRNA"])  # not yet disqualified
+        bot.ensure_focus_cohort_contracts()
         self.assertIn("MRNA", bot.focus_symbol_no_chain)
-        self.assertIsNone(bot.focus_symbol)
+        self.assertEqual(bot.focus_cohort, [])
 
     def test_a_transient_failure_does_not_disqualify_on_its_own(self):
         bot, calls = self.bot(fail=True)
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         self.assertNotIn("MRNA", bot.focus_symbol_no_chain)
-        self.assertEqual(bot.focus_symbol, "MRNA")
+        self.assertEqual(bot.focus_cohort, ["MRNA"])
 
     def test_a_success_resets_the_failure_streak(self):
         bot, calls = self.bot()
@@ -882,11 +911,11 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
             return real_fetch(underlying=underlying)
 
         bot.api.option_contracts = flaky
-        bot.ensure_focus_symbol_contracts()
-        self.assertEqual(bot.focus_contract_discovery_failures, 1)
-        bot.ensure_focus_symbol_contracts()
-        self.assertEqual(bot.focus_contract_discovery_failures, 0)
-        self.assertEqual(bot.focus_symbol, "MRNA")
+        bot.ensure_focus_cohort_contracts()
+        self.assertEqual(bot.focus_contract_discovery_failures["MRNA"], 1)
+        bot.ensure_focus_cohort_contracts()
+        self.assertEqual(bot.focus_contract_discovery_failures["MRNA"], 0)
+        self.assertEqual(bot.focus_cohort, ["MRNA"])
 
     def test_disqualifies_when_nothing_discovered_is_affordable(self):
         """Live incident: GOOGL locked, its own liquid $7.55/$7.90
@@ -900,21 +929,69 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
             quotes={"MRNAC": {"symbol": "MRNAC", "bid": "7.55", "ask": "7.90"}},
             buying_power=Decimal("363"),
         )
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         self.assertIn("MRNA", bot.focus_symbol_no_chain)
-        self.assertIsNone(bot.focus_symbol)
+        self.assertEqual(bot.focus_cohort, [])
 
     def test_stays_locked_when_at_least_one_contract_is_affordable(self):
         bot, calls = self.bot(buying_power=Decimal("300"))
-        bot.ensure_focus_symbol_contracts()
-        self.assertEqual(bot.focus_symbol, "MRNA")
+        bot.ensure_focus_cohort_contracts()
+        self.assertEqual(bot.focus_cohort, ["MRNA"])
         self.assertNotIn("MRNA", bot.focus_symbol_no_chain)
+
+    def test_capital_tied_up_in_a_position_never_disqualifies_the_rest(self):
+        """The cohort's defining hazard. Capital is first-come-first-
+        served, so the moment one member's contract is bought the
+        remaining buying power drops below what the others cost.
+        Treating that as "unaffordable" would delete the rest of the
+        cohort as a side effect of successfully trading - collapsing
+        it to nothing after the very first fill.
+        """
+        bot, calls = self.bot(
+            contracts=[_fake_contract("MRNA", "MRNAC", "CALL", 170)],
+            quotes={"MRNAC": {"symbol": "MRNAC", "bid": "7.55", "ask": "7.90"}},
+            buying_power=Decimal("5"),
+            open_positions=[{"instrument_type": "OPTION", "symbol": "NVDAC"}],
+        )
+        bot.ensure_focus_cohort_contracts()
+        self.assertEqual(bot.focus_cohort, ["MRNA"])
+        self.assertNotIn("MRNA", bot.focus_symbol_no_chain)
+        self.assertNotIn(
+            "MRNA",
+            bot.focus_symbol_affordability_checked,
+            "must stay re-checkable so it is re-evaluated for real "
+            "once the open position closes and capital returns",
+        )
+
+    def test_one_dead_name_does_not_drop_the_rest_of_the_cohort(self):
+        """Only MRNA has a listed chain in this fixture. AAPL must burn
+        its own streak and leave, while MRNA keeps trading - the whole
+        reason for holding more than one name.
+        """
+        bot, calls = self.bot(focus_cohort=("MRNA", "AAPL"))
+        bot.strategy.prices = {"MRNA": Decimal("168"), "AAPL": Decimal("200")}
+        for _ in range(bot.config.focus_contract_discovery_max_failures):
+            bot.ensure_focus_cohort_contracts()
+        self.assertEqual(bot.focus_cohort, ["MRNA"])
+        self.assertIn("AAPL", bot.focus_symbol_no_chain)
+        self.assertNotIn("MRNA", bot.focus_symbol_no_chain)
+
+    def test_failure_streaks_are_counted_per_symbol(self):
+        """A single shared counter let one bad name spend the retry
+        budget of every other member.
+        """
+        bot, calls = self.bot(focus_cohort=("MRNA", "AAPL"))
+        bot.strategy.prices = {"MRNA": Decimal("168"), "AAPL": Decimal("200")}
+        bot.ensure_focus_cohort_contracts()
+        self.assertEqual(bot.focus_contract_discovery_failures["AAPL"], 1)
+        self.assertEqual(bot.focus_contract_discovery_failures["MRNA"], 0)
+        self.assertEqual(bot.focus_cohort, ["MRNA", "AAPL"])
 
     def test_affordability_is_checked_once_per_lock_not_every_cycle(self):
         bot, calls = self.bot(buying_power=Decimal("300"))
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         quote_calls_after_first = len(calls["option_quotes"])
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         self.assertEqual(len(calls["option_quotes"]), quote_calls_after_first)
 
     def test_stale_persisted_contracts_are_dropped_and_rediscovered(self):
@@ -924,13 +1001,13 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
         discovered contracts (persisted from a prior session) expired
         in 4 days - inside the 14-day floor - so _evaluate_option_
         entry's own DTE gate silently rejected every attempt as "too
-        close to expiration," while ensure_focus_symbol_contracts
+        close to expiration," while ensure_focus_cohort_contracts
         treated their mere presence as "chain already exists" and
         never rediscovered a fresh, tradeable one.
         """
         stale = _fake_contract("MRNA", "MRNAC-OLD", "CALL", 170, dte=4)
         bot, calls = self.bot(existing_contracts=[stale])
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         self.assertNotIn(stale, bot.option_contracts)
         self.assertEqual(calls["option_contracts"], ["MRNA"])
         self.assertTrue(
@@ -950,21 +1027,21 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
         stale = _fake_contract("MRNA", "MRNAC-OLD", "CALL", 170, dte=4)
         bot, calls = self.bot(existing_contracts=[stale])
         with unittest.mock.patch("time.monotonic", return_value=5.0):
-            bot.ensure_focus_symbol_contracts()
+            bot.ensure_focus_cohort_contracts()
         self.assertNotIn(stale, bot.option_contracts)
 
     def test_a_fresh_persisted_contract_is_left_alone(self):
         fresh = _fake_contract("MRNA", "MRNAC-OLD", "CALL", 170, dte=20)
         bot, calls = self.bot(existing_contracts=[fresh])
-        bot.ensure_focus_symbol_contracts()
+        bot.ensure_focus_cohort_contracts()
         self.assertIn(fresh, bot.option_contracts)
         self.assertEqual(calls["option_contracts"], [])
 
 
 class RepickOnNoChainTests(unittest.TestCase):
-    """select_focus_symbol's side of the same incident: when
-    ensure_focus_symbol_contracts disqualifies the locked symbol (sets
-    focus_symbol to None but leaves focus_symbol_date stamped for
+    """select_focus_cohort's side of the same incident: when
+    ensure_focus_cohort_contracts disqualifies the locked symbol (sets
+    the cohort empty but leaves focus_cohort_date stamped for
     today), the account must not get stuck with no symbol - it must
     fall through and pick a replacement, excluding the disqualified
     name.
@@ -975,8 +1052,8 @@ class RepickOnNoChainTests(unittest.TestCase):
         bot = SimpleNamespace(
             config=focus_config(),
             daily_batch=["GRML", "MRNA"],
-            focus_symbol=None,
-            focus_symbol_date=now.date(),
+            focus_cohort=[],
+            focus_cohort_date=now.date(),
             focus_logged_empty_date=None,
             focus_symbol_no_chain={"GRML"},
             wash_sales=SimpleNamespace(blocked_until=lambda key: None),
@@ -998,7 +1075,7 @@ class RepickOnNoChainTests(unittest.TestCase):
             focus_symbol_is_affordable=lambda symbol: True,
         )
         bot.session_moment = AutoTrader.session_moment.__get__(bot)
-        bot.select_focus_symbol = AutoTrader.select_focus_symbol.__get__(bot)
+        bot.select_focus_cohort = AutoTrader.select_focus_cohort.__get__(bot)
         return bot
 
     def moment(self, hh, mm):
@@ -1006,19 +1083,19 @@ class RepickOnNoChainTests(unittest.TestCase):
 
     def test_repicks_a_replacement_after_disqualification(self):
         bot = self.bot(self.moment(11, 0))
-        bot.select_focus_symbol(self.moment(11, 0))
-        self.assertEqual(bot.focus_symbol, "MRNA")
+        bot.select_focus_cohort(self.moment(11, 0))
+        self.assertEqual(bot.focus_cohort, ["MRNA"])
 
     def test_never_repicks_the_disqualified_symbol_even_though_it_scores_higher(self):
         bot = self.bot(self.moment(11, 0))
-        bot.select_focus_symbol(self.moment(11, 0))
-        self.assertNotEqual(bot.focus_symbol, "GRML")
+        bot.select_focus_cohort(self.moment(11, 0))
+        self.assertNotIn("GRML", bot.focus_cohort)
 
 
 class ProactiveAffordabilityInSelectionTests(unittest.TestCase):
     """By request: "we want affordable options only so the stocks
     should also be focused like that" - checked proactively inside
-    select_focus_symbol's candidate loop, so an established/liquid
+    select_focus_cohort's candidate loop, so an established/liquid
     name whose cheapest contract still exceeds buying power never
     locks in the first place (live incident: GOOGL locked, then had
     to be reactively disqualified, wasting real trading time).
@@ -1029,8 +1106,8 @@ class ProactiveAffordabilityInSelectionTests(unittest.TestCase):
         bot = SimpleNamespace(
             config=focus_config(),
             daily_batch=["GOOGL", "MRNA"],
-            focus_symbol=None,
-            focus_symbol_date=None,
+            focus_cohort=[],
+            focus_cohort_date=None,
             focus_logged_empty_date=None,
             focus_symbol_no_chain=set(),
             wash_sales=SimpleNamespace(blocked_until=lambda key: None),
@@ -1050,7 +1127,7 @@ class ProactiveAffordabilityInSelectionTests(unittest.TestCase):
             focus_symbol_is_affordable=lambda symbol: affordable.get(symbol, True),
         )
         bot.session_moment = AutoTrader.session_moment.__get__(bot)
-        bot.select_focus_symbol = AutoTrader.select_focus_symbol.__get__(bot)
+        bot.select_focus_cohort = AutoTrader.select_focus_cohort.__get__(bot)
         return bot
 
     def moment(self, hh, mm):
@@ -1058,18 +1135,103 @@ class ProactiveAffordabilityInSelectionTests(unittest.TestCase):
 
     def test_an_unaffordable_higher_scoring_symbol_is_skipped(self):
         bot = self.bot(self.moment(9, 45), affordable={"GOOGL": False, "MRNA": True})
-        bot.select_focus_symbol(self.moment(9, 45))
-        self.assertEqual(bot.focus_symbol, "MRNA")
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(bot.focus_cohort, ["MRNA"])
 
     def test_an_affordable_symbol_still_locks_normally(self):
         bot = self.bot(self.moment(9, 45), affordable={"GOOGL": True, "MRNA": True})
-        bot.select_focus_symbol(self.moment(9, 45))
-        self.assertEqual(bot.focus_symbol, "GOOGL")  # higher score wins when both fit
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(bot.focus_cohort[0], "GOOGL")  # higher score ranks first
 
     def test_nothing_locks_when_every_candidate_is_unaffordable(self):
         bot = self.bot(self.moment(9, 45), affordable={"GOOGL": False, "MRNA": False})
-        bot.select_focus_symbol(self.moment(9, 45))
-        self.assertIsNone(bot.focus_symbol)
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(bot.focus_cohort, [])
+
+
+class CohortSelectionTests(unittest.TestCase):
+    """By explicit request: "allow a cohort of 5-10 stocks then, that
+    all fit the criteria so that there are more options to play with."
+    The single-symbol version made a whole session contingent on one
+    name happening to have an affordable contract.
+    """
+
+    def bot(self, batch, affordable=None, blocked=(), size=10):
+        tz = ZoneInfo("America/New_York")
+        scores = {symbol: float(len(batch) - i) for i, symbol in enumerate(batch)}
+        affordable = affordable or {}
+        bot = SimpleNamespace(
+            config=focus_config(focus_cohort_size=size),
+            daily_batch=list(batch),
+            focus_cohort=[],
+            focus_cohort_date=None,
+            focus_logged_empty_date=None,
+            focus_symbol_no_chain=set(),
+            wash_sales=SimpleNamespace(
+                blocked_until=lambda key: True
+                if key.split(":")[0] in blocked
+                else None
+            ),
+            agent_assessment=lambda symbol: None,
+            strategy=SimpleNamespace(
+                metrics={symbol: {"volume": 5_000_000} for symbol in batch},
+                prices={symbol: Decimal("100") for symbol in batch},
+                priority_score=lambda s, a: scores[s],
+            ),
+            timezone=tz,
+            focus_symbol_is_affordable=lambda symbol: affordable.get(symbol, True),
+        )
+        bot.session_moment = AutoTrader.session_moment.__get__(bot)
+        bot.select_focus_cohort = AutoTrader.select_focus_cohort.__get__(bot)
+        return bot
+
+    def moment(self, hh, mm):
+        return datetime(2026, 9, 21, hh, mm, tzinfo=ZoneInfo("America/New_York"))
+
+    def test_every_qualifying_name_joins_the_cohort_ranked_by_score(self):
+        batch = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
+        bot = self.bot(batch)
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(bot.focus_cohort, batch)
+
+    def test_the_cohort_is_capped_at_focus_cohort_size(self):
+        batch = [f"S{i}" for i in range(20)]
+        bot = self.bot(batch, size=10)
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(len(bot.focus_cohort), 10)
+        self.assertEqual(bot.focus_cohort, batch[:10])
+
+    def test_members_still_have_to_clear_every_gate_individually(self):
+        # The cohort is MORE candidates, not weaker ones.
+        bot = self.bot(
+            ["AAA", "BBB", "CCC", "DDD"],
+            affordable={"BBB": False},
+            blocked={"CCC"},
+        )
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(bot.focus_cohort, ["AAA", "DDD"])
+
+    def test_a_disqualified_member_is_backfilled_without_disturbing_the_rest(self):
+        batch = ["AAA", "BBB", "CCC"]
+        bot = self.bot(batch, size=2)
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(bot.focus_cohort, ["AAA", "BBB"])
+        # BBB turns out to have no chain - it leaves, CCC takes the slot.
+        bot.focus_symbol_no_chain.add("BBB")
+        bot.select_focus_cohort(self.moment(10, 0))
+        self.assertEqual(bot.focus_cohort, ["AAA", "CCC"])
+
+    def test_an_unchanged_cohort_is_not_relocked_every_cycle(self):
+        bot = self.bot(["AAA", "BBB"])
+        bot.select_focus_cohort(self.moment(9, 45))
+        locked = list(bot.focus_cohort)
+        bot.select_focus_cohort(self.moment(9, 46))
+        self.assertEqual(bot.focus_cohort, locked)
+
+    def test_nothing_locks_when_no_candidate_clears_the_gates(self):
+        bot = self.bot(["AAA", "BBB"], affordable={"AAA": False, "BBB": False})
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(bot.focus_cohort, [])
 
 
 class StockSuspensionTests(unittest.TestCase):

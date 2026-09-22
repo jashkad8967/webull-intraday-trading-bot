@@ -11,7 +11,7 @@ def refresh_daily_batch(self, moment: datetime) -> None:
     out for everyday, do online research for that."
 
     Stage one of a two-stage funnel - this builds the morning
-    shortlist, and select_focus_symbol picks the single all-in name
+    shortlist, and select_focus_cohort picks the tradeable cohort
     out of it once the opening range has resolved. Before this, the
     candidate pool for any given decision was "whatever the scanner
     happened to surface from a ~5000-symbol universe this cycle",
@@ -77,6 +77,20 @@ def refresh_daily_batch(self, moment: datetime) -> None:
         # attempt of the new day.
         self.daily_batch_first_attempt_date = moment.date()
         self.daily_batch_first_attempt_at = None
+        # Focus-mode disqualifications are explicitly scoped to ONE
+        # session ("permanent for today: a listed chain does not
+        # appear mid-session"), but these sets live for the life of
+        # the process, so without this a container running across
+        # several days accumulates them forever - a name that was
+        # merely unaffordable on Monday would stay barred on Friday
+        # after the account grew or its premium fell. The cohort makes
+        # that far worse than it was under a single focus symbol:
+        # every session can now retire up to focus_cohort_size names
+        # instead of one, so the tradeable universe shrinks roughly an
+        # order of magnitude faster the longer the bot stays up.
+        self.focus_symbol_no_chain.clear()
+        self.focus_contract_discovery_failures.clear()
+        self.focus_symbol_affordability_checked.clear()
     if moment < self.session_moment(moment, self.config.daily_batch_refresh_time):
         # Not yet - the pre-market tape this reads isn't meaningful
         # until the 08:30-09:30 ET window (a real market-structure

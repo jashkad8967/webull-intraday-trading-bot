@@ -143,21 +143,22 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     # underlying now gets a fresh sample every single cycle,
     # completely decoupled from the option-contract quote rotation.
     # By explicit request ("i want this to be faster more high
-    # frequency trades"): with focus mode locked onto one symbol,
-    # every OTHER discovered underlying's direction signal is
-    # provably unusable - option entry already rejects anything that
-    # isn't the focus symbol before direction is even checked (see
-    # "not today's focus symbol" in _evaluate_option_entry) - yet
-    # this quote batch kept fetching all of them anyway (confirmed
-    # live: quoted=69/69 and climbing as background discovery kept
-    # finding more names), directly slowing how often THIS cycle's
-    # actual signal (the focus symbol's) refreshes. VIXY is dropped
-    # too in this state: option_market_regime_ok is itself already
-    # skipped for focus-mode entries (see _evaluate_option_entry),
-    # so there is nothing left that reads current_vixy.
-    if self.config.focus_mode_enabled and self.focus_symbol:
-        underlyings = [self.focus_symbol]
-        quote_symbols = [self.focus_symbol]
+    # frequency trades"): with focus mode locked onto a cohort, every
+    # discovered underlying OUTSIDE it has a provably unusable
+    # direction signal - option entry already rejects anything not in
+    # the cohort before direction is even checked (see "not in today's
+    # focus cohort" in _evaluate_option_entry) - yet this quote batch
+    # kept fetching all of them anyway (confirmed live: quoted=69/69
+    # and climbing as background discovery kept finding more names),
+    # directly slowing how often the signals that can actually trade
+    # refresh. The cohort is bounded by focus_cohort_size, so this
+    # stays a small, fixed set rather than the whole discovered
+    # universe. VIXY is dropped too in this state: option_market_
+    # regime_ok is itself already skipped for focus-mode entries (see
+    # _evaluate_option_entry), so nothing reads current_vixy.
+    if self.config.focus_mode_enabled and self.focus_cohort:
+        underlyings = list(self.focus_cohort)
+        quote_symbols = list(self.focus_cohort)
     elif self.config.focus_mode_enabled and self.daily_batch:
         # By explicit request ("at 9:45am, the stock needs to be
         # selected, and its options should all be discovered and

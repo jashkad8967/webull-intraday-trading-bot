@@ -109,24 +109,24 @@ def _evaluate_option_entry(
         ] += 1
         return open_count, buying_power
     underlying = contract["underlying_symbol"]
-    # By explicit request: "find one really good volatile stock to
-    # play with and go all in on that for the day... make sure you
-    # use all of the capital." Deliberately placed ABOVE the smoke-
-    # test bypass below, and above every entry-QUALITY gate, because
-    # this is a STRUCTURAL constraint (which symbol the account is
-    # committed to today), not a judgment about whether this setup
-    # looks good. Sizing was never the thing preventing an all-in
-    # position - option_capital_fraction is already 1.0 - it was
-    # max_open_positions letting buying power drain into whatever
-    # the scanner surfaced first. Gating entry to the one focus
-    # symbol is what actually leaves the whole account available to
-    # it. Until a focus symbol is locked (pre-09:45, or a day where
-    # nothing cleared the gates) no option entry is allowed at all.
-    if self.config.focus_mode_enabled and underlying != self.focus_symbol:
+    # By explicit request: "allow a cohort of 5-10 stocks then, that
+    # all fit the criteria so that there are more options to play
+    # with." Deliberately placed ABOVE the smoke-test bypass below,
+    # and above every entry-QUALITY gate, because this is a STRUCTURAL
+    # constraint (which symbols the account is committed to today),
+    # not a judgment about whether this setup looks good. Sizing was
+    # never the thing preventing a full-size position -
+    # option_capital_fraction is already 1.0 - it was
+    # max_open_positions letting buying power drain into whatever the
+    # scanner surfaced first. Gating entry to the cohort is what
+    # actually leaves the whole account available to the names that
+    # earned it. Until the cohort is locked (pre-08:45 CT, or a day
+    # where nothing cleared the gates) no option entry is allowed.
+    if self.config.focus_mode_enabled and underlying not in self.focus_cohort:
         self.option_gate_rejections[
-            "not today's focus symbol"
-            if self.focus_symbol
-            else "no focus symbol locked yet"
+            "not in today's focus cohort"
+            if self.focus_cohort
+            else "no focus cohort locked yet"
         ] += 1
         return open_count, buying_power
     # By request ("once you hit a certain profit slow down") - the
