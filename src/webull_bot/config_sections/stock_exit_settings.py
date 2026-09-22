@@ -31,6 +31,26 @@ class StockExitSettings(BaseSettings):
     # round trip. Also folded into every profit target (stock, option) so a
     # target isn't hit at a price that nets a loss once this fee comes out.
     sell_fee_dollars: Decimal = Field(default=Decimal("0.02"), ge=0)
+    # Options are charged PER CONTRACT, not per trade, so the flat
+    # stock fee above is the wrong shape for them and under-counts by
+    # more the bigger the position gets.
+    #
+    # Webull's published pass-throughs on the sell leg, per contract:
+    # OCC clearing $0.025 + Options Regulatory Fee $0.02295, plus the
+    # SEC fee (0.0000206 x principal) and the FINRA TAF ($0.01 min).
+    # A 2-contract exit at $1.45 works out to ~$0.11 all-in, and OCC
+    # and ORF are charged on the BUY leg too, so ~$0.07/contract is a
+    # fair round-trip estimate. Confirmed against the live account.
+    #
+    # Why this matters beyond accounting: this figure feeds the
+    # "never price a PROFIT exit below cost + fee" guard. Modelling
+    # $0.02 for a whole option trade made that guard far too generous
+    # at size - at 10 contracts the real cost is ~$0.55 against $0.02
+    # assumed, which is exactly how an exit gets booked as a profit
+    # while actually losing money.
+    option_sell_fee_per_contract: Decimal = Field(
+        default=Decimal("0.07"), ge=0
+    )
     stock_stop_loss_min_percent: Decimal = Field(default=Decimal("0.009"), gt=0, le=1)
     stock_stop_loss_max_percent: Decimal = Field(default=Decimal("0.015"), gt=0, le=1)
     stock_stop_loss_range_multiplier: Decimal = Field(

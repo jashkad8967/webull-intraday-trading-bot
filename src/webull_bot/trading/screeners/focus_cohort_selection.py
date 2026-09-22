@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime
 
 log = logging.getLogger("webull-bot")
@@ -80,8 +81,32 @@ def select_focus_cohort(self, moment: datetime) -> None:
             and not _both_directions_blocked(self, symbol)
         ]
         if survivors == self.focus_cohort and survivors:
-            # Already locked today and every member is still tradeable.
-            return
+            # Every member is still tradeable. Normally nothing to do -
+            # EXCEPT when the cohort is below its target size, because
+            # the names that missed the lock are not permanently
+            # ineligible. Affordability is the usual reason a batch
+            # name fails here, and it moves all session: buying power
+            # changes as positions open and close, and premiums drift.
+            # Without this the cohort froze at whatever happened to
+            # qualify in one instant - live 2026-09-22 it locked 4 of
+            # a 9-name batch against focus_cohort_size 10 and could
+            # never have grown, which defeats the point of having a
+            # cohort at all.
+            #
+            # Throttled because the re-check is not free: it runs
+            # focus_symbol_is_affordable for every batch member, and
+            # that quotes contracts. Once a cycle would spend real API
+            # budget re-asking a question whose answer changes slowly.
+            if len(survivors) >= self.config.focus_cohort_size:
+                return
+            now = time.monotonic()
+            if (
+                self.focus_cohort_growth_attempt_at is not None
+                and now - self.focus_cohort_growth_attempt_at
+                < self.config.focus_cohort_growth_seconds
+            ):
+                return
+            self.focus_cohort_growth_attempt_at = now
         if not self.config.focus_repick_when_blocked:
             self.focus_cohort = survivors
             return

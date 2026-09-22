@@ -133,6 +133,10 @@ def refresh_daily_batch(self, moment: datetime) -> None:
         self.focus_symbol_no_chain.clear()
         self.focus_contract_discovery_failures.clear()
         self.focus_symbol_affordability_checked.clear()
+        # Chains go stale overnight (expirations roll out of the DTE
+        # window), so yesterday's sweep must not suppress today's.
+        self.focus_wide_discovered.clear()
+        self.focus_cohort_growth_attempt_at = None
     if moment < self.session_moment(moment, self.config.daily_batch_refresh_time):
         # Not yet - the pre-market tape this reads isn't meaningful
         # until the 08:30-09:30 ET window (a real market-structure

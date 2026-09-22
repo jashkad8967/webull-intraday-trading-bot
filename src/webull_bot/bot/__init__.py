@@ -846,6 +846,15 @@ class AutoTrader:
         # disqualified on its own streak without a transient error on
         # it counting against everyone else.
         self.focus_contract_discovery_failures: dict[str, int] = defaultdict(int)
+        # Underlyings that have had the FULL strike/expiration sweep
+        # (_wide_focus_contracts), as opposed to the 2 contracts
+        # discover_option_contracts' background rotation leaves behind.
+        # Tracked explicitly because "has any contracts" cannot tell
+        # those apart - see focus_symbol_is_affordable's comment for
+        # the live incident where a cohort traded off one ATM strike.
+        self.focus_wide_discovered: set[str] = set()
+        # Throttles cohort growth re-checks - see select_focus_cohort.
+        self.focus_cohort_growth_attempt_at: float | None = None
         # Underlyings whose affordability was confirmed by
         # _check_focus_symbol_affordable - avoids re-quoting a symbol
         # already known affordable on every single cycle.
