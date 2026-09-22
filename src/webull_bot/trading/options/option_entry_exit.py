@@ -627,7 +627,7 @@ def _evaluate_option_exit(
     # decision's own real profit target already builds in) guarantees
     # this only fires on a genuinely realizable gain.
     if decision.action == "HOLD" and sell_realizable_price > cost:
-        fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
+        fee_per_share = (self.config.option_sell_fee_per_contract * quantity) / (quantity * 100)
         momentum_exit = False
         # Live incident (NKE, recurring even after the AMD fix): the
         # AMD fix required clearing cost by more than fee_per_share

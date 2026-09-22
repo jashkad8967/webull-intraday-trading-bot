@@ -15,7 +15,16 @@ def record_realized_exit(
     both care about the running picture, not cent-perfect accounting.
     Returns the estimated pnl so callers can show it on the trade log.
     """
-    pnl = (exit_price - average_cost) * quantity * multiplier - self.config.sell_fee_dollars
+    # Options are billed per contract, not per trade - see
+    # option_sell_fee_per_contract. Using the flat stock fee here made
+    # every realized option P&L optimistic, and that number feeds the
+    # dashboard, the trade log and the daily-loss circuit breaker.
+    fee = (
+        self.config.option_sell_fee_per_contract * abs(quantity)
+        if multiplier == 100
+        else self.config.sell_fee_dollars
+    )
+    pnl = (exit_price - average_cost) * quantity * multiplier - fee
     self.daily_realized_pnl += pnl
     if pnl < 0:
         self.daily_realized_loss += -pnl

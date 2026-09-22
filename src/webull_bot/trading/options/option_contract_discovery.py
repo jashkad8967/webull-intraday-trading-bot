@@ -153,19 +153,34 @@ def focus_symbol_is_affordable(self, symbol: str) -> bool:
     # single cycle until lock is pure repeated cost. Re-check
     # affordability freshly each time (buying power can shift) but
     # only ever do the real discovery fetch once per candidate.
-    existing = [
-        item for item in self.option_contracts if item["underlying_symbol"] == symbol
-    ]
-    if existing:
-        buying_power = self.cached_option_buying_power or 0
-        affordable, _ = _cheapest_affordable(self, existing, buying_power)
-        return affordable
+    #
+    # Keyed on focus_wide_discovered, NOT on "does this underlying have
+    # any contracts at all". Live 2026-09-22: discover_option_contracts'
+    # slow background rotation leaves exactly 2 contracts per name (one
+    # CALL, one PUT, a single strike - see select_atm_options), and an
+    # any-contracts test treats that as a discovered chain. The cohort
+    # locked GME/TSLA/COIN/PLTR with 2 contracts each while NVDA - which
+    # happened to have none when it was first evaluated, so it took the
+    # branch below - had 180. Affordability was then decided off one ATM
+    # strike, the most expensive point on the board, when cheaper OTM
+    # strikes inside the moneyness cap were available and never fetched.
+    if symbol in self.focus_wide_discovered:
+        existing = [
+            item
+            for item in self.option_contracts
+            if item["underlying_symbol"] == symbol
+        ]
+        if existing:
+            buying_power = self.cached_option_buying_power or 0
+            affordable, _ = _cheapest_affordable(self, existing, buying_power)
+            return affordable
     try:
         contracts = _wide_focus_contracts(self, symbol, price)
     except Exception:
         return True
     if not contracts:
         return True
+    self.focus_wide_discovered.add(symbol)
     already_known = {item["symbol"] for item in self.option_contracts}
     new_contracts = [c for c in contracts if c["symbol"] not in already_known]
     if new_contracts:
@@ -313,9 +328,12 @@ def ensure_focus_cohort_contracts(self) -> None:
 
 
 def _ensure_one_focus_symbol_contracts(self, underlying: str) -> None:
-    if any(
-        item["underlying_symbol"] == underlying for item in self.option_contracts
-    ):
+    # Gated on focus_wide_discovered rather than "has any contracts",
+    # for the reason spelled out in focus_symbol_is_affordable: the
+    # background rotation leaves 2 contracts per name, and treating
+    # that as a discovered chain meant a cohort member kept a single
+    # ATM strike all session instead of the full board.
+    if underlying in self.focus_wide_discovered:
         self.focus_contract_discovery_failures.pop(underlying, None)
         _check_focus_symbol_affordable(self, underlying)
         return
@@ -329,6 +347,7 @@ def _ensure_one_focus_symbol_contracts(self, underlying: str) -> None:
             raise RuntimeError(f"No matching options found for {underlying}")
         self.option_contracts.extend(contracts)
         self.option_discovery_attempted.add(underlying)
+        self.focus_wide_discovered.add(underlying)
         self.focus_contract_discovery_failures.pop(underlying, None)
         self.option_contracts_state.save(
             self.option_contracts,

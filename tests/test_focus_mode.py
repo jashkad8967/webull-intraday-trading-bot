@@ -37,6 +37,7 @@ def focus_config(**overrides):
         profit_lock_enabled=True,
         profit_lock_arm_percent=Decimal("0.10"),
         profit_lock_giveback_fraction=Decimal("0.50"),
+        profit_lock_min_gain_percent=Decimal("0.025"),
         profit_lock_giveback_fraction_after_throttle=Decimal("0.25"),
         pressure_enabled=True,
         pressure_min_for_entry=Decimal("0.15"),
@@ -44,6 +45,7 @@ def focus_config(**overrides):
         pressure_flip_exit_threshold=Decimal("0.25"),
         pressure_history_seconds=300,
         sell_fee_dollars=Decimal("0.02"),
+        option_sell_fee_per_contract=Decimal("0.07"),
         option_take_profit_percent=Decimal("0.15"),
         option_stop_loss_percent=Decimal("0.50"),
         option_min_dte=14,
@@ -209,6 +211,13 @@ class ProfitLockTrailTests(unittest.TestCase):
         # $1.00 position targets $1.15, which would fire first and
         # hide whether the trail works at all.
         overrides.setdefault("option_take_profit_percent", Decimal("5"))
+        # Arm/giveback pinned to the values these cases were written
+        # against, so they keep testing the TRAIL MECHANISM rather than
+        # whatever the shipped defaults happen to be. The defaults
+        # themselves are covered by
+        # test_the_real_defaults_would_have_saved_the_live_gme_trade.
+        overrides.setdefault("profit_lock_arm_percent", Decimal("0.10"))
+        overrides.setdefault("profit_lock_giveback_fraction", Decimal("0.50"))
         strategy = SimpleNamespace(config=focus_config(**overrides))
         return option_decision(
             strategy,
@@ -225,14 +234,56 @@ class ProfitLockTrailTests(unittest.TestCase):
         self.assertEqual(decision.action, "HOLD")
 
     def test_holds_while_price_stays_above_the_floor(self):
-        # Peak 1.40 -> floor = 1.00 + 0.40*0.5 = 1.20
-        decision = self.decide(price="1.30", peak="1.40")
+        # Peak 1.40 is a +40% run, so the >=20% tier applies: give
+        # back 20%, floor = 1.00 + 0.40*0.80 = 1.32.
+        decision = self.decide(price="1.35", peak="1.40")
         self.assertEqual(decision.action, "HOLD")
 
     def test_locks_in_the_gain_once_price_falls_back_to_the_floor(self):
         decision = self.decide(price="1.20", peak="1.40")
         self.assertEqual(decision.action, "PROFIT")
-        self.assertEqual(decision.target_price, Decimal("1.20"))
+        self.assertEqual(decision.target_price, Decimal("1.3200"))
+
+    def test_the_giveback_tightens_as_the_run_gets_bigger(self):
+        """By request: "have the profit lock dynamic shift based on the
+        amount of profit it is at." A fixed fraction is wrong at both
+        ends - it surrenders a painful share of a large winner, and on
+        a small one hands back so little that fees eat the rest.
+        """
+        # cost 1.00 throughout; floor = 1 + gain*(1-giveback)
+        for peak, expected_floor, tier in (
+            ("1.04", "1.0260", "under 5% -> config default 0.35"),
+            ("1.08", "1.0560", "5-10%  -> 0.30"),
+            ("1.15", "1.1125", "10-20% -> 0.25"),
+            ("1.40", "1.3200", ">=20%  -> 0.20"),
+        ):
+            decision = self.decide(
+                price="1.00",
+                peak=peak,
+                profit_lock_arm_percent=Decimal("0.025"),
+                profit_lock_giveback_fraction=Decimal("0.35"),
+            )
+            self.assertEqual(
+                decision.target_price,
+                Decimal(expected_floor),
+                f"peak {peak} ({tier})",
+            )
+
+    def test_an_armed_trail_never_books_less_than_the_minimum_gain(self):
+        """By request: "but yeah never below 2.5%." A position that
+        armed just over the bar must not trail down to a few cents and
+        still call itself a PROFIT.
+        """
+        # Peak 1.03 (+3%), giveback 0.35 -> raw floor 1.0195, which is
+        # under the 2.5% minimum, so the floor is lifted to 1.025.
+        decision = self.decide(
+            price="1.00",
+            peak="1.03",
+            profit_lock_arm_percent=Decimal("0.025"),
+            profit_lock_giveback_fraction=Decimal("0.35"),
+        )
+        self.assertEqual(decision.action, "PROFIT")
+        self.assertGreaterEqual(decision.target_price, Decimal("1.025"))
         self.assertIn("profit-lock", decision.reason)
 
     def test_the_floor_always_sits_above_entry_cost(self):
@@ -246,13 +297,64 @@ class ProfitLockTrailTests(unittest.TestCase):
         # Peak barely over the arm bar on a large position, so the
         # floor lands inside the fee margin - taking it would book a
         # real loss labelled PROFIT, the exact LFUS/FIGR/MAGN failure.
+        # Options are billed per contract now, so the knob that moves
+        # an option's fee margin is option_sell_fee_per_contract - the
+        # flat stock fee no longer reaches this path at all.
         decision = self.decide(
             price="1.00",
             peak="1.10",
             quantity=1,
-            sell_fee_dollars=Decimal("20"),
+            option_sell_fee_per_contract=Decimal("20"),
         )
         self.assertNotEqual(decision.action, "PROFIT")
+
+    def test_the_real_defaults_would_have_saved_the_live_gme_trade(self):
+        """Live 2026-09-22, GME 261009C23: bought 2 at $1.40, ran to
+        $1.46 (+4.29%, +$12 open), round-tripped to $1.37 (-$6). The
+        lock never armed because the arm bar was 10% and the whole
+        move was 4.29% - the one mechanism meant to stop a winner
+        becoming a loser sat disarmed the entire time.
+
+        Uses the SHIPPED defaults deliberately: this is a test about
+        whether the numbers we actually run are set correctly, not
+        about whether the trail maths works.
+        """
+        from webull_bot.config import Settings
+
+        real = Settings()
+        strategy = SimpleNamespace(
+            config=focus_config(
+                option_take_profit_percent=real.option_take_profit_percent,
+                option_stop_loss_percent=real.option_stop_loss_percent,
+                profit_lock_arm_percent=real.profit_lock_arm_percent,
+                profit_lock_giveback_fraction=real.profit_lock_giveback_fraction,
+            )
+        )
+        # At the peak the trail must be armed.
+        peak = Decimal("1.46")
+        cost = Decimal("1.40")
+        armed = (peak - cost) / cost >= real.profit_lock_arm_percent
+        self.assertTrue(
+            armed,
+            f"a {((peak-cost)/cost*100):.2f}% run must arm the trail - "
+            f"arm bar is {real.profit_lock_arm_percent*100:.1f}%",
+        )
+        # Falling back to 1.37 must exit as PROFIT, not ride to the stop.
+        decision = option_decision(
+            strategy,
+            Decimal("1.37"),
+            2,
+            cost,
+            30,
+            peak_price=peak,
+        )
+        self.assertEqual(
+            decision.action,
+            "PROFIT",
+            "the give-back from $1.46 to $1.37 must trigger the lock "
+            "instead of letting a +$12 position close at -$6",
+        )
+        self.assertGreater(decision.target_price, cost)
 
     def test_a_tighter_giveback_locks_in_more_of_the_peak(self):
         strategy = SimpleNamespace(
@@ -413,6 +515,8 @@ class EmptyResultRetryTests(unittest.TestCase):
             focus_symbol_no_chain=set(),
             focus_contract_discovery_failures=defaultdict(int),
             focus_symbol_affordability_checked=set(),
+            focus_wide_discovered=set(),
+            focus_cohort_growth_attempt_at=None,
             premarket_gainers=set(),
             agent_predicted_gainers=set(),
             seed_popular_symbols=set(),
@@ -719,7 +823,13 @@ class FocusSymbolIsAffordableDiscoveryTests(unittest.TestCase):
     post-lock discovery latency.
     """
 
-    def bot(self, price=Decimal("168"), existing_contracts=None, fail=False):
+    def bot(
+        self,
+        price=Decimal("168"),
+        existing_contracts=None,
+        fail=False,
+        wide_discovered=None,
+    ):
         calls = {"option_contracts": []}
         contracts = [
             _fake_contract("MRNA", "MRNAC", "CALL", 170),
@@ -762,6 +872,7 @@ class FocusSymbolIsAffordableDiscoveryTests(unittest.TestCase):
             cached_option_buying_power=Decimal("300"),
             api=FakeApi(),
             option_contracts_state=SimpleNamespace(save=lambda *a, **k: None),
+            focus_wide_discovered=set(wide_discovered or ()),
             strategy=SimpleNamespace(
                 prices={"MRNA": price} if price else {},
                 option_order_quantity=order_quantity,
@@ -838,6 +949,7 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
         fail=False,
         buying_power=Decimal("300"),
         open_positions=None,
+        wide_discovered=None,
     ):
         calls = {"option_contracts": [], "option_quotes": []}
         default_contracts = contracts or [
@@ -893,6 +1005,7 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
             focus_symbol_no_chain=set(),
             focus_contract_discovery_failures=defaultdict(int),
             focus_symbol_affordability_checked=set(),
+            focus_wide_discovered=set(wide_discovered or ()),
             last_stale_contract_prune=None,
         )
         bot.ensure_focus_cohort_contracts = (
@@ -909,14 +1022,39 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
             {c["symbol"] for c in bot.option_contracts}, {"MRNAC", "MRNAP"}
         )
 
-    def test_is_a_no_op_when_the_chain_already_exists(self):
+    def test_is_a_no_op_when_the_wide_chain_already_exists(self):
         bot, calls = self.bot(
             existing_contracts=[
                 _fake_contract("MRNA", "MRNAC", "CALL", 170)
-            ]
+            ],
+            wide_discovered={"MRNA"},
         )
         bot.ensure_focus_cohort_contracts()
         self.assertEqual(calls["option_contracts"], [])
+
+    def test_two_leftover_contracts_do_not_count_as_a_discovered_chain(self):
+        """Live 2026-09-22: discover_option_contracts' background
+        rotation leaves exactly 2 contracts per name (one CALL, one
+        PUT, a single strike). Treating that as "the chain exists"
+        meant cohort members kept ONE ATM strike all session while
+        NVDA - which happened to have none when first evaluated - got
+        the full 180-contract board. Affordability was then judged off
+        the most expensive point on the board.
+        """
+        bot, calls = self.bot(
+            existing_contracts=[
+                _fake_contract("MRNA", "MRNAC", "CALL", 170),
+                _fake_contract("MRNA", "MRNAP", "PUT", 166),
+            ],
+        )
+        bot.ensure_focus_cohort_contracts()
+        self.assertEqual(
+            calls["option_contracts"],
+            ["MRNA"],
+            "a cohort member without the wide sweep must still be "
+            "fully discovered, not skipped because 2 stale contracts "
+            "happen to be present",
+        )
 
     def test_does_nothing_without_a_cohort(self):
         bot, calls = self.bot(focus_cohort=[])
@@ -1095,7 +1233,9 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
 
     def test_a_fresh_persisted_contract_is_left_alone(self):
         fresh = _fake_contract("MRNA", "MRNAC-OLD", "CALL", 170, dte=20)
-        bot, calls = self.bot(existing_contracts=[fresh])
+        bot, calls = self.bot(
+            existing_contracts=[fresh], wide_discovered={"MRNA"}
+        )
         bot.ensure_focus_cohort_contracts()
         self.assertIn(fresh, bot.option_contracts)
         self.assertEqual(calls["option_contracts"], [])
@@ -1173,6 +1313,7 @@ class ProactiveAffordabilityInSelectionTests(unittest.TestCase):
             focus_cohort_date=None,
             focus_logged_empty_date=None,
             focus_symbol_no_chain=set(),
+            focus_cohort_growth_attempt_at=None,
             wash_sales=SimpleNamespace(blocked_until=lambda key: None),
             agent_assessment=lambda symbol: None,
             strategy=SimpleNamespace(
@@ -1230,6 +1371,7 @@ class CohortSelectionTests(unittest.TestCase):
             focus_cohort_date=None,
             focus_logged_empty_date=None,
             focus_symbol_no_chain=set(),
+            focus_cohort_growth_attempt_at=None,
             wash_sales=SimpleNamespace(
                 blocked_until=lambda key: True
                 if key.split(":")[0] in blocked

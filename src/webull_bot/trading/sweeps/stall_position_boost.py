@@ -116,7 +116,7 @@ def boost_stalled_positions(
                 contract = self.api.contract_from_position(position)
                 if not contract:
                     continue
-                fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
+                fee_per_share = (self.config.option_sell_fee_per_contract * quantity) / (quantity * 100)
                 quote = self.api.option_quote(contract["symbol"])
                 sell_price = self._stall_exit_price(
                     quote, average_cost, min_profit, fee_per_share

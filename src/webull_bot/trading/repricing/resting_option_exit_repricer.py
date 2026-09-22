@@ -145,7 +145,7 @@ def reprice_resting_option_exits(
                 if target is None or target == order.get("limit_price"):
                     continue
                 if cost > 0 and target < cost + (
-                    self.config.sell_fee_dollars / (quantity * 100)
+                    (self.config.option_sell_fee_per_contract * quantity) / (quantity * 100)
                 ):
                     # Never chase down below entry cost - see the
                     # matching stock-side guard in

@@ -21,7 +21,14 @@ class OptionTradingSettings(BaseSettings):
     # rarer run. Lowered to a bar an actual quick pop can realistically
     # clear, so a real gain gets locked in instead of being held out
     # for a 75% move that usually never comes before reversing.
-    option_take_profit_percent: Decimal = Field(default=Decimal("0.15"), gt=0)
+    #
+    # Lowered 0.15 -> 0.10 by explicit request ("15% gain is also a
+    # lot"), alongside the stop coming in to 0.20. On a $363 account a
+    # typical 2-contract position is ~$280, so 15% was +$42 against a
+    # 50% stop of -$140: the downside was over 3x the upside on every
+    # single trade. 10% banks +$28 against -$56, which a normal win
+    # rate can actually carry.
+    option_take_profit_percent: Decimal = Field(default=Decimal("0.10"), gt=0)
     # By request: "it doesn't buy puts while there is a dip, or a
     # call on a dip entry and quickly sell it. This should happen
     # for quick profit." Lets a CALL enter on the underlying's own
@@ -32,7 +39,17 @@ class OptionTradingSettings(BaseSettings):
     # dip/rip signals and eligibility bar, not a new speculative
     # mechanism.
     option_scalp_enabled: bool = True
-    option_stop_loss_percent: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    # Tightened 0.50 -> 0.20 by explicit request ("per contract 50%
+    # loss is too much"). The old value was not a stop so much as a
+    # catastrophe gate: on a $363 account a 2-contract $280 position
+    # losing 50% is -$140, or 38% of the whole account gone on ONE
+    # trade, and recovering that needs five 10% winners. 20% caps the
+    # same trade at -$56 (15% of the account). The tradeoff, stated
+    # honestly: option bid/ask spreads run 2-3% on their own, so a
+    # tighter stop does get shaken out by noise more often - that is
+    # accepted in exchange for never handing back a third of the
+    # account on a single position.
+    option_stop_loss_percent: Decimal = Field(default=Decimal("0.20"), gt=0, le=1)
     # By explicit request, for a one-off diagnostic: "make sure it
     # fires... no barrier, quickly sell it, and then change the option
     # strategy again." Off by default (real gates always apply) - when

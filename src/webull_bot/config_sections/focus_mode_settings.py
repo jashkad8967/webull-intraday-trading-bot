@@ -48,6 +48,14 @@ class FocusModeSettings(BaseSettings):
     # of setups, not simultaneous positions. As the account grows,
     # more of the cohort can be held at once with no change here.
     focus_cohort_size: int = Field(default=10, ge=1, le=25)
+    # How often select_focus_cohort re-checks whether MORE batch names
+    # now qualify, while the cohort sits below focus_cohort_size. Not
+    # free: the re-check runs focus_symbol_is_affordable for every
+    # batch member, which quotes contracts. Affordability moves slowly
+    # (buying power shifts as positions open/close, premiums drift), so
+    # once a cycle would spend real API budget re-asking a question
+    # whose answer rarely changes that fast.
+    focus_cohort_growth_seconds: int = Field(default=120, ge=10, le=3600)
     # By request: "only take a good batch of stocks to look out for
     # everyday." Two-stage funnel - research a batch each morning
     # (this), then pick the focus cohort out of it at the open.
@@ -209,14 +217,46 @@ class FocusModeSettings(BaseSettings):
     # when it fires it is always a genuine PROFIT exit, never a loss
     # dressed up as one.
     profit_lock_enabled: bool = True
+    # Lowered 0.10 -> 0.025, set from a measured live failure rather
+    # than from reasoning about round percentages.
+    #
+    # 2026-09-22, GME 261009C23: bought 2 at $1.40, ran to $1.46
+    # (+4.29%, +$12 open), then round-tripped to $1.37 (-$6). The lock
+    # never armed, because the peak never reached the 10% bar - so the
+    # single mechanism built to stop a winner becoming a loser sat
+    # disarmed through the entire move. An intermediate 5% would not
+    # have caught it either: the whole run was 4.29%.
+    #
+    # The arm has to sit BELOW the size of move this account actually
+    # gets, not at a round number. At 2.5% that trade arms on the way
+    # up and, with the giveback below, exits near $1.44 for roughly
+    # +$7 instead of -$6 - a $13 swing on one position.
+    #
+    # Safe to set this tight because the peak is tracked on the
+    # REALIZABLE (bid) price, not the mark, so the bid/ask spread is
+    # already priced in rather than being mistaken for a gain.
     profit_lock_arm_percent: Decimal = Field(
-        default=Decimal("0.10"), gt=0, le=10
+        default=Decimal("0.025"), gt=0, le=10
     )
     # How much of the peak gain may be handed back before the lock
-    # fires. 0.5 = give back at most half of what the position was up
-    # at its best.
+    # fires. Tightened 0.50 -> 0.35 (keep 65% of the best) for the same
+    # GME incident above: on moves this small, surrendering half the
+    # peak leaves so little that fees eat the rest.
     profit_lock_giveback_fraction: Decimal = Field(
-        default=Decimal("0.50"), gt=0, le=1
+        default=Decimal("0.35"), gt=0, le=1
+    )
+    # By explicit request ("but yeah never below 2.5%"): the hard
+    # floor on an ARMED trail. Whatever the giveback tiers compute,
+    # the exit never books less than this much gain over cost. Without
+    # it a position that armed at +2.6% could trail down to a couple
+    # of cents and still be called a PROFIT - green on paper, not
+    # worth the round trip once the per-contract fee is paid.
+    #
+    # Matches profit_lock_arm_percent on purpose: arm and floor at the
+    # same number means "the moment this is worth protecting, that is
+    # also the least it may be sold for".
+    profit_lock_min_gain_percent: Decimal = Field(
+        default=Decimal("0.025"), ge=0, le=10
     )
     # Tighter leash once the daily profit throttle has armed - the
     # day is already good, so open winners are held more defensively.

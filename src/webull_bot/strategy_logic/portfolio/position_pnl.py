@@ -11,6 +11,26 @@ def open_position_count(positions: list[dict]) -> int:
     )
 
 
+def position_exit_fee(self, position: dict) -> Decimal:
+    """What closing this position will actually cost in fees.
+
+    Stocks pay a flat per-trade regulatory pass-through. OPTIONS pay
+    PER CONTRACT (OCC clearing + ORF, plus SEC/TAF on the sell), so
+    charging them the flat stock fee under-counts by more the larger
+    the position - at 10 contracts the real cost is ~$0.55 against
+    $0.02 assumed. That gap matters beyond reporting: the same figure
+    feeds the "never price a PROFIT exit below cost + fee" guard, so
+    under-counting it books losing exits as wins.
+    """
+    if position.get("instrument_type") != "OPTION":
+        return self.config.sell_fee_dollars
+    try:
+        quantity = abs(Decimal(str(position.get("quantity", "0"))))
+    except Exception:
+        return self.config.sell_fee_dollars
+    return self.config.option_sell_fee_per_contract * quantity
+
+
 def position_unrealized_pnl(self, position: dict) -> Decimal:
     """Net of the flat sell fee this position hasn't paid yet - it's
     still open, but closing it will cost that fee, so showing the raw
@@ -25,7 +45,7 @@ def position_unrealized_pnl(self, position: dict) -> Decimal:
     reported = position.get("unrealized_profit_loss")
     if reported not in (None, ""):
         try:
-            return Decimal(str(reported)) - self.config.sell_fee_dollars
+            return Decimal(str(reported)) - position_exit_fee(self, position)
         except Exception:
             pass
     try:
@@ -43,7 +63,9 @@ def position_unrealized_pnl(self, position: dict) -> Decimal:
             if position.get("instrument_type") == "OPTION"
             else Decimal("1")
         )
-        return (price - cost) * quantity * multiplier - self.config.sell_fee_dollars
+        return (price - cost) * quantity * multiplier - position_exit_fee(
+            self, position
+        )
     except Exception:
         return Decimal("0")
 
@@ -73,7 +95,7 @@ def position_day_pnl(self, position: dict) -> Decimal:
     reported = position.get("day_profit_loss")
     if reported not in (None, ""):
         try:
-            return Decimal(str(reported)) - self.config.sell_fee_dollars
+            return Decimal(str(reported)) - position_exit_fee(self, position)
         except Exception:
             return Decimal("0")
     try:

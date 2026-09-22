@@ -634,6 +634,7 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
                 # fee, not just cost - see the guard in
                 # reprice_resting_option_exits.
                 sell_fee_dollars=Decimal("0.02"),
+                option_sell_fee_per_contract=Decimal("0.02"),
             ),
             api=FakeApi(),
             status=SimpleNamespace(
@@ -761,6 +762,7 @@ class RepriceRestingOptionExitsTests(unittest.TestCase):
                 price_sanity_cooldown_seconds=60,
                 option_take_profit_percent=Decimal("0.15"),
                 sell_fee_dollars=Decimal("0.02"),
+                option_sell_fee_per_contract=Decimal("0.02"),
             ),
             api=FakeApi(),
             status=SimpleNamespace(rekey_trade=lambda old, new: None),
@@ -1609,6 +1611,7 @@ class VolatilityScalpRepriceTests(unittest.TestCase):
             config=SimpleNamespace(
                 volatility_scalp_reprice_seconds=Decimal("1"),
                 sell_fee_dollars=Decimal("0"),
+                option_sell_fee_per_contract=Decimal("0"),
                 volatility_scalp_target_percent=Decimal("0.005"),
                 volatility_scalp_max_exit_spread_percent=Decimal("8"),
             ),

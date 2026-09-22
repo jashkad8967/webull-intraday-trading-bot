@@ -546,7 +546,7 @@ def option_decision(
     # Same flat-fee-to-per-share conversion as stock_decision, but one
     # contract represents 100 shares, so the fee is spread over
     # quantity * 100, not quantity alone.
-    fee_per_share = self.config.sell_fee_dollars / (quantity * 100)
+    fee_per_share = (self.config.option_sell_fee_per_contract * quantity) / (quantity * 100)
     if average_cost > 0 and days_to_expiration <= self.config.option_min_hold_dte:
         # Forced exit regardless of target/stop - theta/gamma accelerate
         # sharply in the final days before expiration, and holding
@@ -635,10 +635,38 @@ def _profit_lock_floor(
     if peak_price < arm_at:
         return None
     if giveback_fraction is None:
-        giveback_fraction = self.config.profit_lock_giveback_fraction
+        # By explicit request ("have the profit lock dynamic shift
+        # based on the amount of profit it is at"): give back LESS of
+        # a bigger run. A fixed fraction is wrong at both ends - it
+        # surrenders a painful share of a large winner, while on a
+        # small one it hands back so little that fees eat the rest.
+        # Tightening as the gain grows is the ratchet that stops a
+        # genuinely big move round-tripping.
+        peak_gain = (peak_price - average_cost) / average_cost
+        for threshold, tier_giveback in (
+            (Decimal("0.20"), Decimal("0.20")),  # +20% or more -> keep 80%
+            (Decimal("0.10"), Decimal("0.25")),  # +10%         -> keep 75%
+            (Decimal("0.05"), Decimal("0.30")),  # +5%          -> keep 70%
+        ):
+            if peak_gain >= threshold:
+                giveback_fraction = tier_giveback
+                break
+        else:
+            giveback_fraction = self.config.profit_lock_giveback_fraction
     floor = average_cost + (peak_price - average_cost) * (
         Decimal("1") - giveback_fraction
     )
+    # By explicit request ("but yeah never below 2.5%"): once the trail
+    # is armed the exit must never book less than this gain, whatever
+    # the giveback maths produces. Without it a position that armed at
+    # +2.6% could trail down to a few cents of profit and still call
+    # itself a PROFIT exit - technically green, but not worth the
+    # round trip once fees are paid.
+    minimum_floor = average_cost * (
+        Decimal("1") + self.config.profit_lock_min_gain_percent
+    )
+    if floor < minimum_floor:
+        floor = minimum_floor
     if floor <= average_cost + fee_per_share:
         return None
     if price > floor:
