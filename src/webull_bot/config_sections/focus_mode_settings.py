@@ -75,8 +75,31 @@ class FocusModeSettings(BaseSettings):
     # exposes no news feed - a stock gapping on real volume is gapping
     # BECAUSE of a catalyst, which is the signal the batch is trying to
     # capture.
+    #
+    # Lowered 2.0 -> 0.5 (by explicit request: "no make it 0.5").
+    # Measured live 2026-09-22 at 08:58 CT against the full candidate
+    # universe: ZERO names cleared 2%. The whole tape topped out at
+    # CRM 1.86%, GOOGL 1.74%, NFLX 1.52%. A threshold nothing reaches
+    # is not a quality bar, it is an off switch - and it is why 09-19,
+    # 09-21 and 09-22 produced no option orders at all while 09-16
+    # produced 247. At 0.5 those three plus AAPL and DIA qualify, which
+    # is the 5-10 cohort that was asked for.
+    #
+    # The tradeoff, recorded honestly: a half-percent move is close to
+    # noise, and a long option bleeds premium on a name that does not
+    # go anywhere, so this admits setups that will not follow through.
+    # That is an accepted cost of having a cohort at all on a quiet
+    # tape rather than sitting out the session.
+    #
+    # This threshold is also doing less work than it looks like it is.
+    # Under the single-symbol design it chose the ONE name the whole
+    # account committed to, so it had to be strict. With a cohort it
+    # is a universe filter feeding ten slots, and the real entry
+    # decision belongs to the direction signal plus
+    # pressure_supports_entry, which are checked per contract against
+    # a live quote.
     daily_batch_min_gap_percent: Decimal = Field(
-        default=Decimal("2"), gt=0, le=100
+        default=Decimal("0.5"), gt=0, le=100
     )
     # By explicit request, after two live incidents (GRML at 286.7%
     # gap, GRAL) both locked as the focus symbol with no real options
