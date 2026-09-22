@@ -65,10 +65,24 @@ def refresh_daily_batch(self, moment: datetime) -> None:
     is real. This stage gates on the gap, which IS meaningful
     pre-market.
     """
-    if self.daily_batch_date == moment.date():
-        return
     if not self.config.focus_mode_enabled:
         return
+    if self.daily_batch_date == moment.date() and moment >= self.session_moment(
+        moment, self.config.focus_lock_time
+    ):
+        # Settled: the cohort locks off this batch, so once the lock
+        # has passed there is nothing left for a rebuild to change.
+        return
+    # Deliberately KEEPS rebuilding between daily_batch_refresh_time
+    # and focus_lock_time instead of freezing on the first non-empty
+    # result. Live, 2026-09-22: the 07:45 CT pass saw only 11
+    # candidates and just one cleared the gap gate, so the cohort
+    # would have locked a single name - exactly the single-symbol
+    # behaviour the cohort exists to replace. The pool is thin that
+    # early because the sources it unions are still pre-market; by the
+    # bell the same screen sees 65-84 candidates. Freezing at the
+    # first success meant the cohort could never be richer than the
+    # thinnest reading of the morning.
     if self.daily_batch_first_attempt_date != moment.date():
         # A new day - a leftover attempt timestamp from a prior day's
         # give-up would otherwise make time.monotonic()'s elapsed
@@ -159,7 +173,19 @@ def refresh_daily_batch(self, moment: datetime) -> None:
         )
     scored.sort(key=lambda row: row[0], reverse=True)
     selected = scored[: self.config.daily_batch_size]
-    self.daily_batch = [symbol for _, symbol, _ in selected]
+    fresh = [symbol for _, symbol, _ in selected]
+    # Union with what already qualified earlier this morning rather
+    # than replacing it. A rebuild reads a live tape, so a name whose
+    # gap has since faded would otherwise be dropped - but the gap is
+    # a morning CATALYST signal, and fading does not undo the
+    # catalyst. Equally important, a thin later pass must never be
+    # able to wipe a batch that was already good. Everything here is
+    # re-gated on price/volume/affordability at lock time anyway, so
+    # carrying a name forward costs nothing but keeps the cohort from
+    # shrinking on tape noise.
+    if fresh:
+        carried = [symbol for symbol in self.daily_batch if symbol not in fresh]
+        self.daily_batch = (fresh + carried)[: self.config.daily_batch_size]
     if not self.daily_batch:
         # Live incident: give-up was originally tied to focus_lock_
         # time (09:45) directly against wall-clock `moment`. That
@@ -222,6 +248,11 @@ def refresh_daily_batch(self, moment: datetime) -> None:
         return
     self.daily_batch_date = moment.date()
     self.daily_batch_first_attempt_at = None
+    if self.daily_batch == self.daily_batch_logged:
+        # Rebuilds run every cycle until the lock; only announce a
+        # batch that actually changed.
+        return
+    self.daily_batch_logged = list(self.daily_batch)
     log.info(
         "BATCH  | %s of %s candidates | %s",
         len(self.daily_batch),
