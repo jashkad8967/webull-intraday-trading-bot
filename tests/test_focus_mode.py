@@ -54,6 +54,9 @@ def focus_config(**overrides):
         option_max_moneyness_percent=Decimal("0.15"),
         option_eod_close_time="15:50",
         option_min_hold_dte=7,
+        option_stale_exit_enabled=False,
+        option_stale_exit_minutes=45,
+        option_stale_exit_max_loss_percent=Decimal("0.08"),
         option_discovery_seconds=300,
         time_aware_stop_enabled=False,
         time_aware_stop_widen_seconds=60,
@@ -440,6 +443,75 @@ class ProfitLockTrailTests(unittest.TestCase):
 
     def test_legacy_callers_without_a_peak_are_unaffected(self):
         decision = self.decide(price="1.05", peak=None)
+        self.assertEqual(decision.action, "HOLD")
+
+
+class StaleOptionExitTests(unittest.TestCase):
+    """By explicit request, after three positions sat open over two
+    hours going nowhere: "if something is not going for much profit at
+    all then make it sell for even cents" / "now it is in a loss, why
+    didn't it sell".
+
+    Live 2026-09-22: MARA (-8.3%), SOFI (-3.5%) and NFLX (-1.0%) all
+    opened at 10:46 and were still open past 12:52. The target needs
+    +10%, the trail must arm at +2.5%, the stop needs -20%, and
+    boost_stalled_positions never sells at a loss - so a trade that
+    merely does not work hits nothing at all.
+    """
+
+    def decide(self, price, cost="1.00", seconds=None, **overrides):
+        overrides.setdefault("option_stale_exit_enabled", True)
+        overrides.setdefault("option_stale_exit_minutes", 45)
+        overrides.setdefault(
+            "option_stale_exit_max_loss_percent", Decimal("0.08")
+        )
+        strategy = SimpleNamespace(config=focus_config(**overrides))
+        return option_decision(
+            strategy,
+            Decimal(price),
+            1,
+            Decimal(cost),
+            30,
+            seconds_since_entry=seconds,
+        )
+
+    def test_a_stalled_small_loser_is_closed_to_free_the_capital(self):
+        # -3.5%, the live SOFI case: inside the stop, past the timer.
+        decision = self.decide("0.965", seconds=46 * 60)
+        self.assertEqual(decision.action, "LOSS")
+        self.assertIn("stale position", decision.reason)
+
+    def test_a_stalled_tiny_winner_is_taken_rather_than_held(self):
+        decision = self.decide("1.01", seconds=46 * 60)
+        self.assertEqual(decision.action, "PROFIT")
+        self.assertIn("stale position", decision.reason)
+
+    def test_it_does_not_fire_before_the_timer(self):
+        decision = self.decide("0.97", seconds=10 * 60)
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_a_real_loser_is_left_to_the_stop_not_dumped_on_a_timer(self):
+        # -15% is past option_stale_exit_max_loss_percent (8%): this is
+        # not a stalled trade, it is a losing one, and the -20% stop
+        # owns it. Without that bound the timer would dump every loser
+        # at whatever the market offered the instant it expired.
+        decision = self.decide("0.85", seconds=90 * 60)
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_a_working_trade_is_never_cut_short_by_the_clock(self):
+        """The timer sits BELOW the target and trail on purpose."""
+        decision = self.decide("1.25", seconds=90 * 60)
+        self.assertEqual(decision.action, "PROFIT")
+        self.assertIn("profit target", decision.reason)
+
+    def test_disabled_leaves_the_old_behaviour_untouched(self):
+        decision = self.decide(
+            "0.97", seconds=90 * 60, option_stale_exit_enabled=False
+        )
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_no_entry_timestamp_never_triggers_it(self):
+        decision = self.decide("0.97", seconds=None)
         self.assertEqual(decision.action, "HOLD")
 
 

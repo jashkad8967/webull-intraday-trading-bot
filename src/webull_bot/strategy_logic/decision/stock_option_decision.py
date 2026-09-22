@@ -599,6 +599,52 @@ def option_decision(
         return Decision("PROFIT", "profit-lock trail hit", lock)
     if average_cost > 0 and price >= target:
         return Decision("PROFIT", "option profit target reached", target)
+    # By explicit request, after three positions sat open for over two
+    # hours going nowhere: "if something is not going for much profit
+    # at all then make it sell for even cents" / "now it is in a loss,
+    # why didn't it sell".
+    #
+    # Nothing in the ladder above can act on a trade that simply does
+    # not work. The target needs +10%, the trail must first arm at
+    # +2.5%, the stop needs -20%, and boost_stalled_positions is
+    # explicitly "never sells at a loss". A position that drifts a few
+    # percent negative and stalls there hits NONE of them - live
+    # 2026-09-22 MARA (-8.3%), SOFI (-3.5%) and NFLX (-1.0%) were all
+    # opened at 10:46 and still open past 12:52, holding capital that
+    # could have funded setups that did work.
+    #
+    # So: past option_stale_exit_minutes without ever arming the
+    # trail, close it. Deliberately placed BELOW the trail and target
+    # so a position that is genuinely working is never cut short by
+    # the clock - this only reaches trades that went nowhere.
+    #
+    # Bounded by option_stale_exit_max_loss_percent: beyond that this
+    # is not a stalled trade but a losing one, and the real stop owns
+    # it. Without that bound this would dump every loser at whatever
+    # the market offered the moment the timer expired.
+    if (
+        average_cost > 0
+        and self.config.option_stale_exit_enabled
+        and seconds_since_entry is not None
+        and seconds_since_entry
+        >= self.config.option_stale_exit_minutes * 60
+    ):
+        loss_fraction = (average_cost - price) / average_cost
+        if loss_fraction <= self.config.option_stale_exit_max_loss_percent:
+            minutes = int(seconds_since_entry // 60)
+            if price > average_cost + fee_per_share:
+                return Decision(
+                    "PROFIT",
+                    f"stale position - {minutes}m without arming the "
+                    "trail, taking the small gain",
+                    price,
+                )
+            return Decision(
+                "LOSS",
+                f"stale position - {minutes}m going nowhere, freeing "
+                "the capital",
+                price,
+            )
     return Decision("HOLD", "option waiting for profit", target)
 
 
