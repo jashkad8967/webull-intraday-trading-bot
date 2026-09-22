@@ -814,6 +814,10 @@ class AutoTrader:
         # re-picking.
         self.daily_batch: list[str] = []
         self.daily_batch_date = None
+        # Last batch actually announced - the batch rebuilds every cycle
+        # until the cohort locks, so this keeps an unchanged result
+        # from re-logging on each pass.
+        self.daily_batch_logged: list[str] = []
         # Live incident: the batch's give-up used to compare `moment`
         # directly against focus_lock_time, which broke on any
         # restart landing after 09:45 (every mid-session redeploy) -

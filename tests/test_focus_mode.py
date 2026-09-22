@@ -403,6 +403,7 @@ class EmptyResultRetryTests(unittest.TestCase):
             config=focus_config(option_eod_close_time="15:50"),
             daily_batch=[],
             daily_batch_date=None,
+            daily_batch_logged=[],
             daily_batch_first_attempt_at=None,
             daily_batch_first_attempt_date=None,
             daily_batch_logged_empty_date=None,
@@ -523,6 +524,60 @@ class EmptyResultRetryTests(unittest.TestCase):
         bot = self.bot(self.moment(15, 55))
         bot.refresh_daily_batch(self.moment(15, 55))
         self.assertEqual(bot.daily_batch_date, self.moment(15, 55).date())
+
+    def test_the_batch_keeps_rebuilding_until_the_cohort_locks(self):
+        """Live, 2026-09-22: the 07:45 CT pass saw 11 candidates and
+        exactly one cleared, so the cohort would have locked a single
+        name - the behaviour the cohort exists to replace. The pool is
+        thin that early because its sources are still pre-market; by
+        the bell the same screen sees 65-84. Freezing on the first
+        non-empty result capped the cohort at the morning's thinnest
+        reading.
+        """
+        thin = {"AAPL": {"volume": 5_000_000, "change_ratio": 0.03, "spread_percent": "0.1"}}
+        bot = self.bot(self.moment(8, 45), metrics=thin)
+        bot.strategy.prices = {"AAPL": Decimal("100"), "MSFT": Decimal("100")}
+        bot.seed_popular_symbols = {"AAPL", "MSFT"}
+        bot.refresh_daily_batch(self.moment(8, 45))
+        self.assertEqual(bot.daily_batch, ["AAPL"])
+        # Post-bell: MSFT now qualifies too and must be picked up.
+        bot.strategy.metrics["MSFT"] = {
+            "volume": 9_000_000,
+            "change_ratio": 0.05,
+            "spread_percent": "0.1",
+        }
+        bot.refresh_daily_batch(self.moment(9, 35))
+        self.assertEqual(sorted(bot.daily_batch), ["AAPL", "MSFT"])
+
+    def test_a_later_thin_pass_never_wipes_an_already_good_batch(self):
+        metrics = {
+            "AAPL": {"volume": 5_000_000, "change_ratio": 0.03, "spread_percent": "0.1"}
+        }
+        bot = self.bot(self.moment(8, 45), metrics=metrics)
+        bot.strategy.prices = {"AAPL": Decimal("100")}
+        bot.seed_popular_symbols = {"AAPL"}
+        bot.refresh_daily_batch(self.moment(8, 45))
+        self.assertEqual(bot.daily_batch, ["AAPL"])
+        # Gap fades - a catalyst that already fired is not undone.
+        bot.strategy.metrics["AAPL"]["change_ratio"] = 0.001
+        bot.refresh_daily_batch(self.moment(9, 30))
+        self.assertEqual(bot.daily_batch, ["AAPL"])
+
+    def test_the_batch_stops_rebuilding_once_the_lock_has_passed(self):
+        metrics = {
+            "AAPL": {"volume": 5_000_000, "change_ratio": 0.03, "spread_percent": "0.1"}
+        }
+        bot = self.bot(self.moment(8, 45), metrics=metrics)
+        bot.strategy.prices = {"AAPL": Decimal("100"), "MSFT": Decimal("100")}
+        bot.seed_popular_symbols = {"AAPL", "MSFT"}
+        bot.refresh_daily_batch(self.moment(8, 45))
+        bot.strategy.metrics["MSFT"] = {
+            "volume": 9_000_000,
+            "change_ratio": 0.05,
+            "spread_percent": "0.1",
+        }
+        bot.refresh_daily_batch(self.moment(10, 30))
+        self.assertEqual(bot.daily_batch, ["AAPL"])
 
     def test_a_new_day_clears_the_previous_session_s_disqualifications(self):
         """Disqualifications are scoped to one session by design, but
