@@ -56,6 +56,59 @@ class StrategySelectionTests(StrategyConfigMixin, unittest.TestCase):
         )
         self.assertIn("S49", batch)
 
+    def test_force_include_survives_a_batch_size_cap_smaller_than_itself(self):
+        """The live 2026-09-22 starvation bug, in one assertion.
+
+        focus_mode_stock_batch_size caps the batch at 20 while stock
+        entries are suspended, and that cap silently truncated
+        force_include - even though its own config comment promised
+        those names were "guaranteed into every scan regardless of
+        this cap". The daily batch can only score a symbol the
+        scanner has quoted, so the candidate pool went unquoted:
+        selection saw 13 names out of 222 and reported "no candidate
+        cleared" at a 2% gap AND at 0.5%. No threshold could fix that,
+        because the data was never collected.
+        """
+        strategy = TradingStrategy(self.config())
+        symbols = [f"S{i}" for i in range(500)]
+        strategy.prices.update({s: Decimal("10") for s in symbols})
+        must_quote = {f"S{i}" for i in range(400, 460)}  # 60 names, cap is 20
+        batch, _ = strategy.prioritized_stock_batch(
+            symbols,
+            0,
+            [],
+            lambda symbol: None,
+            force_include=must_quote,
+            max_size=20,
+        )
+        missing = must_quote - set(batch)
+        self.assertEqual(
+            missing,
+            set(),
+            "every force_include symbol must be quoted even when it "
+            "outnumbers the batch cap - otherwise selection is scoring "
+            "names it never fetched data for",
+        )
+
+    def test_the_batch_cap_still_bounds_everything_not_guaranteed(self):
+        """The cap must keep doing its real job - bounding per-cycle
+        quote cost - for names that are not force-included.
+        """
+        strategy = TradingStrategy(self.config())
+        symbols = [f"S{i}" for i in range(500)]
+        strategy.prices.update({s: Decimal("10") for s in symbols})
+        batch, _ = strategy.prioritized_stock_batch(
+            symbols,
+            0,
+            [],
+            lambda symbol: None,
+            force_include={"S400", "S401"},
+            max_size=20,
+        )
+        self.assertLessEqual(len(batch), 20)
+        self.assertIn("S400", batch)
+        self.assertIn("S401", batch)
+
     def test_force_include_does_not_duplicate_an_already_held_symbol(self):
         strategy = TradingStrategy(self.config())
         symbols = ["AAPL"]
