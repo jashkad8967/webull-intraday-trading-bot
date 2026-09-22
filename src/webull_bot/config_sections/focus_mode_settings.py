@@ -278,8 +278,27 @@ class FocusModeSettings(BaseSettings):
     pressure_enabled: bool = True
     # How strongly one side must dominate before it can trigger an
     # entry - a call needs >= this, a put needs <= its negative.
+    #
+    # Lowered 0.15 -> 0.05 on measured evidence. Conviction is
+    # clamp(volume_delta_latest/volume_delta_ema - 1, 0, 1), so 0.15
+    # demanded volume 15% ABOVE its own rolling average on every
+    # single entry. On an ordinary tape that ratio sits near 1.0,
+    # conviction rounds to zero, and the gate vetoes everything no
+    # matter how clean the direction read is.
+    #
+    # Live 2026-09-22, cohort of 10 with warm signals showing CALL=2
+    # PUT=4: the rejection counter read "buy/sell pressure does not
+    # support this direction=20" cycle after cycle - every candidate
+    # contract, every cycle, blocked on this one gate alone. It was
+    # also the sole blocker on NVDA earlier that morning (18 of 20).
+    #
+    # 0.05 still requires genuine above-average participation AND the
+    # right direction - it keeps the thing this gate exists for ("a
+    # dip that nobody is buying is not a dip worth buying a call
+    # into") while setting the bar at a level a real intraday move
+    # actually reaches.
     pressure_min_for_entry: Decimal = Field(
-        default=Decimal("0.15"), ge=0, le=1
+        default=Decimal("0.05"), ge=0, le=1
     )
     # Opposing pressure that reads as momentum exhaustion on an open
     # position, joining the existing rsi_divergence and resistance
