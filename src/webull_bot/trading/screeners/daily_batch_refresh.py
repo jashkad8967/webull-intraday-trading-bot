@@ -6,6 +6,33 @@ from decimal import Decimal
 log = logging.getLogger("webull-bot")
 
 
+def daily_batch_candidates(self) -> set[str]:
+    """The pool refresh_daily_batch scores - every already-wired
+    morning source, unioned, then narrowed to established names.
+
+    Extracted so the scan loop can force-quote exactly this set (see
+    stock_scan_batch). The batch can only score a symbol the scanner
+    has actually quoted, so any name missing from the scan is
+    invisible to selection no matter how well it is moving - keeping
+    the two definitions in one place is what stops them drifting
+    apart again.
+    """
+    candidates = (
+        set(self.premarket_gainers)
+        | set(self.agent_predicted_gainers)
+        | set(self.seed_popular_symbols)
+        | set(self.agent_popular_symbols)
+    )
+    for bucket in self.market_pulse_cache.values():
+        for row in bucket:
+            symbol = str(row.get("symbol", "")).upper()
+            if symbol:
+                candidates.add(symbol)
+    if self.config.daily_batch_require_established_symbols:
+        candidates &= set(self.config.option_candidates())
+    return candidates
+
+
 def refresh_daily_batch(self, moment: datetime) -> None:
     """By explicit request: "only take a good batch of stocks to look
     out for everyday, do online research for that."
@@ -127,19 +154,7 @@ def refresh_daily_batch(self, moment: datetime) -> None:
     # until focus_lock_time gives the scan loop time to warm up.
     # Every already-wired morning source, unioned. Each of these is
     # refreshed by its own once-daily screener before this runs.
-    candidates = (
-        set(self.premarket_gainers)
-        | set(self.agent_predicted_gainers)
-        | set(self.seed_popular_symbols)
-        | set(self.agent_popular_symbols)
-    )
-    for bucket in self.market_pulse_cache.values():
-        for row in bucket:
-            symbol = str(row.get("symbol", "")).upper()
-            if symbol:
-                candidates.add(symbol)
-    if self.config.daily_batch_require_established_symbols:
-        candidates &= set(self.config.option_candidates())
+    candidates = daily_batch_candidates(self)
     scored: list[tuple[float, str, dict]] = []
     for symbol in candidates:
         metrics = self.strategy.metrics.get(symbol)

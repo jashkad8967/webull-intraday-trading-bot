@@ -236,7 +236,23 @@ def prioritized_stock_batch(
     # the same top-ranked names each cycle.
     explore_floor = max(1, size - popular_count - penny_count)
     priority = list(dict.fromkeys(held + popular_selected + penny_selected))
-    priority = priority[: size - explore_floor]
+    # held (open positions + force_include) is NOT subject to the
+    # batch-size truncation below. Live incident 2026-09-22: focus
+    # mode caps the batch at focus_mode_stock_batch_size (20) while
+    # stock entries are suspended, and its config comment states the
+    # focus names are "guaranteed into every scan regardless of this
+    # cap - see prioritized_stock_batch's force_include". They were
+    # not: this slice cut them like anything else. The daily batch can
+    # only score a symbol the scanner has quoted, so the candidate
+    # pool went unquoted and selection saw 13 names out of 222 - no
+    # threshold could fix that, because the data was never collected.
+    # Truncating only the ranked/exploratory remainder keeps the cap
+    # doing its real job (bounding per-cycle quote cost) without
+    # silently starving the pipeline it exists to serve.
+    guaranteed = [symbol for symbol in priority if symbol in set(held)]
+    discretionary = [symbol for symbol in priority if symbol not in set(held)]
+    room = max(0, size - explore_floor - len(guaranteed))
+    priority = guaranteed + discretionary[:room]
     # Request exactly the open exploration slots, skipping symbols already
     # in the priority slice so exploration always keeps paging forward
     # through fresh names instead of re-picking (and then discarding)
@@ -251,7 +267,13 @@ def prioritized_stock_batch(
         if probe and probe[0] not in priority_set:
             exploration.append(probe[0])
     selected = list(dict.fromkeys(priority + exploration))
-    selected = selected[:size]
+    # Same reasoning as the priority slice above: the final cut must
+    # not drop a guaranteed name either, or the batch cap silently
+    # un-guarantees what force_include promised.
+    held_set_for_cut = set(held)
+    required = [symbol for symbol in selected if symbol in held_set_for_cut]
+    optional = [symbol for symbol in selected if symbol not in held_set_for_cut]
+    selected = required + optional[: max(0, size - len(required))]
     self.selection_buckets = {}
     held_set = set(held)
     popular_set = set(popular_selected)

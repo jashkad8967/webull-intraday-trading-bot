@@ -2,10 +2,36 @@
 import time
 from decimal import Decimal
 
+from webull_bot.trading.screeners.daily_batch_refresh import daily_batch_candidates
 from webull_bot.trading.screeners.stock_scan_quotes import _fetch_stock_scan_quotes
 from webull_bot.webull_api import WebullAPI
 
 log = logging.getLogger("webull-bot")
+
+
+def _focus_scan_force_include(self) -> set[str] | None:
+    """Symbols that must be quoted every cycle while focus mode runs.
+
+    The locked cohort (its direction EMA gates every option entry, so
+    a stale quote directly delays detecting a real cross) PLUS the
+    daily-batch candidate pool.
+
+    The candidate pool is the part that was missing, and it made the
+    whole funnel unfillable. refresh_daily_batch can only score a
+    symbol that already has metrics and a price, and those only come
+    from this scan - but focus mode caps the batch at
+    focus_mode_stock_batch_size (20) out of a universe in the
+    thousands, so a given candidate was re-quoted roughly once every
+    ~86 cycles. Measured live 2026-09-22: 13 of 222 candidates had
+    data, and the batch kept reporting "no candidate cleared" at a 2%
+    gap AND at 0.5% - not because nothing was moving, but because
+    almost nothing was being looked at.
+    """
+    if not self.config.focus_mode_enabled:
+        return None
+    force = set(self.focus_cohort)
+    force |= daily_batch_candidates(self)
+    return force or None
 
 
 def _prepare_stock_scan_batch(
@@ -229,7 +255,7 @@ def _prepare_stock_scan_batch(
             positions,
             self.agent_assessment,
             scan_watch_symbols,
-            set(self.focus_cohort) if self.focus_cohort else None,
+            _focus_scan_force_include(self),
             self.config.focus_mode_stock_batch_size
             if focus_entries_suspended
             else None,
