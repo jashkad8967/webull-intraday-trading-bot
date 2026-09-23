@@ -85,6 +85,29 @@ def _cheapest_affordable(
     slice. Returns (True, price) for the first contract that sizes to
     at least 1 contract at the given buying power, else (False,
     cheapest price seen) for diagnostics.
+
+    "Affordable" here means affordable AND actually enterable. Live
+    2026-09-23: a 10-name cohort locked, 8 of those names produced
+    ZERO entries all session, and the gate counters showed "sizing
+    produced zero contracts=9" and "delta out of range=9" every cycle
+    - the same wall from two sides. Probing all 6717 discovered
+    contracts against the real gates showed why. On a $247 account
+    the per-entry cap is $98.92, i.e. $0.99 of premium; AAPL's
+    cheapest contract inside the delta window cost $2.00, NVDA's and
+    AMZN's $1.85, PLTR's $2.85, AVGO's $3.10, MRNA's $5.40. The
+    contracts those names DID have under $0.99 carried delta 0.08-
+    0.16 - far-OTM lottery tickets that option_delta_ok correctly
+    rejects. So each name passed this check on a contract that could
+    never clear entry, locked into the cohort, and then died at the
+    delta gate on every single attempt.
+
+    Checking price alone answers "can the account buy something",
+    which is not the question. The question is "can the account buy
+    something it is allowed to enter", so this applies the same
+    option_delta_ok filter the entry path applies. Names whose only
+    affordable strikes are lottery tickets are now correctly reported
+    unaffordable, and the cohort fills with names that can actually
+    trade instead of names that merely quote.
     """
     if not contracts:
         return False, None
@@ -107,6 +130,8 @@ def _cheapest_affordable(
         except Exception:
             continue
         if limit_price is None:
+            continue
+        if not self.strategy.option_delta_ok(self.api.option_delta(quote)):
             continue
         if cheapest is None or limit_price < cheapest:
             cheapest = limit_price
@@ -488,10 +513,21 @@ def _check_focus_symbol_affordable(self, underlying: str) -> None:
     if any(
         position.get("instrument_type") == "OPTION"
         for position in (self.cached_positions or [])
-    ):
+    ) and _could_afford_when_flat(self, cheapest):
         # Capital is deployed, not missing. Deliberately NOT memoised
         # as checked, so this is re-evaluated for real once positions
         # close and the money comes back.
+        #
+        # Gated on _could_afford_when_flat because "deployed" is only
+        # the right reading when the shortfall really is transient.
+        # Live 2026-09-23: one SOFI contract was open, so this branch
+        # shielded EVERY unaffordable cohort member from being
+        # dropped - including AAPL, AVGO, MRNA and PLTR, whose
+        # cheapest in-delta contracts ($2.00-$5.40) the account could
+        # not have bought with the position closed and every dollar
+        # free. They sat in the cohort taking up slots and rejecting
+        # on every cycle. A name out of reach at FULL capital is out
+        # of reach, position or no position.
         return
     self.focus_symbol_affordability_checked.add(underlying)
     log.warning(
@@ -502,6 +538,25 @@ def _check_focus_symbol_affordable(self, underlying: str) -> None:
         buying_power,
     )
     _disqualify_from_cohort(self, underlying)
+
+
+def _could_afford_when_flat(self, cheapest: Decimal | None) -> bool:
+    """Would this name be affordable with every position closed and
+    the whole account free? Decides whether an unaffordable reading
+    taken while capital is deployed is transient (wait for the money
+    to come back) or structural (drop it now).
+
+    Unknown account value or unknown price answers True - the caller
+    then takes the conservative path and keeps the symbol, same as
+    every other best-effort check here.
+    """
+    if cheapest is None:
+        return True
+    account_value = self.cached_account_value
+    if account_value is None or account_value <= 0:
+        return True
+    ceiling = account_value * self.config.option_capital_fraction
+    return cheapest * 100 <= ceiling
 
 
 def discover_option_contracts(self) -> None:
