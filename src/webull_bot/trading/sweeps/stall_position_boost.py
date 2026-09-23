@@ -128,14 +128,30 @@ def boost_stalled_positions(
                 )
                 if sell_price is None:
                     continue
-                order_id = self.api.place_option(
-                    contract,
-                    "SELL",
-                    quantity,
-                    sell_price,
-                    "SELL_TO_CLOSE",
-                )
-                self.pending_option_exits.add(symbol)
+                # Claimed as LATE as possible - right before the
+                # irreversible call, after every early-return check has
+                # passed. This sweep runs on the scan thread while the
+                # 0.5s protection thread evaluates the same contract's
+                # exit, and a bare `not in pending_option_exits` test is
+                # check-then-act across a broker round-trip, so both can
+                # pass and place two SELLs for one position. Claiming
+                # here also means no early return needs to hand the
+                # claim back. See _claim_option_exit.
+                if not self._claim_option_exit(symbol):
+                    continue
+                try:
+                    order_id = self.api.place_option(
+                        contract,
+                        "SELL",
+                        quantity,
+                        sell_price,
+                        "SELL_TO_CLOSE",
+                    )
+                except Exception:
+                    # Placement failed - release, or this contract is
+                    # locked out of every future exit this session.
+                    self._release_option_exit(symbol)
+                    raise
                 pnl = self.record_realized_exit(average_cost, sell_price, quantity, multiplier=100)
                 self.record_trade(
                     key, order_id, "PROFIT", sell_price, pnl=pnl,

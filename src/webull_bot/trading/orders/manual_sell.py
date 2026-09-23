@@ -135,14 +135,28 @@ def _manual_sell(
         sell_price = self.api.quote_ask(quote) or self.api.option_limit_price(
             quote, "SELL"
         )
-        order_id = self.api.place_option(
-            contract,
-            "SELL",
-            quantity,
-            sell_price,
-            "SELL_TO_CLOSE",
-        )
-        self.pending_option_exits.add(symbol)
+        # Claimed immediately before the irreversible call. The
+        # dashboard now dispatches on the 0.5s protection thread, so
+        # this races the same contract's automated exit, and a bare
+        # membership test is check-then-act across a broker round-trip.
+        # See _claim_option_exit.
+        if not self._claim_option_exit(symbol):
+            log.info(
+                "CMD    | manual sell skipped | %-8s | exit already pending",
+                symbol,
+            )
+            return
+        try:
+            order_id = self.api.place_option(
+                contract,
+                "SELL",
+                quantity,
+                sell_price,
+                "SELL_TO_CLOSE",
+            )
+        except Exception:
+            self._release_option_exit(symbol)
+            raise
         pnl = self.record_realized_exit(cost, sell_price, quantity, multiplier=100)
         self.record_trade(
             f"OPTION:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl,

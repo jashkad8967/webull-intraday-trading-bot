@@ -180,6 +180,13 @@ class FocusModeIntegrationTestCase(unittest.TestCase):
 
         bot._evaluate_option_entry = _evaluate_option_entry.__get__(bot)
         bot._evaluate_option_exit = _evaluate_option_exit.__get__(bot)
+        from webull_bot.trading.orders.option_exit_claim import (
+            _claim_option_exit,
+            _release_option_exit,
+        )
+
+        bot._claim_option_exit = _claim_option_exit.__get__(bot)
+        bot._release_option_exit = _release_option_exit.__get__(bot)
         return bot, placed_orders
 
     def _quote(self, bid, ask):

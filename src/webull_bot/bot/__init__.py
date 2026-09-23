@@ -113,6 +113,10 @@ from webull_bot.trading.orders.iceberg_order_processing import (
     process_iceberg_orders,
 )
 from webull_bot.trading.orders.locks import _rekey_working_order
+from webull_bot.trading.orders.option_exit_claim import (
+    _claim_option_exit,
+    _release_option_exit,
+)
 from webull_bot.trading.orders.manual_buy import _manual_buy
 from webull_bot.trading.orders.manual_cancel_order import _manual_cancel_order
 from webull_bot.trading.orders.manual_sell import _manual_sell
@@ -428,6 +432,8 @@ class AutoTrader:
     # Manual dashboard buy/sell command execution - moved out to
     # trading/orders/.
     _manual_sell = _manual_sell
+    _claim_option_exit = _claim_option_exit
+    _release_option_exit = _release_option_exit
     _manual_buy = _manual_buy
     # Batched-quote helpers used across repricers and stall detection -
     # moved out to trading/quoting/.
