@@ -323,7 +323,24 @@ def ensure_focus_cohort_contracts(self) -> None:
     if not self.config.focus_mode_enabled or not self.focus_cohort:
         return
     _prune_stale_contracts(self)
+    # Chain discovery is bounded per cycle, for the same reason
+    # select_focus_cohort bounds it: _wide_focus_contracts takes ~30
+    # SECONDS per underlying, and this runs inline in the main loop.
+    # Live 2026-09-23 with a 10-name cohort that meant up to 5 minutes
+    # inside a single cycle - consecutive SCAN lines went 08:56:53 ->
+    # 09:02:25 - which is catastrophic for everything downstream that
+    # is measured per cycle.
+    #
+    # Already-discovered members are still visited every cycle: that
+    # path only re-checks affordability and costs nothing. Only NEW
+    # discovery is rationed, so a freshly locked cohort fills in over
+    # the next minute or two instead of stalling the loop outright.
+    budget = self.config.focus_lock_discovery_per_pass
     for underlying in list(self.focus_cohort):
+        if underlying not in self.focus_wide_discovered:
+            if budget <= 0:
+                continue
+            budget -= 1
         _ensure_one_focus_symbol_contracts(self, underlying)
 
 
