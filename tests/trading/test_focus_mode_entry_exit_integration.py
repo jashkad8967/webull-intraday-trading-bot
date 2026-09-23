@@ -14,6 +14,7 @@ a time.
 """
 import unittest
 from collections import defaultdict, deque
+from datetime import datetime, timezone as dt_timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -34,6 +35,36 @@ def _contract(underlying, symbol, option_type, strike="170", dte=20):
         "expiration_date": (date.today() + timedelta(days=dte)).isoformat(),
         "tradable_status": "OC",
     }
+
+
+class FakeOpenTimes:
+    """In-memory stand-in for PositionOpenTimeStore.
+
+    Matches the contract the exit path depends on: note_open is
+    IDEMPOTENT (a key already recorded keeps its original timestamp),
+    which is what makes a position's age resume across a restart
+    instead of resetting to zero.
+    """
+
+    def __init__(self, opened=None):
+        self.opened_at = dict(opened or {})
+
+    def note_open(self, key):
+        if key not in self.opened_at:
+            self.opened_at[key] = datetime.now(dt_timezone.utc)
+        return self.opened_at[key]
+
+    def opened(self, key):
+        return self.opened_at.get(key)
+
+    def forget(self, key):
+        self.opened_at.pop(key, None)
+
+    def opened_before_today(self, key):
+        moment = self.opened_at.get(key)
+        if moment is None:
+            return False
+        return moment.date() < datetime.now(dt_timezone.utc).date()
 
 
 class FocusModeIntegrationTestCase(unittest.TestCase):
@@ -119,6 +150,8 @@ class FocusModeIntegrationTestCase(unittest.TestCase):
             trade_times=defaultdict(deque),
             price_sanity_rejected_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
+            timezone=dt_timezone.utc,
             consecutive_exit_failures={},
             manual_touch_at={},
             submitted_order_ids_today=set(),

@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 from webull_bot.bot import AutoTrader
 from webull_bot.strategy import TradingStrategy
+from fake_open_times import FakeOpenTimes
 
 
 SCENARIOS: list = []
@@ -441,6 +442,7 @@ def idle_cash_ramp_reaches_a_relaxed_entry_and_resets_on_a_fill():
     fake_bot.status = SimpleNamespace(record_trade=lambda *a, **k: None)
     fake_bot.recent_stop_losses = deque()
     fake_bot.position_opened_at = {}
+    fake_bot.position_open_times = FakeOpenTimes()
     fake_bot.symbol_pnl_history = defaultdict(deque)
     fake_bot.consecutive_exit_failures = defaultdict(int)
     fake_bot.submitted_order_ids_today = set()
@@ -473,6 +475,7 @@ def daic_style_repeated_stop_loss_reentry_is_blocked():
         recent_stop_losses=deque(),
         last_volatility_stop_loss_at={},
         position_opened_at={},
+            position_open_times=FakeOpenTimes(),
         symbol_pnl_history=defaultdict(deque),
         submitted_order_ids_today=set(),
         config=config,

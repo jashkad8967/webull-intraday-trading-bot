@@ -32,6 +32,9 @@ def _position_protection_loop(self) -> None:
     """
     while True:
         started = time.monotonic()
+        # Heartbeat for the watchdog - stamped BEFORE the work, so a
+        # call that wedges inside this try block stops refreshing it.
+        self.protection_loop_ticked_at = started
         try:
             # By request: "the manual sell button or cancel button or
             # buy buttons are very slow and not working properly, they

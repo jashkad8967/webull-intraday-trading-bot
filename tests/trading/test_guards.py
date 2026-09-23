@@ -6,6 +6,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from webull_bot.strategy import TradingStrategy
+from fake_open_times import FakeOpenTimes
 
 
 class FreshEntryBlackoutActiveTests(unittest.TestCase):
@@ -171,6 +172,7 @@ class ManualTouchPauseTests(unittest.TestCase):
             submitted_order_ids_today=set(),
             last_exit_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(list),
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},
@@ -196,6 +198,7 @@ class ManualTouchPauseTests(unittest.TestCase):
             submitted_order_ids_today=set(),
             last_exit_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(list),
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},
@@ -550,6 +553,7 @@ class StopLossGuardTests(unittest.TestCase):
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
         )
@@ -684,6 +688,7 @@ class SymbolQuarantineTests(unittest.TestCase):
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
         )
@@ -764,6 +769,7 @@ class PostStopReentryCooldownTests(unittest.TestCase):
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
         )
@@ -789,6 +795,7 @@ class PostStopReentryCooldownTests(unittest.TestCase):
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
         )

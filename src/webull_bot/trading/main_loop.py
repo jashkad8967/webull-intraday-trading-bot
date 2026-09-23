@@ -3,6 +3,7 @@ import threading
 import time
 from datetime import timedelta
 
+from webull_bot.trading.guards.loop_watchdog import start_loop_watchdog
 from webull_bot.webull_api import MarketDataPermissionError
 
 log = logging.getLogger("webull-bot")
@@ -18,7 +19,13 @@ def run(self) -> None:
     threading.Thread(
         target=self._position_protection_loop, daemon=True
     ).start()
+    # Both loops stamp a heartbeat below; this exits the process if
+    # either wedges, so restart:unless-stopped can bring it back. A
+    # hung loop otherwise keeps the container "Up" while stops and
+    # profit exits quietly stop being submitted.
+    start_loop_watchdog(self)
     while True:
+        self.main_loop_ticked_at = time.monotonic()
         moment = self.now()
         if not self.is_trading_day(moment):
             time.sleep(60)
@@ -73,6 +80,14 @@ def run(self) -> None:
         if option_closeout <= moment < option_close:
             self.close_instruments({"OPTION"})
             self.close_fractional_positions_before_core_close()
+
+        # Anything still held from an earlier session is overdue the
+        # moment options are tradeable again. Placed BEFORE the entry
+        # paths below so the account is not adding new risk on top of
+        # positions it already failed to close - see
+        # close_carried_over_options for the live incident.
+        if option_open <= moment < option_closeout:
+            self.close_carried_over_options(moment)
 
         opening_grace_active = option_open <= moment < option_open + timedelta(
             minutes=self.config.opening_grace_minutes

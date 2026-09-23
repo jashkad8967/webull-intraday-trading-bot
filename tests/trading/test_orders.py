@@ -7,6 +7,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from webull_bot.webull_api import WebullAPI
+from fake_open_times import FakeOpenTimes
 
 
 class HasPendingBuyOrderTests(unittest.TestCase):
@@ -968,6 +969,7 @@ class WorkingOrdersConcurrencyTests(unittest.TestCase):
             submitted_order_ids_today=set(),
             last_exit_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},

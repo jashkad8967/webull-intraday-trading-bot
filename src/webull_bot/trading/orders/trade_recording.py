@@ -59,6 +59,10 @@ def record_trade(
     if action in ("PROFIT", "STOP", "MANUAL_SELL"):
         self.last_exit_at[key] = submitted_at
         self.position_opened_at.pop(key, None)
+        # Keep the persisted entry-time file describing only what is
+        # actually open - that is what keeps it bounded by position
+        # count rather than growing for the life of the deployment.
+        self.position_open_times.forget(key)
         # Live incident (this bug, caught right after shipping
         # evaluate_held_stock_exits): self.cached_positions only
         # gets refreshed once per SLOW trade_stocks cycle (30-90s+
@@ -177,6 +181,11 @@ def record_trade(
         # Feeds TradingStrategy.adaptive_stop_percent's time-aware
         # widen window - see position_opened_at.
         self.position_opened_at[key] = submitted_at
+        # Persisted alongside it so the age SURVIVES a restart, and so
+        # a position carried past its own end-of-day close can be told
+        # apart from one opened this morning - see
+        # PositionOpenTimeStore and close_carried_over_options.
+        self.position_open_times.note_open(key)
         # A fresh position starts with a clean exit-failure count -
         # see consecutive_exit_failures.
         if key.startswith("STOCK:"):

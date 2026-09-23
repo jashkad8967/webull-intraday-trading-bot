@@ -45,5 +45,9 @@ class StateAndTuningSettings(BaseSettings):
     # the dashboard only ever opens TODAY's file - so keeping a month
     # was storage spent on data no one looks at. 0 disables pruning.
     log_retention_days: int = Field(default=5, ge=0, le=365)
+    # When each currently-open position was entered. Tiny and bounded:
+    # one timestamp per OPEN position, pruned to what is still held.
+    # See PositionOpenTimeStore for the two live failures it fixes.
+    position_open_times_state_file: str = "conf/position_open_times.json"
     status_file: str = "status.json"
     command_file: str = "commands.json"

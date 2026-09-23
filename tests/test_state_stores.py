@@ -10,6 +10,7 @@ from pathlib import Path
 
 from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.wash_sale import WashSaleTracker
+from webull_bot.position_open_times import PositionOpenTimeStore
 
 
 class WashSaleTrackerTests(unittest.TestCase):
@@ -355,5 +356,104 @@ class DailyPnlTrackerTests(unittest.TestCase):
 
             self.assertEqual(errors, [])
             self.assertTrue(path.exists())
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+
+class PositionOpenTimeStoreTests(unittest.TestCase):
+    """The age clock used to reset to zero on every restart, because
+    position_opened_at was in-memory and the exit path reseeded a
+    missing entry from "first sight". Each restart therefore bought a
+    stalled position another full option_stale_exit_minutes of
+    immunity - a bot restarted repeatedly could hold one forever.
+    """
+
+    def _store(self, path):
+        return PositionOpenTimeStore(
+            str(path), timezone.utc, logging.getLogger("test-posage")
+        )
+
+    def test_the_recorded_time_survives_a_restart(self):
+        path = Path("tests/.generated_posage/open.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            first = self._store(path).note_open("OPTION:SOFI")
+            # A second process reading the same file.
+            second = self._store(path).note_open("OPTION:SOFI")
+            self.assertEqual(first, second)
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_note_open_is_idempotent_within_one_process(self):
+        path = Path("tests/.generated_posage/idem.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            store = self._store(path)
+            first = store.note_open("OPTION:SOFI")
+            again = store.note_open("OPTION:SOFI")
+            self.assertEqual(first, again)
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_opened_before_today_distinguishes_a_carried_position(self):
+        path = Path("tests/.generated_posage/carried.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+            path.write_text(
+                json.dumps({
+                    "OPTION:OLD": yesterday.isoformat(),
+                    "OPTION:NEW": datetime.now(timezone.utc).isoformat(),
+                }),
+                encoding="utf-8",
+            )
+            store = self._store(path)
+            self.assertTrue(store.opened_before_today("OPTION:OLD"))
+            self.assertFalse(store.opened_before_today("OPTION:NEW"))
+            # An unknown key must not be treated as carried over.
+            self.assertFalse(store.opened_before_today("OPTION:UNSEEN"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_forget_and_retain_only_keep_the_file_bounded(self):
+        path = Path("tests/.generated_posage/bounded.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            store = self._store(path)
+            for key in ("A", "B", "C", "D"):
+                store.note_open(key)
+            store.forget("A")
+            store.retain_only({"B", "C"})
+            self.assertEqual(set(store.opened_at), {"B", "C"})
+            reloaded = self._store(path)
+            self.assertEqual(set(reloaded.opened_at), {"B", "C"})
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_a_corrupt_file_does_not_crash_the_bot(self):
+        path = Path("tests/.generated_posage/corrupt.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text("{not json", encoding="utf-8")
+            store = self._store(path)
+            self.assertEqual(store.opened_at, {})
+            self.assertIsNotNone(store.note_open("OPTION:SOFI"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_a_corrupt_timestamp_is_not_read_as_carried_over(self):
+        path = Path("tests/.generated_posage/badstamp.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text(
+                json.dumps({"OPTION:SOFI": "not-a-date"}), encoding="utf-8"
+            )
+            store = self._store(path)
+            self.assertFalse(store.opened_before_today("OPTION:SOFI"))
+            # And a fresh stamp replaces it rather than sticking.
+            self.assertIsNotNone(store.note_open("OPTION:SOFI"))
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
