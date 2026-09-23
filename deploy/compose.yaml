@@ -12,6 +12,13 @@ services:
       dockerfile: Dockerfile
     container_name: webull-trading-bot
     restart: unless-stopped
+    # Bound both containers on a 1GB host so neither can starve the
+    # other or invite the kernel OOM killer to pick the victim - which
+    # on an unbounded pair is as likely to be the trading bot holding
+    # live positions as the dashboard nobody is looking at. The trader
+    # gets the larger share because it is the one that must not die.
+    mem_limit: 600m
+    memswap_limit: 600m
     env_file:
       - ${BOT_ENV_FILE:-/opt/webull-bot/shared/.env}
     environment:
@@ -47,6 +54,10 @@ services:
       dockerfile: Dockerfile
     container_name: webull-trading-dashboard
     restart: unless-stopped
+    # Deliberately the smaller share: if memory gets tight the
+    # dashboard is the one that should be squeezed, never the trader.
+    mem_limit: 256m
+    memswap_limit: 256m
     environment:
       STATUS_FILE: /var/data/status.json
       LOG_DIRECTORY: /var/data/logs
