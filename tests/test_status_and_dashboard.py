@@ -960,6 +960,13 @@ class DashboardCommandTests(unittest.TestCase):
             ),
             wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
         )
+        from webull_bot.trading.orders.option_exit_claim import (
+            _claim_option_exit,
+            _release_option_exit,
+        )
+
+        fake_bot._claim_option_exit = _claim_option_exit.__get__(fake_bot)
+        fake_bot._release_option_exit = _release_option_exit.__get__(fake_bot)
         fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: Decimal("1")
         fake_bot.record_trade = lambda *a, **k: None
         manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
@@ -1007,6 +1014,13 @@ class DashboardCommandTests(unittest.TestCase):
             ),
             wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
         )
+        from webull_bot.trading.orders.option_exit_claim import (
+            _claim_option_exit,
+            _release_option_exit,
+        )
+
+        fake_bot._claim_option_exit = _claim_option_exit.__get__(fake_bot)
+        fake_bot._release_option_exit = _release_option_exit.__get__(fake_bot)
         fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: Decimal("1")
         fake_bot.record_trade = lambda *a, **k: None
         manual_sell = AutoTrader._manual_sell.__get__(fake_bot)
@@ -1040,6 +1054,13 @@ class DashboardCommandTests(unittest.TestCase):
             ),
             wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
         )
+        from webull_bot.trading.orders.option_exit_claim import (
+            _claim_option_exit,
+            _release_option_exit,
+        )
+
+        fake_bot._claim_option_exit = _claim_option_exit.__get__(fake_bot)
+        fake_bot._release_option_exit = _release_option_exit.__get__(fake_bot)
         fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: (
             recorded_pnl.append((cost, price, qty)) or (price - cost) * qty * multiplier
         )
@@ -1087,6 +1108,13 @@ class DashboardCommandTests(unittest.TestCase):
             ),
             wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
         )
+        from webull_bot.trading.orders.option_exit_claim import (
+            _claim_option_exit,
+            _release_option_exit,
+        )
+
+        fake_bot._claim_option_exit = _claim_option_exit.__get__(fake_bot)
+        fake_bot._release_option_exit = _release_option_exit.__get__(fake_bot)
         fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: (
             price - cost
         ) * qty * multiplier
@@ -1138,6 +1166,13 @@ class DashboardCommandTests(unittest.TestCase):
             ),
             wash_sales=SimpleNamespace(block=lambda symbol, reason: None),
         )
+        from webull_bot.trading.orders.option_exit_claim import (
+            _claim_option_exit,
+            _release_option_exit,
+        )
+
+        fake_bot._claim_option_exit = _claim_option_exit.__get__(fake_bot)
+        fake_bot._release_option_exit = _release_option_exit.__get__(fake_bot)
         fake_bot.record_realized_exit = lambda cost, price, qty, multiplier=1: (
             price - cost
         ) * qty * multiplier

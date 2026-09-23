@@ -935,14 +935,33 @@ def _evaluate_option_exit(
             tolerance=OPTION_PRICE_SANITY_TOLERANCE,
         ):
             return buying_power
-        order_id = self.api.place_option(
-            contract,
-            "SELL",
-            quantity,
-            limit_price,
-            "SELL_TO_CLOSE",
-        )
-        self.pending_option_exits.add(option_symbol)
+        # Claim this contract's exit BEFORE the API round-trip, not
+        # after. _evaluate_option_exit is now reached from TWO threads -
+        # the 0.5s protection loop (evaluate_held_option_exits) and the
+        # slow scan (trade_options) - and the guard above is a plain
+        # check-then-act: both could pass `option_symbol not in
+        # pending_option_exits` before either added to it. The gap spans
+        # an entire place_option round-trip, hundreds of milliseconds,
+        # so the collision is realistic rather than theoretical, and the
+        # result is TWO sell orders against one position.
+        #
+        # _claim_option_exit does the test-and-set under a lock and
+        # returns False if another thread already owns this exit.
+        if not self._claim_option_exit(option_symbol):
+            return buying_power
+        try:
+            order_id = self.api.place_option(
+                contract,
+                "SELL",
+                quantity,
+                limit_price,
+                "SELL_TO_CLOSE",
+            )
+        except Exception:
+            # Release, or a transient broker error locks this contract
+            # out of every future exit for the rest of the session.
+            self._release_option_exit(option_symbol)
+            raise
         pnl = self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
         self.record_trade(
             key, order_id, "PROFIT", limit_price, pnl=pnl,
@@ -963,13 +982,33 @@ def _evaluate_option_exit(
             tolerance=OPTION_PRICE_SANITY_TOLERANCE,
         ):
             return buying_power
-        order_id = self.api.place_option(
-            contract,
-            "SELL",
-            quantity,
-            limit_price,
-            "SELL_TO_CLOSE",
-        )
+        # Claim this contract's exit BEFORE the API round-trip, not
+        # after. _evaluate_option_exit is now reached from TWO threads -
+        # the 0.5s protection loop (evaluate_held_option_exits) and the
+        # slow scan (trade_options) - and the guard above is a plain
+        # check-then-act: both could pass `option_symbol not in
+        # pending_option_exits` before either added to it. The gap spans
+        # an entire place_option round-trip, hundreds of milliseconds,
+        # so the collision is realistic rather than theoretical, and the
+        # result is TWO sell orders against one position.
+        #
+        # _claim_option_exit does the test-and-set under a lock and
+        # returns False if another thread already owns this exit.
+        if not self._claim_option_exit(option_symbol):
+            return buying_power
+        try:
+            order_id = self.api.place_option(
+                contract,
+                "SELL",
+                quantity,
+                limit_price,
+                "SELL_TO_CLOSE",
+            )
+        except Exception:
+            # Release, or a transient broker error locks this contract
+            # out of every future exit for the rest of the session.
+            self._release_option_exit(option_symbol)
+            raise
         # By request: "you can constantly buy puts and calls
         # on the same stock as it dips and rises" - blocking
         # the whole underlying after ANY option stop-loss
@@ -985,7 +1024,6 @@ def _evaluate_option_exit(
             f"{contract['underlying_symbol']}:{contract['option_type']}",
             "option stop-loss exit submitted",
         )
-        self.pending_option_exits.add(option_symbol)
         pnl = self.record_realized_exit(cost, limit_price, quantity, multiplier=100)
         self.record_trade(
             key, order_id, "STOP", limit_price, pnl=pnl,
