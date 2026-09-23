@@ -304,8 +304,26 @@ class FocusModeSettings(BaseSettings):
     # position, joining the existing rsi_divergence and resistance
     # checks as an exit trigger. Profit-protection only, same as those.
     pressure_flip_exit_enabled: bool = True
+    # Lowered 0.25 -> 0.10 by request ("it should exit green on its
+    # own before fading"). This is the trigger that sells INTO the
+    # turn rather than waiting for the trail to give back part of the
+    # peak, so it is the difference between exiting near the high and
+    # exiting after the fade.
+    #
+    # At 0.25 it effectively never fired. conviction is
+    # clamp(latest_delta/volume_delta_ema - 1, 0, 1) and the EMA
+    # tracks that same series, so the ratio mean-reverts to 1.0 -
+    # demanding 0.25 meant demanding volume 25% ABOVE its own average
+    # in the same instant the price turned. Same zero-by-construction
+    # problem that made the ENTRY gate veto everything.
+    #
+    # 0.10 still requires real participation behind the reversal
+    # (~10% above average volume, moving against the position), so
+    # this is not a hair trigger - and it can only ever convert a
+    # HOLD into a realizable PROFIT, never cut a loser, because the
+    # caller gates it behind the min_margin guard.
     pressure_flip_exit_threshold: Decimal = Field(
-        default=Decimal("0.25"), ge=0, le=1
+        default=Decimal("0.10"), ge=0, le=1
     )
     # Rolling window of pressure samples kept per symbol - long enough
     # to see a flip, short enough that stale readings never drive a

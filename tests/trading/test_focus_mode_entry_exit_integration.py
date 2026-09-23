@@ -478,6 +478,53 @@ class DailyProfitThrottleTests(FocusModeIntegrationTestCase):
         self.assertEqual(placed[0][1], "BUY")
 
 
+class ExitPricingPathsAreAllReachableTests(FocusModeIntegrationTestCase):
+    """momentum_exit was initialised inside the "is this a realizable
+    gain" branch, but the exit-pricing code reads it on EVERY path - a
+    plain target hit, a stop, a stale exit - none of which enter that
+    branch. Those paths raised UnboundLocalError, i.e. the exit simply
+    failed to place.
+    """
+
+    def _bot(self):
+        from webull_bot.strategy_logic.decision.stock_option_decision import (
+            option_decision,
+        )
+
+        bot, placed = self._build()
+        bot.strategy.option_decision = option_decision.__get__(bot.strategy)
+        bot.strategy.config = bot.config
+        return bot, placed
+
+    def test_a_stop_evaluation_does_not_raise(self):
+        """The stop has its own confirmation window before it submits,
+        so this pins that the path RUNS - the regression was an
+        UnboundLocalError, i.e. the exit blowing up before it could
+        decide anything at all.
+        """
+        bot, placed = self._bot()
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        for _ in range(3):
+            bot._evaluate_option_exit(
+                contract, "NVDAC", "OPTION:NVDAC",
+                self._quote("0.70", "0.72"), Decimal("0.70"),
+                quantity=1, cost=Decimal("1.00"), days_to_expiration=20,
+                buying_power=bot.cached_option_buying_power,
+            )
+
+    def test_a_plain_target_still_places_its_order(self):
+        bot, placed = self._bot()
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        bot._evaluate_option_exit(
+            contract, "NVDAC", "OPTION:NVDAC",
+            self._quote("1.30", "1.32"), Decimal("1.30"),
+            quantity=1, cost=Decimal("1.00"), days_to_expiration=20,
+            buying_power=bot.cached_option_buying_power,
+        )
+        self.assertEqual(len(placed), 1, "a target hit must still reach the broker")
+        self.assertGreater(placed[0][3], Decimal("1.00"))
+
+
 class EntryClockSurvivesRestartTests(FocusModeIntegrationTestCase):
     """position_opened_at is in-memory only, so every restart wipes it
     for positions that are still open.

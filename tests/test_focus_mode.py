@@ -508,6 +508,61 @@ class OptionStopIsNotWidenedOnFreshPositionsTests(unittest.TestCase):
         )
 
 
+class MomentumExitFillsImmediatelyTests(unittest.TestCase):
+    """By request: "it should exit green on its own before fading" and
+    "execution is also important".
+
+    A momentum exit fires because exhaustion was detected - RSI
+    divergence, resistance, or participation flipping against the
+    position. The whole point is to be OUT before the fade, so the
+    order has to actually cross, not rest.
+
+    decision.target_price for these is sell_realizable_price, the BID,
+    which is already marketable. Quantizing it UP to the $0.05 option
+    tick pushed it ABOVE the bid (1.43 -> 1.45), so the order rested
+    while the premium kept falling - the exact failure being fixed.
+    """
+
+    def test_rounding_down_keeps_a_bid_priced_exit_marketable(self):
+        from decimal import ROUND_DOWN, ROUND_UP
+
+        from webull_bot.webull_api import WebullAPI
+
+        api = WebullAPI.__new__(WebullAPI)
+        bid = Decimal("1.43")
+        up = api._quantize_to_option_tick(bid, ROUND_UP)
+        down = api._quantize_to_option_tick(bid, ROUND_DOWN)
+        self.assertGreater(
+            up, bid, "ROUND_UP lifts the price above the bid - it rests"
+        )
+        self.assertLessEqual(
+            down, bid, "ROUND_DOWN keeps it at or below the bid - it fills"
+        )
+
+    def test_one_tick_of_rounding_still_clears_cost(self):
+        """The ROUND_UP existed to stop a target quantizing back onto
+        cost (the NKE incident). A momentum exit is safe from that
+        because min_margin already requires a full $0.05 tick of
+        headroom over cost before it can fire at all.
+        """
+        from decimal import ROUND_DOWN
+
+        from webull_bot.webull_api import WebullAPI
+
+        api = WebullAPI.__new__(WebullAPI)
+        cost = Decimal("1.40")
+        # min_margin = max(fee_per_share, 0.05); the trigger needs
+        # sell_realizable_price - cost > that, so the worst legal case
+        # is a hair over one tick above cost.
+        bid = cost + Decimal("0.051")
+        placed = api._quantize_to_option_tick(bid, ROUND_DOWN)
+        self.assertGreater(
+            placed, cost,
+            "even after rounding down a full tick the exit must be "
+            "strictly above cost",
+        )
+
+
 class StaleOptionExitTests(unittest.TestCase):
     """By explicit request, after three positions sat open over two
     hours going nowhere: "if something is not going for much profit at
