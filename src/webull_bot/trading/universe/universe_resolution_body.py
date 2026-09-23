@@ -160,10 +160,23 @@ def _resolve_targets_work_body(self, moment: datetime) -> None:
     available = set(self.stock_symbols)
     self.seed_popular_symbols = set(self.config.popular_stocks()) & available
     self.agent_popular_symbols.clear()
-    self.daily_realized_loss = Decimal("0")
-    self.daily_realized_pnl = Decimal("0")
-    self.daily_pnl.reset()
-    self.daily_loss_breaker_triggered = False
+    # Only a genuinely NEW trading day clears the day's realized
+    # totals and re-arms the loss breaker. resolved_date is in-memory
+    # and None after every restart, so this block used to run on every
+    # boot - wiping the running loss and re-arming the circuit breaker
+    # mid-session. Live 2026-09-23: -$52.14 realized was erased and
+    # the breaker re-armed ~8 times across one session's deploys, so
+    # it could never have tripped however badly the day went.
+    #
+    # daily_pnl persists to disk precisely so a restart resumes where
+    # it left off; belongs_to_today reports whether the totals now
+    # held were rehydrated for today, which is exactly the "did we
+    # restart, or is it tomorrow" question this needs.
+    if not self.daily_pnl.belongs_to_today():
+        self.daily_realized_loss = Decimal("0")
+        self.daily_realized_pnl = Decimal("0")
+        self.daily_pnl.reset()
+        self.daily_loss_breaker_triggered = False
     self.option_entry_occurred_today = False
     self.submitted_order_ids_today.clear()
     self.reconciliation_flagged_order_ids.clear()
