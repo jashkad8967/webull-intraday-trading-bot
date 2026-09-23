@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from webull_bot.bot import AutoTrader
 from webull_bot.strategy import TradingStrategy
 from webull_bot.strategy_logic.decision.stock_option_decision import option_decision
+from webull_bot.strategy_logic.regime.market_regime import option_delta_ok
 
 
 def focus_config(**overrides):
@@ -1075,13 +1076,14 @@ class FocusSymbolIsAffordableDiscoveryTests(unittest.TestCase):
         existing_contracts=None,
         fail=False,
         wide_discovered=None,
+        quotes=None,
     ):
         calls = {"option_contracts": []}
         contracts = [
             _fake_contract("MRNA", "MRNAC", "CALL", 170),
             _fake_contract("MRNA", "MRNAP", "PUT", 166),
         ]
-        quotes = {
+        quotes = quotes or {
             "MRNAC": {"symbol": "MRNAC", "bid": "1.90", "ask": "2.00"},
             "MRNAP": {"symbol": "MRNAP", "bid": "1.80", "ask": "1.90"},
         }
@@ -1105,6 +1107,11 @@ class FocusSymbolIsAffordableDiscoveryTests(unittest.TestCase):
                     return None
                 return (Decimal(str(bid)) + Decimal(str(ask))) / 2
 
+            @staticmethod
+            def option_delta(quote):
+                delta = quote.get("delta")
+                return None if delta is None else Decimal(str(delta))
+
         def order_quantity(limit_price, bp):
             cost = limit_price * 100
             return (int(bp // cost), cost) if cost > 0 else (0, cost)
@@ -1122,6 +1129,7 @@ class FocusSymbolIsAffordableDiscoveryTests(unittest.TestCase):
             strategy=SimpleNamespace(
                 prices={"MRNA": price} if price else {},
                 option_order_quantity=order_quantity,
+                option_delta_ok=option_delta_ok,
             ),
         )
         bot.focus_symbol_is_affordable = AutoTrader.focus_symbol_is_affordable.__get__(bot)
@@ -1154,6 +1162,66 @@ class FocusSymbolIsAffordableDiscoveryTests(unittest.TestCase):
         bot.focus_symbol_is_affordable("MRNA")
         symbols = [c["symbol"] for c in bot.option_contracts]
         self.assertEqual(symbols.count("MRNAC"), 1)
+
+    def test_a_cheap_contract_outside_the_delta_window_is_not_affordable(self):
+        """Live 2026-09-23, the reason the account sat out most of a
+        session: 8 of the 10 locked cohort members produced ZERO
+        entries all day, showing up as "sizing produced zero
+        contracts=9 | delta out of range=9" every cycle - the same
+        wall seen from two sides.
+
+        Those names DID have contracts under the $0.99 per-entry
+        budget, which is all this check used to ask about, but they
+        carried delta 0.08-0.16: far-OTM lottery tickets that
+        option_delta_ok rejects at entry. Their cheapest strike inside
+        the delta window ran $1.25-$5.40, well out of reach. So each
+        name passed affordability on a contract it could never
+        actually enter, locked into the cohort, and then died at the
+        delta gate on every single attempt.
+
+        "Can the account buy something" is the wrong question. The
+        question is "can the account buy something it is allowed to
+        enter".
+        """
+        bot, _ = self.bot(
+            quotes={
+                # Affordable at $300 buying power, but 0.11 delta -
+                # exactly the shape that fooled the old check.
+                "MRNAC": {
+                    "symbol": "MRNAC", "bid": "0.20", "ask": "0.30",
+                    "delta": "0.11",
+                },
+                "MRNAP": {
+                    "symbol": "MRNAP", "bid": "0.20", "ask": "0.30",
+                    "delta": "-0.09",
+                },
+            }
+        )
+        self.assertFalse(bot.focus_symbol_is_affordable("MRNA"))
+
+    def test_an_affordable_contract_inside_the_delta_window_still_passes(self):
+        bot, _ = self.bot(
+            quotes={
+                "MRNAC": {
+                    "symbol": "MRNAC", "bid": "0.20", "ask": "0.30",
+                    "delta": "0.45",
+                },
+                "MRNAP": {
+                    "symbol": "MRNAP", "bid": "0.20", "ask": "0.30",
+                    "delta": "-0.40",
+                },
+            }
+        )
+        self.assertTrue(bot.focus_symbol_is_affordable("MRNA"))
+
+    def test_a_missing_delta_still_passes(self):
+        """option_delta_ok's own convention: an unavailable delta is
+        not evidence against the contract, same as every other
+        best-effort gate here. The default fixture quotes carry no
+        delta at all.
+        """
+        bot, _ = self.bot()
+        self.assertTrue(bot.focus_symbol_is_affordable("MRNA"))
 
     def test_fails_open_when_no_price_is_known_yet(self):
         bot, calls = self.bot(price=None)
@@ -1227,6 +1295,11 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
                     return None
                 return (Decimal(str(bid)) + Decimal(str(ask))) / 2
 
+            @staticmethod
+            def option_delta(quote):
+                delta = quote.get("delta")
+                return None if delta is None else Decimal(str(delta))
+
         def order_quantity(limit_price, bp):
             cost = limit_price * 100
             if cost <= 0:
@@ -1247,6 +1320,7 @@ class EnsureFocusSymbolContractsTests(unittest.TestCase):
             strategy=SimpleNamespace(
                 prices={focus_cohort[0]: price} if price and focus_cohort else {},
                 option_order_quantity=order_quantity,
+                option_delta_ok=option_delta_ok,
             ),
             focus_symbol_no_chain=set(),
             focus_contract_discovery_failures=defaultdict(int),
@@ -1608,18 +1682,24 @@ class CohortSelectionTests(unittest.TestCase):
     name happening to have an affordable contract.
     """
 
-    def bot(self, batch, affordable=None, blocked=(), size=10):
+    def bot(self, batch, affordable=None, blocked=(), size=10, scores=None,
+            discovered=(), per_pass=25):
         tz = ZoneInfo("America/New_York")
-        scores = {symbol: float(len(batch) - i) for i, symbol in enumerate(batch)}
+        scores = scores or {
+            symbol: float(len(batch) - i) for i, symbol in enumerate(batch)
+        }
         affordable = affordable or {}
         bot = SimpleNamespace(
-            config=focus_config(focus_cohort_size=size),
+            config=focus_config(
+                focus_cohort_size=size,
+                focus_lock_discovery_per_pass=per_pass,
+            ),
             daily_batch=list(batch),
             focus_cohort=[],
             focus_cohort_date=None,
             focus_logged_empty_date=None,
             focus_symbol_no_chain=set(),
-            focus_wide_discovered=set(),
+            focus_wide_discovered=set(discovered),
             focus_cohort_growth_attempt_at=None,
             wash_sales=SimpleNamespace(
                 blocked_until=lambda key: True
@@ -1654,6 +1734,52 @@ class CohortSelectionTests(unittest.TestCase):
         bot.select_focus_cohort(self.moment(9, 45))
         self.assertEqual(len(bot.focus_cohort), 10)
         self.assertEqual(bot.focus_cohort, batch[:10])
+
+    def test_verified_affordable_names_outrank_unverified_ones(self):
+        """Live 2026-09-23 - the reason the account sat out most of a
+        session with signals firing the whole time.
+
+        focus_lock_discovery_per_pass is 2, so against a 16-name batch
+        only 2 candidates get their affordability actually checked per
+        pass; the other 14 are admitted by a deliberate fail-open
+        branch and settled later. Ranking purely on priority_score
+        then let those UNCHECKED names take the cohort slots, because
+        the fail-open branch is silent - a name nobody looked at
+        scores exactly like a name that passed, and score rewards
+        volatility and volume, which mega-caps win.
+
+        The cohort locked as NVDA, AAPL, ABNB, BABA, PLTR, AMZN,
+        AVGO, MRNA, MARA, SOFI. Probing all 6717 discovered contracts
+        against the real entry gates found 8 of those 10 had ZERO
+        contracts both affordable and inside the delta window -
+        cheapest in-delta strikes of $1.25-$5.40 against a $0.99
+        per-entry budget. Only MARA and SOFI could ever trade.
+
+        Verified names take slots first; unverified ones fill what is
+        left.
+        """
+        batch = ["AAA", "BBB", "CCC", "DDD"]
+        bot = self.bot(
+            batch,
+            # CCC and DDD are the high scorers, but they are past the
+            # 2-name discovery budget so nothing has verified them.
+            scores={"AAA": 1.0, "BBB": 2.0, "CCC": 9.0, "DDD": 8.0},
+            size=2,
+            per_pass=2,
+        )
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(bot.focus_cohort, ["BBB", "AAA"])
+
+    def test_score_still_orders_within_the_verified_group(self):
+        batch = ["AAA", "BBB", "CCC"]
+        bot = self.bot(
+            batch,
+            scores={"AAA": 1.0, "BBB": 5.0, "CCC": 9.0},
+            discovered=("AAA", "BBB", "CCC"),
+            size=3,
+        )
+        bot.select_focus_cohort(self.moment(9, 45))
+        self.assertEqual(bot.focus_cohort, ["CCC", "BBB", "AAA"])
 
     def test_members_still_have_to_clear_every_gate_individually(self):
         # The cohort is MORE candidates, not weaker ones.

@@ -137,7 +137,7 @@ def select_focus_cohort(self, moment: datetime) -> None:
     # restart) has no price data at all for the first instant, and
     # stamping early would mark the day done before a real pick was
     # ever possible.
-    scored: list[tuple[float, str]] = []
+    scored: list[tuple[float, str, bool]] = []
     # Budget for NEW wide chain discovery in this pass.
     #
     # Live incident 2026-09-23: focus_symbol_is_affordable does a full
@@ -187,14 +187,15 @@ def select_focus_cohort(self, moment: datetime) -> None:
         if not already_known and discovery_budget <= 0:
             # Out of budget this pass - admit it and let the post-lock
             # check settle it, rather than stalling the whole lock.
-            pass
+            verified = False
         else:
             if not already_known:
                 discovery_budget -= 1
             if not self.focus_symbol_is_affordable(symbol):
                 continue
+            verified = True
         score = self.strategy.priority_score(symbol, self.agent_assessment(symbol))
-        scored.append((score, symbol))
+        scored.append((score, symbol, verified))
     if not scored:
         # Keep retrying while there is still a session left to trade;
         # stop once the option closeout window begins, since a cohort
@@ -213,9 +214,31 @@ def select_focus_cohort(self, moment: datetime) -> None:
                 "not trading options today" if give_up else "will retry",
             )
         return
-    scored.sort(key=lambda row: row[0], reverse=True)
+    # Verified-affordable names take cohort slots ahead of unverified
+    # ones, score breaking ties within each group.
+    #
+    # Live incident 2026-09-23, the reason the account sat out most of
+    # a session: the discovery budget is 2 names per pass against a
+    # 16-name batch, so on the lock pass 14 of 16 candidates were
+    # admitted by the fail-open branch above WITHOUT their
+    # affordability ever being checked. They were scored on volatility
+    # and volume alone - which mega-caps win - so the cohort locked as
+    # NVDA, AAPL, ABNB, BABA, PLTR, AMZN, AVGO, MRNA plus MARA and
+    # SOFI. Probing all 6717 discovered contracts against the real
+    # entry gates showed 8 of those 10 names had ZERO contracts that
+    # were both affordable and inside the delta window: their cheapest
+    # in-delta strikes ran $1.25-$5.40 against a $0.99 per-entry
+    # budget. The gate counters showed it as "sizing produced zero
+    # contracts=9 | delta out of range=9" every single cycle.
+    #
+    # Ranking on score alone is what let unverified names outrank
+    # verified ones, since the fail-open branch is silent - a name
+    # nobody checked looks exactly like a name that passed. Sorting
+    # verified-first means the slots go to names the account can
+    # actually enter, and unverified ones only fill what is left over.
+    scored.sort(key=lambda row: (row[2], row[0]), reverse=True)
     selected = scored[: self.config.focus_cohort_size]
-    cohort = [symbol for _, symbol in selected]
+    cohort = [symbol for _, symbol, _ in selected]
     if cohort == self.focus_cohort:
         # Identical to what is already locked - nothing to announce.
         # Scores drift every cycle, so re-logging an unchanged cohort
@@ -225,9 +248,14 @@ def select_focus_cohort(self, moment: datetime) -> None:
     self.focus_cohort = cohort
     self.focus_cohort_date = moment.date()
     log.info(
-        "FOCUS  | cohort of %s %s (%s cleared the gates) | %s",
+        "FOCUS  | cohort of %s %s (%s cleared the gates, %s "
+        "affordability-verified) | %s",
         len(cohort),
         verb,
         len(scored),
-        " | ".join(f"{symbol}({score:.1f})" for score, symbol in selected),
+        sum(1 for row in selected if row[2]),
+        " | ".join(
+            f"{symbol}({score:.1f}{'' if verified else ' unverified'})"
+            for score, symbol, verified in selected
+        ),
     )
