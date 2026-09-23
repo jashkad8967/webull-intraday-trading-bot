@@ -112,10 +112,19 @@ jobs:
     needs: merge-to-main
     if: vars.GCP_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     concurrency:
       group: gcp-production
       cancel-in-progress: false
     env:
+      # Images are built HERE and pulled by the host. Building on the
+      # production box (2 cores, 1GB, also running the bot) drove load
+      # above 12, starved the trading loop to 5-7 minute cycles, and
+      # timed out two deploys mid-session on 2026-09-22.
+      BOT_IMAGE_REPO: ghcr.io/${{ github.repository }}/trader
+      DASHBOARD_IMAGE_REPO: ghcr.io/${{ github.repository }}/dashboard
       GCP_HOST: ${{ secrets.GCP_HOST }}
       GCP_USER: ${{ secrets.GCP_USER }}
       GCP_SSH_PORT: ${{ secrets.GCP_SSH_PORT || '22' }}
@@ -137,6 +146,37 @@ jobs:
           printf '%s\n' "$GCP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
 
+      - name: Log in to the image registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push the trader image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.BOT_IMAGE_REPO }}:${{ github.sha }}
+          # Layer cache lives in Actions, so an unchanged base layer is
+          # never rebuilt - this is also what keeps the build inside the
+          # timeout the on-host build kept blowing.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push the dashboard image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./ui
+          push: true
+          tags: ${{ env.DASHBOARD_IMAGE_REPO }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Package release
         run: |
           tar \
@@ -156,9 +196,19 @@ jobs:
             "$RUNNER_TEMP/webull-bot-${GITHUB_SHA}.tar.gz" \
             "${GCP_USER}@${GCP_HOST}:/tmp/webull-bot-${GITHUB_SHA}.tar.gz"
 
+      - name: Authorise the host to pull the release image
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Piped over stdin rather than passed as an argument, so the
+          # token never appears in the host's process list. GITHUB_TOKEN
+          # is scoped to this run and expires with it, so no long-lived
+          # credential is stored on the box.
+          printf '%s' "$REGISTRY_TOKEN" | ssh             -p "$GCP_SSH_PORT"             "${GCP_USER}@${GCP_HOST}"             "docker login ghcr.io -u '${GITHUB_ACTOR}' --password-stdin"
+
       - name: Deploy to the live host
         run: |
           ssh \
             -p "$GCP_SSH_PORT" \
             "${GCP_USER}@${GCP_HOST}" \
-            "/opt/webull-bot/bin/deploy '/tmp/webull-bot-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"
+            "BOT_IMAGE_REPO='${BOT_IMAGE_REPO}' DASHBOARD_IMAGE_REPO='${DASHBOARD_IMAGE_REPO}' /opt/webull-bot/bin/deploy '/tmp/webull-bot-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"
