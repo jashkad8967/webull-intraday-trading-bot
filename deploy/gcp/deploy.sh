@@ -28,6 +28,24 @@ if [[ ! -s "${DEPLOY_ROOT}/shared/.env" ]]; then
   exit 1
 fi
 
+# Preflight disk check. Pulling two images and extracting a release
+# tree needs room; starting that on an almost-full disk is what took
+# this host down on 2026-09-23 (99% full -> Docker daemon wedged with
+# `docker ps` hanging -> bot DOWN mid-session -> load average 20 and
+# sshd unable to complete a banner exchange, needing a console reset).
+#
+# Failing here is strictly better than that: the currently running
+# container keeps trading untouched, and the error says exactly what
+# is wrong while the machine is still reachable.
+AVAILABLE_MB="$(df -Pm "${DEPLOY_ROOT}" | awk 'NR==2 {print $4}')"
+if [[ "${AVAILABLE_MB}" -lt 1500 ]]; then
+  echo "Refusing to deploy: only ${AVAILABLE_MB}MB free on ${DEPLOY_ROOT}." >&2
+  echo "The running container is untouched. Reclaim space first:" >&2
+  echo "  docker images   # then: docker rmi <old revision tags>" >&2
+  echo "  sudo du -xhd1 /opt/webull-bot/releases | sort -rh | head" >&2
+  exit 1
+fi
+
 RELEASE_DIR="${DEPLOY_ROOT}/releases/${REVISION}"
 mkdir -p "${RELEASE_DIR}"
 tar -xzf "${ARCHIVE}" -C "${RELEASE_DIR}"
@@ -101,6 +119,57 @@ install -m 0750 \
 mv -f "${DEPLOY_ROOT}/bin/deploy.next" "${DEPLOY_ROOT}/bin/deploy"
 
 rm -f -- "${ARCHIVE}"
-docker image prune -f >/dev/null
+
+# Reclaim disk from superseded deploys.
+#
+# Live outage 2026-09-23: this host filled to 99% (124M free on an
+# 8.7G root) and wedged Docker - the daemon still reported "active"
+# but `docker ps` hung and `docker ps -a` returned nothing, so the
+# trading bot was DOWN mid-session with four open option positions
+# and no stop, no profit-lock and no EOD close. The box then went
+# unreachable entirely: at load average 20 sshd could not finish a
+# banner exchange, and recovery needed a console reset.
+#
+# `docker image prune -f` alone caused it. That only removes DANGLING
+# images - untagged, unreferenced layers. Every deploy pulls
+# ghcr.io/.../trader:<sha> and dashboard:<sha>, which are fully
+# TAGGED and therefore never dangling, so each one stayed on disk
+# forever. On a 2-core/1GB/8.7G instance a few weeks of deploys is
+# all it takes.
+#
+# Release trees leak the same way: each deploy extracts a full source
+# checkout into releases/<sha> and nothing ever removed the old ones.
+#
+# Both are pruned by RETENTION rather than age, and both deliberately
+# keep the current revision AND the previous one, because the failure
+# path above rolls back to PREVIOUS_REVISION - pruning it would turn
+# a failed deploy into an outage instead of a rollback.
+prune_images() {
+  local repo="$1"
+  [[ -n "${repo}" ]] || return 0
+  docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
+    | awk -v repo="${repo}" '$1 ~ "^"repo":" {print $1}' \
+    | grep -v ":${REVISION}$" \
+    | { [[ -n "${PREVIOUS_REVISION}" ]] \
+        && grep -v ":${PREVIOUS_REVISION}$" || cat; } \
+    | xargs -r -n1 docker rmi -f >/dev/null 2>&1 || true
+}
+prune_images "${BOT_IMAGE_REPO:-}"
+prune_images "${DASHBOARD_IMAGE_REPO:-}"
+docker image prune -f >/dev/null 2>&1 || true
+
+# Keep the newest few release trees (current and previous are always
+# among them; ls -t orders by mtime, newest first).
+if [[ -d "${DEPLOY_ROOT}/releases" ]]; then
+  ls -1t "${DEPLOY_ROOT}/releases" 2>/dev/null \
+    | tail -n +4 \
+    | while read -r old; do
+        [[ "${old}" == "${REVISION}" ]] && continue
+        [[ "${old}" == "${PREVIOUS_REVISION}" ]] && continue
+        rm -rf -- "${DEPLOY_ROOT:?}/releases/${old}"
+      done
+fi
+
+df -h "${DEPLOY_ROOT}" | tail -1
 
 echo "Deployed ${REVISION}; webull-trading-bot is running."
