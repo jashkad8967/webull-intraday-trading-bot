@@ -1071,7 +1071,9 @@ class ActualFillPriceCorrectionTests(unittest.TestCase):
             daily_realized_loss=Decimal("0"),
             daily_pnl=SimpleNamespace(record=lambda pnl, loss: None),
             status=SimpleNamespace(
-                amend_trade_pnl=lambda oid, pnl: amended.update({oid: pnl})
+                amend_trade_pnl=lambda oid, pnl, price=None: amended.update(
+                    {oid: (pnl, price)}
+                )
             ),
         )
         correct = AutoTrader.correct_realized_exit.__get__(fake_bot)
@@ -1080,9 +1082,18 @@ class ActualFillPriceCorrectionTests(unittest.TestCase):
         delta = (Decimal("35.71") - Decimal("35.81")) * Decimal("1.2067")
         correct("order-figr", Decimal("0.052402"), delta)
 
-        corrected = amended["order-figr"]
+        corrected, shown_price = amended["order-figr"]
         self.assertLess(corrected, 0)
         self.assertAlmostEqual(float(corrected), -0.068268, places=6)
+        # Live 2026-09-23: a BABA stop submitted at 1.10 filled at
+        # 1.19. The pnl was corrected by $18 but the trade log kept
+        # showing 1.10, so the dashboard reported an exit price the
+        # account never traded at. The corrected pnl and the displayed
+        # price must describe the SAME fill.
+        self.assertIsNone(
+            shown_price,
+            "no fill price passed here - the displayed price is left alone",
+        )
         # The running totals must follow the correction, including the
         # losing-side tracker the daily breaker reads.
         self.assertAlmostEqual(
@@ -1101,7 +1112,7 @@ class ActualFillPriceCorrectionTests(unittest.TestCase):
             daily_realized_loss=Decimal("0"),
             daily_pnl=SimpleNamespace(record=lambda pnl, loss: None),
             status=SimpleNamespace(
-                amend_trade_pnl=lambda oid, pnl: touched.append(oid)
+                amend_trade_pnl=lambda oid, pnl, price=None: touched.append(oid)
             ),
         )
         correct = AutoTrader.correct_realized_exit.__get__(fake_bot)

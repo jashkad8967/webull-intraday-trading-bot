@@ -33,7 +33,11 @@ def record_realized_exit(
 
 
 def correct_realized_exit(
-    self, order_id: str, estimated_pnl: Decimal | None, delta: Decimal
+    self,
+    order_id: str,
+    estimated_pnl: Decimal | None,
+    delta: Decimal,
+    actual_price: Decimal | None = None,
 ) -> None:
     """Re-price an already-recorded exit against its REAL fill.
 
@@ -63,7 +67,14 @@ def correct_realized_exit(
     if corrected < 0:
         self.daily_realized_loss += -corrected
     self.daily_pnl.record(self.daily_realized_pnl, self.daily_realized_loss)
-    self.status.amend_trade_pnl(order_id, corrected)
+    # Amend the displayed PRICE as well, not just the pnl. Live
+    # 2026-09-23: a BABA stop was submitted at 1.10 and filled at
+    # 1.19. The pnl was corrected by $18, but the trade log kept
+    # showing 1.10 - so the dashboard reported an exit price the
+    # account never traded at, and the user spotted the discrepancy
+    # before the bot did. The corrected pnl and the shown price have
+    # to describe the same fill.
+    self.status.amend_trade_pnl(order_id, corrected, actual_price)
 
 
 def reverse_phantom_exit(
