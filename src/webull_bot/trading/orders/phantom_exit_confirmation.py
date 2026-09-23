@@ -75,7 +75,7 @@ def _correct_to_actual_fill(
         "OPTION:"
     ) else Decimal("1")
     delta = (actual - estimated) * quantity * multiplier
-    self.correct_realized_exit(order_id, pnl, delta)
+    self.correct_realized_exit(order_id, pnl, delta, actual)
     log.warning(
         "ORDER  | %s | filled at %s, not the submitted %s - corrected "
         "realized pnl by $%s | id=%s",

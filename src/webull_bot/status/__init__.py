@@ -150,7 +150,12 @@ class StatusWriter:
                     self._save_state()
                     return
 
-    def amend_trade_pnl(self, order_id: str, pnl: Decimal) -> None:
+    def amend_trade_pnl(
+        self,
+        order_id: str,
+        pnl: Decimal,
+        actual_price: Decimal | None = None,
+    ) -> None:
         """Rewrite a already-displayed trade's pnl once its REAL fill
         price is known - see AutoTrader.correct_realized_exit. Without
         this the dashboard keeps showing the submission-time estimate
@@ -162,6 +167,12 @@ class StatusWriter:
             for trade in self.trades:
                 if trade.get("order_id") == order_id:
                     trade["pnl"] = str(pnl)
+                    if actual_price is not None:
+                        # The price shown must be the price it FILLED
+                        # at, not the one submitted - otherwise the
+                        # dashboard reports a trade the account never
+                        # made (BABA: submitted 1.10, filled 1.19).
+                        trade["limit_price"] = str(actual_price)
                     self._save_state()
                     return
 
