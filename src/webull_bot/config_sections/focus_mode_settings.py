@@ -56,6 +56,14 @@ class FocusModeSettings(BaseSettings):
     # once a cycle would spend real API budget re-asking a question
     # whose answer rarely changes that fast.
     focus_cohort_growth_seconds: int = Field(default=120, ge=10, le=3600)
+    # How many NEW option chains select_focus_cohort may discover in a
+    # single pass. Live 2026-09-23: a full chain fetch takes ~30s per
+    # name, and the cohort loop ran it for every undiscovered candidate
+    # inline - with a 16-name batch that is ~8 minutes for ONE pass, so
+    # the cohort never locked at all and a whole session went untraded
+    # while signals fired. Bounded so the lock happens immediately and
+    # discovery catches up over the following passes.
+    focus_lock_discovery_per_pass: int = Field(default=2, ge=1, le=25)
     # By request: "only take a good batch of stocks to look out for
     # everyday." Two-stage funnel - research a batch each morning
     # (this), then pick the focus cohort out of it at the open.
