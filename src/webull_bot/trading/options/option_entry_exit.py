@@ -12,6 +12,34 @@ from webull_bot.webull_api import QuoteUnavailableError
 log = logging.getLogger("webull-bot")
 
 
+def _position_quantity(position: dict) -> Decimal:
+    try:
+        return Decimal(str(position.get("quantity", 0) or 0))
+    except Exception:
+        return Decimal("0")
+
+
+def _option_underlying(self, position: dict) -> str:
+    """Underlying ticker for an option position.
+
+    Webull reports these two different ways depending on the endpoint:
+    `symbol` is sometimes the full OCC contract symbol and sometimes
+    the bare underlying with the contract details carried in `legs`.
+    option_scan_batch already has to handle both when it matches a
+    position back to its contract; this is the narrow "which stock is
+    this?" version of the same problem.
+    """
+    for leg in position.get("legs") or []:
+        leg_symbol = str(leg.get("symbol", "") or "")
+        if leg_symbol:
+            return leg_symbol
+    raw = str(position.get("symbol", "") or "")
+    for candidate in self.option_contracts:
+        if candidate.get("symbol") == raw:
+            return str(candidate.get("underlying_symbol", raw))
+    return raw
+
+
 def _evaluate_option_entry(
     self,
     contract: dict,
@@ -129,6 +157,51 @@ def _evaluate_option_entry(
             else "no focus cohort locked yet"
         ] += 1
         return open_count, buying_power
+    # Concentration cap, per UNDERLYING rather than per contract.
+    #
+    # Live 2026-09-23, minutes after the cohort finally started
+    # trading: a verified 5-name cohort put 3 of its 4 open positions
+    # into SOFI - three DIFFERENT contracts (0.63, 0.70 and 0.80,
+    # averaging UP) - and drained buying power from $247 to $17. The
+    # cohort exists precisely so the account is not hostage to one
+    # name ("allow a cohort of 5-10 stocks then, that all fit the
+    # criteria so that there are more options to play with"), and
+    # collapsing it into a single underlying defeats the feature.
+    #
+    # Nothing caught it because every existing guard is keyed on the
+    # exact option_symbol: option_average_down_count tracks adds to
+    # ONE contract, so SOFI261009C00016500 and SOFI261016C00017000
+    # each opened with a fresh budget and neither could see the
+    # other, let alone the SOFI position already on the book.
+    # max_open_positions is account-wide and was nowhere near its
+    # limit. There was no per-underlying view at all.
+    #
+    # Deliberately counts DISTINCT open contracts on this underlying,
+    # so a genuine average-down into a contract already held still
+    # goes through its own separate, intentional budget below.
+    # Counts POSITIONS, not symbols: a Webull option position reports
+    # its bare underlying ("SOFI") in `symbol` with the contract
+    # details in `legs`, so collapsing to a set of symbols would have
+    # counted all three SOFI contracts as one and let this gate pass.
+    #
+    # This function is only ever called for a contract whose own
+    # position is flat (see the docstring above), so every position
+    # counted here is necessarily a DIFFERENT contract on the same
+    # underlying - a real average-down into a contract already held
+    # never reaches this path and keeps its own separate budget.
+    if self.config.option_max_positions_per_underlying:
+        held = sum(
+            1
+            for position in positions
+            if position.get("instrument_type") == "OPTION"
+            and _option_underlying(self, position) == underlying
+            and _position_quantity(position) != 0
+        )
+        if held >= self.config.option_max_positions_per_underlying:
+            self.option_gate_rejections[
+                "already at the position cap for this underlying"
+            ] += 1
+            return open_count, buying_power
     # By request ("once you hit a certain profit slow down") - the
     # day's target is already banked, so stop ADDING risk. Exits, the
     # profit-lock trail and the EOD close all stay live below.
