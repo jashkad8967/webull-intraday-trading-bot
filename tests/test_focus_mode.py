@@ -38,7 +38,7 @@ def focus_config(**overrides):
         profit_lock_enabled=True,
         profit_lock_arm_percent=Decimal("0.10"),
         profit_lock_giveback_fraction=Decimal("0.50"),
-        profit_lock_min_gain_percent=Decimal("0.025"),
+        profit_lock_min_gain_fraction=Decimal("0.5"),
         profit_lock_giveback_fraction_after_throttle=Decimal("0.25"),
         pressure_enabled=True,
         pressure_min_for_entry=Decimal("0.15"),
@@ -334,8 +334,9 @@ class ProfitLockTrailTests(unittest.TestCase):
         armed just over the bar must not trail down to a few cents and
         still call itself a PROFIT.
         """
-        # Peak 1.03 (+3%), giveback 0.35 -> raw floor 1.0195, which is
-        # under the 2.5% minimum, so the floor is lifted to 1.025.
+        # Peak 1.03 (+3%): giveback 0.35 -> raw floor 1.0195, and the
+        # scaled minimum is half the peak gain = +1.5% -> 1.015. The
+        # raw floor already clears that, so it stands.
         decision = self.decide(
             price="1.00",
             peak="1.03",
@@ -343,7 +344,7 @@ class ProfitLockTrailTests(unittest.TestCase):
             profit_lock_giveback_fraction=Decimal("0.35"),
         )
         self.assertEqual(decision.action, "PROFIT")
-        self.assertGreaterEqual(decision.target_price, Decimal("1.025"))
+        self.assertGreaterEqual(decision.target_price, Decimal("1.015"))
         self.assertIn("profit-lock", decision.reason)
 
     def test_the_floor_always_sits_above_entry_cost(self):

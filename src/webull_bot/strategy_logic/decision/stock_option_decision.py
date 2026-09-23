@@ -719,14 +719,26 @@ def _profit_lock_floor(
     floor = average_cost + (peak_price - average_cost) * (
         Decimal("1") - giveback_fraction
     )
-    # By explicit request ("but yeah never below 2.5%"): once the trail
-    # is armed the exit must never book less than this gain, whatever
-    # the giveback maths produces. Without it a position that armed at
-    # +2.6% could trail down to a few cents of profit and still call
-    # itself a PROFIT exit - technically green, but not worth the
-    # round trip once fees are paid.
+    # The minimum locked-in gain SCALES with how far the position ran,
+    # by explicit request: "if it goes up 2.5, should sell at 1% min,
+    # 3% up then 1.5% min, 5% up then 2.5% min".
+    #
+    # A FIXED minimum was wrong at both ends. At 2.5% it equalled the
+    # arm bar, so a position that armed at +2.6% had its floor forced
+    # up to +2.5% - effectively the peak itself - and sold on the very
+    # first tick down, turning the trail into a hair trigger. At a 20%
+    # peak the same fixed 2.5% was so far below the run that it
+    # guaranteed almost nothing.
+    #
+    # Half the peak gain tracks the request closely (peak 3% -> 1.5%,
+    # peak 5% -> 2.5%) and, being proportional, keeps meaning the same
+    # thing at any size. This is a FLOOR of last resort: the giveback
+    # tiers above normally hold more than half the peak, so they win -
+    # this only binds when a tier would have surrendered more.
     minimum_floor = average_cost * (
-        Decimal("1") + self.config.profit_lock_min_gain_percent
+        Decimal("1")
+        + (peak_price - average_cost) / average_cost
+        * self.config.profit_lock_min_gain_fraction
     )
     if floor < minimum_floor:
         floor = minimum_floor
