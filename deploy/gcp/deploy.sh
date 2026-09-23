@@ -45,7 +45,29 @@ fi
 
 cd "${RELEASE_DIR}"
 export BOT_IMAGE_TAG="${REVISION}"
-docker compose -f deploy/compose.yaml -p webull-bot build
+
+# Images are BUILT BY CI and pulled from the registry, never built
+# here. Live incident 2026-09-22: `docker compose build` ran on this
+# host - 2 cores, 1GB RAM, also running the trading bot and the
+# dashboard. It drove load average above 12, starved the trading loop
+# so consecutive SCAN cycles were 5-7 MINUTES apart (held positions
+# went unmonitored and a filled exit went unnoticed), and still timed
+# out: two deploys failed with DeadlineExceeded mid-session, leaving
+# merged fixes unshipped.
+#
+# BOT_IMAGE_REPO/DASHBOARD_IMAGE_REPO are exported by the deploy
+# caller. When they are unset the compose defaults are plain local
+# tags, and the fallback below builds locally - so a hand-run deploy
+# on a machine with no registry access still works.
+if [[ -n "${BOT_IMAGE_REPO:-}" ]]; then
+  export BOT_IMAGE_REPO DASHBOARD_IMAGE_REPO
+  if ! docker compose -f deploy/compose.yaml -p webull-bot pull; then
+    echo "Registry pull failed; falling back to a local build." >&2
+    docker compose -f deploy/compose.yaml -p webull-bot build
+  fi
+else
+  docker compose -f deploy/compose.yaml -p webull-bot build
+fi
 
 if ! docker compose -f deploy/compose.yaml -p webull-bot up -d --remove-orphans; then
   echo "New container failed to start; attempting rollback." >&2
