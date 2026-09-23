@@ -336,6 +336,83 @@ class StallExitPriceSpreadSanityTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class OptionStallSpreadBoundTests(unittest.TestCase):
+    """The stall breaker is the only mechanism that banks a SMALL
+    green move - the trail needs +2.5% to arm and the target needs
+    +10%.
+
+    Its ask-fallback was bounded by stock_entry_max_spread_percent
+    (0.50%), a STOCK bound. Option spreads run 2-10% routinely, so the
+    fallback was skipped on essentially every option position and the
+    breaker could only ever exit off the bid alone.
+
+    Live 2026-09-23: a MARA put sat +1.67% (+$3.86) for ~50 minutes
+    and never sold. The trail was one cent short of arming, the target
+    needs 10%, and the mechanism built for exactly this gain was
+    disabled by a bound options cannot satisfy.
+    """
+
+    def _api(self, bid, ask):
+        from webull_bot.webull_api import WebullAPI
+
+        api = WebullAPI.__new__(WebullAPI)
+        return SimpleNamespace(
+            quote_bid=lambda q: Decimal(bid),
+            quote_ask=lambda q: Decimal(ask),
+            price_tick_size=lambda p: Decimal("0.01"),
+            _quantize_to_option_tick=api._quantize_to_option_tick,
+        )
+
+    def _bot(self, bid, ask, option_bound):
+        from webull_bot.bot import AutoTrader
+
+        bot = SimpleNamespace(
+            api=self._api(bid, ask),
+            config=SimpleNamespace(
+                stock_entry_max_spread_percent=Decimal("0.50"),
+                option_max_entry_spread_percent=Decimal("25"),
+                stall_breaker_ask_fallback_fraction=Decimal("1"),
+            ),
+        )
+        bot._stall_exit_price = AutoTrader._stall_exit_price.__get__(bot)
+        return bot
+
+    def test_a_normal_option_spread_no_longer_blocks_the_exit(self):
+        # bid 1.20 / ask 1.26 is a ~5% spread - utterly normal for an
+        # option, and 10x the stock bound.
+        bot = self._bot("1.20", "1.26", Decimal("25"))
+        price = bot._stall_exit_price(
+            {}, Decimal("1.20"), Decimal("0.01"), Decimal("0.0007"),
+            Decimal("25"),
+        )
+        self.assertIsNotNone(
+            price,
+            "a 5% option spread must not disable the stall breaker",
+        )
+
+    def test_the_stock_bound_would_have_blocked_it(self):
+        """Pins the regression itself: the old default returns None on
+        the very same quote.
+        """
+        bot = self._bot("1.20", "1.26", Decimal("0.50"))
+        price = bot._stall_exit_price(
+            {}, Decimal("1.20"), Decimal("0.01"), Decimal("0.0007"),
+            Decimal("0.50"),
+        )
+        self.assertIsNone(price)
+
+    def test_a_genuinely_broken_option_spread_is_still_refused(self):
+        """The bound still has to mean something - a 60% spread is a
+        quote glitch, not a tradeable market.
+        """
+        bot = self._bot("1.00", "1.60", Decimal("25"))
+        price = bot._stall_exit_price(
+            {}, Decimal("1.00"), Decimal("0.01"), Decimal("0.0007"),
+            Decimal("25"),
+        )
+        self.assertIsNone(price)
+
+
 class StallBreakerWideSpreadResubmitTests(unittest.TestCase):
     def test_boost_stalled_positions_does_not_resubmit_at_an_unfillable_ask(self):
         from webull_bot.bot import AutoTrader
