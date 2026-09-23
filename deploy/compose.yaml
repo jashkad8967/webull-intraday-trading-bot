@@ -1,6 +1,12 @@
 services:
   trader:
-    image: webull-intraday-trading-bot:${BOT_IMAGE_TAG:-local}
+    # Pulled from GHCR, built by CI - see deploy/gcp/deploy.sh.
+    # Building here used to run ON the production host, a 2-core/1GB
+    # box that also runs the bot: it pegged load above 12, starved the
+    # trading loop for minutes at a time, and timed out two deploys
+    # mid-session on 2026-09-22. BOT_IMAGE_REPO lets a local dev build
+    # keep using a plain local tag.
+    image: ${BOT_IMAGE_REPO:-webull-intraday-trading-bot}:${BOT_IMAGE_TAG:-local}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -35,7 +41,7 @@ services:
         max-file: "3"
 
   dashboard:
-    image: webull-trading-dashboard:${BOT_IMAGE_TAG:-local}
+    image: ${DASHBOARD_IMAGE_REPO:-webull-trading-dashboard}:${BOT_IMAGE_TAG:-local}
     build:
       context: ../ui
       dockerfile: Dockerfile
