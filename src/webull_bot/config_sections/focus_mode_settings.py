@@ -263,8 +263,22 @@ class FocusModeSettings(BaseSettings):
     # Matches profit_lock_arm_percent on purpose: arm and floor at the
     # same number means "the moment this is worth protecting, that is
     # also the least it may be sold for".
-    profit_lock_min_gain_percent: Decimal = Field(
-        default=Decimal("0.025"), ge=0, le=10
+    # The minimum locked-in gain, as a FRACTION OF THE PEAK GAIN, by
+    # explicit request: "if it goes up 2.5, should sell at 1% min, 3%
+    # up then 1.5% min, 5% up then 2.5% min".
+    #
+    # Replaces a fixed percentage, which was wrong at both ends. At
+    # 2.5% it equalled profit_lock_arm_percent, so a position that
+    # armed at +2.6% had its floor forced to the peak and sold on the
+    # first tick down. At a 20% peak the same 2.5% guaranteed almost
+    # nothing. Half the peak matches the request (3% -> 1.5%, 5% ->
+    # 2.5%) and means the same thing at any size.
+    #
+    # A floor of last resort: the giveback tiers normally hold more
+    # than half the peak, so they win - this only binds when a tier
+    # would have surrendered more.
+    profit_lock_min_gain_fraction: Decimal = Field(
+        default=Decimal("0.5"), ge=0, le=1
     )
     # Tighter leash once the daily profit throttle has armed - the
     # day is already good, so open winners are held more defensively.

@@ -63,7 +63,7 @@ class StrategyConfigMixin:
             profit_lock_enabled=True,
             profit_lock_arm_percent=Decimal("0.10"),
             profit_lock_giveback_fraction=Decimal("0.50"),
-            profit_lock_min_gain_percent=Decimal("0.025"),
+            profit_lock_min_gain_fraction=Decimal("0.5"),
             profit_lock_giveback_fraction_after_throttle=Decimal("0.25"),
             pressure_enabled=True,
             pressure_min_for_entry=Decimal("0.15"),
