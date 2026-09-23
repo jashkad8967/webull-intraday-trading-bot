@@ -190,6 +190,26 @@ class OptionTradingSettings(BaseSettings):
     # large enough to clear the premium floor, so a bad pick costs a
     # third of the account instead of all of it.
     option_capital_fraction: Decimal = Field(default=Decimal("0.4"), gt=0, le=1)
+    # Concentration cap per UNDERLYING, the companion to the fraction
+    # above: that one bounds how much each position costs, this one
+    # bounds how many of them can ride on the same stock.
+    #
+    # Live 2026-09-23, minutes after the cohort fix let the account
+    # start trading again: a verified 5-name cohort put 3 of its 4
+    # open positions into SOFI - three different contracts, bought at
+    # 0.63, 0.70 and 0.80 (averaging UP) - and took buying power from
+    # $247 to $17. Nothing caught it. option_average_down_count is
+    # keyed on the exact option_symbol, so each new SOFI strike
+    # opened with a fresh budget and could not see the others;
+    # max_open_positions is account-wide and was nowhere near its
+    # limit. There was no per-underlying view at all.
+    #
+    # 1 by default: the cohort exists so the account is spread across
+    # 5-10 researched names, and one contract per name is what
+    # actually expresses that. Raising it re-admits exactly the
+    # concentration the cohort was built to prevent. 0 disables the
+    # cap entirely.
+    option_max_positions_per_underlying: int = Field(default=1, ge=0, le=10)
     # By request: "look for cheaper options to buy in to." select_atm_
     # options always picked the single strike nearest the money -
     # correct for delta, but on a small account often unaffordable

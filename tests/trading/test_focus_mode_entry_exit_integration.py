@@ -256,6 +256,71 @@ class CallAndPutEntryTests(FocusModeIntegrationTestCase):
         self.assertEqual(len(placed), 1)
         self.assertEqual(placed[0][1], "BUY")
 
+    def test_a_second_contract_on_a_name_already_held_is_refused(self):
+        """Live 2026-09-23, minutes after the cohort fix let the
+        account trade again: a verified 5-name cohort put 3 of its 4
+        open positions into SOFI - three DIFFERENT contracts bought at
+        0.63, 0.70 and 0.80, averaging UP - and drained buying power
+        from $247 to $17.
+
+        Nothing caught it. option_average_down_count is keyed on the
+        exact option_symbol, so each new SOFI strike opened with a
+        fresh budget and could not see the others; max_open_positions
+        is account-wide and was nowhere near its limit. There was no
+        per-underlying view at all, which defeats the entire point of
+        spreading the account over a 5-10 name cohort.
+        """
+        bot, placed = self._build()
+        contract = _contract("NVDA", "NVDAC2", "CALL")
+        quote = self._quote("1.90", "2.00")
+        self._enter(
+            bot, contract, quote, directions={"NVDA": "CALL"},
+            # A DIFFERENT NVDA contract is already on the book.
+            positions=[{
+                "instrument_type": "OPTION",
+                "symbol": "NVDA",
+                "quantity": "1",
+                "legs": [{"symbol": "NVDA"}],
+            }],
+        )
+        self.assertEqual(placed, [])
+        self.assertEqual(
+            bot.option_gate_rejections[
+                "already at the position cap for this underlying"
+            ],
+            1,
+        )
+
+    def test_a_position_in_another_name_does_not_block_this_one(self):
+        bot, placed = self._build()
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        quote = self._quote("1.90", "2.00")
+        self._enter(
+            bot, contract, quote, directions={"NVDA": "CALL"},
+            positions=[{
+                "instrument_type": "OPTION",
+                "symbol": "SOFI",
+                "quantity": "1",
+                "legs": [{"symbol": "SOFI"}],
+            }],
+        )
+        self.assertEqual(len(placed), 1)
+
+    def test_a_closed_position_on_the_name_does_not_block_a_re_entry(self):
+        bot, placed = self._build()
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        quote = self._quote("1.90", "2.00")
+        self._enter(
+            bot, contract, quote, directions={"NVDA": "CALL"},
+            positions=[{
+                "instrument_type": "OPTION",
+                "symbol": "NVDA",
+                "quantity": "0",
+                "legs": [{"symbol": "NVDA"}],
+            }],
+        )
+        self.assertEqual(len(placed), 1)
+
     def test_a_call_never_enters_on_a_bearish_signal(self):
         bot, placed = self._build()
         contract = _contract("NVDA", "NVDAC", "CALL")

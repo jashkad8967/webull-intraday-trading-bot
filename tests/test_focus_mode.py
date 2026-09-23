@@ -58,6 +58,7 @@ def focus_config(**overrides):
         option_max_moneyness_percent=Decimal("0.15"),
         option_eod_close_time="15:50",
         option_min_hold_dte=7,
+        option_max_positions_per_underlying=1,
         option_stale_exit_enabled=False,
         held_option_exit_enabled=False,
         option_time_aware_stop_enabled=False,
