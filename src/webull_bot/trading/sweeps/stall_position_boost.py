@@ -124,7 +124,32 @@ def boost_stalled_positions(
                 fee_per_share = (self.config.option_sell_fee_per_contract * quantity) / (quantity * 100)
                 quote = self.api.option_quote(contract["symbol"])
                 sell_price = self._stall_exit_price(
-                    quote, average_cost, min_profit, fee_per_share
+                    quote,
+                    average_cost,
+                    min_profit,
+                    fee_per_share,
+                    # Options need their OWN spread bound. The default
+                    # is stock_entry_max_spread_percent (0.50%), and
+                    # option spreads run 2-10% routinely - so the
+                    # ask-fallback was skipped on essentially every
+                    # option position and the stall breaker could only
+                    # ever exit off the bid alone.
+                    #
+                    # Live 2026-09-23: a MARA put sat +1.67% (+$3.86)
+                    # for ~50 minutes and never sold. The trail had
+                    # not armed (one cent short of the 2.5% bar), the
+                    # take-profit needs 10%, and the one mechanism
+                    # built to bank exactly this kind of small gain was
+                    # silently disabled by a bound options can never
+                    # satisfy. The docstring warns callers with
+                    # deliberately wide-spread positions to pass their
+                    # own bound; this one never did.
+                    #
+                    # option_max_entry_spread_percent is the bound this
+                    # codebase already trusts for option liquidity -
+                    # a contract we were willing to BUY at that spread
+                    # is one we should be willing to rest an exit in.
+                    self.config.option_max_entry_spread_percent,
                 )
                 if sell_price is None:
                     continue
