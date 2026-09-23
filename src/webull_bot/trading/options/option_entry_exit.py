@@ -1,6 +1,6 @@
 import logging
 import time
-from decimal import ROUND_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 from webull_bot.strategy_logic.types import Decision
 from webull_bot.trading.guards.price_sanity import (
@@ -640,9 +640,12 @@ def _evaluate_option_exit(
     # clear cost by at least fee_per_share (the exact margin option_
     # decision's own real profit target already builds in) guarantees
     # this only fires on a genuinely realizable gain.
+    # Initialised at function scope, not inside the branch below: the
+    # exit-pricing code reads it on EVERY path (a plain target hit, a
+    # stop, a stale exit), and those paths never enter this branch.
+    momentum_exit = False
     if decision.action == "HOLD" and sell_realizable_price > cost:
         fee_per_share = (self.config.option_sell_fee_per_contract * quantity) / (quantity * 100)
-        momentum_exit = False
         # Live incident (NKE, recurring even after the AMD fix): the
         # AMD fix required clearing cost by more than fee_per_share
         # (~$0.0002/share for a typical contract) - nowhere near
@@ -893,12 +896,35 @@ def _evaluate_option_exit(
         # (0.18 -> 0.18, three times, each a real -$0.02 loss). ROUND_UP
         # to the real tick guarantees the placed price is never
         # quantized back down below the intended target.
+        # A momentum exit is URGENT and must actually fill. By request
+        # ("it should exit green on its own before fading" /
+        # "execution is also important"): these fire because
+        # exhaustion was detected - RSI divergence, resistance, or
+        # participation flipping against the position - so the whole
+        # point is to be out before the fade, not to hold out for a
+        # better print while the premium bleeds.
+        #
+        # decision.target_price for these is sell_realizable_price,
+        # the BID - already marketable. Rounding it UP to the $0.05
+        # tick pushes it ABOVE the bid (bid 1.43 -> 1.45), so the
+        # order rests instead of filling and the position keeps
+        # falling while it waits. Rounding DOWN keeps it at or below
+        # the bid, where it crosses immediately.
+        #
+        # Safe against the NKE incident the ROUND_UP was added for:
+        # that was a fixed TARGET quantizing back down onto cost. A
+        # momentum exit only exists inside the min_margin guard above,
+        # which already requires sell_realizable_price to clear cost
+        # by a full $0.05 tick - so giving back at most one tick of
+        # rounding still lands strictly above cost.
+        rounding = ROUND_DOWN if momentum_exit else ROUND_UP
         target = self.api._quantize_to_option_tick(
-            decision.target_price, ROUND_UP
+            decision.target_price, rounding
         )
-        limit_price = max(
-            target,
-            self.api.option_limit_price(quote, "SELL"),
+        limit_price = (
+            target
+            if momentum_exit
+            else max(target, self.api.option_limit_price(quote, "SELL"))
         )
         if not self.price_sanity_cooldown_ready(
             option_symbol
