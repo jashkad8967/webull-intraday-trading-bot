@@ -6,8 +6,6 @@ from datetime import date, datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from rich.logging import RichHandler
-
 from webull_bot.analyst_data import AnalystDataService
 from webull_bot.commands import CommandQueue
 from webull_bot.config import settings
@@ -266,19 +264,24 @@ from webull_bot.webull_api import (
 )
 
 
+# Plain stdout, deliberately not rich.logging.RichHandler.
+#
+# Rich renders ANSI colour, box drawing and word wrapping for a human
+# at a TTY. Nothing here is at a TTY: this runs headless under Docker,
+# whose json-file driver captures plain text, and the on-disk log gets
+# its own formatter in daily_logging. So every one of those features
+# was being computed and then thrown away - and rich drags in pygments
+# and markdown-it-py to do it, on a 2-core/1GB host with an 8.7G disk
+# that ran out of room on 2026-09-23 and took the bot down mid-session.
+#
+# The format string reproduces what RichHandler was printing (time,
+# level, message) so log lines and anything that greps them are
+# unchanged.
 logging.basicConfig(
     level=logging.INFO,
-    format="%(message)s",
-    handlers=[
-        RichHandler(
-            show_time=True,
-            show_level=True,
-            show_path=False,
-            markup=False,
-            log_time_format="%H:%M:%S",
-            omit_repeated_times=False,
-        )
-    ],
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger("webull-bot")
 

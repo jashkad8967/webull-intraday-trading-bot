@@ -20,7 +20,8 @@ class TradingTimezoneFormatter(logging.Formatter):
 class DatedDailyFileHandler(logging.Handler):
     """Write logs live to logs/YYYY/MM/YYYY-MM-DD.log in trading time.
 
-    Keeps the newest `retention_days` files and deletes the rest.
+    Keeps the newest `retention_days` files (default 5) and deletes
+    the rest.
 
     Without that this grew without bound: one file per day, forever,
     on a deploy host with an 8.7G root. That host filled to 99% on
@@ -36,7 +37,7 @@ class DatedDailyFileHandler(logging.Handler):
     once per day, not once per record.
     """
 
-    def __init__(self, directory: str, timezone: str, retention_days: int = 30):
+    def __init__(self, directory: str, timezone: str, retention_days: int = 5):
         super().__init__()
         self.directory = Path(directory)
         self.timezone = ZoneInfo(timezone)
@@ -110,7 +111,7 @@ def add_daily_file_logging(
     logger: logging.Logger,
     directory: str,
     timezone: str,
-    retention_days: int = 30,
+    retention_days: int = 5,
 ) -> None:
     if any(isinstance(item, DatedDailyFileHandler) for item in logger.handlers):
         return

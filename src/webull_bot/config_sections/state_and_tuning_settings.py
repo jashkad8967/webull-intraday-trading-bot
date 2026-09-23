@@ -38,5 +38,12 @@ class StateAndTuningSettings(BaseSettings):
     )
     strategy_tuning_state_file: str = "conf/strategy_tuning.json"
     log_directory: str = "logs"
+    # Days of daily log files to keep. 5 by explicit request ("there is
+    # no need to save so much data") after the host's 8.7G root filled
+    # to 99% on 2026-09-23 and wedged Docker with the bot DOWN
+    # mid-session. Nothing reads these beyond the last few sessions -
+    # the dashboard only ever opens TODAY's file - so keeping a month
+    # was storage spent on data no one looks at. 0 disables pruning.
+    log_retention_days: int = Field(default=5, ge=0, le=365)
     status_file: str = "status.json"
     command_file: str = "commands.json"

@@ -57,12 +57,43 @@ class WashSaleTracker:
                 migrated += 1
             elif isinstance(value, dict) and "blocked_at" in value:
                 blocks[symbol] = value
+        # Drop entries whose block has already expired.
+        #
+        # blocked_until() prunes lazily, but only for a symbol someone
+        # asks about - so a name the scanner never surfaces again keeps
+        # its entry forever. Live 2026-09-23 this file held 336 blocks,
+        # most of them long-dead penny stocks from weeks earlier, and
+        # every one was re-read, re-serialised and re-written on every
+        # save. By explicit request ("there is no need to save so much
+        # data"), expired blocks are dropped once at load instead of
+        # accumulating for the life of the deployment.
+        expired = []
+        now = datetime.now(self.timezone)
+        for symbol, value in blocks.items():
+            try:
+                blocked_at = datetime.fromisoformat(value["blocked_at"])
+            except (KeyError, ValueError, TypeError):
+                expired.append(symbol)
+                continue
+            if now >= blocked_at + timedelta(days=self.block_days):
+                expired.append(symbol)
+        for symbol in expired:
+            blocks.pop(symbol, None)
+        if expired:
+            self.log.info(
+                "WASH   | dropped %s expired block(s) at load | %s remain",
+                len(expired),
+                len(blocks),
+            )
         if migrated:
             self.log.warning(
                 "WASH   | migrated %s legacy block(s) to the current "
                 "WASH_SALE_BLOCK_DAYS setting",
                 migrated,
             )
+        if migrated or expired:
+            # Persist immediately so the shrunken set is what the next
+            # start reads, rather than re-deriving it every boot.
             self.blocks = blocks
             self._save()
         return blocks

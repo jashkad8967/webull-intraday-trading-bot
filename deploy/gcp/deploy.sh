@@ -73,12 +73,12 @@ export BOT_IMAGE_TAG="${REVISION}"
 # out: two deploys failed with DeadlineExceeded mid-session, leaving
 # merged fixes unshipped.
 #
-# BOT_IMAGE_REPO/DASHBOARD_IMAGE_REPO are exported by the deploy
-# caller. When they are unset the compose defaults are plain local
-# tags, and the fallback below builds locally - so a hand-run deploy
-# on a machine with no registry access still works.
+# BOT_IMAGE_REPO is exported by the deploy caller. When it is unset the
+# compose default is a plain local tag and the fallback below builds
+# locally - so a hand-run deploy on a machine with no registry access
+# still works.
 if [[ -n "${BOT_IMAGE_REPO:-}" ]]; then
-  export BOT_IMAGE_REPO DASHBOARD_IMAGE_REPO
+  export BOT_IMAGE_REPO
   if ! docker compose -f deploy/compose.yaml -p webull-bot pull; then
     echo "Registry pull failed; falling back to a local build." >&2
     docker compose -f deploy/compose.yaml -p webull-bot build
@@ -132,7 +132,7 @@ rm -f -- "${ARCHIVE}"
 #
 # `docker image prune -f` alone caused it. That only removes DANGLING
 # images - untagged, unreferenced layers. Every deploy pulls
-# ghcr.io/.../trader:<sha> and dashboard:<sha>, which are fully
+# ghcr.io/.../trader:<sha>, which is fully
 # TAGGED and therefore never dangling, so each one stayed on disk
 # forever. On a 2-core/1GB/8.7G instance a few weeks of deploys is
 # all it takes.
@@ -155,7 +155,14 @@ prune_images() {
     | xargs -r -n1 docker rmi -f >/dev/null 2>&1 || true
 }
 prune_images "${BOT_IMAGE_REPO:-}"
-prune_images "${DASHBOARD_IMAGE_REPO:-}"
+# The dashboard image is gone (merged into the trader container), so
+# sweep every tag left over from before that merge - none of them is
+# the current or previous revision of anything that still runs.
+if [[ -n "${BOT_IMAGE_REPO:-}" ]]; then
+  docker images --format '{{.Repository}}:{{.Tag}}' \
+    | grep -E "(^|/)(dashboard|webull-trading-dashboard):" \
+    | xargs -r -n1 docker rmi -f >/dev/null 2>&1 || true
+fi
 docker image prune -f >/dev/null 2>&1 || true
 
 # Keep the newest few release trees (current and previous are always

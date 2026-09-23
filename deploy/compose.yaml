@@ -1,4 +1,16 @@
 services:
+  # ONE container. The dashboard used to be a second service with its
+  # own base image and its own dependency tree - two of everything on a
+  # 2-core/1GB host whose 8.7G root filled to 99% on 2026-09-23 and
+  # wedged Docker, leaving the bot DOWN mid-session with four open
+  # option positions and no stop, no profit-lock and no EOD close.
+  #
+  # The two only ever communicated through files (/var/data/status.json,
+  # the log directory, /var/commands/commands.json), so merging them
+  # changes no protocol: the dashboard now runs as a second process
+  # inside this container reading the same paths on the same local
+  # filesystem. See deploy/entrypoint.sh for the process layout and why
+  # it is a separate process rather than a thread.
   trader:
     # Pulled from GHCR, built by CI - see deploy/gcp/deploy.sh.
     # Building here used to run ON the production host, a 2-core/1GB
@@ -12,13 +24,10 @@ services:
       dockerfile: Dockerfile
     container_name: webull-trading-bot
     restart: unless-stopped
-    # Bound both containers on a 1GB host so neither can starve the
-    # other or invite the kernel OOM killer to pick the victim - which
-    # on an unbounded pair is as likely to be the trading bot holding
-    # live positions as the dashboard nobody is looking at. The trader
-    # gets the larger share because it is the one that must not die.
-    mem_limit: 600m
-    memswap_limit: 600m
+    # Bounded so a leak cannot invite the kernel OOM killer to choose
+    # between this and the rest of the box. Covers both processes now.
+    mem_limit: 700m
+    memswap_limit: 700m
     env_file:
       - ${BOT_ENV_FILE:-/opt/webull-bot/shared/.env}
     environment:
@@ -30,6 +39,10 @@ services:
       OPTION_CONTRACTS_STATE_FILE: /var/data/conf/option_contracts.json
       STATUS_FILE: /var/data/status.json
       COMMAND_FILE: /var/commands/commands.json
+      # Read by the dashboard process, which shares this environment
+      # now that it runs in the same container.
+      TRADING_TIMEZONE: America/Chicago
+      GIT_SHA: ${BOT_IMAGE_TAG:-local}
       # Keep this in step with TRADING_TIMEZONE: the option DTE window
       # and contract pruning call date.today(), which reads the
       # container's system zone, not the configured trading zone. The
@@ -40,42 +53,13 @@ services:
     volumes:
       - trading-data:/var/data
       - command-data:/var/commands
-    stop_grace_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "3"
-
-  dashboard:
-    image: ${DASHBOARD_IMAGE_REPO:-webull-trading-dashboard}:${BOT_IMAGE_TAG:-local}
-    build:
-      context: ../ui
-      dockerfile: Dockerfile
-    container_name: webull-trading-dashboard
-    restart: unless-stopped
-    # Deliberately the smaller share: if memory gets tight the
-    # dashboard is the one that should be squeezed, never the trader.
-    mem_limit: 256m
-    memswap_limit: 256m
-    environment:
-      STATUS_FILE: /var/data/status.json
-      LOG_DIRECTORY: /var/data/logs
-      TRADING_TIMEZONE: America/Chicago
-      COMMAND_FILE: /var/commands/commands.json
-      GIT_SHA: ${BOT_IMAGE_TAG:-local}
-      TZ: America/Chicago
-    volumes:
-      - trading-data:/var/data:ro
-      - command-data:/var/commands
     ports:
       # Loopback-only by default: view it with
       # `ssh -L 8080:localhost:8080 <user>@<host>` and open localhost:8080.
       # Change to "0.0.0.0:8080:8080" to expose it directly (and open the
       # firewall port) if you want it reachable without an SSH tunnel.
       - "127.0.0.1:8080:8080"
-    depends_on:
-      - trader
+    stop_grace_period: 30s
     logging:
       driver: json-file
       options:
