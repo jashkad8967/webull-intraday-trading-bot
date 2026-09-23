@@ -9,6 +9,7 @@ from webull_bot.config import Settings
 from webull_bot.strategy import TradingStrategy
 
 from support.fixtures import StrategyConfigMixin
+from fake_open_times import FakeOpenTimes
 
 
 class LateCoreSessionTransitionTests(StrategyConfigMixin, unittest.TestCase):
@@ -444,6 +445,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=time.monotonic() - 999999,
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             consecutive_exit_failures=defaultdict(int),
             submitted_order_ids_today=set(),
@@ -473,6 +475,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=stale,
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             consecutive_exit_failures=defaultdict(int),
             submitted_order_ids_today=set(),
@@ -504,6 +507,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=time.monotonic(),
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             consecutive_exit_failures=defaultdict(int),
             submitted_order_ids_today=set(),
@@ -526,6 +530,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=time.monotonic(),
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             consecutive_exit_failures=defaultdict(int),
             submitted_order_ids_today=set(),
@@ -548,6 +553,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=time.monotonic(),
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             consecutive_exit_failures=defaultdict(int),
             submitted_order_ids_today=set(),
@@ -571,6 +577,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             last_capital_deployed_at=stale,
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
         )
@@ -600,6 +607,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
             option_contracts=[],
@@ -638,6 +646,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
             option_contracts=[
@@ -687,6 +696,7 @@ class IdleCashRelaxationTests(unittest.TestCase):
             recent_stop_losses=deque(),
             last_volatility_stop_loss_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             submitted_order_ids_today=set(),
             option_contracts=[

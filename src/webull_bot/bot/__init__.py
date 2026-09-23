@@ -25,6 +25,7 @@ from webull_bot.invalid_symbols import InvalidSymbolTracker
 from webull_bot.option_contracts_state import OptionContractsStateStore
 from webull_bot.market_agent import MarketResearchAgent
 from webull_bot.pairs import PairsStrategy
+from webull_bot.position_open_times import PositionOpenTimeStore
 from webull_bot.risk.entry_blackout import fresh_entry_blackout_active
 from webull_bot.risk.options_priority_window import options_priority_window_active
 from webull_bot.risk.profit_target_multiplier import profit_target_multiplier
@@ -101,6 +102,9 @@ from webull_bot.trading.options.option_entry_exit import (
 )
 from webull_bot.trading.options.option_scan_batch import _prepare_option_scan_batch
 from webull_bot.trading.orders.close_instruments import close_instruments
+from webull_bot.trading.orders.carried_over_options import (
+    close_carried_over_options,
+)
 from webull_bot.trading.orders.exit_failure_tracking import _note_exit_failure
 from webull_bot.trading.orders.force_market_exit import should_force_market_exit
 from webull_bot.trading.orders.held_exit_evaluation import evaluate_held_stock_exits
@@ -399,6 +403,7 @@ class AutoTrader:
     stop_loss_guard_active = stop_loss_guard_active
     symbol_quarantined = symbol_quarantined
     close_instruments = close_instruments
+    close_carried_over_options = close_carried_over_options
     _manual_cancel_order = _manual_cancel_order
     process_ui_commands = process_ui_commands
     # Daily universe-resolution pipeline (non-blocking dispatch, download/
@@ -521,6 +526,11 @@ class AutoTrader:
         )
         self.invalid_symbols = InvalidSymbolTracker(
             self.config.invalid_symbol_state_file,
+            log,
+        )
+        self.position_open_times = PositionOpenTimeStore(
+            self.config.position_open_times_state_file,
+            self.timezone,
             log,
         )
         self.wash_skip_logged: set[str] = set()
@@ -735,6 +745,14 @@ class AutoTrader:
         # on exit, so a fresh entry always starts its own noise-grace
         # window regardless of how long the symbol was previously held.
         self.position_opened_at: dict[str, float] = {}
+        # Loop heartbeats for the watchdog (see loop_watchdog). None
+        # until each loop has run once - startup can legitimately take
+        # a while and there is nothing to compare against yet.
+        self.main_loop_ticked_at: float | None = None
+        self.protection_loop_ticked_at: float | None = None
+        # Date the carried-over option sweep last ran - see
+        # close_carried_over_options. Once per day, at the option open.
+        self.carried_over_options_date: date | None = None
         self.cached_buying_power = Decimal("0")
         # See account_state - option sizing/affordability must use
         # this, never cached_buying_power (a separate, stock-only pool).

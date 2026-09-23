@@ -1,5 +1,6 @@
 import logging
 import time
+from datetime import datetime
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 from webull_bot.strategy_logic.types import Decision
@@ -695,11 +696,24 @@ def _evaluate_option_exit(
         # deploy restarted the container - they would never have been
         # closed by the timer that exists precisely for them.
         #
-        # Seeding from first sight under-counts the true age (the clock
-        # restarts rather than resuming), which is the conservative
-        # direction: it can only ever delay a stale exit, never fire
-        # one early on a position that has not actually gone stale.
-        opened_at = time.monotonic()
+        # This used to reseed from FIRST SIGHT, which reset the age
+        # clock to zero on every restart - so each restart bought a
+        # stalled position another full option_stale_exit_minutes of
+        # immunity, and a bot restarted repeatedly could hold one
+        # indefinitely. The persisted entry time is now the source of
+        # truth, so the age RESUMES across a restart instead.
+        #
+        # note_open is idempotent: a position already on record keeps
+        # its original timestamp, and only one genuinely first seen
+        # gets stamped now (still an under-count for anything opened
+        # before this store existed, which is the safe direction - it
+        # can delay a stale exit, never fire one early).
+        recorded = self.position_open_times.note_open(key)
+        age_seconds = max(
+            0.0,
+            (datetime.now(self.timezone) - recorded).total_seconds(),
+        )
+        opened_at = time.monotonic() - age_seconds
         self.position_opened_at[key] = opened_at
     seconds_since_entry = time.monotonic() - opened_at
     # By request ("make sure when there is a profit to not let on too

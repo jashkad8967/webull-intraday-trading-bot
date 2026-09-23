@@ -3,6 +3,7 @@ import unittest.mock
 from collections import defaultdict, deque
 from decimal import Decimal
 from types import SimpleNamespace
+from fake_open_times import FakeOpenTimes
 
 
 
@@ -44,6 +45,7 @@ class StopLossEscalationTests(unittest.TestCase):
             working_orders={},
             status=SimpleNamespace(record_trade=lambda *a, **k: None),
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             consecutive_exit_failures=defaultdict(int),
             submitted_order_ids_today=set(),
@@ -82,6 +84,7 @@ class StopLossEscalationTests(unittest.TestCase):
             submitted_order_ids_today=set(),
             last_exit_at={},
             position_opened_at={},
+            position_open_times=FakeOpenTimes(),
             symbol_pnl_history=defaultdict(deque),
             consecutive_exit_failures=defaultdict(int),
             recent_stop_losses=deque(),

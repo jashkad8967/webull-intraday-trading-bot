@@ -1,0 +1,210 @@
+"""Two failures that let real positions go unmanaged.
+
+1. Positions carried past their own end-of-day close. This bot is
+   intraday-flat by design, but option_eod_close_time only runs inside
+   its own window - a bot not running during that window never
+   flattens, and nothing afterwards ever noticed. Live 2026-09-23: the
+   host's disk filled, Docker wedged, the bot was DOWN from ~13:10 CT
+   and came back at 15:54 - after options stopped trading at 15:00 -
+   holding 2x SOFI and 1x NFLX that should have closed at 14:50.
+
+2. A wedged loop. restart:unless-stopped only covers a process that
+   EXITS; a bot stuck on a socket with no timeout keeps the container
+   "Up" while stops and profit exits quietly stop being submitted.
+"""
+
+import logging
+import time
+import unittest
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+from webull_bot.trading.guards import loop_watchdog
+from webull_bot.trading.orders.carried_over_options import (
+    close_carried_over_options,
+)
+
+
+def _option(symbol, quantity=1):
+    return {
+        "instrument_type": "OPTION",
+        "symbol": symbol,
+        "quantity": str(quantity),
+    }
+
+
+class CarriedOverOptionTests(unittest.TestCase):
+    def _bot(self, positions, opened_dates=None):
+        closed = []
+        now = datetime.now(timezone.utc)
+
+        class OpenTimes:
+            def __init__(self):
+                self.dates = dict(opened_dates or {})
+
+            def opened_before_today(self, key):
+                stamp = self.dates.get(key)
+                if stamp is None:
+                    return False
+                return stamp.date() < now.date()
+
+        bot = SimpleNamespace(
+            carried_over_options_date=None,
+            cached_positions=positions,
+            position_open_times=OpenTimes(),
+            close_instruments=lambda kinds: closed.append(kinds),
+        )
+        bot.close_carried_over_options = close_carried_over_options.__get__(bot)
+        return bot, closed
+
+    def test_a_position_from_a_previous_session_is_closed(self):
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        bot, closed = self._bot(
+            [_option("SOFI261009C00016500")],
+            {"OPTION:SOFI261009C00016500": yesterday},
+        )
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertEqual(closed, [{"OPTION"}])
+
+    def test_a_position_opened_today_is_left_alone(self):
+        """The discriminator that matters. A mid-session restart must
+        not be mistaken for a new day - a 'close everything open when
+        the session starts' rule would dump legitimate intraday
+        positions on every deploy.
+        """
+        bot, closed = self._bot(
+            [_option("SOFI261009C00016500")],
+            {"OPTION:SOFI261009C00016500": datetime.now(timezone.utc)},
+        )
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertEqual(closed, [])
+
+    def test_a_position_with_no_record_is_left_to_the_normal_ladder(self):
+        bot, closed = self._bot([_option("SOFI261009C00016500")], {})
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertEqual(closed, [])
+
+    def test_it_runs_only_once_per_day(self):
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        bot, closed = self._bot(
+            [_option("SOFI261009C00016500")],
+            {"OPTION:SOFI261009C00016500": yesterday},
+        )
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertEqual(closed, [{"OPTION"}])
+
+    def test_an_empty_position_list_does_not_burn_the_daily_run(self):
+        """cached_positions is empty for the first cycles after a
+        restart. Stamping the day then would mark it handled before
+        anything could be seen, and the carried position would survive
+        the whole session.
+        """
+        bot, closed = self._bot([], {})
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertIsNone(bot.carried_over_options_date)
+
+    def test_a_zero_quantity_position_is_ignored(self):
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        bot, closed = self._bot(
+            [_option("SOFI261009C00016500", quantity=0)],
+            {"OPTION:SOFI261009C00016500": yesterday},
+        )
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertEqual(closed, [])
+
+    def test_a_stock_position_is_ignored(self):
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        bot, closed = self._bot(
+            [{"instrument_type": "EQUITY", "symbol": "SOFI", "quantity": "5"}],
+            {"OPTION:SOFI": yesterday},
+        )
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertEqual(closed, [])
+
+
+class LoopWatchdogTests(unittest.TestCase):
+    """The watchdog decides whether to kill a live trading process, so
+    its threshold arithmetic is worth locking down directly.
+    """
+
+    def test_thresholds_are_well_clear_of_the_worst_measured_cycle(self):
+        # Slow scans were measured at 5-7 minutes under host load on
+        # 2026-09-22. A limit near that would restart-loop a healthy
+        # bot and drop the in-memory profit-lock peaks each time.
+        self.assertGreaterEqual(loop_watchdog.MAIN_LOOP_STALL_SECONDS, 840)
+        # The protection loop submits the stops, so it gets the
+        # tighter bound of the two.
+        self.assertLess(
+            loop_watchdog.PROTECTION_LOOP_STALL_SECONDS,
+            loop_watchdog.MAIN_LOOP_STALL_SECONDS,
+        )
+
+    def test_a_never_started_loop_is_not_treated_as_stalled(self):
+        """Startup (auth, universe resolution) legitimately takes a
+        while, and None means 'no tick yet', not 'stalled forever'.
+        """
+        exits = []
+        bot = SimpleNamespace(
+            main_loop_ticked_at=None,
+            protection_loop_ticked_at=None,
+        )
+        self.assertFalse(self._would_exit(bot, exits))
+
+    def test_a_fresh_tick_does_not_trigger(self):
+        now = time.monotonic()
+        bot = SimpleNamespace(
+            main_loop_ticked_at=now,
+            protection_loop_ticked_at=now,
+        )
+        self.assertFalse(self._would_exit(bot, []))
+
+    def test_a_stalled_protection_loop_triggers(self):
+        now = time.monotonic()
+        bot = SimpleNamespace(
+            main_loop_ticked_at=now,
+            protection_loop_ticked_at=now
+            - loop_watchdog.PROTECTION_LOOP_STALL_SECONDS
+            - 1,
+        )
+        self.assertTrue(self._would_exit(bot, []))
+
+    def test_a_stalled_main_loop_triggers(self):
+        now = time.monotonic()
+        bot = SimpleNamespace(
+            main_loop_ticked_at=now - loop_watchdog.MAIN_LOOP_STALL_SECONDS - 1,
+            protection_loop_ticked_at=now,
+        )
+        self.assertTrue(self._would_exit(bot, []))
+
+    def test_a_slow_but_living_main_loop_does_not_trigger(self):
+        """Seven minutes is a real, observed scan cycle - it must not
+        be mistaken for a hang.
+        """
+        now = time.monotonic()
+        bot = SimpleNamespace(
+            main_loop_ticked_at=now - 7 * 60,
+            protection_loop_ticked_at=now,
+        )
+        self.assertFalse(self._would_exit(bot, []))
+
+    def _would_exit(self, bot, exits):
+        """Mirror of the watchdog's decision, without killing pytest."""
+        now = time.monotonic()
+        for last, limit in (
+            (bot.main_loop_ticked_at, loop_watchdog.MAIN_LOOP_STALL_SECONDS),
+            (
+                bot.protection_loop_ticked_at,
+                loop_watchdog.PROTECTION_LOOP_STALL_SECONDS,
+            ),
+        ):
+            if last is None:
+                continue
+            if now - last >= limit:
+                return True
+        return False
+
+
+if __name__ == "__main__":
+    unittest.main()
