@@ -28,6 +28,61 @@ class WashSaleTrackerTests(unittest.TestCase):
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
+    def test_expired_blocks_are_dropped_at_load_not_carried_forever(self):
+        """blocked_until() prunes lazily - only for a symbol someone
+        asks about - so a name the scanner never surfaces again keeps
+        its entry for the life of the deployment. Live 2026-09-23 this
+        file held 336 blocks, most of them long-dead penny stocks from
+        weeks earlier, every one re-read and re-serialised on every
+        save, on a host whose disk had just filled to 99%.
+        """
+        path = Path("tests/.generated_wash/expired.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            now = datetime.now(timezone.utc)
+            path.write_text(
+                json.dumps({
+                    "STALE": {
+                        "blocked_at": (now - timedelta(days=90)).isoformat()
+                    },
+                    "ALSOSTALE": {
+                        "blocked_at": (now - timedelta(days=32)).isoformat()
+                    },
+                    "FRESH": {
+                        "blocked_at": (now - timedelta(days=2)).isoformat()
+                    },
+                    "CORRUPT": {"blocked_at": "not-a-date"},
+                }),
+                encoding="utf-8",
+            )
+            tracker = self._tracker(path, 31)
+            self.assertEqual(set(tracker.blocks), {"FRESH"})
+            # And the shrunken set is what the next start reads.
+            self.assertEqual(
+                set(json.loads(path.read_text(encoding="utf-8"))), {"FRESH"}
+            )
+            self.assertIsNotNone(tracker.blocked_until("FRESH"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_a_file_of_only_live_blocks_is_not_rewritten(self):
+        path = Path("tests/.generated_wash/all_live.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            now = datetime.now(timezone.utc)
+            payload = {
+                "FRESH": {"blocked_at": (now - timedelta(days=1)).isoformat()}
+            }
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            before = path.read_text(encoding="utf-8")
+            tracker = self._tracker(path, 31)
+            self.assertEqual(set(tracker.blocks), {"FRESH"})
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
     def test_direction_scoped_key_only_blocks_the_matching_side(self):
         # By request: "you can constantly buy puts and calls on the
         # same stock as it dips and rises" - option stop-loss wash-

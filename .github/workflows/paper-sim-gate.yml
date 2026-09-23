@@ -49,7 +49,57 @@ jobs:
       - run: bash -n deploy/gcp/bootstrap.sh deploy/gcp/deploy.sh
       - run: BOT_ENV_FILE="$GITHUB_WORKSPACE/.env.example" BOT_IMAGE_TAG=ci docker compose -f deploy/compose.yaml config
       - run: docker build --tag webull-intraday-trading-bot:ci .
-      - run: docker build --tag webull-trading-dashboard:ci ui
+
+      # The dashboard now ships INSIDE the trader image (one container
+      # since 2026-09-23). Building proves the image assembles; it does
+      # not prove the dashboard can actually start from it, and that
+      # gap is exactly the kind that only shows up at market open.
+      #
+      # ui/server.py imports fcntl, so it cannot even be imported off
+      # Linux - a local smoke test on a dev machine silently proves
+      # nothing. This runs the REAL image and hits the REAL endpoints
+      # the manual buy/sell/cancel buttons depend on.
+      - name: The dashboard actually serves from the merged image
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/smoke/data/logs /tmp/smoke/cmd
+          echo '{"account_value":"0","buying_power":"0","positions":[]}'             > /tmp/smoke/data/status.json
+          chmod -R 0777 /tmp/smoke
+          docker run -d --name dash-smoke             -e STATUS_FILE=/var/data/status.json             -e LOG_DIRECTORY=/var/data/logs             -e COMMAND_FILE=/var/commands/commands.json             -e TRADING_TIMEZONE=America/Chicago             -v /tmp/smoke/data:/var/data             -v /tmp/smoke/cmd:/var/commands             -p 8099:8080             --entrypoint uvicorn             webull-intraday-trading-bot:ci             server:app --app-dir /app/ui --host 0.0.0.0 --port 8080
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8099/api/status; then
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "dashboard never came up" >&2
+              docker logs dash-smoke >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          curl -sf -o /dev/null http://127.0.0.1:8099/
+          curl -sf -o /dev/null http://127.0.0.1:8099/api/logs
+          # The manual sell button must reach the command queue the bot
+          # drains - the path that mattered most in live trading.
+          curl -sf -X POST http://127.0.0.1:8099/api/sell             -H 'Content-Type: application/json'             -d '{"symbol":"SOFI","instrument_type":"OPTION"}' | tee /tmp/sell.json
+          grep -q '"queued": *true' /tmp/sell.json
+          grep -q SOFI /tmp/smoke/cmd/commands.json
+          docker rm -f dash-smoke >/dev/null
+
+      # The image must stay small: this host has an 8.7G root that
+      # filled to 99% on 2026-09-23 and wedged Docker with the bot down
+      # mid-session holding live positions.
+      - name: The image stays under its size budget
+        run: |
+          set -euo pipefail
+          BYTES=$(docker image inspect webull-intraday-trading-bot:ci             --format '{{.Size}}')
+          MB=$((BYTES / 1024 / 1024))
+          echo "image size: ${MB}MB"
+          if [ "${MB}" -gt 400 ]; then
+            echo "Image grew past its 400MB budget (${MB}MB)." >&2
+            echo "This host cannot absorb it - see deploy/gcp/deploy.sh." >&2
+            exit 1
+          fi
 
   paper-sim-gate:
     needs: validate
@@ -124,7 +174,6 @@ jobs:
       # above 12, starved the trading loop to 5-7 minute cycles, and
       # timed out two deploys mid-session on 2026-09-22.
       BOT_IMAGE_REPO: ghcr.io/${{ github.repository }}/trader
-      DASHBOARD_IMAGE_REPO: ghcr.io/${{ github.repository }}/dashboard
       GCP_HOST: ${{ secrets.GCP_HOST }}
       GCP_USER: ${{ secrets.GCP_USER }}
       GCP_SSH_PORT: ${{ secrets.GCP_SSH_PORT || '22' }}
@@ -168,15 +217,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build and push the dashboard image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./ui
-          push: true
-          tags: ${{ env.DASHBOARD_IMAGE_REPO }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
       - name: Package release
         run: |
           tar \
@@ -211,4 +251,4 @@ jobs:
           ssh \
             -p "$GCP_SSH_PORT" \
             "${GCP_USER}@${GCP_HOST}" \
-            "BOT_IMAGE_REPO='${BOT_IMAGE_REPO}' DASHBOARD_IMAGE_REPO='${DASHBOARD_IMAGE_REPO}' /opt/webull-bot/bin/deploy '/tmp/webull-bot-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"
+            "BOT_IMAGE_REPO='${BOT_IMAGE_REPO}' /opt/webull-bot/bin/deploy '/tmp/webull-bot-${GITHUB_SHA}.tar.gz' '${GITHUB_SHA}'"

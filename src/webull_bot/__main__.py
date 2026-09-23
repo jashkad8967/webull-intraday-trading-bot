@@ -12,6 +12,7 @@ def main() -> None:
             log,
             runtime_config.log_directory,
             runtime_config.trading_timezone,
+            runtime_config.log_retention_days,
         )
         if "--close-all" in sys.argv:
             force_close_all()

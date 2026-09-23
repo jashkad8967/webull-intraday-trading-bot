@@ -49,6 +49,16 @@ fi
 
 docker volume create webull-trading-data >/dev/null
 
+# Disk guard, independent of deploys. See install-disk-cleanup.sh for
+# why this exists (2026-09-23: root filled to 99%, Docker wedged, bot
+# DOWN mid-session holding live positions, machine needed a console
+# reset). Kept in its own script so it can also be installed on an
+# EXISTING host, which is exactly what that outage needed and what
+# bootstrap-only code could not provide.
+if [[ -f "${SCRIPT_DIR}/install-disk-cleanup.sh" ]]; then
+  bash "${SCRIPT_DIR}/install-disk-cleanup.sh"
+fi
+
 echo
 echo "GCE VM bootstrap complete."
 echo "1. Edit ${DEPLOY_ROOT}/shared/.env and enter your secrets."
