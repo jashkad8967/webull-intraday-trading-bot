@@ -138,6 +138,27 @@ def select_focus_cohort(self, moment: datetime) -> None:
     # stamping early would mark the day done before a real pick was
     # ever possible.
     scored: list[tuple[float, str]] = []
+    # Budget for NEW wide chain discovery in this pass.
+    #
+    # Live incident 2026-09-23: focus_symbol_is_affordable does a full
+    # option-chain fetch for any candidate not yet in
+    # focus_wide_discovered, and that takes ~30 SECONDS per name
+    # (measured: PLTR 08:47:16, AMZN 08:47:47). With a 16-name batch
+    # this loop needed ~8 minutes to finish a single pass, so
+    # select_focus_cohort never reached its lock or even its "nothing
+    # cleared" log - the cohort simply never locked, and the account
+    # sat out a session with CALL=11 PUT=4 signals firing.
+    #
+    # Discovery is bounded per pass instead. Candidates already
+    # discovered are still checked properly (that path only re-quotes,
+    # it does not re-fetch the chain); undiscovered ones beyond the
+    # budget are admitted on the affordability check's own fail-open
+    # convention and verified right after the lock by
+    # ensure_focus_cohort_contracts, which disqualifies and backfills
+    # exactly as it does for a chain that turns out not to exist.
+    # Each pass discovers a few more, so the picture sharpens within
+    # a minute or two instead of blocking the whole session.
+    discovery_budget = self.config.focus_lock_discovery_per_pass
     for symbol in self.daily_batch:
         # Confirmed this session to have no discoverable option chain
         # at all - see ensure_focus_cohort_contracts. Permanent for
@@ -162,8 +183,16 @@ def select_focus_cohort(self, moment: datetime) -> None:
         # contract against $363) and then immediately having to
         # disqualify it wastes real trading time. See
         # focus_symbol_is_affordable's own docstring.
-        if not self.focus_symbol_is_affordable(symbol):
-            continue
+        already_known = symbol in self.focus_wide_discovered
+        if not already_known and discovery_budget <= 0:
+            # Out of budget this pass - admit it and let the post-lock
+            # check settle it, rather than stalling the whole lock.
+            pass
+        else:
+            if not already_known:
+                discovery_budget -= 1
+            if not self.focus_symbol_is_affordable(symbol):
+                continue
         score = self.strategy.priority_score(symbol, self.agent_assessment(symbol))
         scored.append((score, symbol))
     if not scored:

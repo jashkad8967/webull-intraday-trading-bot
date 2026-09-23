@@ -28,6 +28,7 @@ def focus_config(**overrides):
         focus_max_price=Decimal("600"),
         focus_repick_when_blocked=True,
         focus_cohort_size=10,
+        focus_lock_discovery_per_pass=25,
         focus_contract_discovery_max_failures=3,
         focus_daily_profit_target_fraction=Decimal("0.05"),
         profit_throttle_confirm_readings=3,
@@ -1501,6 +1502,7 @@ class RepickOnNoChainTests(unittest.TestCase):
             focus_cohort_date=now.date(),
             focus_logged_empty_date=None,
             focus_symbol_no_chain={"GRML"},
+            focus_wide_discovered=set(),
             wash_sales=SimpleNamespace(blocked_until=lambda key: None),
             agent_assessment=lambda symbol: None,
             strategy=SimpleNamespace(
@@ -1555,6 +1557,7 @@ class ProactiveAffordabilityInSelectionTests(unittest.TestCase):
             focus_cohort_date=None,
             focus_logged_empty_date=None,
             focus_symbol_no_chain=set(),
+            focus_wide_discovered=set(),
             focus_cohort_growth_attempt_at=None,
             wash_sales=SimpleNamespace(blocked_until=lambda key: None),
             agent_assessment=lambda symbol: None,
@@ -1613,6 +1616,7 @@ class CohortSelectionTests(unittest.TestCase):
             focus_cohort_date=None,
             focus_logged_empty_date=None,
             focus_symbol_no_chain=set(),
+            focus_wide_discovered=set(),
             focus_cohort_growth_attempt_at=None,
             wash_sales=SimpleNamespace(
                 blocked_until=lambda key: True
