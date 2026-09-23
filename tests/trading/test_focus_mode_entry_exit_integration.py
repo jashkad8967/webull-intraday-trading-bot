@@ -345,6 +345,101 @@ class CallAndPutEntryTests(FocusModeIntegrationTestCase):
         self.assertEqual(placed[1][1], "BUY")
 
 
+class CohortConsensusTests(FocusModeIntegrationTestCase):
+    """Every other gate judges a contract in ISOLATION, so when the
+    whole cohort is falling the loop hunts for the one name still
+    printing CALL and goes long into a down tape.
+
+    Live 2026-09-23, at the moment each entry was placed:
+        08:52:35  CALL=1  PUT=9   <- BABA call bought 08:50
+        08:53:55  CALL=2  PUT=7   <- MARA call bought 08:54
+    Both were underwater immediately; the account went $368.98 ->
+    $343.22.
+    """
+
+    def _directions(self, calls, puts):
+        d = {f"C{i}": "CALL" for i in range(calls)}
+        d.update({f"P{i}": "PUT" for i in range(puts)})
+        d["NVDA"] = "CALL"
+        return d
+
+    def test_a_call_is_blocked_when_the_cohort_is_overwhelmingly_put(self):
+        bot, placed = self._build()
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        # The live shape: 1 CALL against 9 PUTs.
+        bot._evaluate_option_entry(
+            contract, "NVDAC", "OPTION:NVDAC",
+            self._quote("1.00", "1.02"), Decimal("1.00"),
+            days_to_expiration=20, current_iv=None,
+            directions=self._directions(0, 9),
+            guard_active=False, current_vixy=None, open_count=0,
+            buying_power=Decimal("400"), positions=[],
+        )
+        self.assertEqual(
+            placed, [], "a call must not be bought into a falling cohort"
+        )
+        self.assertEqual(
+            bot.option_gate_rejections["cohort momentum is against this direction"],
+            1,
+        )
+
+    def test_the_majority_side_still_enters(self):
+        """The gate blocks the MINORITY side only - it must never stop
+        a trade that agrees with the tape.
+        """
+        bot, placed = self._build()
+        contract = _contract("NVDA", "NVDAP", "PUT")
+        directions = self._directions(0, 9)
+        directions["NVDA"] = "PUT"
+        bot._evaluate_option_entry(
+            contract, "NVDAP", "OPTION:NVDAP",
+            self._quote("1.00", "1.02"), Decimal("1.00"),
+            days_to_expiration=20, current_iv=None,
+            directions=directions,
+            guard_active=False, current_vixy=None, open_count=0,
+            buying_power=Decimal("400"), positions=[],
+        )
+        self.assertEqual(
+            bot.option_gate_rejections["cohort momentum is against this direction"],
+            0,
+            "the side the cohort agrees with must not be blocked",
+        )
+
+    def test_a_split_cohort_does_not_block_anything(self):
+        bot, placed = self._build()
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        bot._evaluate_option_entry(
+            contract, "NVDAC", "OPTION:NVDAC",
+            self._quote("1.00", "1.02"), Decimal("1.00"),
+            days_to_expiration=20, current_iv=None,
+            directions=self._directions(5, 5),
+            guard_active=False, current_vixy=None, open_count=0,
+            buying_power=Decimal("400"), positions=[],
+        )
+        self.assertEqual(
+            bot.option_gate_rejections["cohort momentum is against this direction"],
+            0,
+            "a split tape is not consensus",
+        )
+
+    def test_too_few_signals_is_not_treated_as_consensus(self):
+        """Three names disagreeing is noise, not a tape."""
+        bot, placed = self._build()
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        bot._evaluate_option_entry(
+            contract, "NVDAC", "OPTION:NVDAC",
+            self._quote("1.00", "1.02"), Decimal("1.00"),
+            days_to_expiration=20, current_iv=None,
+            directions={"P0": "PUT", "P1": "PUT"},
+            guard_active=False, current_vixy=None, open_count=0,
+            buying_power=Decimal("400"), positions=[],
+        )
+        self.assertEqual(
+            bot.option_gate_rejections["cohort momentum is against this direction"],
+            0,
+        )
+
+
 class FullAccountUtilizationTests(FocusModeIntegrationTestCase):
     """By explicit request: "it utilizes the entire account value."""
 

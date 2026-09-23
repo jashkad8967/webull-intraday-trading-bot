@@ -171,7 +171,25 @@ class OptionTradingSettings(BaseSettings):
     # entry QUALITY gates (premium floor, moneyness cap, IV
     # percentile, volatility/RVOL floors, spread ceiling) are what
     # carry the risk budget now, not a blanket sizing cap.
-    option_capital_fraction: Decimal = Field(default=Decimal("1.0"), gt=0, le=1)
+    # Maximum share of buying power ONE option entry may take.
+    #
+    # Lowered 1.0 -> 0.4 by explicit request after a single position
+    # swallowed the account. Live 2026-09-23: BABA took 2 contracts at
+    # $1.45 = $290 of a $369 balance - 79% - in one name, and MARA
+    # took most of what was left. One wrong direction call was
+    # therefore the whole account, and both were CALLS, so they were
+    # not even independent bets.
+    #
+    # 1.0 was set for "use the entire account" back when focus mode
+    # meant ONE symbol, where concentration was the whole point. With
+    # a cohort of ten the same setting just means the first contract
+    # evaluated eats everything and the other nine never get funded -
+    # it defeats the cohort rather than expressing it.
+    #
+    # At 0.4 a $369 balance funds roughly three positions, each still
+    # large enough to clear the premium floor, so a bad pick costs a
+    # third of the account instead of all of it.
+    option_capital_fraction: Decimal = Field(default=Decimal("0.4"), gt=0, le=1)
     # By request: "look for cheaper options to buy in to." select_atm_
     # options always picked the single strike nearest the money -
     # correct for delta, but on a small account often unaffordable

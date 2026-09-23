@@ -1027,31 +1027,46 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         self.assertEqual(quantity, 10)
 
     def test_focus_mode_ignores_option_quantity_and_notional_caps(self):
-        """By explicit request ("it utilizes the entire account
-        value"): focus mode commits the whole account to ONE position
-        by design (see option_capital_fraction's own history - raised
-        0.05 -> 1.0 for "no cap for options... spend all the money if
-        needed"). option_quantity (20) and max_order_notional ($1000)
-        are flat ceilings left over from the old multi-symbol
-        strategy that would silently undercut full utilization on a
-        cheap contract or a larger account - not yet binding at this
-        account's current size, but a real violation of this
-        requirement once it grows. Both are exempted in focus mode
-        (the real Settings default), leaving pure affordability
-        (capital_fraction=1.0) as the only bound.
+        """option_quantity (20) and max_order_notional ($1000) are flat
+        ceilings left over from the old multi-symbol strategy. They
+        would silently undercut sizing on a cheap contract or a larger
+        account, so focus mode exempts both - the only bound is
+        option_capital_fraction.
+
+        That fraction is now 0.4, NOT 1.0. It was 1.0 when focus mode
+        meant ONE symbol and concentration was the point; with a
+        cohort of ten it just meant the first contract evaluated ate
+        the whole balance and the other nine never got funded. Live
+        2026-09-23: BABA took $290 of a $369 account (79%) in one
+        name, so a single wrong direction call was the entire
+        account.
+
+        This pins both halves: the flat ceilings must NOT clamp
+        (20 contracts and 10 contracts respectively would both bind
+        here), while the capital fraction MUST.
         """
         from webull_bot.config import Settings
 
         config = Settings(_env_file=None)
         self.assertTrue(config.focus_mode_enabled)  # the real default
         strategy = TradingStrategy(config)
-        # $1 premium -> $100/contract, $5000 buying power -> 50
-        # contracts fully affordable. Neither option_quantity=20 nor
-        # max_order_notional=$1000 (10 contracts) may clamp this.
+        # $1 premium -> $100/contract, $5000 buying power. Pure
+        # affordability would be 50 contracts; option_quantity=20 and
+        # max_order_notional=$1000 (10 contracts) must NOT clamp it;
+        # capital_fraction 0.4 must, at 20 contracts ($2000 of $5000).
         quantity, _ = strategy.option_order_quantity(
             Decimal("1.00"), Decimal("5000")
         )
-        self.assertEqual(quantity, 50)
+        expected = int(Decimal("5000") * config.option_capital_fraction / 100)
+        self.assertEqual(quantity, expected)
+        self.assertLess(
+            quantity, 50, "the capital fraction must bound the size"
+        )
+        self.assertGreater(
+            quantity,
+            10,
+            "max_order_notional ($1000 = 10 contracts) must stay exempt",
+        )
 
     def test_real_config_default_captures_a_realistic_quick_pop_as_profit(self):
         # By request: "if there is immediate profit after a buy, why

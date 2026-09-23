@@ -29,6 +29,8 @@ def focus_config(**overrides):
         focus_repick_when_blocked=True,
         focus_cohort_size=10,
         focus_lock_discovery_per_pass=25,
+        focus_consensus_fraction=Decimal("0.7"),
+        focus_consensus_min_signals=4,
         focus_contract_discovery_max_failures=3,
         focus_daily_profit_target_fraction=Decimal("0.05"),
         profit_throttle_confirm_readings=3,

@@ -139,6 +139,34 @@ def _evaluate_option_entry(
         return open_count, buying_power
     direction = directions.get(underlying, "HOLD")
     contract_type = contract.get("option_type")
+    # Cohort-wide direction consensus. Every other gate judges this
+    # contract in ISOLATION, which means that when the whole cohort is
+    # falling the loop hunts for the one name still printing CALL and
+    # goes long into a down tape - the exact opposite of "trade calls
+    # and puts as momentum shifts".
+    #
+    # Live 2026-09-23, at the moment both entries were placed:
+    #   08:52:35  CALL=1  PUT=9      <- BABA call bought 08:50
+    #   08:53:55  CALL=2  PUT=7      <- MARA call bought 08:54
+    # Seven to nine of ten members signalled PUT and it bought CALLS
+    # on the exceptions. Both were immediately underwater; the account
+    # went $368.98 -> $343.22.
+    #
+    # Blocks the MINORITY side only. It never forces a trade: when the
+    # cohort is split, or too few names have a live signal to mean
+    # anything, this stays out of the way and the per-contract gates
+    # decide as before.
+    if self.config.focus_mode_enabled and contract_type in ("CALL", "PUT"):
+        calls = sum(1 for d in directions.values() if d == "CALL")
+        puts = sum(1 for d in directions.values() if d == "PUT")
+        decided = calls + puts
+        if decided >= self.config.focus_consensus_min_signals:
+            opposed = puts if contract_type == "CALL" else calls
+            if opposed / decided >= self.config.focus_consensus_fraction:
+                self.option_gate_rejections[
+                    "cohort momentum is against this direction"
+                ] += 1
+                return open_count, buying_power
     # By explicit request, for a one-off diagnostic
     # ("make sure it fires... no barrier, quickly sell
     # it, and then change the option strategy again"):
@@ -247,22 +275,28 @@ def _evaluate_option_entry(
                 "buy/sell pressure does not support this direction"
             ] += 1
             return open_count, buying_power
-        # By explicit request ("there should not be too much quality
-        # gate on the contract other than volume and volatility after
-        # the momentum has been identified"): entry_extension_ok is a
-        # chase/timing filter tuned for a broad multi-symbol
-        # candidate pool. Focus mode already pre-vets a single
-        # established underlying (large-cap, liquid, real volume -
-        # see refresh_daily_batch), so once the direction/pressure
-        # signals below confirm real momentum, an extra "is it too
-        # close to today's high/low" veto stacks caution on top of
-        # caution rather than screening out a genuinely bad pick.
-        # Skipped only in focus mode; the non-focus path (disabled by
-        # default) keeps it.
+        # entry_extension_ok is the chase/timing filter: refuses a CALL
+        # when the underlying is already jammed against today's high
+        # (and a PUT against the low).
+        #
+        # It used to be SKIPPED in focus mode, on the reasoning that
+        # focus mode "already pre-vets a single established
+        # underlying". That was written when focus mode meant one
+        # symbol, and it is now backwards in a way that costs real
+        # money: refresh_daily_batch SELECTS ON GAP, i.e. it
+        # deliberately surfaces names that have already moved, and
+        # then the one gate that says "this already ran, do not buy
+        # the top" was switched off. Selection and entry were pulling
+        # in opposite directions.
+        #
+        # Live 2026-09-23: BABA (+4.35% on the day) and MARA (+1.8%)
+        # were both bought as CALLS minutes after the open, both
+        # immediately underwater - the account went from $368.98 to
+        # $343.22. Pre-vetting a name as liquid and established says
+        # nothing about whether RIGHT NOW is a sane moment to buy it.
         underlying_price = self.strategy.prices.get(underlying)
         if (
-            not self.config.focus_mode_enabled
-            and underlying_price is not None
+            underlying_price is not None
             and not self.strategy.entry_extension_ok(
                 underlying,
                 underlying_price,

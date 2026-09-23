@@ -64,6 +64,24 @@ class FocusModeSettings(BaseSettings):
     # while signals fired. Bounded so the lock happens immediately and
     # discovery catches up over the following passes.
     focus_lock_discovery_per_pass: int = Field(default=2, ge=1, le=25)
+    # Cohort-wide direction consensus, by explicit request after two
+    # bad entries. Every other gate judges a contract in ISOLATION, so
+    # when the whole cohort is falling the loop hunts for the one name
+    # still printing CALL and goes long into a down tape.
+    #
+    # Live 2026-09-23: CALL=1 PUT=9 when the BABA call was bought, and
+    # CALL=2 PUT=7 when the MARA call was bought. Both underwater
+    # immediately; the account went $368.98 -> $343.22.
+    #
+    # If this fraction or more of the cohort's DECIDED signals oppose
+    # the trade, the minority side is blocked. 0.7 means seven of ten.
+    focus_consensus_fraction: Decimal = Field(
+        default=Decimal("0.7"), gt=Decimal("0.5"), le=1
+    )
+    # Below this many decided (non-HOLD) signals the sample is too
+    # small to read as consensus, and the gate stays out of the way -
+    # three names disagreeing is noise, not a tape.
+    focus_consensus_min_signals: int = Field(default=4, ge=2, le=25)
     # By request: "only take a good batch of stocks to look out for
     # everyday." Two-stage funnel - research a batch each morning
     # (this), then pick the focus cohort out of it at the open.
