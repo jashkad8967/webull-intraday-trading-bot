@@ -37,6 +37,23 @@ services:
       DAILY_PNL_STATE_FILE: /var/data/conf/daily_pnl.json
       TRADE_HISTORY_STATE_FILE: /var/data/conf/trade_history.json
       OPTION_CONTRACTS_STATE_FILE: /var/data/conf/option_contracts.json
+      # Every state file MUST be pointed into /var/data explicitly.
+      #
+      # The config defaults are RELATIVE ("conf/x.json"), so a key
+      # without a line here resolves under the container's workdir
+      # /app - which is baked into the image and is NOT a volume, so
+      # the file is silently destroyed on every restart and redeploy.
+      # Nothing errors; the store just quietly forgets everything.
+      #
+      # Found live 2026-09-24: position_open_times.json was being
+      # written correctly to /app/conf with real entries, while the
+      # feature that depends on it (closing positions carried past
+      # their own end-of-day close) could never work, because the
+      # whole point of that store is surviving a restart. The audit
+      # that caught it also found strategy_tuning had been doing the
+      # same thing unnoticed for far longer.
+      POSITION_OPEN_TIMES_STATE_FILE: /var/data/conf/position_open_times.json
+      STRATEGY_TUNING_STATE_FILE: /var/data/conf/strategy_tuning.json
       STATUS_FILE: /var/data/status.json
       COMMAND_FILE: /var/commands/commands.json
       # Read by the dashboard process, which shares this environment
