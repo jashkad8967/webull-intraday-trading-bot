@@ -202,17 +202,70 @@ def option_limit_price(self, quote: dict, side: str) -> Decimal:
             raise QuoteUnavailableError(
                 "option quote has no valid bid/ask spread for a buy"
             )
+        # Reported live 2026-09-24: "0.95 was not mid, it was bid,
+        # then it went straight from bid to ask essentially."
+        # Reproduced exactly. On a nickel-wide spread quantized to a
+        # nickel tick there is NO representable price inside the
+        # spread, so the midpoint has to land on one edge or the
+        # other - and ROUND_HALF_UP sent it to the ASK every time:
+        #
+        #   bid   ask   true mid   old BUY
+        #   0.95  1.00    0.975     1.00   <- the ASK
+        #   0.75  0.80    0.775     0.80   <- the ASK
+        #   1.20  1.25    1.225     1.25   <- the ASK
+        #
+        # Entering at the ask pays the whole spread on every entry,
+        # and it also defeats option_entry_escalate_seconds: an order
+        # that STARTS maximally aggressive has nowhere left to walk.
+        #
+        # ROUND_DOWN instead, so an unrepresentable midpoint lands on
+        # the PASSIVE side and the escalator still has somewhere to
+        # go. This deliberately reverses the earlier ROUND_HALF_UP
+        # change, whose stated worry was that rounding down "collapses
+        # the mid to the raw bid" - starting at the bid is precisely
+        # what is wanted now that a working escalator can walk it up.
+        # Crossing is the escalator's job, and only after the passive
+        # price has been given time to fill.
+        #
+        # The tick stays the flat nickel. option_tick_from_quote infers
+        # a penny grid from a non-nickel-aligned quote, and wiring it in
+        # here was tried and REVERTED: the live OPENAPI_OPTION_PRICE_
+        # STEP_GTE rejection was AAPL quoting bid 7.35/ask 7.59 - a
+        # non-nickel ask - and the penny inference reproduces exactly
+        # the 7.47 that Webull refused. A non-nickel QUOTE does not
+        # prove penny ORDERS are accepted: at/above $3 the nickel rule
+        # is unconditional, and below $3 it only relaxes for Penny
+        # Pilot names (CD was rejected sub-$3). A rejected order is
+        # worse than a slightly coarse one.
         price = (bid + ask) / 2
-        return self._quantize_to_option_tick(
-            max(Decimal("0.01"), price), ROUND_HALF_UP
+        limit = self._quantize_to_option_tick(
+            max(Decimal("0.01"), price), ROUND_DOWN
         )
+        # Never open at or above the ask. Deliberately NOT clamped up
+        # to the raw bid: the bid is frequently not tick-aligned
+        # (0.81 on a nickel grid), and returning it verbatim produces
+        # an order Webull rejects outright - the same class of failure
+        # as the 7.47 rejection above. A tick-aligned price just below
+        # the bid is a valid passive order, which is exactly what the
+        # escalator is there to walk up.
+        if limit >= ask:
+            limit = self._quantize_to_option_tick(
+                max(Decimal("0.01"), ask - self.option_price_tick_size(ask)),
+                ROUND_DOWN,
+            )
+        return limit
     else:
         base = (
             self._sane_bid_or_ask(quote, "bid")
             or self._quote_decimal(quote, "price")
             or self._sane_bid_or_ask(quote, "ask")
         )
+        # Unchanged, deliberately. A SELL limit below the bid is a
+        # FLOOR, not the execution price - it fills at the best
+        # available bid - so crossing buys certainty of fill without
+        # conceding the difference. The nickel tick stays here for the
+        # same order-rejection reason as the BUY branch above.
         price = base * (Decimal("1") - offset)
-    return self._quantize_to_option_tick(
-        max(Decimal("0.01"), price), ROUND_DOWN
-    )
+        return self._quantize_to_option_tick(
+            max(Decimal("0.01"), price), ROUND_DOWN
+        )

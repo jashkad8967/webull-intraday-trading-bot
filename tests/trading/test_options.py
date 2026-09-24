@@ -903,13 +903,25 @@ class OptionPriceTickSizeTests(unittest.TestCase):
         self.assertLessEqual(price, Decimal("0.14"))
         self.assertEqual(price, Decimal("0.10"))
 
-    def test_buy_limit_price_rounds_to_the_nearest_nickel_not_always_down(self):
-        """Live incident: bid=0.10/ask=0.15, a normal 33%-wide but
-        genuinely liquid spread on a cheap contract - the true
-        midpoint is 0.125. Always rounding DOWN collapsed this to
-        0.10, i.e. the raw bid itself, not a real midpoint - by
-        request ("the entry price is... not competitive"). Nearest-
-        tick rounding keeps it representative of the actual midpoint.
+    def test_buy_limit_price_opens_passive_and_never_at_the_ask(self):
+        """bid=0.10/ask=0.15, true midpoint 0.125, which a nickel tick
+        cannot represent - so the price must land on one edge.
+
+        This previously rounded to 0.15 and asserted it, on the
+        reasoning that 0.10 "is the raw bid, not a real midpoint" and
+        therefore uncompetitive. But 0.15 is the ASK: that traded one
+        edge of the spread for the other, and paying the ask on every
+        entry is strictly the more expensive of the two mistakes.
+
+        Reported live 2026-09-24 - "0.95 was not mid, it was bid, then
+        it went straight from bid to ask essentially" - and reproduced
+        across every nickel-wide spread: 0.95/1.00 bought at 1.00,
+        0.75/0.80 at 0.80, 1.20/1.25 at 1.25. Always the ask.
+
+        Opening at the ask also defeats option_entry_escalate_seconds:
+        an order that starts maximally aggressive has nowhere to walk.
+        The passive edge is the correct START, with the escalator
+        crossing the spread only after it has been given time to fill.
         """
         api = WebullAPI.__new__(WebullAPI)
         api.config = SimpleNamespace(
@@ -917,5 +929,26 @@ class OptionPriceTickSizeTests(unittest.TestCase):
             quote_price_sanity_percent=Decimal("0.08"),
         )
         price = api.option_limit_price({"bid": "0.10", "ask": "0.15"}, "BUY")
-        self.assertEqual(price, Decimal("0.15"))
-        self.assertGreater(price, Decimal("0.10"))
+        self.assertEqual(price, Decimal("0.10"))
+        self.assertLess(price, Decimal("0.15"))
+
+    def test_buy_limit_price_never_opens_at_or_above_the_ask(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            option_limit_offset=Decimal("0.03"),
+            quote_price_sanity_percent=Decimal("0.08"),
+        )
+        for bid, ask in (
+            ("0.95", "1.00"),
+            ("0.75", "0.80"),
+            ("1.20", "1.25"),
+            ("0.40", "0.45"),
+            ("2.00", "2.05"),
+        ):
+            price = api.option_limit_price({"bid": bid, "ask": ask}, "BUY")
+            self.assertLess(
+                price, Decimal(ask), f"{bid}/{ask} opened at or above the ask"
+            )
+            # Still a valid order: Webull rejects any premium that is
+            # not on the nickel grid, whatever the quote looks like.
+            self.assertEqual(price % Decimal("0.05"), Decimal("0"))
