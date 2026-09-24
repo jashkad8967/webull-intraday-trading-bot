@@ -186,10 +186,33 @@ class OptionTradingSettings(BaseSettings):
     # evaluated eats everything and the other nine never get funded -
     # it defeats the cohort rather than expressing it.
     #
-    # At 0.4 a $369 balance funds roughly three positions, each still
-    # large enough to clear the premium floor, so a bad pick costs a
-    # third of the account instead of all of it.
-    option_capital_fraction: Decimal = Field(default=Decimal("0.4"), gt=0, le=1)
+    # Raised 0.4 -> 1.0 by explicit request ("should it not be using
+    # all the capital"), and the reasoning behind 0.4 no longer holds.
+    #
+    # 0.4 was chosen to stop ONE position swallowing the account. The
+    # thing that actually caused that - three separate SOFI contracts
+    # opened because every guard was keyed on the exact option_symbol
+    # and none had a per-underlying view - now has its own dedicated
+    # fix in option_max_positions_per_underlying below. A sizing cap
+    # was the blunt instrument standing in for a guard that did not
+    # exist yet.
+    #
+    # Meanwhile 0.4 was actively degrading contract QUALITY, not just
+    # size. Live 2026-09-24 on a $258 balance it capped each entry at
+    # $103, i.e. $1.03 of premium, which excluded AMZN ($1.85), HOOD
+    # ($2.25), PLTR ($2.50), BABA ($2.65), AVGO ($2.85) and TSLA
+    # ($3.45) - six of the eight researched names, evicted within 90
+    # seconds of the cohort locking. What is left under $1.03 is the
+    # cheapest, furthest-OTM end of the board: precisely the low-delta
+    # lottery tickets option_delta_ok exists to reject. The cap was
+    # pushing the account toward the worst contracts available.
+    #
+    # The honest tradeoff at 1.0: one position at a time, so a wrong
+    # direction call is the whole account. What carries the risk now
+    # is the per-underlying cap, the profit-lock trail, the stop, and
+    # the entry quality gates - not a blanket sizing limit that also
+    # priced the account out of every liquid contract.
+    option_capital_fraction: Decimal = Field(default=Decimal("1.0"), gt=0, le=1)
     # Concentration cap per UNDERLYING, the companion to the fraction
     # above: that one bounds how much each position costs, this one
     # bounds how many of them can ride on the same stock.

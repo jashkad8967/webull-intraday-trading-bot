@@ -1033,17 +1033,20 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         account, so focus mode exempts both - the only bound is
         option_capital_fraction.
 
-        That fraction is now 0.4, NOT 1.0. It was 1.0 when focus mode
-        meant ONE symbol and concentration was the point; with a
-        cohort of ten it just meant the first contract evaluated ate
-        the whole balance and the other nine never got funded. Live
-        2026-09-23: BABA took $290 of a $369 account (79%) in one
-        name, so a single wrong direction call was the entire
-        account.
+        The fraction went 1.0 -> 0.4 -> 1.0. It was lowered on
+        2026-09-23 after BABA took $290 of a $369 account (79%) in one
+        name, and raised back on 2026-09-24 by explicit request
+        ("should it not be using all the capital") once the real cause
+        of that pile-up - no per-underlying position guard - had its
+        own fix in option_max_positions_per_underlying. At 0.4 on a
+        $258 balance the cap was $1.03 of premium, which excluded six
+        of eight researched names and left only the cheapest,
+        furthest-OTM contracts on the board.
 
-        This pins both halves: the flat ceilings must NOT clamp
-        (20 contracts and 10 contracts respectively would both bind
-        here), while the capital fraction MUST.
+        This pins what still matters: the flat ceilings must NOT clamp
+        (option_quantity=20 and max_order_notional=$1000 = 10
+        contracts would both bind here), and sizing must follow
+        option_capital_fraction exactly, whatever it is set to.
         """
         from webull_bot.config import Settings
 
@@ -1059,8 +1062,14 @@ class StrategyTuningTests(StrategyConfigMixin, unittest.TestCase):
         )
         expected = int(Decimal("5000") * config.option_capital_fraction / 100)
         self.assertEqual(quantity, expected)
-        self.assertLess(
-            quantity, 50, "the capital fraction must bound the size"
+        # Deliberately NOT `assertLess(quantity, 50)`: that encoded a
+        # fraction below 1.0 and is vacuous now the account is sized
+        # at full capital. assertEqual above is the real bound - it
+        # tracks the configured fraction rather than a magic number.
+        self.assertEqual(
+            quantity,
+            int(Decimal("5000") * config.option_capital_fraction / 100),
+            "sizing must follow option_capital_fraction exactly",
         )
         self.assertGreater(
             quantity,
