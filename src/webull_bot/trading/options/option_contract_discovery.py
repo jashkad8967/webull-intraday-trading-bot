@@ -530,12 +530,31 @@ def _check_focus_symbol_affordable(self, underlying: str) -> None:
         # of reach, position or no position.
         return
     self.focus_symbol_affordability_checked.add(underlying)
+    # Reports the PER-ENTRY CAP, not raw buying power.
+    #
+    # It used to print "cheapest=$1.70 vs buying_power=$254.74", which
+    # reads as a contradiction - $1.70 is obviously less than $254.74,
+    # so the gate looks broken. The real bound is
+    # buying_power * option_capital_fraction / 100, because a contract
+    # costs premium x 100 and only that fraction of the account may go
+    # into one entry. On 2026-09-24 that was $254.74 x 0.4 / 100 =
+    # $1.01, which is what actually evicted AMZN, HOOD, PLTR, BABA,
+    # AVGO and TSLA within 90 seconds of the cohort locking.
+    #
+    # Printing the number that is genuinely being compared makes the
+    # constraint legible: at a glance you can see whether a name is
+    # unreachable because the account is small or because
+    # option_capital_fraction is set low.
+    per_entry = buying_power * self.config.option_capital_fraction
     log.warning(
         "OPTIONS | %s | no affordable contract | cheapest=$%s vs "
-        "buying_power=$%s | dropping it from today's cohort",
+        "max premium $%s (buying power $%s x cap %s / 100) | "
+        "dropping it from today's cohort",
         underlying,
         cheapest,
+        (per_entry / 100).quantize(Decimal("0.01")),
         buying_power,
+        self.config.option_capital_fraction,
     )
     _disqualify_from_cohort(self, underlying)
 
