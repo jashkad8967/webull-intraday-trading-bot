@@ -116,17 +116,31 @@ class OptionTradingSettings(BaseSettings):
         default=Decimal("0.5"), gt=0, le=60
     )
     option_scalp_enabled: bool = True
-    # Tightened 0.50 -> 0.20 by explicit request ("per contract 50%
-    # loss is too much"). The old value was not a stop so much as a
-    # catastrophe gate: on a $363 account a 2-contract $280 position
-    # losing 50% is -$140, or 38% of the whole account gone on ONE
-    # trade, and recovering that needs five 10% winners. 20% caps the
-    # same trade at -$56 (15% of the account). The tradeoff, stated
-    # honestly: option bid/ask spreads run 2-3% on their own, so a
-    # tighter stop does get shaken out by noise more often - that is
-    # accepted in exchange for never handing back a third of the
-    # account on a single position.
-    option_stop_loss_percent: Decimal = Field(default=Decimal("0.20"), gt=0, le=1)
+    # Tightened 0.50 -> 0.20 -> 0.10, each by explicit request. The
+    # original 0.50 was not a stop so much as a catastrophe gate; 0.20
+    # capped a 2-contract $280 position at -$56.
+    #
+    # 0.10 was requested immediately after this fired live on
+    # 2026-09-24: an NVDA put entered at 1.74 stopped at 1.39, exactly
+    # the configured -20%, for -$35. The stop worked perfectly - the
+    # problem was that option_capital_fraction is now 1.0, so that one
+    # contract was 65% of the account and a routine stop became a 13%
+    # ACCOUNT loss. At 0.10 the same trade loses ~$17.
+    #
+    # Two honest consequences, neither a reason not to do it:
+    #
+    # Option bid/ask spreads run 2-3% on their own, so a 10% stop sits
+    # only three or four spreads away from entry and will be shaken
+    # out by noise materially more often than 20% was.
+    #
+    # It now EQUALS option_take_profit_percent (0.10), so the nominal
+    # risk/reward is 1:1 - and the real ratio is worse than that,
+    # because the profit-lock trail deliberately exits winners early on
+    # a fade while losers run the full stop. Profitability therefore
+    # depends on a win rate comfortably above 50%, not on the ratio.
+    # Turning the take-profit up, or the capital fraction down, are the
+    # two levers that restore an edge; this setting alone does not.
+    option_stop_loss_percent: Decimal = Field(default=Decimal("0.10"), gt=0, le=1)
     # By explicit request, for a one-off diagnostic: "make sure it
     # fires... no barrier, quickly sell it, and then change the option
     # strategy again." Off by default (real gates always apply) - when
