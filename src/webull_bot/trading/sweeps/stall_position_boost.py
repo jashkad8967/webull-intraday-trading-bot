@@ -109,19 +109,48 @@ def boost_stalled_positions(
                 )
                 boosted += 1
             elif instrument_type == "OPTION" and options_active:
-                if symbol in self.pending_option_exits:
+                # Resolve the CONTRACT before any duplicate check.
+                #
+                # A Webull option position reports the bare underlying
+                # ("GME") in `symbol`, while pending_option_exits and
+                # working_orders are keyed by the OCC contract symbol
+                # ("GME261009C00024000"). Testing the bare symbol
+                # against those meant BOTH guards silently missed, and
+                # this sweep submitted a second sell against a position
+                # the repricer was already exiting. Live 2026-09-24,
+                # repeatedly:
+                #
+                #   STALL | GME | HTTP 417
+                #   OPENAPI_OPTION_LONG_POSITION_MUST_BE_CLOSE_THAN_
+                #   SELL_SHORT - "You can not place order in excess of
+                #   current holding quantity"
+                #
+                # The broker rejected it, so it cost nothing this
+                # time. It stops being harmless the moment both orders
+                # are accepted: two sells against one position leaves
+                # the account short a contract it never owned.
+                contract = self.api.contract_from_position(position)
+                if not contract:
                     continue
-                key = f"OPTION:{symbol}"
+                option_symbol = str(contract.get("symbol", "") or "")
+                if not option_symbol:
+                    continue
+                if option_symbol in self.pending_option_exits:
+                    continue
+                key = f"OPTION:{option_symbol}"
                 if self.has_pending_sell_order(key):
                     continue
                 if not self.cooldown_ready(key):
                     continue
                 if now - self.last_trade.get(key, 0.0) < stall_seconds:
                     continue
-                contract = self.api.contract_from_position(position)
-                if not contract:
-                    continue
-                fee_per_share = (self.config.option_sell_fee_per_contract * quantity) / (quantity * 100)
+                # quantity cancels out algebraically - written this way
+                # it only creates a 0/0 DivisionUndefined when a stale
+                # snapshot reports a closed position, the same crash
+                # that took down the held-option exit path today.
+                fee_per_share = (
+                    self.config.option_sell_fee_per_contract / 100
+                )
                 quote = self.api.option_quote(contract["symbol"])
                 sell_price = self._stall_exit_price(
                     quote,
@@ -162,7 +191,12 @@ def boost_stalled_positions(
                 # pass and place two SELLs for one position. Claiming
                 # here also means no early return needs to hand the
                 # claim back. See _claim_option_exit.
-                if not self._claim_option_exit(symbol):
+                # Claim the CONTRACT, not the bare underlying. The
+                # 0.5s protection thread claims option_symbol, so
+                # claiming "GME" here collided with nothing and the
+                # test-and-set that exists specifically to stop two
+                # SELLs for one position never actually fired.
+                if not self._claim_option_exit(option_symbol):
                     continue
                 try:
                     order_id = self.api.place_option(
@@ -175,7 +209,8 @@ def boost_stalled_positions(
                 except Exception:
                     # Placement failed - release, or this contract is
                     # locked out of every future exit this session.
-                    self._release_option_exit(symbol)
+                    # Must release the SAME key that was claimed.
+                    self._release_option_exit(option_symbol)
                     raise
                 pnl = self.record_realized_exit(average_cost, sell_price, quantity, multiplier=100)
                 self.record_trade(
