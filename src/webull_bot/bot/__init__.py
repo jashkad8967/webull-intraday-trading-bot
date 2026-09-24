@@ -900,6 +900,10 @@ class AutoTrader:
         self.day_start_equity: Decimal | None = None
         self.day_start_equity_date = None
         self.profit_throttle_armed = False
+        # True only once a REACHED daily target has been given back -
+        # see new_entries_blocked. Two-way: recovering above the floor
+        # clears it.
+        self.profit_floor_breached = False
         # Consecutive equity readings currently above the daily
         # target - see profit_throttle_confirm_readings for the
         # settlement-spike incident this exists to filter out.

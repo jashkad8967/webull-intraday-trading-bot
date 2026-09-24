@@ -25,6 +25,18 @@ class DailyPnlTracker:
         # RESTART mid-session is not mistaken for a new trading day -
         # see belongs_to_today.
         self.stored_date: str | None = None
+        # Equity at the START of today's session, persisted for the
+        # same reason as the totals above: it was in-memory only, so
+        # every restart re-captured it at whatever the account happened
+        # to be worth right then. Live 2026-09-24 it was re-baselined
+        # SEVEN times ($276.07 -> $256.81 -> $254.69 -> $258.62 ->
+        # $264.40 -> $259.40), each restart lower than the last, until
+        # the daily profit throttle armed at $273.16 "+5.30%" against a
+        # $259.40 baseline - while the real day start was $276.07 and
+        # the account was actually DOWN $2.91 on the day. It then
+        # stopped opening positions for the rest of the session on the
+        # strength of a gain that never happened.
+        self.day_start_equity: Decimal | None = None
         self.realized_pnl, self.realized_loss = self._load()
 
     def _load(self) -> tuple[Decimal, Decimal]:
@@ -41,6 +53,12 @@ class DailyPnlTracker:
         if payload.get("date") != today:
             return Decimal("0"), Decimal("0")
         self.stored_date = today
+        raw_start = payload.get("day_start_equity")
+        if raw_start is not None:
+            try:
+                self.day_start_equity = Decimal(str(raw_start))
+            except (ArithmeticError, ValueError, TypeError):
+                self.day_start_equity = None
         try:
             realized_pnl = Decimal(str(payload["realized_pnl"]))
             realized_loss = Decimal(str(payload["realized_loss"]))
@@ -69,7 +87,20 @@ class DailyPnlTracker:
         self.realized_loss = realized_loss
         self._save()
 
+    def record_day_start_equity(self, equity: Decimal) -> None:
+        """Stamp the session's opening equity, once per day.
+
+        Deliberately write-once per date: a restart mid-session must
+        NOT overwrite it, which is the whole failure this exists to
+        prevent.
+        """
+        if self.day_start_equity is not None and self.belongs_to_today():
+            return
+        self.day_start_equity = equity
+        self._save()
+
     def reset(self) -> None:
+        self.day_start_equity = None
         self.record(Decimal("0"), Decimal("0"))
 
     def _save(self) -> None:
@@ -88,6 +119,8 @@ class DailyPnlTracker:
             "realized_pnl": str(self.realized_pnl),
             "realized_loss": str(self.realized_loss),
         }
+        if self.day_start_equity is not None:
+            payload["day_start_equity"] = str(self.day_start_equity)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
         with self._save_lock:
