@@ -325,6 +325,67 @@ class CallAndPutEntryTests(FocusModeIntegrationTestCase):
             1,
         )
 
+    def test_a_resting_buy_on_the_same_name_blocks_a_second_entry(self):
+        """The cap counted filled POSITIONS only, which left a race
+        the width of a fill. A buy takes seconds to fill while it
+        escalates, and during that window the underlying still shows
+        zero positions - so the next entry on the same name passed the
+        cap and both filled. Live 2026-09-24:
+
+          12:03:56  BUY GME261009C00023500 @ 1.70  (working)
+          12:04:51  BUY GME261009C00027000 @ 0.60  (allowed)
+          12:06:01  POS GME 1 @ 1.81 + POS GME 1 @ 0.60
+                    = $241 of a $249 account in ONE underlying
+
+        Exactly the concentration this cap exists to prevent, arriving
+        through the gap between placement and fill.
+        """
+        bot, placed = self._build()
+        bot.option_contracts = [
+            _contract("NVDA", "NVDAC_OTHER", "CALL"),
+        ]
+        bot.working_orders = {
+            "o1": {
+                "key": "OPTION:NVDAC_OTHER",
+                "action": "BUY",
+                "cancel_requested_at": None,
+            }
+        }
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        quote = self._quote("1.90", "2.00")
+        self._enter(bot, contract, quote, directions={"NVDA": "CALL"})
+        self.assertEqual(placed, [], "entered while a buy was already resting")
+
+    def test_a_cancelled_resting_buy_does_not_block(self):
+        bot, placed = self._build()
+        bot.option_contracts = [_contract("NVDA", "NVDAC_OTHER", "CALL")]
+        bot.working_orders = {
+            "o1": {
+                "key": "OPTION:NVDAC_OTHER",
+                "action": "BUY",
+                "cancel_requested_at": 1.0,
+            }
+        }
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        quote = self._quote("1.90", "2.00")
+        self._enter(bot, contract, quote, directions={"NVDA": "CALL"})
+        self.assertEqual(len(placed), 1)
+
+    def test_a_resting_buy_on_a_different_name_does_not_block(self):
+        bot, placed = self._build()
+        bot.option_contracts = [_contract("SOFI", "SOFIC", "CALL")]
+        bot.working_orders = {
+            "o1": {
+                "key": "OPTION:SOFIC",
+                "action": "BUY",
+                "cancel_requested_at": None,
+            }
+        }
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        quote = self._quote("1.90", "2.00")
+        self._enter(bot, contract, quote, directions={"NVDA": "CALL"})
+        self.assertEqual(len(placed), 1)
+
     def test_a_position_in_another_name_does_not_block_this_one(self):
         bot, placed = self._build()
         contract = _contract("NVDA", "NVDAC", "CALL")

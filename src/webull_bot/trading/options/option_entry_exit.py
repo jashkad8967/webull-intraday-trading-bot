@@ -4,6 +4,7 @@ from datetime import datetime
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 from webull_bot.strategy_logic.types import Decision
+from webull_bot.trading.orders.locks import _working_orders_lock
 from webull_bot.trading.guards.price_sanity import (
     OPTION_PRICE_SANITY_TOLERANCE,
     option_entry_spread_ok,
@@ -18,6 +19,39 @@ def _position_quantity(position: dict) -> Decimal:
         return Decimal(str(position.get("quantity", 0) or 0))
     except Exception:
         return Decimal("0")
+
+
+def _pending_option_buys_for(self, underlying: str) -> int:
+    """Count resting BUY orders on this underlying's contracts.
+
+    working_orders is keyed by order id with an "OPTION:<contract>"
+    key, so the contract has to be mapped back to its underlying via
+    the known chain - the same bare-underlying-vs-contract mismatch
+    that defeated the stall sweep and the manual-sell guards earlier
+    today, in a third place.
+    """
+    try:
+        with _working_orders_lock(self):
+            orders = list(self.working_orders.values())
+    except Exception:
+        return 0
+    by_symbol = {
+        str(item.get("symbol")): str(item.get("underlying_symbol", ""))
+        for item in getattr(self, "option_contracts", []) or []
+    }
+    pending = 0
+    for order in orders:
+        if order.get("action") not in ("BUY",):
+            continue
+        if order.get("cancel_requested_at") is not None:
+            continue
+        key = str(order.get("key") or "")
+        if not key.startswith("OPTION:"):
+            continue
+        contract_symbol = key.split(":", 1)[1]
+        if by_symbol.get(contract_symbol) == underlying:
+            pending += 1
+    return pending
 
 
 def _option_underlying(self, position: dict) -> str:
@@ -198,6 +232,24 @@ def _evaluate_option_entry(
             and _option_underlying(self, position) == underlying
             and _position_quantity(position) != 0
         )
+        # Resting BUY orders count too, not just filled positions.
+        #
+        # Counting positions alone left a race wide enough to drive
+        # through: a buy takes seconds to fill while escalating, and
+        # during that window the underlying still shows ZERO positions,
+        # so the next entry on the same name passes the cap and both
+        # fill. Live 2026-09-24:
+        #
+        #   12:03:56  BUY GME261009C00023500 @ 1.70  (working, escalating)
+        #   12:04:51  BUY GME261009C00027000 @ 0.60  (allowed - GME had
+        #                                             no position YET)
+        #   12:06:01  POS GME 1 @ 1.81 + POS GME 1 @ 0.60
+        #             = $241 of a $249 account in one underlying
+        #
+        # That is the exact 3xSOFI concentration this cap was written
+        # to prevent, arriving through the gap between placement and
+        # fill instead.
+        held += _pending_option_buys_for(self, underlying)
         if held >= self.config.option_max_positions_per_underlying:
             self.option_gate_rejections[
                 "already at the position cap for this underlying"
