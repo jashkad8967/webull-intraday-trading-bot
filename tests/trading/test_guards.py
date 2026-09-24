@@ -1654,3 +1654,123 @@ class FractionalExitGuardTests(unittest.TestCase):
 
         self.assertEqual(calls, ["STALE"])
         self.assertIn("STALE", fake_bot.pending_stock_exits)
+
+
+class StallSweepOptionKeyingTests(unittest.TestCase):
+    """The stall sweep must key its duplicate-exit guards on the OCC
+    CONTRACT symbol, not the bare underlying.
+
+    A Webull option position reports the bare underlying ("GME") in
+    `symbol`, while pending_option_exits, working_orders and the
+    _claim_option_exit test-and-set are all keyed by the contract
+    ("GME261009C00024000"). Testing the bare symbol against those made
+    every guard miss, so this sweep submitted a second SELL against a
+    position the repricer was already exiting. Live 2026-09-24,
+    repeatedly:
+
+      STALL | GME | HTTP 417
+      OPENAPI_OPTION_LONG_POSITION_MUST_BE_CLOSE_THAN_SELL_SHORT
+      "You can not place order in excess of current holding quantity"
+
+    The broker rejected it every time, so it cost nothing - but it
+    stops being harmless the moment both orders are accepted.
+    """
+
+    def _bot(self, placed, claimed, pending=(), has_pending=False):
+        from webull_bot.bot import AutoTrader
+
+        contract = {
+            "symbol": "GME261009C00024000",
+            "underlying_symbol": "GME",
+            "option_type": "CALL",
+            "strike_price": "24.0",
+            "expiration_date": "2026-10-09",
+        }
+
+        class FakeApi:
+            @staticmethod
+            def contract_from_position(position):
+                return contract
+
+            @staticmethod
+            def option_quote(symbol):
+                return {"symbol": symbol, "bid": "1.20", "ask": "1.25"}
+
+            @staticmethod
+            def quote_bid(q):
+                return Decimal(str(q["bid"]))
+
+            @staticmethod
+            def quote_ask(q):
+                return Decimal(str(q["ask"]))
+
+            @staticmethod
+            def place_option(*a, **k):
+                placed.append(a)
+                return "order-1"
+
+            @staticmethod
+            def price_tick_size(price):
+                return Decimal("0.01")
+
+        fake_bot = SimpleNamespace(
+            config=SimpleNamespace(
+                stall_breaker_enabled=True,
+                stall_breaker_seconds=1,
+                stall_breaker_min_profit=Decimal("0.01"),
+                sell_fee_dollars=Decimal("0.02"),
+                option_sell_fee_per_contract=Decimal("0.07"),
+                stock_entry_max_spread_percent=Decimal("0.50"),
+                option_max_entry_spread_percent=Decimal("25"),
+            ),
+            api=FakeApi(),
+            stock_categories={},
+            last_trade={},
+            last_stall_boost=0.0,
+            pending_stock_exits=set(),
+            pending_option_exits=set(pending),
+        )
+        fake_bot.cooldown_ready = lambda key: True
+        fake_bot.has_pending_sell_order = lambda key: has_pending
+        fake_bot.is_fractional_quantity = AutoTrader.is_fractional_quantity
+        fake_bot._stall_equity_quotes = (
+            AutoTrader._stall_equity_quotes.__get__(fake_bot)
+        )
+        fake_bot._stall_exit_price = (
+            AutoTrader._stall_exit_price.__get__(fake_bot)
+        )
+        fake_bot._claim_option_exit = lambda s: (claimed.append(s), True)[1]
+        fake_bot._release_option_exit = lambda s: None
+        fake_bot.record_realized_exit = lambda *a, **k: Decimal("1")
+        fake_bot.record_trade = lambda *a, **k: None
+        return AutoTrader.boost_stalled_positions.__get__(fake_bot)
+
+    def _position(self):
+        # Exactly how Webull reports it: bare underlying in `symbol`.
+        return [{
+            "instrument_type": "OPTION",
+            "symbol": "GME",
+            "quantity": "1",
+            "cost_price": "1.00",
+        }]
+
+    def test_it_claims_the_contract_not_the_bare_underlying(self):
+        placed, claimed = [], []
+        boost = self._bot(placed, claimed)
+        boost(self._position(), options_active=True, core_session_active=True)
+        self.assertEqual(claimed, ["GME261009C00024000"])
+
+    def test_a_pending_exit_on_the_contract_blocks_the_sweep(self):
+        placed, claimed = [], []
+        boost = self._bot(
+            placed, claimed, pending={"GME261009C00024000"}
+        )
+        boost(self._position(), options_active=True, core_session_active=True)
+        self.assertEqual(placed, [], "swept while an exit was already pending")
+        self.assertEqual(claimed, [])
+
+    def test_a_resting_sell_order_blocks_the_sweep(self):
+        placed, claimed = [], []
+        boost = self._bot(placed, claimed, has_pending=True)
+        boost(self._position(), options_active=True, core_session_active=True)
+        self.assertEqual(placed, [], "swept while a sell order was resting")
