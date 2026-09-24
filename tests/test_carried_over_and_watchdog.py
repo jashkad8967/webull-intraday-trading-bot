@@ -48,10 +48,24 @@ class CarriedOverOptionTests(unittest.TestCase):
                     return False
                 return stamp.date() < now.date()
 
+        class Api:
+            @staticmethod
+            def contract_from_position(position):
+                # Webull reports the bare underlying in `symbol`; the
+                # contract has to be resolved to key anything by it.
+                raw = str(position.get("symbol", ""))
+                mapping = {
+                    "GME": "GME261009C00024000",
+                    "SOFI": "SOFI261009C00016500",
+                }
+                resolved = mapping.get(raw, raw)
+                return {"symbol": resolved, "underlying_symbol": raw}
+
         bot = SimpleNamespace(
             carried_over_options_date=None,
             cached_positions=positions,
             position_open_times=OpenTimes(),
+            api=Api(),
             close_instruments=lambda kinds: closed.append(kinds),
         )
         bot.close_carried_over_options = close_carried_over_options.__get__(bot)
@@ -65,6 +79,35 @@ class CarriedOverOptionTests(unittest.TestCase):
         )
         bot.close_carried_over_options(datetime.now(timezone.utc))
         self.assertEqual(closed, [{"OPTION"}])
+
+    def test_a_bare_underlying_position_still_matches_its_contract_record(
+        self,
+    ):
+        """The bug this sweep shipped with, and the reason it could
+        never fire.
+
+        Webull reports an option position's `symbol` as the bare
+        underlying ("GME"), while position_open_times is written by
+        record_trade under the OCC contract key
+        ("OPTION:GME261009C00024000"). Building the lookup key from the
+        position symbol produced "OPTION:GME", which matches nothing -
+        so the sweep found no carried-over positions no matter what was
+        actually held, and a sweep that never fires is indistinguishable
+        from one with nothing to do.
+        """
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        bot, closed = self._bot(
+            # Position reports the BARE underlying...
+            [_option("GME")],
+            # ...while the record is keyed by the CONTRACT.
+            {"OPTION:GME261009C00024000": yesterday},
+        )
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertEqual(
+            closed,
+            [{"OPTION"}],
+            "a bare-underlying position must resolve to its contract",
+        )
 
     def test_a_position_opened_today_is_left_alone(self):
         """The discriminator that matters. A mid-session restart must

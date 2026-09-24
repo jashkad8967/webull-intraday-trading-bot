@@ -47,12 +47,29 @@ def close_carried_over_options(self, moment) -> None:
             continue
         if quantity == 0:
             continue
-        symbol = str(position.get("symbol", "") or "")
-        if not symbol:
+        # Resolve the CONTRACT. position["symbol"] is the bare
+        # underlying ("GME"), while position_open_times is written by
+        # record_trade under the OCC contract key
+        # ("OPTION:GME261009C00024000") - so building the key from the
+        # position symbol produced "OPTION:GME", which matches nothing
+        # and made this entire sweep incapable of ever firing.
+        #
+        # Found 2026-09-24 by sweeping for this exact bare-underlying-
+        # vs-contract mismatch after it had already broken the stall
+        # sweep (7cabc78), the manual-sell guards (132eb3a) and the
+        # per-underlying cap (bc3a81e). Fourth instance, and the only
+        # one that silently disabled a feature outright rather than
+        # producing a visible broker rejection - which is why it went
+        # unnoticed: a sweep that never fires looks exactly like a
+        # sweep with nothing to do.
+        contract = self.api.contract_from_position(position)
+        option_symbol = str((contract or {}).get("symbol", "") or "")
+        if not option_symbol:
             continue
-        key = f"OPTION:{symbol}"
-        if self.position_open_times.opened_before_today(key):
-            carried.append(symbol)
+        if self.position_open_times.opened_before_today(
+            f"OPTION:{option_symbol}"
+        ):
+            carried.append(option_symbol)
     # Stamped only once positions are actually visible. cached_positions
     # is empty on the very first cycles after a restart, and stamping
     # then would mark the day handled before anything could be seen.
