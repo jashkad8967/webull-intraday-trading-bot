@@ -143,6 +143,7 @@ class FocusModeIntegrationTestCase(unittest.TestCase):
             pending_option_exits=set(),
             cached_option_buying_power=Decimal("10000"),
             profit_throttle_armed=False,
+            profit_floor_breached=False,
             symbol_quarantine_until={},
             symbol_pnl_history=defaultdict(deque),
             last_trade={},
@@ -630,9 +631,16 @@ class DailyProfitThrottleTests(FocusModeIntegrationTestCase):
     NEW risk, never exits or averaging down.
     """
 
-    def test_armed_throttle_blocks_a_fresh_entry(self):
+    def test_a_given_back_gain_blocks_a_fresh_entry(self):
+        """Reaching the daily target no longer blocks anything - by
+        explicit request 2026-09-24, "even if it hits its target it
+        should continue trading, it should just not allow losses to go
+        below that 5%". Entries stop only once that reached target has
+        been GIVEN BACK, which is profit_floor_breached.
+        """
         bot, placed = self._build()
         bot.profit_throttle_armed = True
+        bot.profit_floor_breached = True
         contract = _contract("NVDA", "NVDAC", "CALL")
         quote = self._quote("1.90", "2.00")
         self._enter(bot, contract, quote, directions={"NVDA": "CALL"})
@@ -642,6 +650,17 @@ class DailyProfitThrottleTests(FocusModeIntegrationTestCase):
                 "daily profit target reached - new entries throttled"
             ],
             1,
+        )
+
+    def test_reaching_the_target_alone_still_allows_entries(self):
+        bot, placed = self._build()
+        bot.profit_throttle_armed = True
+        bot.profit_floor_breached = False
+        contract = _contract("NVDA", "NVDAC", "CALL")
+        quote = self._quote("1.90", "2.00")
+        self._enter(bot, contract, quote, directions={"NVDA": "CALL"})
+        self.assertEqual(
+            len(placed), 1, "hitting the target must not stop trading"
         )
 
     def test_armed_throttle_does_not_block_averaging_down(self):

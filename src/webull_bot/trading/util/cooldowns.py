@@ -66,7 +66,14 @@ def has_pending_sell_order(self, key: str) -> bool:
         orders = list(self.working_orders.values())
     return any(
         order.get("key") == key
-        and order.get("action") in ("SELL", "STOP", "PROFIT")
+        # MANUAL_SELL belongs here too. A sell the USER placed from
+        # the dashboard reserves the broker-side quantity exactly like
+        # an automated one, but was omitted - so every automated exit
+        # path believed nothing was resting and kept submitting into a
+        # position already spoken for, logging HTTP 417
+        # OPENAPI_OPTION_LONG_POSITION_MUST_BE_CLOSE_THAN_SELL_SHORT
+        # on every cycle (live 2026-09-24).
+        and order.get("action") in ("SELL", "STOP", "PROFIT", "MANUAL_SELL")
         and order.get("cancel_requested_at") is None
         for order in orders
     )

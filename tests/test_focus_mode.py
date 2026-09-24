@@ -644,13 +644,30 @@ class ProfitThrottleTests(unittest.TestCase):
     """
 
     def bot(self, **overrides):
+        # Stand-in for DailyPnlTracker's persisted day-start equity.
+        # Write-once per date on purpose: a mid-session restart must
+        # not re-baseline it, which is the failure that armed the
+        # throttle on a gain that never happened (live 2026-09-24).
+        class OpeningEquity:
+            def __init__(self):
+                self.day_start_equity = None
+
+            def record_day_start_equity(self, equity):
+                if self.day_start_equity is None:
+                    self.day_start_equity = equity
+
+            def belongs_to_today(self):
+                return self.day_start_equity is not None
+
         bot = SimpleNamespace(
             config=focus_config(**overrides),
             day_start_equity=None,
             day_start_equity_date=None,
             profit_throttle_armed=False,
+            profit_floor_breached=False,
             profit_throttle_streak=0,
             cached_total_equity=None,
+            daily_pnl=OpeningEquity(),
             now=lambda: datetime(2026, 9, 21, 10, 0, tzinfo=ZoneInfo("UTC")),
         )
         bot.update_profit_throttle = (
@@ -671,12 +688,61 @@ class ProfitThrottleTests(unittest.TestCase):
         bot.update_profit_throttle(Decimal("415"))
         self.assertFalse(bot.new_entries_blocked())
 
-    def test_arms_once_the_target_holds_for_enough_readings(self):
+    def test_reaching_the_target_does_NOT_stop_trading(self):
+        """By explicit request 2026-09-24: "even if it hits its target
+        it should continue trading, it should just not allow losses to
+        go below that 5%".
+
+        Reaching the target used to halt new entries for the rest of
+        the session. Live that day it armed at 09:42 and the account
+        sat out the remaining five hours - and it armed on a FALSE
+        baseline at that (see the day-start persistence tests), so it
+        surrendered the day over a gain that never happened.
+        """
         bot = self.bot()
         bot.update_profit_throttle(Decimal("400"))
         for _ in range(3):
             bot.update_profit_throttle(Decimal("420"))
+        self.assertTrue(bot.profit_throttle_armed, "target should register")
+        self.assertFalse(
+            bot.new_entries_blocked(),
+            "hitting the target must not stop trading",
+        )
+
+    def test_entries_stop_only_once_the_gain_is_given_back(self):
+        bot = self.bot()
+        bot.update_profit_throttle(Decimal("400"))
+        for _ in range(3):
+            bot.update_profit_throttle(Decimal("420"))  # target = 420
+        self.assertFalse(bot.new_entries_blocked())
+        bot.update_profit_throttle(Decimal("419"))  # back to the floor
+        self.assertTrue(
+            bot.new_entries_blocked(),
+            "new risk must stop once the banked gain erodes",
+        )
+
+    def test_recovering_above_the_floor_re_enables_entries(self):
+        """Two-way, unlike the old one-way halt: there is no reason to
+        sit out the rest of a session the account is winning.
+        """
+        bot = self.bot()
+        bot.update_profit_throttle(Decimal("400"))
+        for _ in range(3):
+            bot.update_profit_throttle(Decimal("420"))
+        bot.update_profit_throttle(Decimal("419"))
         self.assertTrue(bot.new_entries_blocked())
+        bot.update_profit_throttle(Decimal("425"))
+        self.assertFalse(bot.new_entries_blocked())
+
+    def test_a_dip_before_the_target_is_reached_does_not_block(self):
+        """The floor only exists once the target has actually been
+        reached - an ordinary drawdown early in the day must not be
+        mistaken for giving back a gain.
+        """
+        bot = self.bot()
+        bot.update_profit_throttle(Decimal("400"))
+        bot.update_profit_throttle(Decimal("380"))
+        self.assertFalse(bot.new_entries_blocked())
 
     def test_a_single_settlement_spike_does_not_arm_the_throttle(self):
         """Live incident, first session this shipped: the bot booked
@@ -708,9 +774,12 @@ class ProfitThrottleTests(unittest.TestCase):
         bot.update_profit_throttle(Decimal("401"))  # back under target
         bot.update_profit_throttle(Decimal("420"))
         bot.update_profit_throttle(Decimal("420"))
-        self.assertFalse(bot.new_entries_blocked())
+        self.assertFalse(bot.profit_throttle_armed)
         bot.update_profit_throttle(Decimal("420"))
-        self.assertTrue(bot.new_entries_blocked())
+        self.assertTrue(
+            bot.profit_throttle_armed,
+            "the streak must restart and then register the target",
+        )
 
     def test_stays_armed_after_a_pullback(self):
         # One-way once ARMED: disarming on a dip would re-open size

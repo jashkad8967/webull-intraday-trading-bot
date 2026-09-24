@@ -118,16 +118,35 @@ def _manual_sell(
         if pnl < 0:
             self.wash_sales.block(symbol, "manual sell at a loss")
     elif instrument_type == "OPTION":
-        if symbol in self.pending_option_exits:
-            log.info(
-                "CMD    | manual sell skipped | %-8s | exit already pending",
-                symbol,
-            )
-            return
+        # Resolve the CONTRACT before any claim or membership test.
+        #
+        # The dashboard sends the bare underlying ("GME"), while every
+        # automated exit path claims and records the OCC contract
+        # ("GME261009C00024500"). Claiming "GME" here collided with
+        # nothing, so a manual sell and the bot's own exit could both
+        # reach the broker for one position. Live 2026-09-24, on a
+        # manual GME sell placed at 09:28:38:
+        #
+        #   PROTECT| held-option exit failed | GME261009C00024500
+        #   OPTION | GME261009C00024500
+        #   HTTP 417 OPENAPI_OPTION_LONG_POSITION_MUST_BE_CLOSE_THAN_
+        #   SELL_SHORT - "You can not place order in excess of current
+        #   holding quantity"
+        #
+        # Webull's broker-side reservation was the only thing stopping
+        # a genuine double sell, and it logged an ERROR every cycle
+        # for as long as the manual order rested.
         contract = self.api.contract_from_position(position)
         if not contract:
             log.error(
                 "CMD    | manual sell failed | %-8s | could not resolve option contract",
+                symbol,
+            )
+            return
+        option_symbol = str(contract.get("symbol", "") or "") or symbol
+        if option_symbol in self.pending_option_exits:
+            log.info(
+                "CMD    | manual sell skipped | %-8s | exit already pending",
                 symbol,
             )
             return
@@ -140,7 +159,7 @@ def _manual_sell(
         # this races the same contract's automated exit, and a bare
         # membership test is check-then-act across a broker round-trip.
         # See _claim_option_exit.
-        if not self._claim_option_exit(symbol):
+        if not self._claim_option_exit(option_symbol):
             log.info(
                 "CMD    | manual sell skipped | %-8s | exit already pending",
                 symbol,
@@ -155,12 +174,16 @@ def _manual_sell(
                 "SELL_TO_CLOSE",
             )
         except Exception:
-            self._release_option_exit(symbol)
+            # Must release the SAME key that was claimed.
+            self._release_option_exit(option_symbol)
             raise
         pnl = self.record_realized_exit(cost, sell_price, quantity, multiplier=100)
+        # Keyed on the CONTRACT so has_pending_sell_order - which the
+        # automated exit paths consult with OPTION:<contract> - can
+        # actually see this resting order.
         self.record_trade(
-            f"OPTION:{symbol}", order_id, "MANUAL_SELL", sell_price, pnl=pnl,
-            entry_price=cost, quantity=quantity,
+            f"OPTION:{option_symbol}", order_id, "MANUAL_SELL", sell_price,
+            pnl=pnl, entry_price=cost, quantity=quantity,
         )
         if pnl < 0:
             self.wash_sales.block(

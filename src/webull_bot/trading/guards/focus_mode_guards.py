@@ -37,10 +37,14 @@ def update_profit_throttle(self, total_equity: Decimal) -> None:
     loss. Deriving a second equity figure anywhere else would risk
     reintroducing exactly that bug.
 
-    One-way on purpose: once armed it stays armed for the session
-    even if equity dips back under the target. A throttle that
-    disarmed on a pullback would re-open size into the exact
-    give-back it exists to prevent.
+    By explicit request 2026-09-24 - "even if it hits its target it
+    should continue trading, it should just not allow losses to go
+    below that 5%" - reaching the target is a FLOOR, not a stop sign.
+    It used to halt new entries for the rest of the session the moment
+    the target was confirmed, which threw away every remaining setup
+    of the day. Now the target level is remembered and trading
+    continues above it; new risk is only refused once equity falls
+    back to that level, which is what actually protects the gain.
     """
     if not self.config.focus_mode_enabled:
         return
@@ -50,7 +54,13 @@ def update_profit_throttle(self, total_equity: Decimal) -> None:
     today = self.now().date()
     if self.day_start_equity_date != today:
         self.day_start_equity_date = today
-        self.day_start_equity = total_equity
+        # Persisted and write-once per date: a mid-session restart must
+        # not re-baseline this. Live 2026-09-24 it was re-captured
+        # SEVEN times, each lower, until the throttle armed on a gain
+        # that never happened - see PositionOpenTimeStore's sibling
+        # note in DailyPnlTracker.
+        self.daily_pnl.record_day_start_equity(total_equity)
+        self.day_start_equity = self.daily_pnl.day_start_equity
         self.profit_throttle_armed = False
         self.profit_throttle_streak = 0
         log.info(
@@ -66,7 +76,7 @@ def update_profit_throttle(self, total_equity: Decimal) -> None:
             ).quantize(Decimal("0.01")),
         )
         return
-    if self.profit_throttle_armed or not self.day_start_equity:
+    if not self.day_start_equity:
         return
     target = self.day_start_equity * (
         Decimal("1") + self.config.focus_daily_profit_target_fraction
@@ -76,6 +86,38 @@ def update_profit_throttle(self, total_equity: Decimal) -> None:
         # transient settlement spike cannot accumulate across the
         # dips between its own occurrences.
         self.profit_throttle_streak = 0
+        if self.profit_throttle_armed:
+            # The banked gain has eroded back to the floor. THIS is
+            # where new risk stops: not on the way up through the
+            # target, but on the way back down to it.
+            if not self.profit_floor_breached:
+                self.profit_floor_breached = True
+                log.warning(
+                    "THROTTLE| equity $%s fell back to the +%s%% floor "
+                    "($%s) - no new entries; exits, the profit-lock "
+                    "trail and the EOD close stay active",
+                    total_equity.quantize(Decimal("0.01")),
+                    (
+                        self.config.focus_daily_profit_target_fraction * 100
+                    ).quantize(Decimal("0.1")),
+                    target.quantize(Decimal("0.01")),
+                )
+        return
+    # Above the floor again - trading resumes. Deliberately two-way
+    # here, unlike the old one-way halt: the floor protects the gain,
+    # and there is no reason to sit out the rest of a session the
+    # account is winning.
+    if self.profit_floor_breached:
+        self.profit_floor_breached = False
+        log.info(
+            "THROTTLE| equity $%s back above the +%s%% floor - entries "
+            "re-enabled",
+            total_equity.quantize(Decimal("0.01")),
+            (
+                self.config.focus_daily_profit_target_fraction * 100
+            ).quantize(Decimal("0.1")),
+        )
+    if self.profit_throttle_armed:
         return
     self.profit_throttle_streak += 1
     needed = self.config.profit_throttle_confirm_readings
@@ -94,10 +136,10 @@ def update_profit_throttle(self, total_equity: Decimal) -> None:
     self.profit_throttle_armed = True
     gain = total_equity - self.day_start_equity
     log.info(
-        "THROTTLE| armed | equity $%s (+$%s, +%s%%) held above the daily "
-        "target for %s consecutive readings - no new entries for the rest "
-        "of the session; exits, averaging down, the profit-lock trail and "
-        "the EOD close stay active",
+        "THROTTLE| daily target reached | equity $%s (+$%s, +%s%%) held "
+        "for %s consecutive readings - this level is now a FLOOR: "
+        "trading continues, and new entries stop only if equity falls "
+        "back to it",
         total_equity.quantize(Decimal("0.01")),
         gain.quantize(Decimal("0.01")),
         (gain / self.day_start_equity * 100).quantize(Decimal("0.01")),
@@ -106,8 +148,23 @@ def update_profit_throttle(self, total_equity: Decimal) -> None:
 
 
 def new_entries_blocked(self) -> bool:
-    """Single read the entry paths share - true once the daily profit
-    throttle has armed. Covers fresh entries AND averaging down: both
-    add risk, which is the thing being slowed down.
+    """Single read the entry paths share. Covers fresh entries AND
+    averaging down: both add risk, which is the thing being stopped.
+
+    By explicit request 2026-09-24 - "even if it hits its target it
+    should continue trading, it should just not allow losses to go
+    below that 5%" - this is no longer true merely because the daily
+    target was REACHED. Hitting the target used to halt entries for
+    the remainder of the session, which surrendered every setup left
+    in the day at exactly the point the account was doing well.
+
+    It is now true only once a reached target has been GIVEN BACK:
+    equity ran to +5%, then fell back to that level. That is the
+    moment adding risk threatens the banked gain, and it is two-way -
+    recovering above the floor re-enables entries.
     """
-    return bool(self.config.focus_mode_enabled and self.profit_throttle_armed)
+    return bool(
+        self.config.focus_mode_enabled
+        and self.profit_throttle_armed
+        and self.profit_floor_breached
+    )

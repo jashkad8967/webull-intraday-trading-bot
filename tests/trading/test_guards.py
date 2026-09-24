@@ -1774,3 +1774,75 @@ class StallSweepOptionKeyingTests(unittest.TestCase):
         boost = self._bot(placed, claimed, has_pending=True)
         boost(self._position(), options_active=True, core_session_active=True)
         self.assertEqual(placed, [], "swept while a sell order was resting")
+
+
+class ManualSellVisibilityTests(unittest.TestCase):
+    """A sell the USER places from the dashboard must be visible to
+    the bot's automated exit paths.
+
+    Live 2026-09-24: a manual GME sell placed at 09:28:38 reserved the
+    broker-side quantity, and the bot kept submitting its own exit
+    into the same position every cycle -
+
+      PROTECT| held-option exit failed | GME261009C00024500
+      HTTP 417 OPENAPI_OPTION_LONG_POSITION_MUST_BE_CLOSE_THAN_SELL_SHORT
+
+    Three separate guards all missed it, for two different reasons:
+    manual_sell claimed and recorded the bare underlying ("GME") while
+    every automated path uses the OCC contract, and MANUAL_SELL was
+    absent from has_pending_sell_order's action list. Webull's own
+    reservation was the only thing preventing a double sell.
+    """
+
+    def _bot(self, orders):
+        from webull_bot.bot import AutoTrader
+
+        fake_bot = SimpleNamespace(working_orders=dict(orders))
+        fake_bot._working_orders_lock = None
+        return AutoTrader.has_pending_sell_order.__get__(fake_bot)
+
+    def _order(self, key, action):
+        return {
+            "key": key,
+            "action": action,
+            "cancel_requested_at": None,
+        }
+
+    def test_a_manual_sell_counts_as_a_pending_sell(self):
+        has_pending = self._bot(
+            {"o1": self._order("OPTION:GME261009C00024500", "MANUAL_SELL")}
+        )
+        self.assertTrue(has_pending("OPTION:GME261009C00024500"))
+
+    def test_automated_sell_actions_still_count(self):
+        for action in ("SELL", "STOP", "PROFIT"):
+            has_pending = self._bot(
+                {"o1": self._order("OPTION:GME261009C00024500", action)}
+            )
+            self.assertTrue(
+                has_pending("OPTION:GME261009C00024500"), action
+            )
+
+    def test_a_buy_is_not_a_pending_sell(self):
+        has_pending = self._bot(
+            {"o1": self._order("OPTION:GME261009C00024500", "BUY")}
+        )
+        self.assertFalse(has_pending("OPTION:GME261009C00024500"))
+
+    def test_a_cancelled_sell_does_not_block(self):
+        order = self._order("OPTION:GME261009C00024500", "MANUAL_SELL")
+        order["cancel_requested_at"] = 1.0
+        has_pending = self._bot({"o1": order})
+        self.assertFalse(has_pending("OPTION:GME261009C00024500"))
+
+    def test_a_manual_sell_on_the_bare_underlying_does_not_match_the_contract(
+        self,
+    ):
+        """Documents WHY manual_sell must record the contract symbol:
+        a key of OPTION:GME can never match the OPTION:<contract> that
+        every automated exit path looks up.
+        """
+        has_pending = self._bot(
+            {"o1": self._order("OPTION:GME", "MANUAL_SELL")}
+        )
+        self.assertFalse(has_pending("OPTION:GME261009C00024500"))
