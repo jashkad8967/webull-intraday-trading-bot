@@ -646,7 +646,22 @@ def option_decision(
         and seconds_since_entry
         >= self.config.option_stale_exit_minutes * 60
     ):
-        loss_fraction = (average_cost - price) / average_cost
+        # average_cost > 0 guard, same as option_average_down_signal
+        # already does below. A position snapshot can arrive with a
+        # zero cost (seen live 2026-09-24 right after a container
+        # restart, while cached_positions was still filling in), and
+        # `(0 - 0) / 0` raises decimal.DivisionUndefined - which
+        # surfaced as "PROTECT| held-option exit failed |
+        # F261016P00013500 | [<class 'decimal.DivisionUndefined'>]"
+        # and took the ENTIRE exit evaluation down for that contract.
+        # A crashing exit path on a live position is the worst failure
+        # mode here: the stop, the profit target and the profit-lock
+        # trail all stop being evaluated together.
+        loss_fraction = (
+            (average_cost - price) / average_cost
+            if average_cost > 0
+            else Decimal("0")
+        )
         if loss_fraction <= self.config.option_stale_exit_max_loss_percent:
             minutes = int(seconds_since_entry // 60)
             if price > average_cost + fee_per_share:
@@ -697,6 +712,16 @@ def _profit_lock_floor(
     arm_at = average_cost * (Decimal("1") + self.config.profit_lock_arm_percent)
     if peak_price < arm_at:
         return None
+    # Hoisted to function scope: it is read again by minimum_floor
+    # below, on EVERY path, while the tier loop that first needed it
+    # only runs when giveback_fraction is None. Computing it inside
+    # that branch left it unbound whenever a caller passed an explicit
+    # giveback (the throttled path does), raising UnboundLocalError -
+    # the same shape as the momentum_exit bug fixed earlier this week.
+    #
+    # Division is safe here without its own guard: the early return
+    # above already rejects average_cost <= 0.
+    peak_gain = (peak_price - average_cost) / average_cost
     if giveback_fraction is None:
         # By explicit request ("have the profit lock dynamic shift
         # based on the amount of profit it is at"): give back LESS of
@@ -705,7 +730,6 @@ def _profit_lock_floor(
         # small one it hands back so little that fees eat the rest.
         # Tightening as the gain grows is the ratchet that stops a
         # genuinely big move round-tripping.
-        peak_gain = (peak_price - average_cost) / average_cost
         for threshold, tier_giveback in (
             (Decimal("0.20"), Decimal("0.20")),  # +20% or more -> keep 80%
             (Decimal("0.10"), Decimal("0.25")),  # +10%         -> keep 75%
@@ -736,9 +760,7 @@ def _profit_lock_floor(
     # tiers above normally hold more than half the peak, so they win -
     # this only binds when a tier would have surrendered more.
     minimum_floor = average_cost * (
-        Decimal("1")
-        + (peak_price - average_cost) / average_cost
-        * self.config.profit_lock_min_gain_fraction
+        Decimal("1") + peak_gain * self.config.profit_lock_min_gain_fraction
     )
     if floor < minimum_floor:
         floor = minimum_floor

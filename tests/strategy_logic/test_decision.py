@@ -5,6 +5,9 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from webull_bot.strategy import TradingStrategy
+from webull_bot.strategy_logic.decision.stock_option_decision import (
+    option_decision,
+)
 from webull_bot.webull_api import QuoteUnavailableError, WebullAPI
 
 from support.fixtures import StrategyConfigMixin
@@ -251,3 +254,57 @@ class ProfitTargetTickQuantizationTests(unittest.TestCase):
         self.assertGreater(target, Decimal("0.18"))
         self.assertEqual(target, Decimal("0.20"))
         self.assertEqual(target % Decimal("0.05"), Decimal("0"))
+
+
+class ZeroCostDoesNotCrashTheExitPath(unittest.TestCase):
+    """Live 2026-09-24, with a real position open:
+
+        PROTECT| held-option exit failed | F261016P00013500
+              | [<class 'decimal.DivisionUndefined'>]
+
+    A position snapshot arrived with a zero average_cost (seen right
+    after a container restart, while cached_positions was still
+    filling in). Three profit-lock/stale-exit expressions divided by
+    average_cost without the `> 0` guard that option_average_down_
+    signal already had, and `(0 - 0) / 0` raises DivisionUndefined.
+
+    That exception propagated out of option_decision and killed the
+    WHOLE exit evaluation for that contract - so the stop, the profit
+    target and the profit-lock trail all stopped being evaluated
+    together, on a live position. A crashing exit path is the worst
+    failure mode in this file.
+    """
+
+    def _strategy(self):
+        from webull_bot.config import Settings
+
+        return SimpleNamespace(config=Settings())
+
+    def test_zero_cost_and_zero_price_does_not_raise(self):
+        decision = option_decision(
+            self._strategy(), Decimal("0"), 1, Decimal("0"), 20,
+            seconds_since_entry=3600, peak_price=Decimal("0"),
+        )
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_zero_cost_with_a_live_price_and_peak_does_not_raise(self):
+        decision = option_decision(
+            self._strategy(), Decimal("0.77"), 1, Decimal("0"), 20,
+            seconds_since_entry=3600, peak_price=Decimal("0.81"),
+        )
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_zero_cost_with_no_peak_does_not_raise(self):
+        decision = option_decision(
+            self._strategy(), Decimal("0"), 1, Decimal("0"), 20,
+            seconds_since_entry=3600, peak_price=None,
+        )
+        self.assertEqual(decision.action, "HOLD")
+
+    def test_a_normal_position_still_decides_the_same_way(self):
+        """The guards must not change behaviour for real costs."""
+        decision = option_decision(
+            self._strategy(), Decimal("1.20"), 1, Decimal("1.00"), 20,
+            seconds_since_entry=60, peak_price=Decimal("1.25"),
+        )
+        self.assertEqual(decision.action, "PROFIT")
