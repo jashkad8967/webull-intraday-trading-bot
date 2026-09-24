@@ -270,6 +270,30 @@ def _quote_decimal(quote: dict, field: str) -> Decimal | None:
     return number if number.is_finite() and number > 0 else None
 
 
+# How wide a two-sided OPTION quote may be and still corroborate
+# itself. Real option spreads run 2-10% routinely and the entry gate
+# (option_max_entry_spread_percent, 25%) is what decides whether a
+# spread is TRADEABLE; this only decides whether the two numbers are
+# believable as a pair.
+_PAIRED_QUOTE_MAX_SPREAD = Decimal("0.30")
+
+
+def _is_option_quote(quote: dict) -> bool:
+    """Option snapshots carry greeks; stock snapshots do not.
+
+    The distinction matters because the last-price sanity bound below
+    is calibrated for stocks, where an 8% gap between bid and last is
+    genuinely implausible, and is actively harmful on options, where
+    it is routine. Keyed on fields the broker only returns for
+    contracts (confirmed against a live snapshot: delta, gamma,
+    imp_vol, open_interest) rather than on a flag this codebase would
+    have to thread through every call site.
+    """
+    return any(
+        key in quote for key in ("delta", "gamma", "imp_vol", "open_interest")
+    )
+
+
 def _sane_bid_or_ask(self, quote: dict, field: str) -> Decimal | None:
     """bid/ask extraction with a sanity check against the same quote's
     own last-trade price.
@@ -289,6 +313,44 @@ def _sane_bid_or_ask(self, quote: dict, field: str) -> Decimal | None:
     value = self._quote_decimal(quote, field)
     if value is None:
         return None
+    # A bid and ask that corroborate EACH OTHER are better evidence
+    # than a last-trade price that may be minutes stale.
+    #
+    # Live incident 2026-09-24, and the most damaging bug of the day: a
+    # held MARA put quoted bid 1.05 / ask 1.08 - a tight, healthy,
+    # 3-cent market - with a last trade of 1.20. The bid is 12.5% from
+    # that last trade, over the 8% bound, so BOTH sides were rejected
+    # as insane and quote_bid/quote_ask returned None. The exit path
+    # cannot price without a quote, so the 10% stop could not fire on a
+    # position already 12.5% down.
+    #
+    # The failure reinforces itself in the worst possible direction:
+    # the further a position falls away from its last trade, the more
+    # certainly its quotes are discarded, so the stop becomes LESS able
+    # to fire exactly as it becomes more necessary.
+    #
+    # The 8% bound was calibrated on a STOCK (FPE, ask $20.08 against a
+    # $17.7 last - genuinely broken data). For options an 8% gap
+    # between bid and last is unremarkable: premiums are leveraged, so
+    # a 1% underlying move is a 10%+ premium move, and the last trade
+    # on a thin contract is frequently minutes old.
+    #
+    # So when both sides are present and mutually consistent - positive,
+    # correctly ordered, and not absurdly wide - they are trusted on
+    # their own. FPE is still caught: its pair would have to be
+    # internally consistent to pass, and a single broken side (the
+    # actual failure there) leaves the pair unusable and falls through
+    # to the last-price check below.
+    bid = self._quote_decimal(quote, "bid")
+    ask = self._quote_decimal(quote, "ask")
+    if (
+        _is_option_quote(quote)
+        and bid is not None
+        and ask is not None
+        and bid <= ask
+        and (ask - bid) / ask <= _PAIRED_QUOTE_MAX_SPREAD
+    ):
+        return value
     reference = self._quote_decimal(quote, "price")
     if reference is None:
         return value

@@ -659,3 +659,82 @@ class ShortPricingTests(unittest.TestCase):
         fake_api = _fake_webull_api()
         ask_fn = WebullAPI.quote_ask.__get__(fake_api)
         self.assertEqual(ask_fn({"ask": "17.85", "price": "17.81"}), Decimal("17.85"))
+
+
+class OptionQuoteSanityTests(unittest.TestCase):
+    """The most damaging bug of 2026-09-24: a held MARA put quoted
+    bid 1.05 / ask 1.08 - a tight, healthy 3-cent market - with a last
+    trade of 1.20. The bid sits 12.5% from that last trade, over the 8%
+    sanity bound, so BOTH sides were discarded and quote_bid/quote_ask
+    returned None. The exit path cannot price without a quote, so the
+    10% stop could not fire on a position already 12.5% down.
+
+    The failure reinforces itself in the worst direction: the further a
+    position falls from its last trade, the more certainly its quotes
+    are rejected, so the stop becomes LESS able to fire exactly as it
+    becomes more necessary.
+
+    The 8% bound was calibrated on a STOCK (FPE, ask $20.08 against a
+    $17.7 last - genuinely broken data) and is correct there. On
+    options an 8% bid-to-last gap is unremarkable, because premiums are
+    leveraged and the last trade on a thin contract is often minutes
+    old.
+    """
+
+    GREEKS = {
+        "delta": "-0.4",
+        "gamma": "0.1",
+        "imp_vol": "0.5",
+        "open_interest": "100",
+    }
+
+    def _api(self):
+        api = WebullAPI.__new__(WebullAPI)
+        api.config = SimpleNamespace(
+            quote_price_sanity_percent=Decimal("0.08"),
+            option_limit_offset=Decimal("0.03"),
+        )
+        return api
+
+    def test_the_live_mara_quote_resolves(self):
+        api = self._api()
+        quote = {**self.GREEKS, "bid": "1.05", "ask": "1.08", "price": "1.20"}
+        self.assertEqual(api.quote_bid(quote), Decimal("1.05"))
+        self.assertEqual(api.quote_ask(quote), Decimal("1.08"))
+
+    def test_a_falling_option_can_still_be_priced_for_an_exit(self):
+        """The property that actually matters: a position well below
+        its last trade must remain sellable.
+        """
+        api = self._api()
+        for last in ("1.20", "1.50", "2.00", "5.00"):
+            quote = {**self.GREEKS, "bid": "1.05", "ask": "1.08", "price": last}
+            self.assertIsNotNone(
+                api.quote_bid(quote), f"unsellable against last={last}"
+            )
+
+    def test_an_absurdly_wide_option_pair_is_not_trusted(self):
+        api = self._api()
+        quote = {**self.GREEKS, "bid": "0.40", "ask": "1.00", "price": "0.95"}
+        self.assertIsNone(api.quote_bid(quote))
+
+    def test_an_inverted_option_pair_is_not_trusted(self):
+        api = self._api()
+        quote = {**self.GREEKS, "bid": "1.20", "ask": "1.05", "price": "1.10"}
+        self.assertIsNone(api.quote_bid(quote))
+
+    def test_the_stock_guard_is_unchanged(self):
+        """FPE, the incident the original bound was written for: a
+        broken $28.49 ask against a $17.75 last on a STOCK quote (no
+        greeks) must still be rejected.
+        """
+        api = self._api()
+        quote = {"bid": "17.70", "ask": "28.49", "price": "17.75"}
+        self.assertIsNone(api.quote_ask(quote))
+        self.assertEqual(api.quote_bid(quote), Decimal("17.70"))
+
+    def test_a_normal_stock_quote_still_resolves(self):
+        api = self._api()
+        quote = {"bid": "99.98", "ask": "100.02", "price": "100.00"}
+        self.assertEqual(api.quote_bid(quote), Decimal("99.98"))
+        self.assertEqual(api.quote_ask(quote), Decimal("100.02"))
