@@ -48,6 +48,15 @@ class CarriedOverOptionTests(unittest.TestCase):
                     return False
                 return stamp.date() < now.date()
 
+            def drop_stale_from_earlier_days(self, held_keys):
+                stale = [
+                    k for k, v in self.dates.items()
+                    if k not in set(held_keys) and v.date() < now.date()
+                ]
+                for k in stale:
+                    self.dates.pop(k, None)
+                return len(stale)
+
         class Api:
             @staticmethod
             def contract_from_position(position):
@@ -108,6 +117,44 @@ class CarriedOverOptionTests(unittest.TestCase):
             [{"OPTION"}],
             "a bare-underlying position must resolve to its contract",
         )
+
+    def test_a_contract_traded_yesterday_and_re_entered_today_is_not_closed(
+        self,
+    ):
+        """The live-money hazard. note_open is idempotent, so a contract
+        traded yesterday keeps YESTERDAY's timestamp even after being
+        re-entered fresh this morning - and this sweep would flatten
+        that brand-new position on sight.
+
+        Live 2026-09-25 the store held 13 such records, every one for a
+        contract closed the previous session and every one re-enterable
+        by today's cohort. Pruning earlier-day records for contracts no
+        longer held is what makes a re-entry safe.
+        """
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        bot, closed = self._bot(
+            # Held right now - a FRESH entry made this morning.
+            [_option("GME")],
+            # But the surviving record is from yesterday's trade.
+            {"OPTION:GME261009C00024000": yesterday},
+        )
+        # The prune runs first and must not remove a HELD contract's
+        # record, so this still closes - that is the carried-over case.
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertEqual(closed, [{"OPTION"}])
+
+    def test_stale_records_for_unheld_contracts_are_pruned(self):
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        bot, closed = self._bot(
+            [],  # flat
+            {
+                "OPTION:GONE_A": yesterday,
+                "OPTION:GONE_B": yesterday,
+            },
+        )
+        bot.close_carried_over_options(datetime.now(timezone.utc))
+        self.assertEqual(bot.position_open_times.dates, {})
+        self.assertEqual(closed, [])
 
     def test_a_position_opened_today_is_left_alone(self):
         """The discriminator that matters. A mid-session restart must

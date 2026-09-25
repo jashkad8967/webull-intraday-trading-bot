@@ -36,6 +36,28 @@ def close_carried_over_options(self, moment) -> None:
     """
     if self.carried_over_options_date == moment.date():
         return
+    # Drop yesterday's records for contracts no longer held, BEFORE
+    # deciding what is carried over.
+    #
+    # note_open is idempotent, so a contract traded yesterday and
+    # re-entered today keeps YESTERDAY's timestamp - which would make
+    # this sweep flatten a legitimately fresh position. Live
+    # 2026-09-25 the file held 13 such records, every one for a closed
+    # contract, any of which the cohort could re-enter the same
+    # morning. Scoped to earlier days only, so a restart's momentarily
+    # empty snapshot cannot delete the age of something actually open.
+    held_keys = {
+        f"OPTION:{str((self.api.contract_from_position(p) or {}).get('symbol', '') or '')}"
+        for p in (self.cached_positions or [])
+        if p.get("instrument_type") == "OPTION"
+    }
+    dropped = self.position_open_times.drop_stale_from_earlier_days(held_keys)
+    if dropped:
+        log.info(
+            "CARRY  | dropped %s stale entry-time record(s) from a "
+            "previous session",
+            dropped,
+        )
     positions = self.cached_positions or []
     carried = []
     for position in positions:

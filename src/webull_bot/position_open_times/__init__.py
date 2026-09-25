@@ -115,19 +115,47 @@ class PositionOpenTimeStore:
             if self.opened_at.pop(key, None) is not None:
                 self._save()
 
-    def retain_only(self, keys) -> None:
-        """Drop records for positions that are no longer held.
+    def drop_stale_from_earlier_days(self, held_keys) -> int:
+        """Remove records from a PREVIOUS day for positions no longer
+        held. Returns how many were dropped.
 
-        This is what keeps the file bounded: it only ever describes
-        what is open right now.
+        Two reasons this is needed, both found live 2026-09-25 with 13
+        stale entries sitting in the file:
+
+        1. note_open is idempotent - it preserves the ORIGINAL
+           timestamp - so re-entering a contract that was traded
+           yesterday keeps yesterday's date. opened_before_today then
+           reports True and close_carried_over_options would flatten a
+           legitimately fresh position the moment the session opened.
+           That is a live-money bug, not just untidiness.
+
+        2. forget() runs on exit, but the fast exit-evaluation loop
+           re-stamps via note_open for a few seconds afterwards while
+           cached_positions still shows the closed position - so
+           records come back after being removed and the file grows.
+
+        Deliberately scoped to EARLIER DAYS only, and never touches a
+        record stamped today. An empty or momentarily stale position
+        snapshot (every restart has one) must not be able to delete the
+        age of something actually open - losing that would reset a
+        held position's stale-exit clock, which is the very bug the
+        store was written to fix.
         """
-        keep = set(keys)
+        keep = set(held_keys)
+        today = datetime.now(self.timezone).date()
         with self._lock:
-            stale = [key for key in self.opened_at if key not in keep]
+            stale = []
+            for key, value in self.opened_at.items():
+                if key in keep:
+                    continue
+                parsed = self._parse(value)
+                if parsed is None or parsed.date() < today:
+                    stale.append(key)
             for key in stale:
                 self.opened_at.pop(key, None)
             if stale:
                 self._save()
+        return len(stale)
 
     def opened_before_today(self, key: str) -> bool:
         """True when this position was entered on an earlier DATE.

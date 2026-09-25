@@ -416,18 +416,88 @@ class PositionOpenTimeStoreTests(unittest.TestCase):
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 
-    def test_forget_and_retain_only_keep_the_file_bounded(self):
+    def test_forget_removes_a_record(self):
         path = Path("tests/.generated_posage/bounded.json")
         shutil.rmtree(path.parent, ignore_errors=True)
         try:
             store = self._store(path)
-            for key in ("A", "B", "C", "D"):
+            for key in ("A", "B"):
                 store.note_open(key)
             store.forget("A")
-            store.retain_only({"B", "C"})
-            self.assertEqual(set(store.opened_at), {"B", "C"})
-            reloaded = self._store(path)
-            self.assertEqual(set(reloaded.opened_at), {"B", "C"})
+            self.assertEqual(set(store.opened_at), {"B"})
+            self.assertEqual(set(self._store(path).opened_at), {"B"})
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_stale_records_from_earlier_days_are_dropped(self):
+        """Live 2026-09-25: 13 records sat in this file, every one for a
+        contract closed the previous session.
+
+        forget() runs on exit, but the fast exit-evaluation loop
+        re-stamps via note_open for a few seconds afterwards while
+        cached_positions still shows the closed position - so records
+        come back after being removed.
+        """
+        path = Path("tests/.generated_posage/stale.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+            now = datetime.now(timezone.utc)
+            path.write_text(
+                json.dumps({
+                    "OPTION:OLD_A": yesterday.isoformat(),
+                    "OPTION:OLD_B": yesterday.isoformat(),
+                    "OPTION:HELD_FROM_YESTERDAY": yesterday.isoformat(),
+                    "OPTION:TODAY": now.isoformat(),
+                }),
+                encoding="utf-8",
+            )
+            store = self._store(path)
+            dropped = store.drop_stale_from_earlier_days(
+                {"OPTION:HELD_FROM_YESTERDAY"}
+            )
+            self.assertEqual(dropped, 2)
+            self.assertEqual(
+                set(store.opened_at),
+                {"OPTION:HELD_FROM_YESTERDAY", "OPTION:TODAY"},
+            )
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_a_genuinely_carried_position_keeps_its_record(self):
+        """The whole point of the store: a position actually still held
+        from yesterday must keep its real entry date, or the carried-over
+        sweep cannot see it and its stale-exit clock resets.
+        """
+        path = Path("tests/.generated_posage/carried_keep.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+            path.write_text(
+                json.dumps({"OPTION:HELD": yesterday.isoformat()}),
+                encoding="utf-8",
+            )
+            store = self._store(path)
+            store.drop_stale_from_earlier_days({"OPTION:HELD"})
+            self.assertTrue(store.opened_before_today("OPTION:HELD"))
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+    def test_todays_records_survive_an_empty_position_snapshot(self):
+        """Every restart has a moment where cached_positions is empty.
+        That must never delete the age of something actually open -
+        losing it resets the stale-exit clock, the original bug.
+        """
+        path = Path("tests/.generated_posage/empty_snapshot.json")
+        shutil.rmtree(path.parent, ignore_errors=True)
+        try:
+            store = self._store(path)
+            store.note_open("OPTION:OPENED_TODAY")
+            dropped = store.drop_stale_from_earlier_days(set())
+            self.assertEqual(dropped, 0)
+            self.assertIn("OPTION:OPENED_TODAY", store.opened_at)
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
 

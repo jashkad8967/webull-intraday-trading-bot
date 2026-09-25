@@ -47,6 +47,29 @@ EOF
   chown "${DEPLOY_USER}:${DEPLOY_USER}" "${DEPLOY_ROOT}/shared/.env"
 fi
 
+# Swap cushion. This instance has 955MB of RAM and shipped with NO
+# swap, so anything that spikes memory has nowhere to go but the OOM
+# killer and the page-thrash that precedes it.
+#
+# Live 2026-09-24, mid-session with two positions open: a scheduled
+# unattended apt upgrade pushed available memory to 34MB. Load average
+# hit 32.59, systemd-timesyncd could not get enough CPU to hold the
+# clock, and it drifted 8 seconds - past Webull's request-timestamp
+# window, so EVERY api call started failing with
+# CLOCK_SKEW_EXCEEDED. The bot was up and healthy and simply could not
+# place an order, including exits, with 35 minutes left before the
+# option close.
+#
+# 512M rather than the conventional 1G: the deploy preflight refuses
+# to run under 1500MB free disk, and this host's root is 8.7G.
+if [[ ! -f /swapfile ]]; then
+  fallocate -l 512M /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -q "^/swapfile" /etc/fstab     || echo "/swapfile none swap sw 0 0" >>/etc/fstab
+fi
+
 docker volume create webull-trading-data >/dev/null
 
 # Disk guard, independent of deploys. See install-disk-cleanup.sh for
