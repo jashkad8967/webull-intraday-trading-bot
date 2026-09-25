@@ -18,6 +18,7 @@ def focus_config(**overrides):
     """Only the knobs the focus-mode code paths actually read."""
     base = dict(
         focus_mode_enabled=True,
+        option_entries_halted=False,
         focus_lock_time="09:45",
         daily_batch_refresh_time="08:45",
         daily_batch_size=8,
@@ -1991,3 +1992,46 @@ class RealSessionScheduleAlignmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EntriesHaltedTests(unittest.TestCase):
+    """OPTION_ENTRIES_HALTED must stop all new option risk while
+    leaving every exit path reachable.
+
+    Added 2026-09-25 after the account fell from $249.70 to $149.17 in
+    under two hours. The correct response to "I am going to lose all my
+    money" is a switch that stops opening positions immediately, not
+    another parameter change made under pressure - every mid-session
+    parameter change that day cost money to learn from.
+
+    A halt that stranded open positions without a stop would be far
+    worse than the losses it prevents, so this is deliberately narrow.
+    """
+
+    def _bot(self, halted, **overrides):
+        bot = SimpleNamespace(
+            config=focus_config(option_entries_halted=halted, **overrides),
+            profit_throttle_armed=False,
+            profit_floor_breached=False,
+        )
+        bot.new_entries_blocked = AutoTrader.new_entries_blocked.__get__(bot)
+        return bot
+
+    def test_halted_blocks_entries(self):
+        self.assertTrue(self._bot(True).new_entries_blocked())
+
+    def test_not_halted_allows_entries(self):
+        self.assertFalse(self._bot(False).new_entries_blocked())
+
+    def test_halt_applies_even_with_focus_mode_off(self):
+        """The halt is a hard stop on risk, not a focus-mode feature -
+        it must not be escapable by disabling focus mode.
+        """
+        bot = self._bot(True, focus_mode_enabled=False)
+        self.assertTrue(bot.new_entries_blocked())
+
+    def test_halt_does_not_depend_on_the_profit_throttle(self):
+        bot = self._bot(True)
+        bot.profit_throttle_armed = False
+        bot.profit_floor_breached = False
+        self.assertTrue(bot.new_entries_blocked())

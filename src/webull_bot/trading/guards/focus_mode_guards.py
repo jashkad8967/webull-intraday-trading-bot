@@ -176,6 +176,12 @@ def new_entries_blocked(self) -> bool:
     moment adding risk threatens the banked gain, and it is two-way -
     recovering above the floor re-enables entries.
     """
+    # Hard halt first, and independent of focus mode: when this is set
+    # nothing new opens at all. Exits, the stop, the profit-lock trail,
+    # the stale exit and the EOD close are all downstream of this and
+    # stay active - see option_entries_halted.
+    if self.config.option_entries_halted:
+        return True
     return bool(
         self.config.focus_mode_enabled
         and self.profit_throttle_armed

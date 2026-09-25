@@ -1094,11 +1094,45 @@ def _evaluate_option_exit(
         target = self.api._quantize_to_option_tick(
             decision.target_price, rounding
         )
-        limit_price = (
-            target
-            if momentum_exit
-            else max(target, self.api.option_limit_price(quote, "SELL"))
-        )
+        # Price the exit to FILL, not to the target.
+        #
+        # This was max(target, marketable) - it took the HIGHER of the
+        # two, so whenever the profit target sat above what the market
+        # would pay, the order rested where nobody was buying and the
+        # gain was free to fade. The target's job is to decide WHEN to
+        # sell; it must not also be the price.
+        #
+        # Live 2026-09-25, and I had already found and then dismissed
+        # this on a Ford trade the day before:
+        #
+        #   09:29  BUY 3 XPEV 10500P @ 0.60  ($180)
+        #   09:41  last 0.61, +$1.29 in profit
+        #   09:31  PROFIT @ 0.65 -> cancelled unfilled
+        #   09:34  PROFIT @ 0.65 -> cancelled unfilled
+        #   09:38  PROFIT @ 0.65 -> cancelled unfilled
+        #   10:17  STOP  @ 0.45 -> filled 0.51        -$27
+        #
+        # Three refusals to take a real, fillable gain because 0.65 was
+        # four cents above the bid, and the winner became a loser.
+        #
+        # The hard rule that a PROFIT may never price below cost plus
+        # the sell fee is preserved: that is what stops a "profit" exit
+        # booking an actual loss, which this project has done before.
+        # When the marketable price cannot clear that floor there is no
+        # profit available to take, so the order rests at the floor and
+        # the stop owns the downside - which is the correct division of
+        # labour, and the one case where waiting is right.
+        marketable = self.api.option_limit_price(quote, "SELL")
+        if momentum_exit:
+            limit_price = target
+        else:
+            exit_fee_per_share = (
+                self.config.option_sell_fee_per_contract / 100
+            )
+            profit_floor = self.api._quantize_to_option_tick(
+                cost + exit_fee_per_share, ROUND_UP
+            )
+            limit_price = max(marketable, profit_floor)
         if not self.price_sanity_cooldown_ready(
             option_symbol
         ) or not self.price_sanity_ok(
