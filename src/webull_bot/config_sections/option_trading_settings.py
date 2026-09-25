@@ -127,20 +127,38 @@ class OptionTradingSettings(BaseSettings):
     # contract was 65% of the account and a routine stop became a 13%
     # ACCOUNT loss. At 0.10 the same trade loses ~$17.
     #
-    # Two honest consequences, neither a reason not to do it:
+    # 0.10 -> 0.05 by explicit request, and this time the number comes
+    # from measured results rather than judgement. Every option round
+    # trip on 2026-09-24:
     #
-    # Option bid/ask spreads run 2-3% on their own, so a 10% stop sits
-    # only three or four spreads away from entry and will be shaken
-    # out by noise materially more often than 20% was.
+    #   WINS   n=12  median  5.3%  best 16.6%  worst  2.5%
+    #          reached the 10% take-profit: 1 of 12
+    #   LOSSES n=6   median -13.0%  worst -26.3%  smallest -10.1%
+    #   win rate 67%, avg win $6.18 vs avg loss $17.07
+    #   breakeven needed 73% -> NEGATIVE EXPECTANCY
     #
-    # It now EQUALS option_take_profit_percent (0.10), so the nominal
-    # risk/reward is 1:1 - and the real ratio is worse than that,
-    # because the profit-lock trail deliberately exits winners early on
-    # a fade while losers run the full stop. Profitability therefore
-    # depends on a win rate comfortably above 50%, not on the ratio.
-    # Turning the take-profit up, or the capital fraction down, are the
-    # two levers that restore an edge; this setting alone does not.
-    option_stop_loss_percent: Decimal = Field(default=Decimal("0.10"), gt=0, le=1)
+    # The bot picks direction well and still lost money, because losses
+    # ran ~2.8x the size of wins. A 10% stop is sized against a win
+    # that essentially never arrives: the median favourable move is
+    # 5.3%, so winners are taken by the profit-lock trail around 5%
+    # while losers travel the full stop. At a 5% stop and a 5.3% median
+    # win, a 67% win rate is roughly +1.9% expectancy per trade.
+    #
+    # The real risk, stated plainly: option spreads run 2-3%, so 5%
+    # leaves only about two spreads of room. Expect noticeably more
+    # stop-outs, and expect some of today's winners to become losers.
+    # That is the trade being made deliberately - smaller, more
+    # frequent losses against wins that are finally larger than them.
+    # Anything much tighter (3-4%) sits inside one spread and would
+    # stop out on the bid/ask alone, collapsing the win rate the whole
+    # calculation depends on.
+    #
+    # NOTE: option_stale_exit_max_loss_percent (0.08) is now looser
+    # than this stop, so it can no longer bind - a position can never
+    # be 8% down without having already stopped out. That leaves the
+    # stale exit free to act on any stalled position, which is what it
+    # is for.
+    option_stop_loss_percent: Decimal = Field(default=Decimal("0.05"), gt=0, le=1)
     # By explicit request, for a one-off diagnostic: "make sure it
     # fires... no barrier, quickly sell it, and then change the option
     # strategy again." Off by default (real gates always apply) - when
