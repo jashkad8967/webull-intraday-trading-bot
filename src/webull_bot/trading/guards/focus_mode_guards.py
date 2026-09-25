@@ -63,15 +63,28 @@ def update_profit_throttle(self, total_equity: Decimal) -> None:
         self.day_start_equity = self.daily_pnl.day_start_equity
         self.profit_throttle_armed = False
         self.profit_throttle_streak = 0
+        # Report the PERSISTED baseline, not the current equity.
+        #
+        # This printed total_equity and derived the target from it, so
+        # after a mid-session restart it announced today's day-start as
+        # whatever the account happened to be worth right then. Live
+        # 2026-09-25 it logged "day-start equity $188.72 | slowing down
+        # at +5.0% ($198.16)" while daily_pnl.json correctly held
+        # $249.70 and the throttle was correctly using a $262.18
+        # target. The logic was right and the log was wrong - which is
+        # worse than the reverse, because it looked exactly like the
+        # day-start persistence fix had failed and sent me to
+        # re-investigate a bug that was not there.
+        baseline = self.day_start_equity or total_equity
         log.info(
             "THROTTLE| day-start equity $%s | slowing down at +%s%% "
             "($%s)",
-            total_equity.quantize(Decimal("0.01")),
+            baseline.quantize(Decimal("0.01")),
             (self.config.focus_daily_profit_target_fraction * 100).quantize(
                 Decimal("0.1")
             ),
             (
-                total_equity
+                baseline
                 * (Decimal("1") + self.config.focus_daily_profit_target_fraction)
             ).quantize(Decimal("0.01")),
         )
