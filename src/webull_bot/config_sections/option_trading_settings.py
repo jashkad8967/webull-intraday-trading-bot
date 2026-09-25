@@ -158,7 +158,36 @@ class OptionTradingSettings(BaseSettings):
     # be 8% down without having already stopped out. That leaves the
     # stale exit free to act on any stalled position, which is what it
     # is for.
-    option_stop_loss_percent: Decimal = Field(default=Decimal("0.05"), gt=0, le=1)
+    # REVERTED 0.05 -> 0.10 the same morning, after watching it live.
+    #
+    # The 5% experiment failed within 25 minutes, 2026-09-25:
+    #
+    #   08:46 BUY GME 24000P 0.70->0.80 | 08:48 STOP 0.75  122s  -$15
+    #   09:07 BUY GME 23000C 1.25->1.30 | 09:08 STOP 1.20   50s   -$5
+    #   09:10 BUY BABA 104P  0.95       | 09:10 STOP 0.86   26s  -$12
+    #   account 249.70 -> 215.96
+    #
+    # Three stop-outs in 26, 50 and 122 SECONDS. BABA moved 9.5%
+    # against the position in 26 seconds with no escalation involved,
+    # which is the decisive data point: 5% is simply inside the normal
+    # minute-to-minute noise of these contracts, so the stop fires
+    # before a trade can resolve either way.
+    #
+    # The expectancy arithmetic that justified 5% (median win 5.3%,
+    # win rate 67% -> +1.9%/trade) held WIN RATE CONSTANT while
+    # tightening the stop. That assumption is what broke: the win rate
+    # collapsed, because trades that would have worked were stopped out
+    # first. A tighter stop does not just cap losses, it converts
+    # winners into losers, and the measured 67% was a property of the
+    # 10-20% stops in force when it was measured.
+    #
+    # Back to 0.10, which measured marginally positive over a full
+    # session rather than catastrophic over 25 minutes. The real fix for
+    # the win/loss asymmetry is not a tighter stop - it is capping how
+    # far an entry escalates (see option_entry_max_escalation_percent)
+    # and lowering option_take_profit_percent so winners bank at target
+    # instead of relying on the trail.
+    option_stop_loss_percent: Decimal = Field(default=Decimal("0.10"), gt=0, le=1)
     # By explicit request, for a one-off diagnostic: "make sure it
     # fires... no barrier, quickly sell it, and then change the option
     # strategy again." Off by default (real gates always apply) - when
@@ -380,6 +409,42 @@ class OptionTradingSettings(BaseSettings):
     # exits, which
     # had no options/entry-side equivalent until now.
     option_entry_escalate_seconds: int = Field(default=30, ge=5, le=120)
+    # NOT YET WIRED IN - see the note at the end of this comment.
+    #
+    # How far above the CURRENT midpoint an escalating entry may pay.
+    #
+    # Live 2026-09-25, two trades under an identical 5% stop, opposite
+    # outcomes, and the only difference was how far the escalator
+    # chased:
+    #
+    #   GME 24000P  mid 0.70 -> filled 0.80  (+14%)
+    #               stopped 122s later, -$15.30
+    #   PLTR 180P   mid 2.25 -> filled 2.27  (+0.9%)
+    #               closed +4.4%, +$11
+    #
+    # The escalated target is a (mid + ask) / 2 blend quantized UP to
+    # the $0.05 option tick. On a $0.70 contract one tick is 7% of
+    # premium, so a single step clears a 5% stop outright - the GME
+    # position was BELOW its own stop the moment it filled, and the
+    # stop then fired on the contract merely returning to its real
+    # mid. On a $2.27 contract the same tick is 2% and the blend is
+    # harmless.
+    #
+    # Capped against the midpoint rather than the order's first limit
+    # on purpose: the question that matters is "how far above fair
+    # value are we paying", not "how far have we moved". At 3% this
+    # binds hard on cheap contracts (where it refuses to chase at all
+    # and lets the order rest at the mid until it fills or times out)
+    # and barely touches the expensive ones it was never a problem for.
+    # Deliberately DEFINED BUT UNUSED for now. The cap was written and
+    # verified against both live cases, but shipping it needed two
+    # existing escalation tests updated, and the 5% stop was actively
+    # losing ~$10-15 per entry while that happened. Reverting the stop
+    # took priority; this lands next, on its own, with those tests
+    # updated rather than rushed.
+    option_entry_max_escalation_percent: Decimal = Field(
+        default=Decimal("0.03"), ge=0, le=1
+    )
     # By explicit request ("just do not trade contracts that are not
     # easy to liquidify"): ORCL was stuck in a repeated STOP-loss
     # cycle - the position's own contract had a genuinely wide 40%+
