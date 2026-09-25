@@ -116,6 +116,22 @@ class OptionTradingSettings(BaseSettings):
         default=Decimal("0.5"), gt=0, le=60
     )
     option_scalp_enabled: bool = True
+    # HARD HALT on new option risk. Exits, the stop, the profit-lock
+    # trail, the stale exit and the EOD close all stay fully active -
+    # this only refuses to OPEN anything new, including averaging down.
+    #
+    # Added 2026-09-25 after a bad session: the account went from
+    # $249.70 to $149.17 (-$100.53) in under two hours across repeated
+    # rapid stop-outs, and the right response to "I am going to lose
+    # all my money" is a switch that stops adding risk immediately
+    # rather than another parameter change made under pressure. Every
+    # change I made mid-session that day cost money to learn from.
+    #
+    # Deliberately an env flag (OPTION_ENTRIES_HALTED=true) so it can
+    # be set or cleared without a code change, and deliberately does
+    # NOT touch exits: a halt that stranded open positions without a
+    # stop would be far worse than the losses it was meant to prevent.
+    option_entries_halted: bool = False
     # Tightened 0.50 -> 0.20 -> 0.10, each by explicit request. The
     # original 0.50 was not a stop so much as a catastrophe gate; 0.20
     # capped a 2-contract $280 position at -$56.
