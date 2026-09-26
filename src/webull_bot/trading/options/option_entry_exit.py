@@ -75,6 +75,46 @@ def _option_underlying(self, position: dict) -> str:
     return raw
 
 
+def _note_odd_exit_price(self, option_symbol, last_price, limit_price) -> None:
+    """Log an exit price that looks far from the last trade - but never
+    BLOCK the exit on it.
+
+    Both exit branches used to gate on price_sanity_ok and return early,
+    which meant a position far enough from its last print could not be
+    closed at all. That is the same self-reinforcing shape as the
+    quote-sanity bug fixed earlier: the further a position runs from its
+    last trade, the more certainly its exit is refused, so protection
+    disappears exactly when it is needed.
+
+    The guard is right for ENTRIES - buying at twice fair value loses
+    real money, and refusing costs nothing. It is wrong for exits,
+    because a limit SELL executes at or above its limit: it fills at the
+    best available bid, so an oddly-priced sell cannot sell cheap. It
+    either fills at the market or does not fill. Refusing to place it
+    protects against nothing and strands the position.
+
+    By explicit request ("it should exit green on its own before
+    fading" / "execution is also important"), and after XPEV went from
+    +$1.29 to -$27 on 2026-09-25 while its exits sat unfilled.
+    """
+    try:
+        if last_price is None or last_price <= 0 or limit_price is None:
+            return
+        deviation = abs(limit_price - last_price) / last_price
+        if deviation > OPTION_PRICE_SANITY_TOLERANCE:
+            log.warning(
+                "EXIT   | %-8s | exit price is %.1f%% from last "
+                "(last=%s limit=%s) - placing anyway, an exit must "
+                "never be blocked on price sanity",
+                option_symbol,
+                deviation * 100,
+                last_price,
+                limit_price,
+            )
+    except Exception:
+        return
+
+
 def _evaluate_option_entry(
     self,
     contract: dict,
@@ -1133,15 +1173,10 @@ def _evaluate_option_exit(
                 cost + exit_fee_per_share, ROUND_UP
             )
             limit_price = max(marketable, profit_floor)
-        if not self.price_sanity_cooldown_ready(
-            option_symbol
-        ) or not self.price_sanity_ok(
-            option_symbol,
-            price,
-            limit_price,
-            tolerance=OPTION_PRICE_SANITY_TOLERANCE,
-        ):
-            return buying_power
+        # Deliberately NOT gated on price_sanity_ok - see
+        # _note_odd_exit_price. A refused exit is strictly worse than an
+        # oddly-priced one.
+        _note_odd_exit_price(self, option_symbol, price, limit_price)
         # Claim this contract's exit BEFORE the API round-trip, not
         # after. _evaluate_option_exit is now reached from TWO threads -
         # the 0.5s protection loop (evaluate_held_option_exits) and the
@@ -1180,15 +1215,10 @@ def _evaluate_option_exit(
         and self.cooldown_ready(key)
     ):
         limit_price = self.api.option_limit_price(quote, "SELL")
-        if not self.price_sanity_cooldown_ready(
-            option_symbol
-        ) or not self.price_sanity_ok(
-            option_symbol,
-            price,
-            limit_price,
-            tolerance=OPTION_PRICE_SANITY_TOLERANCE,
-        ):
-            return buying_power
+        # A STOP especially must never be blocked on price sanity: that
+        # is the one order whose whole purpose is to fire when the
+        # position has moved a long way from where it was trading.
+        _note_odd_exit_price(self, option_symbol, price, limit_price)
         # Claim this contract's exit BEFORE the API round-trip, not
         # after. _evaluate_option_exit is now reached from TWO threads -
         # the 0.5s protection loop (evaluate_held_option_exits) and the

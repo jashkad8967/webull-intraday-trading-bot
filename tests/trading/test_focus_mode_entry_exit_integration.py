@@ -151,6 +151,7 @@ class FocusModeIntegrationTestCase(unittest.TestCase):
             trade_times=defaultdict(deque),
             price_sanity_rejected_at={},
             position_opened_at={},
+            recent_stop_losses=deque(),
             position_open_times=FakeOpenTimes(),
             timezone=dt_timezone.utc,
             consecutive_exit_failures={},
@@ -910,3 +911,93 @@ class ProfitLockTrailIntegrationTests(FocusModeIntegrationTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExitsAreNeverBlockedByPriceSanityTests(FocusModeIntegrationTestCase):
+    """An exit must never be refused on price-sanity grounds.
+
+    Both exit branches used to gate on price_sanity_ok and return early,
+    so a position far enough from its last print could not be closed at
+    all. Same self-reinforcing shape as the quote-sanity bug: the
+    further a position runs, the more certainly its exit is refused, so
+    protection vanishes exactly when it is needed.
+
+    The guard is correct for ENTRIES - buying at twice fair value loses
+    real money and refusing costs nothing. It is wrong for exits,
+    because a limit SELL executes at or above its limit: it fills at the
+    best available bid, so an oddly-priced sell cannot sell cheap. It
+    fills at the market or it does not fill. Refusing to place it
+    protects nothing and strands the position.
+
+    By explicit request - "it should exit green on its own before
+    fading" / "execution is also important".
+    """
+
+    def _exit(self, bot, contract, quote, decision, cost, peak=None):
+        option_symbol = contract["symbol"]
+        bot.strategy.option_decision = lambda *a, **k: decision
+        bot.option_peak_price[option_symbol] = peak or cost
+        return bot._evaluate_option_exit(
+            contract,
+            option_symbol,
+            f"OPTION:{option_symbol}",
+            quote,
+            quote["price"],
+            quantity=Decimal("1"),
+            cost=cost,
+            days_to_expiration=20,
+            buying_power=Decimal("100"),
+        )
+
+    def test_a_stop_places_even_when_the_price_looks_insane(self):
+        """The decisive case. A stop exists precisely to fire when the
+        position has moved a long way from where it was trading, which
+        is the exact condition the sanity guard used to veto.
+        """
+        from webull_bot.strategy_logic.types import Decision
+
+        bot, placed = self._build()
+        contract = _contract("NVDA", "NVDAP_CRASH", "PUT")
+        # last 2.00 against a 0.60 market - a 70% gap, far past the 30%
+        # option sanity tolerance.
+        # Greeks included because real option snapshots carry them -
+        # without them _sane_bid_or_ask treats the quote as a STOCK and
+        # rejects a bid this far from the last trade, which would make
+        # the test pass for the wrong reason (pricing off the stale last
+        # price instead of the live bid).
+        quote = {"bid": Decimal("0.60"), "ask": Decimal("0.70"),
+                 "price": Decimal("2.00"), "delta": "-0.5",
+                 "gamma": "0.1", "imp_vol": "0.6", "open_interest": "500"}
+        self._exit(
+            bot, contract, quote,
+            Decision("LOSS", "option percentage stop reached",
+                     target_price=Decimal("0.58")),
+            cost=Decimal("2.00"),
+        )
+        self.assertEqual(len(placed), 1, "a stop was blocked on price sanity")
+        self.assertEqual(placed[0][1], "SELL")
+        # And priced to FILL - at or below the 0.60 bid, not off the
+        # stale 2.00 last trade.
+        self.assertLessEqual(placed[0][3], Decimal("0.60"))
+
+    def test_a_profit_exit_places_even_when_the_price_looks_insane(self):
+        from webull_bot.strategy_logic.types import Decision
+
+        bot, placed = self._build()
+        contract = _contract("NVDA", "NVDAC_SPIKE", "CALL")
+        quote = {"bid": Decimal("3.00"), "ask": Decimal("3.10"),
+                 "price": Decimal("1.00"), "delta": "0.5",
+                 "gamma": "0.1", "imp_vol": "0.6", "open_interest": "500"}
+        self._exit(
+            bot, contract, quote,
+            Decision("PROFIT", "option profit target reached",
+                     target_price=Decimal("3.05")),
+            cost=Decimal("1.00"),
+            peak=Decimal("3.10"),
+        )
+        self.assertEqual(len(placed), 1, "a profit exit was blocked")
+        self.assertEqual(placed[0][1], "SELL")
+        # Priced near the 3.00 bid, NOT parked at the cost+fee floor -
+        # that floor exists to stop a "profit" booking a loss, not to
+        # become the price on a position that has tripled.
+        self.assertGreater(placed[0][3], Decimal("2.00"))
