@@ -94,6 +94,25 @@ def evaluate_held_option_exits(self) -> None:
         log.debug("PROTECT| held-option quote batch failed | %s", exc)
         return
     quote_by_symbol = {str(row.get("symbol", "")): row for row in rows}
+    # Record the price path of every held position before evaluating
+    # exits. This is the one place in the codebase that already has a
+    # fresh quote for everything currently open, so recording here costs
+    # no extra API call - see QuoteTape for why the path matters: trade
+    # history says what DID happen, not whether a different stop would
+    # have fired on the way.
+    if self.config.quote_tape_enabled:
+        self.quote_tape.record(
+            (
+                str(contract["symbol"]),
+                self.api.quote_bid(quote_by_symbol[str(contract["symbol"])]),
+                self.api.quote_ask(quote_by_symbol[str(contract["symbol"])]),
+                quote_by_symbol[str(contract["symbol"])].get("price"),
+                item.get("cost_price"),
+                item.get("quantity"),
+            )
+            for item, contract in candidates
+            if str(contract["symbol"]) in quote_by_symbol
+        )
     today = date.today()
     for item, contract in candidates:
         option_symbol = str(contract["symbol"])
