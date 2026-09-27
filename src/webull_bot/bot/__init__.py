@@ -26,6 +26,7 @@ from webull_bot.option_contracts_state import OptionContractsStateStore
 from webull_bot.market_agent import MarketResearchAgent
 from webull_bot.pairs import PairsStrategy
 from webull_bot.position_open_times import PositionOpenTimeStore
+from webull_bot.quote_tape import QuoteTape
 from webull_bot.risk.entry_blackout import fresh_entry_blackout_active
 from webull_bot.risk.options_priority_window import options_priority_window_active
 from webull_bot.risk.profit_target_multiplier import profit_target_multiplier
@@ -532,6 +533,13 @@ class AutoTrader:
             self.config.position_open_times_state_file,
             self.timezone,
             log,
+        )
+        self.quote_tape = QuoteTape(
+            self.config.quote_tape_directory,
+            self.timezone,
+            log,
+            interval_seconds=float(self.config.quote_tape_interval_seconds),
+            retention_days=self.config.log_retention_days,
         )
         self.wash_skip_logged: set[str] = set()
         self.unmanaged_held_logged: set[str] = set()

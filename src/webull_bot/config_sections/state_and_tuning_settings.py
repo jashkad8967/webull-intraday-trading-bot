@@ -49,5 +49,17 @@ class StateAndTuningSettings(BaseSettings):
     # one timestamp per OPEN position, pruned to what is still held.
     # See PositionOpenTimeStore for the two live failures it fixes.
     position_open_times_state_file: str = "conf/position_open_times.json"
+    # Recorded option quote tape, for replaying a parameter change
+    # against real ticks instead of against the account. See QuoteTape:
+    # every strategy change on 2026-09-24/25 was validated by losing
+    # money, because trade history says what DID happen but not the
+    # price PATH that decides whether a given stop would have fired.
+    quote_tape_directory: str = "quotes"
+    quote_tape_enabled: bool = True
+    # 2s, not the 0.5s the fast loop polls at: enough resolution to
+    # decide any stop or trail question, a quarter of the disk.
+    quote_tape_interval_seconds: Decimal = Field(
+        default=Decimal("2"), gt=0, le=60
+    )
     status_file: str = "status.json"
     command_file: str = "commands.json"
