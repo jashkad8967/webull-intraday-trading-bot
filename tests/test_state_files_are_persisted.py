@@ -35,8 +35,15 @@ def _declared_state_keys() -> dict[str, str]:
     """Config keys whose default is a relative path to a state file."""
     found: dict[str, str] = {}
     for path in SETTINGS.glob("*.py"):
+        # Matches *_file AND *_directory. Live 2026-09-28: the scanner
+        # only looked for "_file", so quote_tape_directory - added two
+        # days after this guard was written specifically to stop
+        # exactly this - slipped straight past it and would have
+        # written every recorded tape to /app/quotes, wiped on each
+        # restart. A guard that only catches one naming convention
+        # catches nothing it was not already expecting.
         for match in re.finditer(
-            r"^\s{4}(\w+_file)\s*:\s*str\s*=\s*[\"']([^\"']+)[\"']",
+            r"^\s{4}(\w+_(?:file|directory))\s*:\s*str\s*=\s*[\"']([^\"']+)[\"']",
             path.read_text(encoding="utf-8"),
             re.MULTILINE,
         ):
@@ -88,6 +95,8 @@ class StateFilesArePersistedTests(unittest.TestCase):
             "daily_pnl_state_file",
             "position_open_times_state_file",
             "strategy_tuning_state_file",
+            "quote_tape_directory",
+            "log_directory",
         ):
             self.assertIn(expected, keys)
 
