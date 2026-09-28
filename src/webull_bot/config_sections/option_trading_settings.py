@@ -452,12 +452,21 @@ class OptionTradingSettings(BaseSettings):
     # binds hard on cheap contracts (where it refuses to chase at all
     # and lets the order rest at the mid until it fills or times out)
     # and barely touches the expensive ones it was never a problem for.
-    # Deliberately DEFINED BUT UNUSED for now. The cap was written and
-    # verified against both live cases, but shipping it needed two
-    # existing escalation tests updated, and the 5% stop was actively
-    # losing ~$10-15 per entry while that happened. Reverting the stop
-    # took priority; this lands next, on its own, with those tests
-    # updated rather than rushed.
+    # NOW WIRED IN, on measured evidence rather than reasoning. Replayed
+    # from 2026-09-28's recorded quote tape - the first real use of the
+    # replay harness - every entry that day filled at or above the ask:
+    #
+    #   contract              paid   bid    ask   underwater
+    #   UBER261009P00067000   1.20  1.07   1.16     -10.8%
+    #   UBER261009C00071000   0.65  0.61   0.66      -6.2%
+    #   UBER261009C00070000   1.00  0.95   1.00      -5.0%
+    #   UBER261009C00071000   0.75  0.70   0.78      -6.7%
+    #   mean immediate drawdown -7.2% against a 10% stop budget
+    #
+    # The fill alone consumes 72% of the stop. Replayed at a 5% stop all
+    # four positions exit at held=0s - already past their stop on
+    # arrival - which is what actually destroyed 2026-09-25, not the
+    # stop value itself.
     option_entry_max_escalation_percent: Decimal = Field(
         default=Decimal("0.03"), ge=0, le=1
     )

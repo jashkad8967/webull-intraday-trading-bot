@@ -1135,6 +1135,7 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
                 poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                option_entry_max_escalation_percent=Decimal("0.03"),
                 price_sanity_cooldown_seconds=60
             ),
             api=FakeApi(),
@@ -1236,6 +1237,7 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
                 poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                option_entry_max_escalation_percent=Decimal("0.03"),
                 price_sanity_cooldown_seconds=60
             ),
             api=FakeApi(),
@@ -1281,6 +1283,14 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         # Wide spread so the halfway escalation target is clearly
         # distinct from both mid and the full ask after quantizing to
         # the real $0.05 option tick.
+        # mid 1.85, ask 2.00. The uncapped blend is 1.925 -> 1.95, a
+        # 5.4% chase. option_entry_max_escalation_percent (3%) caps it
+        # at 1.85 * 1.03 = 1.9055 -> 1.90 on the $0.05 tick grid.
+        #
+        # Measured from 2026-09-28's recorded tape: every entry that day
+        # filled at or above the ask, a mean 7.2% underwater on arrival
+        # against a 10% stop - the fill consuming 72% of the risk budget
+        # before the market moved at all.
         quote = {
             "symbol": "XYZ260101C00100000",
             "bid": "1.70",
@@ -1323,6 +1333,7 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
                 poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                option_entry_max_escalation_percent=Decimal("0.03"),
                 price_sanity_cooldown_seconds=60
             ),
             api=FakeApi(),
@@ -1357,13 +1368,12 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         with unittest.mock.patch("time.monotonic", return_value=100.0):
             reprice()
 
-        # mid=1.85, ask=2.00 -> raw halfway = 1.925, quantized UP to
-        # the nearest $0.05 tick = 1.95 (distinct from both mid and
-        # the full ask - proves this isn't silently degrading to
-        # either extreme).
+        # The blend would be 1.95; the 3% cap holds it at 1.90. Still
+        # distinct from both mid (1.85) and the full ask (2.00), so this
+        # proves the escalation happens AND that it is bounded.
         self.assertEqual(cancelled, ["order-1"])
         self.assertEqual(
-            placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("1.95"))
+            placed[0], ("XYZ260101C00100000", "BUY", 1, Decimal("1.90"))
         )
 
     def test_a_sanity_rejected_escalation_backs_off_instead_of_retrying_every_cycle(self):
@@ -1386,14 +1396,24 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
             "expiration_date": "2026-01-01",
             "option_type": "CALL",
         }
-        # deviation from last=0.15 to ask=0.20 is 33.3%, past the 30%
-        # option sanity tolerance - a real, durable wide-spread
-        # rejection, not a transient blip.
+        # Prices chosen so the CAPPED escalation still trips sanity.
+        #
+        # This used to use bid 0.10 / ask 0.20 / last 0.15, where the
+        # uncapped blend escalated to the full 0.20 ask - 33% from last,
+        # past the 30% tolerance. option_entry_max_escalation_percent
+        # now holds that escalation at 0.15, which is 0% from last and
+        # sails through, so the scenario no longer exercised the backoff
+        # it exists to test. The cap preventing that escalation is the
+        # correct outcome; this test just needs a case where a BOUNDED
+        # escalation is still implausible.
+        #
+        # mid 2.20, cap 3% -> 2.266 -> 2.25 on the tick grid, which is
+        # 32.4% above a 1.70 last trade. Still rejected.
         quote = {
             "symbol": "XYZ260101C00100000",
-            "bid": "0.10",
-            "ask": "0.20",
-            "price": "0.15",
+            "bid": "2.00",
+            "ask": "2.40",
+            "price": "1.70",
         }
 
         class FakeApi:
@@ -1431,6 +1451,7 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
                 poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                option_entry_max_escalation_percent=Decimal("0.03"),
                 price_sanity_cooldown_seconds=60
             ),
             api=FakeApi(),
@@ -1518,6 +1539,7 @@ class RepriceRestingOptionEntriesTests(unittest.TestCase):
         fake_bot = SimpleNamespace(
             config=SimpleNamespace(
                 poll_seconds=Decimal("0.25"), option_entry_escalate_seconds=30,
+                option_entry_max_escalation_percent=Decimal("0.03"),
                 price_sanity_cooldown_seconds=60
             ),
             api=FakeApi(),

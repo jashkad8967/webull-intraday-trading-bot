@@ -1,6 +1,6 @@
 import logging
 import time
-from decimal import ROUND_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 from webull_bot.trading.guards.price_sanity import OPTION_PRICE_SANITY_TOLERANCE
 from webull_bot.trading.handlers.broker_conflict_check import _broker_conflict
@@ -133,6 +133,30 @@ def reprice_resting_option_entries(self) -> None:
                             max(Decimal("0.01"), (mid_price + ask_price) / 2),
                             ROUND_UP,
                         )
+                        # Cap how far above the midpoint an escalation
+                        # may pay. Measured from 2026-09-28's recorded
+                        # tape: every entry filled at or above the ask,
+                        # a mean of 7.2% underwater on arrival against a
+                        # 10% stop budget - the fill consuming 72% of
+                        # the risk before the market moved. On a $0.70
+                        # contract one $0.05 tick is 7%, so a single
+                        # escalation step clears a tight stop outright.
+                        #
+                        # ROUND_DOWN so the quantized ceiling stays AT
+                        # or under the cap; rounding up would step back
+                        # over it and make the cap a no-op on exactly
+                        # the cheap contracts it exists for.
+                        ceiling = self.api._quantize_to_option_tick(
+                            mid_price
+                            * (
+                                Decimal("1")
+                                + self.config
+                                .option_entry_max_escalation_percent
+                            ),
+                            ROUND_DOWN,
+                        )
+                        if target_price > ceiling:
+                            target_price = ceiling
                     else:
                         # By explicit request ("play in the spread to
                         # make sure it sells, not at the edges... or
