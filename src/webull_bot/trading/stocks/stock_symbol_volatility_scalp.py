@@ -42,6 +42,7 @@ def _process_stock_symbol_volatility_scalp_entry(
         # Focus mode reserves the whole account for one option
         # underlying - see stock_entries_suspended.
         and not self.stock_entries_suspended()
+        and self.stock_entry_symbol_allowed(symbol)
         and not self.new_entries_blocked()
     ):
         # Diagnostic-only pass, by request after live evidence
@@ -211,6 +212,7 @@ def _process_stock_symbol_volatility_scalp_entry(
         # Focus mode reserves the whole account for one option
         # underlying - see stock_entries_suspended.
         and not self.stock_entries_suspended()
+        and self.stock_entry_symbol_allowed(symbol)
         and not self.new_entries_blocked()
         # By explicit request: keep buying this cohort's
         # dips continuously, multiple times a minute, EVEN

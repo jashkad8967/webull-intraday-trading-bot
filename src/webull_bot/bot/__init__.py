@@ -193,6 +193,7 @@ from webull_bot.trading.screeners.agent_predicted_gainers_refresh import (
 from webull_bot.trading.guards.focus_mode_guards import (
     new_entries_blocked,
     stock_entries_suspended,
+    stock_entry_symbol_allowed,
     update_profit_throttle,
 )
 from webull_bot.trading.screeners.daily_batch_refresh import refresh_daily_batch
@@ -399,6 +400,7 @@ class AutoTrader:
     refresh_daily_batch = refresh_daily_batch
     select_focus_cohort = select_focus_cohort
     stock_entries_suspended = stock_entries_suspended
+    stock_entry_symbol_allowed = stock_entry_symbol_allowed
     update_profit_throttle = update_profit_throttle
     new_entries_blocked = new_entries_blocked
     stop_loss_guard_active = stop_loss_guard_active

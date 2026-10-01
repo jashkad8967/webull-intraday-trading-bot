@@ -59,6 +59,44 @@ def stock_entries_suspended(self) -> bool:
     return not (self.focus_cohort or self.daily_batch)
 
 
+def stock_entry_symbol_allowed(self, symbol: str) -> bool:
+    """True while this symbol is one the day's screening actually chose.
+
+    stock_entries_suspended answers "may share entries happen at all".
+    This answers "may THIS name be bought", and the two are not the same
+    question - which is how XOM got bought.
+
+    Live 2026-10-01 10:50: with the cohort locked to [ACN, MRNA, PLTR]
+    and the batch [GOOGL, NVDA, AAPL, ACN, MRNA, RIVN, PLTR, GME], the
+    bot opened XOM. XOM is in neither. The scan batch is built from
+    prioritized_stock_batch over the whole universe UNION
+    scan_watch_symbols (seed_popular | agent_popular | user_watchlist),
+    and XOM sits in the watchlist - so simply allowing entries re-opened
+    the account to 116 watchlist names that cleared no gate that day.
+
+    That position then did real damage despite being flat: $24 of a $85
+    account, in a mega-cap whose daily range is about 1% against a
+    0.9-1.5% stop, which capped option premium at $0.61 and left the
+    whole CALL side of SPY unreachable (0.46/0.47 = 5.4% hurdle, past
+    the 5.0% ceiling) on a day the account was meant to trade options.
+
+    Screening on gap, RVOL, volume and spread is the only reason to
+    believe a name is worth risk at all. Buying something that cleared
+    none of it is not a smaller version of the strategy, it is the
+    absence of one.
+    """
+    if not self.config.focus_mode_enabled:
+        return True
+    screened = {str(s).upper() for s in self.focus_cohort}
+    screened |= {str(s).upper() for s in self.daily_batch}
+    if not screened:
+        # Nothing cleared the gates today. stock_entries_suspended
+        # already sits out in this state; this is deliberate defence in
+        # depth, because that guard has now been wrong twice.
+        return False
+    return str(symbol).upper() in screened
+
+
 def update_profit_throttle(self, total_equity: Decimal) -> None:
     """By explicit request: "once you hit a certain profit slow down."
 
