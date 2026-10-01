@@ -1,4 +1,3 @@
-import fcntl
 import json
 import os
 import time
@@ -11,6 +10,12 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+# Cross-platform advisory locking. This file is read-modify-written by
+# BOTH the dashboard and the trader, and since 2026-10-01 they share it on
+# a Windows machine where fcntl does not exist - an unlocked write here
+# loses a command, and a lost command is a lost order.
+from webull_bot.file_lock import lock_exclusive, unlock
 
 STATUS_FILE = Path(os.environ.get("STATUS_FILE", "status.json"))
 LOG_DIRECTORY = Path(os.environ.get("LOG_DIRECTORY", "logs"))
@@ -39,7 +44,7 @@ def enqueue_command(command_type: str, **fields) -> str:
     COMMAND_FILE.parent.mkdir(parents=True, exist_ok=True)
     COMMAND_FILE.touch(exist_ok=True)
     with open(COMMAND_FILE, "r+", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        locked = lock_exclusive(handle)
         try:
             raw = handle.read().strip()
             try:
@@ -54,7 +59,7 @@ def enqueue_command(command_type: str, **fields) -> str:
             handle.truncate()
             handle.write(json.dumps({"commands": commands}))
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            unlock(handle, locked)
     return command_id
 
 

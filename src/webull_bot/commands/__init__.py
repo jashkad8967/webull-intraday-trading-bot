@@ -3,14 +3,7 @@ import time
 import uuid
 from pathlib import Path
 
-try:
-    import fcntl
-except ImportError:
-    # fcntl is POSIX-only; production always runs in the Linux Docker
-    # image, so this only matters for collecting/running tests on a
-    # native Windows dev machine. No real advisory locking there, but
-    # nothing on Windows shares this file across processes either.
-    fcntl = None
+from webull_bot.file_lock import lock_exclusive, unlock
 
 
 class CommandQueue:
@@ -32,8 +25,12 @@ class CommandQueue:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
         with open(self.path, "r+", encoding="utf-8") as handle:
-            if fcntl is not None:
-                fcntl.flock(handle, fcntl.LOCK_EX)
+            # Cross-platform now, not POSIX-only: since 2026-10-01 the
+            # trader and the dashboard share this file on a WINDOWS
+            # machine, so the old "nothing on Windows shares this file"
+            # assumption no longer holds and an unlocked write here can
+            # lose a command - which is a lost order.
+            locked = lock_exclusive(handle)
             try:
                 raw = handle.read().strip()
                 try:
@@ -49,8 +46,7 @@ class CommandQueue:
                 handle.write(json.dumps({"commands": new_commands}))
                 return result
             finally:
-                if fcntl is not None:
-                    fcntl.flock(handle, fcntl.LOCK_UN)
+                unlock(handle, locked)
 
     def enqueue(self, command_type: str, **fields) -> str:
         command_id = uuid.uuid4().hex
