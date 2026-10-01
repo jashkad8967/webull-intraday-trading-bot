@@ -17,3 +17,6 @@ tests/.generated_logs/
 freqtrade-develop/
 quant-trading-main/
 docs/
+# local run artifacts
+commands/
+quotes/
