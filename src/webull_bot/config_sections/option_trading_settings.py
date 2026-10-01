@@ -131,7 +131,33 @@ class OptionTradingSettings(BaseSettings):
     # be set or cleared without a code change, and deliberately does
     # NOT touch exits: a halt that stranded open positions without a
     # stop would be far worse than the losses it was meant to prevent.
-    option_entries_halted: bool = False
+    # HALTED 2026-10-01 12:58 CT, mid-session, after measuring the real
+    # cause of every option loss on this project:
+    #
+    #   PFE261009C00028000  bought ~0.50, STOP filled 0.43 = -$7.07
+    #   150 seconds held. 8.3% of the account on one trade.
+    #   delta 0.62, so 0.07 of premium is a 0.4% move in PFE itself.
+    #
+    # An option is roughly 35x levered to its underlying, so a 10%
+    # option stop is a 0.27% move in PFE - inside the noise, several
+    # times an hour. The stop was never protecting the position; it was
+    # a coin flip on the next tick. That single mis-scaling explains the
+    # held=0s exits, the 9-of-10 positions that never traded above
+    # cost+fee, and why the 5% stop was catastrophic rather than merely
+    # tight (5% = a 0.13% underlying move).
+    #
+    # A stop that survives noise is ~35% of premium, which on the
+    # cheapest viable contract ($47) is $16 - 19% of this account per
+    # trade. Fixing it properly means scaling the stop to the
+    # UNDERLYING's movement rather than to the premium, and that is a
+    # real change to validate against the recorded tape, not a number to
+    # retune mid-session while losing money.
+    #
+    # Deliberately following this setting's own docstring above: stop
+    # adding risk now, fix the mechanism afterwards. Exits, the stop, the
+    # trail and the EOD close all stay live, so the open PFE put is
+    # still managed.
+    option_entries_halted: bool = True
     # Tightened 0.50 -> 0.20 -> 0.10, each by explicit request. The
     # original 0.50 was not a stop so much as a catastrophe gate; 0.20
     # capped a 2-contract $280 position at -$56.
