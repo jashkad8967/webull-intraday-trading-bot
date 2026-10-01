@@ -26,6 +26,32 @@ class FocusModeSettings(BaseSettings):
     # outside it are rejected and new stock entries are suspended, so
     # the whole account is available to the names that earned it.
     focus_mode_enabled: bool = True
+    # Whether locking the cohort also stops the stock scalper opening
+    # new SHARE positions in those same names.
+    #
+    # Originally unconditional, by explicit request ("go all in on that
+    # for the day... make sure you use all of the capital"): nothing
+    # should compete with the options for buying power. That reasoning
+    # holds only while the options are tradeable at all.
+    #
+    # Measured 2026-10-01 against the recorded tape, they are not - not
+    # at this account size. Round-trip option friction is 8.1% against a
+    # 10% stop, so 81% of the risk budget is spent before direction pays
+    # anything, and 9 of 10 recorded positions never traded above
+    # cost+fee on the bid at any point. The same cohort traded as SHARES
+    # faces a 0.5% max entry spread (stock_entry_max_spread_percent), a
+    # 0.9-1.5% stop, and 1.8:1 reward:risk - roughly 0.3% friction, so
+    # ~80% of the risk budget survives to the trade. Breakeven win rate
+    # falls from 65% to about 43%.
+    #
+    # So this now defaults to False: the morning screening (gap, RVOL,
+    # volume, volatility) keeps doing its job and the account stays
+    # fully deployed in the names that earned it - the INSTRUMENT
+    # changes, not the selection. Suspension is still one flag away for
+    # an account large enough to buy premiums where the hurdle is small,
+    # which is also exactly when option_max_entry_hurdle_fraction stops
+    # rejecting them.
+    focus_mode_suspends_stock_entries: bool = False
     # By explicit request: "allow a cohort of 5-10 stocks then, that all
     # fit the criteria so that there are more options to play with."
     # Focus mode originally locked exactly ONE name for the session,

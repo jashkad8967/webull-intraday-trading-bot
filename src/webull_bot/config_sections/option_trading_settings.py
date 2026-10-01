@@ -511,11 +511,32 @@ class OptionTradingSettings(BaseSettings):
     # the EXIT path too (stall_position_boost), so tightening it would
     # disable exits on positions already held.
     #
-    # Defaulted to 1.0, which rejects only trades whose breakeven sits
-    # at or beyond their own stop - guaranteed losses, no judgment
-    # required. Values near 0.5 are what make this a real filter, and
-    # on a sub-$100 account they reject nearly every candidate: that
-    # is the gate reporting a capital problem, not malfunctioning.
+    # 0.5 - friction may consume at most HALF the risk budget. This is
+    # the minimum defensible standard rather than a tuned value, and it
+    # is deliberately self-correcting: a funded account buying $1.50-$2
+    # premiums has a 2-3% hurdle and clears it without noticing, while
+    # a sub-$100 account cannot reach any contract that meets it and so
+    # trades no options at all. The gate reports the capital problem
+    # instead of bleeding through it.
+    #
+    # Shipped first at 1.0 (reject only breakeven-past-stop, no
+    # judgment needed), then measured properly: at 1.0 the recorded
+    # four sessions still took 7 trades and lost $22.54. The reason no
+    # setting works at $84.70 is that the risk needed to give an option
+    # trade real room collapses to a constant -
+    #
+    #   stop x premium = 2 x (half-tick + fee) x 100 = $9.00
+    #
+    # - independent of which affordable contract is chosen, because the
+    # $0.05 tick and the $0.02 fee are fixed in cents. $9 is 11% of an
+    # $84.70 account per trade, against a 65% breakeven win rate (wins
+    # are capped near the hurdle, losses run to the stop: measured
+    # ratio 0.54). Actual win rate was 36%.
+    #
+    # The nickel tick is not the lever it looks like: inferring a penny
+    # grid from a non-nickel quote was tried and REVERTED, because
+    # Webull rejected the resulting order outright (AAPL at 7.47) - see
+    # option_limit_price. A rejected order is worse than a coarse one.
     option_max_entry_hurdle_fraction: Decimal = Field(
-        default=Decimal("1.0"), gt=0, le=2
+        default=Decimal("0.5"), gt=0, le=2
     )

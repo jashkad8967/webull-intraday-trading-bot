@@ -19,8 +19,22 @@ def stock_entries_suspended(self) -> bool:
     nothing locked is that nothing cleared the quality bar, and the
     designed response to a weak field is to sit out, not to fall
     back to spraying capital across the scanner's leftovers.
+
+    Now gated on focus_mode_suspends_stock_entries, which defaults to
+    False. Reserving the whole account for options only makes sense
+    while options can actually be traded; measured 2026-10-01 they
+    cannot at this account size - 8.1% round-trip friction against a
+    10% stop, and 9 of 10 recorded positions never traded above
+    cost+fee on the bid. The cohort's screening is still doing real
+    work, so the account now deploys into those same names as SHARES
+    (0.5% max spread, 1.8:1 reward:risk) rather than sitting idle
+    waiting for a contract the hurdle gate will refuse. See
+    focus_mode_suspends_stock_entries for the full arithmetic.
     """
-    return bool(self.config.focus_mode_enabled)
+    return bool(
+        self.config.focus_mode_enabled
+        and self.config.focus_mode_suspends_stock_entries
+    )
 
 
 def update_profit_throttle(self, total_equity: Decimal) -> None:
