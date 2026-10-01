@@ -53,6 +53,10 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
                 open_position_count=lambda positions: 0,
                 option_direction_signal=lambda key, price: "HOLD",
                 rotating_batch=rotating_batch,
+                # Written to for option_liquid_underlyings the stock scan
+                # will not reach - see the share-price recording in
+                # _prepare_option_scan_batch.
+                prices={},
             ),
             stop_loss_guard_active=lambda: False,
             focus_cohort=list(focus_cohort or []),
@@ -93,8 +97,25 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
         self,
     ):
         # No daily_batch built yet (e.g. before 08:45) - nothing to
-        # pre-warm, so this falls all the way back to whatever's
-        # already been discovered.
+        # pre-warm. Narrowed 2026-10-01: under FOCUS MODE this no longer
+        # falls back to the whole discovered board.
+        #
+        # Entries in this state are restricted to
+        # option_liquid_underlyings (see _evaluate_option_entry's cohort
+        # check), so the full board was quoting names an entry rejects on
+        # arrival. Live measurement:
+        #
+        #   direction signals | quoted=147/147   <- this branch
+        #   direction signals | quoted=4/4       <- cohort locked
+        #
+        # ~141 wasted quotes per cycle. The VM's egress was running
+        # ~70GB/30d against a 1GiB free allowance, and the same request
+        # budget 429s the pre-close sweep and competes with order
+        # placement. The original docstring here already conceded the
+        # full board was "unrelated to today's actual candidate pool".
+        #
+        # The full board is still correct with focus mode OFF - covered
+        # by test_focus_mode_off_still_scans_the_full_board below.
         from webull_bot.bot import AutoTrader
 
         fake_bot, requested = self._fake_bot(
@@ -102,10 +123,48 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
         )
         prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
         prepare([])
-        self.assertIn("AAPL", requested[0])
-        self.assertIn("MSFT", requested[0])
-        self.assertIn("NVDA", requested[0])
-        self.assertIn("VIXY", requested[0])
+        # This fixture configures no liquid underlyings and holds
+        # nothing, so there is genuinely nothing an entry could use.
+        self.assertEqual(requested[0], [])
+
+    def test_focus_mode_off_still_scans_the_full_board(self):
+        """The narrowing above is focus-mode-specific. With focus mode
+        off there is no cohort restricting entries, so every discovered
+        underlying is a real candidate and must still be quoted.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, requested = self._fake_bot(
+            None, False, self._contracts(), daily_batch=[]
+        )
+        prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
+        prepare([])
+        for symbol in ("AAPL", "MSFT", "NVDA", "VIXY"):
+            self.assertIn(symbol, requested[0])
+
+    def test_focus_mode_without_a_cohort_still_quotes_liquid_and_held(self):
+        """What the narrowed branch must NOT lose: the underlyings an
+        entry could actually use, and anything already held - a held
+        contract's direction/IV context should stay warm even though its
+        exit is covered separately by the backfill and the fast loop.
+
+        An OPTION position's top-level `symbol` is the BARE UNDERLYING in
+        Webull's payload (the contract sits in `legs`), which is what is
+        wanted here - the same quirk that broke four guards elsewhere.
+        """
+        from webull_bot.bot import AutoTrader
+
+        fake_bot, requested = self._fake_bot(
+            None, True, self._contracts(), daily_batch=[]
+        )
+        fake_bot.config.option_liquid_underlyings = ("SPY", "QQQ")
+        prepare = AutoTrader._prepare_option_scan_batch.__get__(fake_bot)
+        prepare([
+            {"instrument_type": "OPTION", "symbol": "PFE", "quantity": "1"},
+        ])
+        asked = set(requested[0])
+        self.assertEqual(asked, {"SPY", "QQQ", "PFE"})
+        self.assertNotIn("MSFT", asked)
 
     def test_pre_lock_pre_warms_daily_batch_candidates_not_the_full_board(self):
         """By explicit request ("at 9:45am, the stock needs to be
