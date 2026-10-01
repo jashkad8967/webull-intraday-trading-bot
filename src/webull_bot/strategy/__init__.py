@@ -14,6 +14,7 @@ from webull_bot.strategy_logic.decision.stock_option_decision import (
     volatility_scalp_entry_spread_ok,
 )
 from webull_bot.strategy_logic.sizing.order_quantity import (
+    core_session_fractional_budget,
     dollar_stock_quantity,
     exit_blocked_by_lot_restriction,
     fractional_stock_quantity,
@@ -320,6 +321,7 @@ class TradingStrategy:
     risk_based_share_count = risk_based_share_count
     stock_order_quantity = stock_order_quantity
     fractional_stock_quantity = fractional_stock_quantity
+    core_session_fractional_budget = core_session_fractional_budget
     dollar_stock_quantity = dollar_stock_quantity
     option_order_quantity = option_order_quantity
     option_average_down_signal = option_average_down_signal

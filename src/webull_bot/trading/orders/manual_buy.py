@@ -60,8 +60,13 @@ def _manual_buy(
         and self.fractional_trading_enabled
         and self.config.stock_core_session_position_fraction > 0
     ):
+        # Floored at the broker's fractional minimum when affordable -
+        # see core_session_fractional_budget. Live 2026-10-01 13:53: at
+        # $80.54 of buying power, 30% is $24.16 against a $25 minimum, so
+        # this returned a target dollar_stock_quantity had to refuse and
+        # the entry died as "no affordable quantity".
         target_notional = min(
-            buying_power * self.config.stock_core_session_position_fraction,
+            self.strategy.core_session_fractional_budget(buying_power),
             buying_power,
             self.config.max_order_notional,
         )

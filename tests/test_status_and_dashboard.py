@@ -856,6 +856,15 @@ class DashboardCommandTests(unittest.TestCase):
                 dollar_stock_quantity=TradingStrategy.dollar_stock_quantity.__get__(
                     TradingStrategy(config)
                 ),
+                # The real implementation, not a stub: it carries the
+                # sub-minimum floor that stops a small account silently
+                # losing the ability to trade (see
+                # tests/test_core_session_fractional_budget.py).
+                core_session_fractional_budget=(
+                    TradingStrategy.core_session_fractional_budget.__get__(
+                        TradingStrategy(config)
+                    )
+                ),
             ),
             api=SimpleNamespace(
                 stock_position=lambda symbol, positions: (Decimal("0"), Decimal("0")),
