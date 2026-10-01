@@ -7,6 +7,8 @@ from webull_bot.strategy_logic.types import Decision
 from webull_bot.trading.orders.locks import _working_orders_lock
 from webull_bot.trading.guards.price_sanity import (
     OPTION_PRICE_SANITY_TOLERANCE,
+    option_entry_breakeven_hurdle,
+    option_entry_breakeven_room_ok,
     option_entry_spread_ok,
 )
 from webull_bot.webull_api import QuoteUnavailableError
@@ -210,6 +212,41 @@ def _evaluate_option_entry(
         self.option_gate_rejections[
             "contract bid/ask spread too wide to liquidate reliably"
         ] += 1
+        return open_count, buying_power
+    # Liquid enough to exit (above) is NOT the same as able to profit
+    # before its own stop fires. Buying at the mid and selling into the
+    # bid opens the position half a spread underwater, with the exit fee
+    # owed on top; if that hurdle reaches the stop, the trade is a
+    # guaranteed loss the moment it fills. Measured from the tape on
+    # 2026-10-01: three of ten real positions were already in that
+    # state at entry, and nine of ten never traded above cost+fee on
+    # the bid at all. Logged at WARNING with the arithmetic, because a
+    # silent rejection here looks identical to "no setup today".
+    hurdle = option_entry_breakeven_hurdle(
+        self.api.quote_bid(quote),
+        self.api.quote_ask(quote),
+        self.config.option_sell_fee_per_contract / 100,
+    )
+    if not option_entry_breakeven_room_ok(
+        self.api.quote_bid(quote),
+        self.api.quote_ask(quote),
+        self.config.option_stop_loss_percent,
+        self.config.option_sell_fee_per_contract / 100,
+        self.config.option_max_entry_hurdle_fraction,
+    ):
+        self.option_gate_rejections[
+            "round-trip cost leaves no room inside the stop budget"
+        ] += 1
+        log.warning(
+            "OPTIONS | %s | REFUSED | breakeven needs +%.1f%% on the bid "
+            "but the stop fires at -%.1f%% | bid=%s ask=%s | this trade "
+            "cannot profit, skipping",
+            option_symbol,
+            hurdle * 100 if hurdle is not None else 0,
+            self.config.option_stop_loss_percent * 100,
+            self.api.quote_bid(quote),
+            self.api.quote_ask(quote),
+        )
         return open_count, buying_power
     underlying = contract["underlying_symbol"]
     # By explicit request: "allow a cohort of 5-10 stocks then, that
