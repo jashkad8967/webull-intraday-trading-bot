@@ -58,7 +58,13 @@ class PrepareOptionScanBatchUnderlyingQuoteScopeTests(unittest.TestCase):
             focus_cohort=list(focus_cohort or []),
             daily_batch=daily_batch or [],
             config=SimpleNamespace(
-                option_batch_size=20, focus_mode_enabled=focus_mode_enabled
+                option_batch_size=20,
+                focus_mode_enabled=focus_mode_enabled,
+                # Empty here so these tests keep asserting ONLY the
+                # cohort/daily-batch/full-board scoping they were written
+                # for. The liquid-underlying additions have their own
+                # coverage in LiquidUnderlyingScanScopeTests below.
+                option_liquid_underlyings=(),
             ),
         )
         return fake_bot, requested
@@ -183,7 +189,9 @@ class PrepareOptionScanBatchHeldPositionTests(unittest.TestCase):
             stop_loss_guard_active=lambda: False,
             focus_cohort=[],
             config=SimpleNamespace(
-                option_batch_size=20, focus_mode_enabled=False
+                option_batch_size=20,
+                focus_mode_enabled=False,
+                option_liquid_underlyings=(),
             ),
         )
         return fake_bot, [held_position]

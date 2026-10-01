@@ -345,7 +345,23 @@ def ensure_focus_cohort_contracts(self) -> None:
     member with no listed chain must not consume the retry budget of
     the others, and removing it leaves the rest of the cohort trading.
     """
-    if not self.config.focus_mode_enabled or not self.focus_cohort:
+    if not self.config.focus_mode_enabled:
+        return
+    # option_liquid_underlyings are discovered alongside the cohort, and
+    # crucially EVEN ON A DAY THE COHORT NEVER LOCKS. Measured
+    # 2026-10-01: on a day whose entire batch failed the gates, the only
+    # chains ever reachable were cohort picks quoted up to 20 cents wide
+    # (ACN, 21.8% round-trip cost at a $0.55 premium) while SPY sat a
+    # penny wide at 4.5%. Returning early on an empty cohort would keep
+    # the one tradeable chain permanently invisible - the gate would then
+    # be refusing every contract because nothing good was ever fetched,
+    # which looks identical to "no setup today" in the logs.
+    cohort = list(self.focus_cohort) + [
+        symbol
+        for symbol in self.config.option_liquid_underlyings
+        if symbol not in self.focus_cohort
+    ]
+    if not cohort:
         return
     _prune_stale_contracts(self)
     # Chain discovery is bounded per cycle, for the same reason
@@ -361,7 +377,7 @@ def ensure_focus_cohort_contracts(self) -> None:
     # discovery is rationed, so a freshly locked cohort fills in over
     # the next minute or two instead of stalling the loop outright.
     budget = self.config.focus_lock_discovery_per_pass
-    for underlying in list(self.focus_cohort):
+    for underlying in cohort:
         if underlying not in self.focus_wide_discovered:
             if budget <= 0:
                 continue

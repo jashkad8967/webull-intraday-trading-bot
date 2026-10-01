@@ -156,9 +156,24 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     # universe. VIXY is dropped too in this state: option_market_
     # regime_ok is itself already skipped for focus-mode entries (see
     # _evaluate_option_entry), so nothing reads current_vixy.
+    # option_liquid_underlyings join the scan set in every focus-mode
+    # state, including an empty cohort. They must be QUOTED, not merely
+    # discovered: option_direction_signal is an EMA(3/8), so an
+    # underlying that is never sampled produces HOLD forever. Measured
+    # 2026-10-01, SPY carried the only contract on the board that could
+    # clear the round-trip-cost gate (4.5% vs ACN's 21.8% at a matched
+    # $0.55 premium) - leaving it out of the quote set would have made it
+    # discoverable, gate-passing and permanently untradeable at once,
+    # indistinguishable in the logs from "no setup today". Same
+    # pre-warming reasoning as the daily-batch branch below.
+    liquid = [
+        symbol
+        for symbol in self.config.option_liquid_underlyings
+        if symbol not in self.focus_cohort
+    ]
     if self.config.focus_mode_enabled and self.focus_cohort:
-        underlyings = list(self.focus_cohort)
-        quote_symbols = list(self.focus_cohort)
+        underlyings = list(self.focus_cohort) + liquid
+        quote_symbols = list(self.focus_cohort) + liquid
     elif self.config.focus_mode_enabled and self.daily_batch:
         # By explicit request ("at 9:45am, the stock needs to be
         # selected, and its options should all be discovered and
@@ -182,7 +197,7 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
         # built. That window (15 minutes at the shipped defaults) is
         # many scan cycles, so an EMA(3/8) is warm well before the
         # lock - but shrinking the open-to-lock gap would eat into it.
-        underlyings = sorted(set(self.daily_batch))
+        underlyings = sorted(set(self.daily_batch) | set(liquid))
         quote_symbols = underlyings
     else:
         underlyings = sorted(
