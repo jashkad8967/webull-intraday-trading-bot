@@ -540,3 +540,36 @@ class OptionTradingSettings(BaseSettings):
     option_max_entry_hurdle_fraction: Decimal = Field(
         default=Decimal("0.5"), gt=0, le=2
     )
+    # Underlyings whose option chains are always eligible, regardless of
+    # whether the day's focus cohort selected them.
+    #
+    # Measured live 2026-10-01 11:14 by surveying real chains at a
+    # matched ~$0.55 premium (scripts/survey_option_hurdles.py):
+    #
+    #   SPY261016P00700000   0.55/0.56   spread 0.01   hurdle  4.5%
+    #   IWM261016P00258000   0.49/0.50   spread 0.01   hurdle  5.1%
+    #   PLTR261009P00172500  0.59/0.65   spread 0.06   hurdle  8.5%
+    #   ACN261016P00185000   0.55/0.75   spread 0.20   hurdle 21.8%
+    #
+    # Identical premium, incompatible economics. ACN was in that day's
+    # LOCKED COHORT and is quoted 20 cents wide - a 21.8% round-trip
+    # cost against a 10% stop, unwinnable before direction is even
+    # considered. SPY at the same premium is quoted a penny wide.
+    #
+    # This is not bad luck in the cohort pick, it is structural. The
+    # cohort gates screen on gap >= 2% and RVOL >= 2, which measure
+    # STOCK volatility; index ETFs essentially never clear them, so the
+    # only chains the bot could ever see were the wide single-name ones.
+    # Chain liquidity and share volatility are different properties and
+    # the selection only measured the second.
+    #
+    # Deliberately a tiny, explicit list rather than a rule. These names
+    # are the most liquid option markets in existence, and an inferred
+    # "is it liquid" test would be one more number calibrated under
+    # conditions that may not hold. Membership here bypasses ONLY cohort
+    # membership - the direction signal, the hurdle gate, the spread
+    # gate, the per-underlying cap, position sizing and every risk
+    # circuit breaker still apply in full.
+    option_liquid_underlyings: tuple[str, ...] = Field(
+        default=("SPY", "QQQ", "IWM")
+    )

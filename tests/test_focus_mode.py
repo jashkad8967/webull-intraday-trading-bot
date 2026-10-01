@@ -83,6 +83,11 @@ def focus_config(**overrides):
         # mean to exercise it pass their own fraction.
         option_max_entry_hurdle_fraction=Decimal("2.0"),
         focus_mode_suspends_stock_entries=False,
+        # Empty by default so the cohort-gating tests keep asserting
+        # exactly the cohort behaviour they were written for; the
+        # liquid-underlying exemption is covered by its own tests, which
+        # pass their own tuple.
+        option_liquid_underlyings=(),
         option_smoke_test_mode=False,
         option_scalp_enabled=True,
         option_straddle_enabled=False,

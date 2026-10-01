@@ -262,7 +262,19 @@ def _evaluate_option_entry(
     # actually leaves the whole account available to the names that
     # earned it. Until the cohort is locked (pre-08:45 CT, or a day
     # where nothing cleared the gates) no option entry is allowed.
-    if self.config.focus_mode_enabled and underlying not in self.focus_cohort:
+    # option_liquid_underlyings is exempt. Measured 2026-10-01: a cohort
+    # pick (ACN) was quoted 20 cents wide at a $0.55 premium - a 21.8%
+    # round-trip cost against a 10% stop - while SPY at the same premium
+    # was quoted a penny wide for 4.5%. The cohort gates measure SHARE
+    # volatility (gap, RVOL), not chain liquidity, so index ETFs never
+    # cleared them and the only chains reachable were the unwinnable
+    # ones. This exempts cohort MEMBERSHIP only; every quality, risk and
+    # direction gate below still applies.
+    if (
+        self.config.focus_mode_enabled
+        and underlying not in self.focus_cohort
+        and underlying not in self.config.option_liquid_underlyings
+    ):
         self.option_gate_rejections[
             "not in today's focus cohort"
             if self.focus_cohort
