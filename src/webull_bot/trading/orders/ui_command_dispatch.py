@@ -26,6 +26,31 @@ def process_ui_commands(
     except Exception as exc:
         log.error("CMD    | queue read failed | %s", exc)
         return buying_power
+    # Logged the moment they are CLAIMED, before any of them runs.
+    #
+    # pop_all clears the queue, so a command taken here and then lost -
+    # the process restarting for a deploy mid-cycle, a crash, a kill -
+    # leaves no trace at all. Live 2026-10-01: a manual NVDA buy was
+    # queued, the container restarted for a deploy seconds later, and the
+    # order simply never existed. Nothing warned; it was only caught by
+    # checking positions afterwards and finding the account still flat.
+    #
+    # Deliberately NOT changed to at-least-once delivery. Re-running a
+    # claimed command after a crash could place a SECOND live order, and
+    # for a trading queue a dropped order is far safer than a duplicated
+    # one - the stale-position race already showed what duplicate sells
+    # cost. So the fix is to make a drop VISIBLE rather than to retry:
+    # this line plus the per-command result below bracket every command,
+    # and a claim with no matching outcome is a dropped order.
+    if commands:
+        log.info(
+            "CMD    | claimed %s command(s) | %s",
+            len(commands),
+            ", ".join(
+                f"{c.get('type')}:{c.get('symbol') or c.get('order_id') or '-'}"
+                for c in commands
+            ),
+        )
     for command in commands:
         command_type = command.get("type")
         try:

@@ -239,13 +239,26 @@ def _evaluate_option_entry(
         self.option_gate_rejections[
             "round-trip cost leaves no room inside the stop budget"
         ] += 1
+        # The ceiling, not the raw stop. The first version of this line
+        # printed "breakeven needs +6.8% but the stop fires at -10.0%",
+        # which reads as though 6.8 < 10 should have passed - the actual
+        # bound is stop x option_max_entry_hurdle_fraction, i.e. 5.0%.
+        # A rejection message that makes the rejection look wrong is
+        # worse than none, because it sends the next reader hunting a
+        # bug in the gate.
+        ceiling = (
+            self.config.option_stop_loss_percent
+            * self.config.option_max_entry_hurdle_fraction
+        )
         log.warning(
-            "OPTIONS | %s | REFUSED | breakeven needs +%.1f%% on the bid "
-            "but the stop fires at -%.1f%% | bid=%s ask=%s | this trade "
-            "cannot profit, skipping",
+            "OPTIONS | %s | REFUSED | round-trip cost %.1f%% exceeds the "
+            "%.1f%% ceiling (%.0f%% stop x %s budget share) | bid=%s ask=%s "
+            "| skipping",
             option_symbol,
             hurdle * 100 if hurdle is not None else 0,
+            ceiling * 100,
             self.config.option_stop_loss_percent * 100,
+            self.config.option_max_entry_hurdle_fraction,
             self.api.quote_bid(quote),
             self.api.quote_ask(quote),
         )
