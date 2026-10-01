@@ -82,6 +82,11 @@ def focus_config(**overrides):
         # tests/test_option_entry_breakeven_room.py, and the cases that
         # mean to exercise it pass their own fraction.
         option_max_entry_hurdle_fraction=Decimal("2.0"),
+        # 0 disables the stop-vs-noise gate for fixtures written before
+        # it existed: their synthetic quotes carry no delta, and those
+        # tests assert other gates. Its own coverage lives in
+        # tests/test_option_stop_survives_noise.py.
+        option_min_stop_underlying_move_percent=Decimal("0"),
         focus_mode_suspends_stock_entries=False,
         # Empty by default so the cohort-gating tests keep asserting
         # exactly the cohort behaviour they were written for; the

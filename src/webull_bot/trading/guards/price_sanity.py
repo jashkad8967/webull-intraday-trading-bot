@@ -151,6 +151,74 @@ def option_entry_breakeven_room_ok(
     return hurdle <= stop_loss_percent * max_hurdle_fraction
 
 
+def option_stop_implied_underlying_move(
+    premium: Decimal | None,
+    delta: Decimal | None,
+    underlying_price: Decimal | None,
+    stop_loss_percent: Decimal,
+) -> Decimal | None:
+    """How far the UNDERLYING must move, as a fraction of its own price,
+    for an option stop to fire.
+
+    An option is levered to its underlying by premium/(delta x spot) -
+    roughly 35x for a cheap at-the-money contract - so a stop expressed
+    as a percentage of PREMIUM says almost nothing about how big a move
+    it actually tolerates. This converts it into the only terms that
+    matter: what the market has to do.
+
+    Returns None when any input is missing or unusable, matching the
+    fail-open convention of every other gate here.
+    """
+    if not premium or not delta or not underlying_price:
+        return None
+    if premium <= 0 or underlying_price <= 0 or abs(delta) <= 0:
+        return None
+    implied_dollars = (premium * stop_loss_percent) / abs(delta)
+    return implied_dollars / underlying_price
+
+
+def option_stop_survives_noise(
+    premium: Decimal | None,
+    delta: Decimal | None,
+    underlying_price: Decimal | None,
+    stop_loss_percent: Decimal,
+    min_underlying_move_percent: Decimal,
+) -> bool:
+    """True while the stop describes a real move rather than noise.
+
+    Measured live 2026-10-01, at a cost of $7.07 in 150 seconds:
+
+        PFE261009C00028000  bought ~0.50, STOP filled 0.43
+        delta 0.62, PFE spot 28.21
+        -> a 10% option stop is a 0.29% move in PFE
+
+    PFE moves 0.29% many times an hour, so the position was not stopped
+    out by an adverse trend, it was stopped out by the next tick. 8.3% of
+    the account, gone, on a contract that passed every other gate -
+    liquidity, spread, delta (0.62, comfortably above the 0.20 floor) and
+    the round-trip-cost hurdle.
+
+    This is the defect behind everything previously blamed on exit logic:
+    the held=0s exits, the 9-of-10 positions that never traded above
+    cost+fee on the bid, and the 5% stop that cost $60.98 in 37 minutes
+    (5% of premium = a 0.13% underlying move, so every position was dead
+    the moment it filled). The exit ladder was fine. The stop was
+    mis-scaled by a factor of ~35 and had been the whole time.
+
+    Note what this does NOT do: it never widens a stop or increases
+    risk. It refuses entries whose stop cannot work, which is the only
+    safe direction to change under pressure. It is also self-correcting
+    - scale option_stop_loss_percent to the instrument (~35% of premium
+    for a contract like PFE's) and these entries pass on their own.
+    """
+    implied = option_stop_implied_underlying_move(
+        premium, delta, underlying_price, stop_loss_percent
+    )
+    if implied is None:
+        return True
+    return implied >= min_underlying_move_percent
+
+
 def price_sanity_cooldown_ready(self, symbol: str) -> bool:
     """False while symbol is still within PRICE_SANITY_COOLDOWN_SECONDS
     of its last price_sanity_ok rejection - without this, a symbol

@@ -10,6 +10,8 @@ from webull_bot.trading.guards.price_sanity import (
     option_entry_breakeven_hurdle,
     option_entry_breakeven_room_ok,
     option_entry_spread_ok,
+    option_stop_implied_underlying_move,
+    option_stop_survives_noise,
 )
 from webull_bot.webull_api import QuoteUnavailableError
 
@@ -249,6 +251,40 @@ def _evaluate_option_entry(
         )
         return open_count, buying_power
     underlying = contract["underlying_symbol"]
+    # The stop must describe a real move, not the next tick. An option is
+    # levered to its underlying by premium/(delta x spot) - ~35x for a
+    # cheap ATM contract - so a stop set as a percentage of PREMIUM says
+    # nothing about the move it tolerates. Live 2026-10-01: PFE's 0.62-
+    # delta call passed liquidity, spread, delta and hurdle, then lost
+    # $7.07 in 150 seconds, because a 10% option stop is a 0.29% move in
+    # PFE and PFE does that many times an hour.
+    implied_move = option_stop_implied_underlying_move(
+        self.api.quote_bid(quote),
+        self.api.option_delta(quote),
+        self.strategy.prices.get(underlying),
+        self.config.option_stop_loss_percent,
+    )
+    if not option_stop_survives_noise(
+        self.api.quote_bid(quote),
+        self.api.option_delta(quote),
+        self.strategy.prices.get(underlying),
+        self.config.option_stop_loss_percent,
+        self.config.option_min_stop_underlying_move_percent,
+    ):
+        self.option_gate_rejections[
+            "stop is smaller than the underlying's own noise"
+        ] += 1
+        log.warning(
+            "OPTIONS | %s | REFUSED | a %.0f%% stop is only a %.2f%% move "
+            "in %s (floor %.2f%%) - it would be hit by noise, not by a "
+            "trend | skipping",
+            option_symbol,
+            self.config.option_stop_loss_percent * 100,
+            (implied_move * 100) if implied_move is not None else 0,
+            underlying,
+            self.config.option_min_stop_underlying_move_percent * 100,
+        )
+        return open_count, buying_power
     # By explicit request: "allow a cohort of 5-10 stocks then, that
     # all fit the criteria so that there are more options to play
     # with." Deliberately placed ABOVE the smoke-test bypass below,
