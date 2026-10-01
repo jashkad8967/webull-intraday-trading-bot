@@ -131,6 +131,12 @@ class FocusModeIntegrationTestCase(unittest.TestCase):
             option_last_buy_price={},
             option_peak_price={},
             option_contracts_state=SimpleNamespace(save=lambda *a, **k: None),
+            # Permissive by default; the veto has its own coverage in
+            # tests/test_operator_overrides.py.
+            operator_overrides=SimpleNamespace(
+                symbol_blocked=lambda symbol: False,
+                entries_halted=lambda: False,
+            ),
             option_gate_rejections=defaultdict(int),
             gate_rejections=defaultdict(int),
             option_momentum_flip={},

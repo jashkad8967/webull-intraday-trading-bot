@@ -49,6 +49,13 @@ class StateAndTuningSettings(BaseSettings):
     # one timestamp per OPEN position, pruned to what is still held.
     # See PositionOpenTimeStore for the two live failures it fixes.
     position_open_times_state_file: str = "conf/position_open_times.json"
+    # Standing operator vetoes, consulted BEFORE every entry
+    # decision - see OperatorOverrides. By explicit request: an
+    # override has to land before the bot decides, not after. A file
+    # rather than a prompt, because entries are decided in a 0.5s
+    # loop and waiting on a human would stall every setup and veto
+    # nothing whenever no one is watching.
+    operator_overrides_state_file: str = "conf/operator_overrides.json"
     # Recorded option quote tape, for replaying a parameter change
     # against real ticks instead of against the account. See QuoteTape:
     # every strategy change on 2026-09-24/25 was validated by losing

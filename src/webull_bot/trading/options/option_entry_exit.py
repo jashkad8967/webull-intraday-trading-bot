@@ -319,6 +319,15 @@ def _evaluate_option_entry(
     # cleared them and the only chains reachable were the unwinnable
     # ones. This exempts cohort MEMBERSHIP only; every quality, risk and
     # direction gate below still applies.
+    # Standing operator veto, before any quality gate below. Checked on
+    # the UNDERLYING, so blocking "ACN" blocks every ACN contract rather
+    # than needing each OCC symbol listed - which is also what an
+    # operator means by "don't trade that name".
+    if self.operator_overrides.symbol_blocked(underlying):
+        self.option_gate_rejections[
+            "operator veto on this underlying"
+        ] += 1
+        return open_count, buying_power
     if (
         self.config.focus_mode_enabled
         and underlying not in self.focus_cohort

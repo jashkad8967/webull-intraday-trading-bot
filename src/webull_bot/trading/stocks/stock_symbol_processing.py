@@ -451,6 +451,7 @@ def _process_stock_symbol(
                 # option underlying - see stock_entries_suspended.
                 and not self.stock_entries_suspended()
                 and self.stock_entry_symbol_allowed(symbol)
+                and not self.operator_overrides.symbol_blocked(symbol)
                 and self.strategy.range_position_supports_long(
                     symbol, self.config.stock_min_entry_range_position
                 )
@@ -607,6 +608,7 @@ def _process_stock_symbol(
                 # option underlying - see stock_entries_suspended.
                 and not self.stock_entries_suspended()
                 and self.stock_entry_symbol_allowed(symbol)
+                and not self.operator_overrides.symbol_blocked(symbol)
                 and self.strategy.range_position_supports_long(
                     symbol, self.config.stock_min_entry_range_position
                 )
