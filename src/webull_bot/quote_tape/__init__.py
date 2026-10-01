@@ -80,15 +80,39 @@ class QuoteTape:
         """Append one sample per held position, throttled per symbol.
 
         `samples` is an iterable of
-        (option_symbol, bid, ask, last, cost, quantity). Returns how
-        many lines were written, for tests - the caller ignores it.
+        (option_symbol, bid, ask, last, cost, quantity) or, preferred,
+        (option_symbol, bid, ask, last, cost, quantity, delta,
+        underlying_price). Returns how many lines were written, for
+        tests - the caller ignores it.
+
+        DELTA AND THE UNDERLYING PRICE WERE ADDED 2026-10-01, after this
+        tape could not answer the question that mattered most.
+
+        PFE261009C00028000 lost $7.07 in 150 seconds because a 10% stop
+        on a 0.62-delta contract is a 0.29% move in PFE, and PFE moves
+        that many times an hour. An option is levered to its underlying
+        by premium/(delta x spot), so the only correct way to scale a
+        stop is per-contract from delta and spot.
+
+        That fix cannot be validated against a tape holding neither.
+        Replaying it needs the price path AND the leverage at each point:
+        without delta, every replayed stop is the same mis-scaled
+        percentage that caused the loss, so the replayer would have
+        happily confirmed the broken design.
+
+        Both are optional so a 6-tuple caller and every already-recorded
+        file still work - the replayer treats a missing value as "not
+        measurable" rather than zero.
         """
         written = 0
         try:
             now = time.monotonic()
             lines = []
             with self._lock:
-                for symbol, bid, ask, last, cost, quantity in samples:
+                for sample in samples:
+                    symbol, bid, ask, last, cost, quantity = sample[:6]
+                    delta = sample[6] if len(sample) > 6 else None
+                    underlying = sample[7] if len(sample) > 7 else None
                     if not symbol:
                         continue
                     previous = self._last_written.get(symbol)
@@ -108,6 +132,12 @@ class QuoteTape:
                                 "l": _num(last),
                                 "c": _num(cost),
                                 "q": _num(quantity),
+                                # Leverage at this instant. Without these
+                                # a replayed stop is necessarily the same
+                                # mis-scaled percentage that caused the
+                                # 2026-10-01 PFE loss.
+                                "d": _num(delta),
+                                "u": _num(underlying),
                             },
                             separators=(",", ":"),
                         )

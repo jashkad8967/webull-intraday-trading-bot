@@ -113,6 +113,16 @@ def evaluate_held_option_exits(self) -> None:
                 quote_by_symbol[str(contract["symbol"])].get("price"),
                 item.get("cost_price"),
                 item.get("quantity"),
+                # Leverage, so a delta-scaled stop can actually be
+                # replayed. Added 2026-10-01: the tape recorded a
+                # perfect price path and still could not answer why
+                # PFE261009C00028000 lost $7.07 in 150 seconds, because
+                # the answer was premium/(delta x spot) and it held
+                # neither term.
+                self.api.option_delta(quote_by_symbol[str(contract["symbol"])]),
+                self.strategy.prices.get(
+                    str(contract.get("underlying_symbol", "")).upper()
+                ),
             )
             for item, contract in candidates
             if str(contract["symbol"]) in quote_by_symbol

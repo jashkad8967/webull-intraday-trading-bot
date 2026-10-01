@@ -67,6 +67,41 @@ class QuoteTapeTests(unittest.TestCase):
         self.assertEqual(row["b"], 0.80)
         self.assertEqual(row["c"], 0.75)
 
+    def test_it_records_delta_and_the_underlying_price(self):
+        """Added 2026-10-01, after this tape recorded a perfect price
+        path and still could not explain the session's worst trade.
+
+        PFE261009C00028000 lost $7.07 in 150 seconds because a 10% stop
+        on a 0.62-delta contract is a 0.29% move in PFE. An option is
+        levered to its underlying by premium/(delta x spot), so a tape
+        holding neither term cannot replay a correctly scaled stop - it
+        can only replay the same mis-scaled percentage that caused the
+        loss, and would have confirmed the broken design.
+        """
+        tape = self._tape()
+        self.addCleanup(tape.close)
+        tape.record(
+            [("PFE261009C00028000", 0.47, 0.50, 0.49, 0.50, 1, 0.6187, 28.21)]
+        )
+        row = json.loads(
+            next(self.dir.glob("*.jsonl")).read_text(encoding="utf-8").strip()
+        )
+        self.assertEqual(row["d"], 0.6187)
+        self.assertEqual(row["u"], 28.21)
+
+    def test_a_six_tuple_caller_still_works(self):
+        """Backwards compatibility both ways: older callers and every
+        tape file already on disk.
+        """
+        tape = self._tape()
+        self.addCleanup(tape.close)
+        self.assertEqual(tape.record(self._samples()), 1)
+        row = json.loads(
+            next(self.dir.glob("*.jsonl")).read_text(encoding="utf-8").strip()
+        )
+        self.assertIsNone(row["d"])
+        self.assertIsNone(row["u"])
+
     def test_the_interval_throttles_repeat_samples(self):
         """The fast loop polls at 0.5s. Recording every poll would be
         four times the disk for no extra resolution on any stop or
