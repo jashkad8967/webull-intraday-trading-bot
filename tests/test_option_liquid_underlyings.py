@@ -42,7 +42,7 @@ class LiquidUnderlyingScanScopeTests(unittest.TestCase):
     """The quote set, which is the failure mode with no error message."""
 
     def _prepare(self, cohort=(), daily_batch=(),
-                 liquid=("SPY", "QQQ", "IWM")):
+                 liquid=("SPY", "QQQ", "IWM"), preset_prices=None):
         from webull_bot.bot import AutoTrader
 
         requested: list[list[str]] = []
@@ -85,6 +85,7 @@ class LiquidUnderlyingScanScopeTests(unittest.TestCase):
                 rotating_batch=lambda symbols, cursor, size: (
                     list(symbols)[:size], 0
                 ),
+                prices=dict(preset_prices or {}),
             ),
             stop_loss_guard_active=lambda: False,
             focus_cohort=list(cohort),
@@ -96,6 +97,7 @@ class LiquidUnderlyingScanScopeTests(unittest.TestCase):
             ),
         )
         AutoTrader._prepare_option_scan_batch.__get__(bot)([])
+        self._prices = bot.strategy.prices
         return requested
 
     def test_liquid_names_are_quoted_alongside_a_locked_cohort(self):
@@ -125,6 +127,38 @@ class LiquidUnderlyingScanScopeTests(unittest.TestCase):
         """The exemption must be switchable off cleanly."""
         requested = self._prepare(cohort=["ACN"], liquid=())
         self.assertEqual(set(requested[0]), {"ACN"})
+
+    def test_the_share_price_is_recorded_so_chain_discovery_can_run(self):
+        """The fourth silent dead end.
+
+        _ensure_one_focus_symbol_contracts returns early unless
+        strategy.prices holds the underlying's share price, and under
+        focus mode the STOCK scan batch is forced to the cohort - so a
+        liquid underlying had no price, therefore no wide chain, and the
+        entry gate just kept logging "no focus cohort locked yet".
+
+        Live 2026-10-01 11:30: SPY and QQQ held 2 contracts each from the
+        background rotation and IWM zero, against PLTR's 4328.
+        """
+        self._prepare(cohort=["ACN"])
+        for symbol in ("SPY", "QQQ", "IWM"):
+            self.assertIn(
+                symbol, self._prices,
+                f"{symbol} has no share price -> wide chain discovery "
+                f"returns early -> no contract is ever tradeable",
+            )
+
+    def test_a_cohort_name_keeps_the_price_the_stock_scan_gave_it(self):
+        """Only fills gaps - never overwrites a price the share scanner
+        already measured, which carries volume/activity context this
+        path does not.
+        """
+        from decimal import Decimal as D
+
+        bot_prices = {"SPY": D("999")}
+        requested = self._prepare(cohort=["ACN"], preset_prices=bot_prices)
+        self.assertEqual(self._prices["SPY"], D("999"))
+        self.assertTrue(requested)
 
 
 class LiquidUnderlyingConfigTests(unittest.TestCase):

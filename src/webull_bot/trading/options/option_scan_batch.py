@@ -225,6 +225,32 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
     directions: dict[str, str] = {}
     for underlying, underlying_quote in underlying_quote_by_symbol.items():
         underlying_price = self.api.quote_price(underlying_quote)
+        # Record the price for any underlying the STOCK scan will not
+        # reach. _ensure_one_focus_symbol_contracts returns early unless
+        # strategy.prices holds the underlying's share price, and under
+        # focus mode the stock scan batch is forced to the cohort - so an
+        # option_liquid_underlyings name had no price, therefore no wide
+        # chain discovery, therefore no tradeable contract, no matter
+        # that every gate would have passed it.
+        #
+        # Live 2026-10-01 11:30: SPY and QQQ held 2 contracts each from
+        # the background rotation and IWM zero, against PLTR's 4328,
+        # while the entry gate logged "no focus cohort locked yet=17".
+        # That is the fourth distinct silent dead end in this feature,
+        # all of which read identically in the logs as "no setup today".
+        #
+        # Deliberately the price ONLY, not update_stock_snapshot: that
+        # also writes activity/metrics, which rank the SHARE scanner,
+        # and quietly promoting index ETFs into stock-entry candidates is
+        # not what this change is for. Same narrow precedent as
+        # volatility_window_seeding.
+        if (
+            underlying in self.config.option_liquid_underlyings
+            and underlying_price
+            and underlying_price > 0
+            and underlying not in self.strategy.prices
+        ):
+            self.strategy.prices[underlying] = underlying_price
         directions[underlying] = self.strategy.option_direction_signal(
             f"OPTU:{underlying}", underlying_price
         )
