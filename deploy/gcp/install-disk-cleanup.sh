@@ -44,7 +44,30 @@ logger -t "${LOG_TAG}" "starting; $(df -Pm / | awk 'NR==2 {print $4}')MB free"
 docker image prune -af --filter "until=48h" >/dev/null 2>&1 || true
 docker builder prune -af >/dev/null 2>&1 || true
 docker container prune -f --filter "until=48h" >/dev/null 2>&1 || true
-journalctl --vacuum-size=100M >/dev/null 2>&1 || true
+journalctl --vacuum-size=50M >/dev/null 2>&1 || true
+
+# syslog/auth.log too, not just the journal.
+#
+# Live 2026-10-01: /var/log had grown to 219M and the nightly cleanup
+# reclaimed only 2MB, because it vacuumed the journal and nothing else.
+# The bot's stdout is written FOUR times - docker's json-file driver
+# (capped at 10m x 3), the bot's own daily file (capped at 5 days),
+# journald, and syslog - and only the first two were bounded. syslog
+# plus syslog.1 alone were 61M, auth.log 11M from SSH sessions, btmp.1
+# another 12M.
+#
+# Disk had reached 1.6G free against a 1500MB deploy preflight, so the
+# next fix would have been refused for lack of space - the failure mode
+# being guarded against would have blocked the guard's own remedy.
+#
+# TRUNCATE rather than delete: rsyslog holds these descriptors open, so
+# unlinking leaves it writing to a deleted inode and the space is never
+# returned until a service restart.
+for logfile in /var/log/syslog /var/log/syslog.1                /var/log/auth.log /var/log/auth.log.1; do
+  [ -f "$logfile" ] && truncate -s 0 "$logfile" 2>/dev/null || true
+done
+rm -f /var/log/btmp.1 /var/log/wtmp.1 2>/dev/null || true
+find /var/log -name "*.gz" -mtime +3 -delete 2>/dev/null || true
 
 # Release trees: keep the newest three, and never the one `current`
 # points at (the rollback target deploy.sh falls back to).
