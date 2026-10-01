@@ -75,6 +75,13 @@ def focus_config(**overrides):
         # integration coverage - see
         # tests/trading/test_focus_mode_entry_exit_integration.py.
         option_max_entry_spread_percent=Decimal("25"),
+        # 2.0 so the round-trip-cost gate is effectively inert for the
+        # fixtures written before it existed - those tests assert other
+        # gates, and their synthetic quotes were never built to clear a
+        # breakeven-room bound. The gate has its own coverage in
+        # tests/test_option_entry_breakeven_room.py, and the cases that
+        # mean to exercise it pass their own fraction.
+        option_max_entry_hurdle_fraction=Decimal("2.0"),
         option_smoke_test_mode=False,
         option_scalp_enabled=True,
         option_straddle_enabled=False,

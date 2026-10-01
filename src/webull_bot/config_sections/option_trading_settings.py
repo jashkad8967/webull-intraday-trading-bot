@@ -486,3 +486,36 @@ class OptionTradingSettings(BaseSettings):
     option_max_entry_spread_percent: Decimal = Field(
         default=Decimal("25"), gt=0, le=100
     )
+    # The share of the stop-loss budget that the round trip itself may
+    # consume. Buying at the mid and selling into the bid means a
+    # position opens half a spread underwater and owes the exit fee on
+    # top; that hurdle must be cleared before direction pays anything.
+    #
+    # Measured 2026-10-01 from the recorded tape - the finding that
+    # explains four straight losing sessions after every mechanical
+    # defect was already fixed. Mean hurdle 8.1% against this 10%
+    # stop, leaving 1.9% of room. Nine of ten positions NEVER traded
+    # above cost+fee on the bid, so no exit rule could win them;
+    # sweeping the trail and target across six configurations moved
+    # the total between -$44 and -$54 and never into profit. The
+    # losing was never in the exit logic that was being tuned.
+    #
+    # The driver is the $0.05 option tick: fixed in cents, so it is
+    # 10% of a $0.50 premium and 2.5% of a $2.00 one. Cheap contracts
+    # are structurally the worst place to trade, and a small account
+    # can afford nothing else - at $85 of buying power the best
+    # attainable hurdle, in a perfect one-tick market, is 5.3%.
+    #
+    # Deliberately NOT a reuse of option_max_entry_spread_percent:
+    # that bound answers "can this be liquidated?" and is applied on
+    # the EXIT path too (stall_position_boost), so tightening it would
+    # disable exits on positions already held.
+    #
+    # Defaulted to 1.0, which rejects only trades whose breakeven sits
+    # at or beyond their own stop - guaranteed losses, no judgment
+    # required. Values near 0.5 are what make this a real filter, and
+    # on a sub-$100 account they reject nearly every candidate: that
+    # is the gate reporting a capital problem, not malfunctioning.
+    option_max_entry_hurdle_fraction: Decimal = Field(
+        default=Decimal("1.0"), gt=0, le=2
+    )

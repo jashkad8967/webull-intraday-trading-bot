@@ -85,6 +85,72 @@ def option_entry_spread_ok(
     return spread_percent <= max_spread_percent
 
 
+def option_entry_breakeven_hurdle(
+    bid: Decimal | None,
+    ask: Decimal | None,
+    sell_fee_per_share: Decimal,
+) -> Decimal | None:
+    """How far the BID must rise, as a fraction of itself, before the
+    position is merely FLAT after the sell fee.
+
+    This is the cost of the round trip, paid before direction matters
+    at all. We buy at the mid, we sell into the bid, so the position
+    opens half a spread underwater and owes the exit fee on top.
+
+    Returns None on a missing/unusable quote, matching the fail-open
+    convention of every other gate here.
+    """
+    if not bid or not ask or bid <= 0 or ask < bid:
+        return None
+    mid = (bid + ask) / 2
+    return (mid + sell_fee_per_share - bid) / bid
+
+
+def option_entry_breakeven_room_ok(
+    bid: Decimal | None,
+    ask: Decimal | None,
+    stop_loss_percent: Decimal,
+    sell_fee_per_share: Decimal,
+    max_hurdle_fraction: Decimal,
+) -> bool:
+    """True while the round-trip cost leaves usable room inside the
+    stop-loss budget.
+
+    This is a DIFFERENT question from option_entry_spread_ok, which
+    asks "is this contract liquid enough to get out of?" (and whose
+    bound is reused on the exit path, so it must stay loose). This
+    asks "can a position in this contract profit before its own stop
+    kills it?" A contract can be perfectly liquid and still fail this.
+
+    Measured 2026-10-01 against the recorded tape, the reason four
+    straight sessions lost money with every mechanical defect already
+    fixed: across 10 reconstructed positions the mean hurdle was 8.1%
+    against a 10% stop - 1.9% of favourable room. NINE of the ten
+    never traded above cost+fee on the bid at any point in their
+    lives, so no exit rule could have won them; sweeping the trail
+    and the take-profit across six configurations moved the total
+    between -$44 and -$54 and never into profit. Three had a hurdle
+    at or BEYOND the stop: guaranteed losses at the moment of entry.
+
+    The arithmetic is driven by the $0.05 option tick, which is fixed
+    in cents and therefore punishing on cheap contracts - 10% of a
+    $0.50 premium, 2.5% of a $2.00 one. That is why this gate exists
+    rather than a premium floor: it is the hurdle that matters, and
+    on a penny-pilot name a cheap contract can pass it honestly.
+
+    max_hurdle_fraction is the share of the stop budget friction may
+    consume. At 1.0 this rejects only trades whose breakeven sits at
+    or past their own stop. Below ~0.5 it demands that most of the
+    risk budget remain available to the trade itself.
+    """
+    hurdle = option_entry_breakeven_hurdle(bid, ask, sell_fee_per_share)
+    if hurdle is None:
+        return True
+    if stop_loss_percent <= 0:
+        return True
+    return hurdle <= stop_loss_percent * max_hurdle_fraction
+
+
 def price_sanity_cooldown_ready(self, symbol: str) -> bool:
     """False while symbol is still within PRICE_SANITY_COOLDOWN_SECONDS
     of its last price_sanity_ok rejection - without this, a symbol
