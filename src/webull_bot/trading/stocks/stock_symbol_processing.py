@@ -451,6 +451,9 @@ def _process_stock_symbol(
                 # option underlying - see stock_entries_suspended.
                 and not self.stock_entries_suspended()
                 and self.stock_entry_symbol_allowed(symbol)
+                and self.strategy.range_position_supports_long(
+                    symbol, self.config.stock_min_entry_range_position
+                )
                 and not self.new_entries_blocked()
                 and state.bucket_position_counts.get(bucket, 0)
                 < bucket_slot_limits.get(bucket, 0)
@@ -604,6 +607,9 @@ def _process_stock_symbol(
                 # option underlying - see stock_entries_suspended.
                 and not self.stock_entries_suspended()
                 and self.stock_entry_symbol_allowed(symbol)
+                and self.strategy.range_position_supports_long(
+                    symbol, self.config.stock_min_entry_range_position
+                )
                 and not self.new_entries_blocked()
                 and state.bucket_position_counts.get(bucket, 0)
                 < bucket_slot_limits.get(bucket, 0)

@@ -82,6 +82,10 @@ from webull_bot.strategy_logic.volatility_scalp.signals import (
     volatility_scalp_momentum_stalling_short,
     volatility_scalp_rip_signal,
 )
+from webull_bot.strategy_logic.market_state.range_position import (
+    range_position,
+    range_position_supports_long,
+)
 from webull_bot.strategy_logic.market_state.snapshot import (
     clear_market_state,
     quote_number,
@@ -233,6 +237,8 @@ class TradingStrategy:
     rotating_batch = staticmethod(rotating_batch)
     quote_number = staticmethod(quote_number)
     update_stock_snapshot = update_stock_snapshot
+    range_position = range_position
+    range_position_supports_long = range_position_supports_long
 
     # Below this many samples, a stdev estimate is too noisy to trust -
     # not configurable (unlike the window length itself), same reasoning

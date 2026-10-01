@@ -212,6 +212,37 @@ class StockExitSettings(BaseSettings):
         ge=0,
         le=Decimal("0.20"),
     )
+    # Minimum position inside today's high/low range for a LONG entry.
+    # Encoded from live discretionary trading on 2026-10-01, where this
+    # was the one criterion not already in the bot - and the one that
+    # separated the two entries that closed green from two that would
+    # have been traps:
+    #
+    #   NVDA   +1.32%  range  87%  -> taken, green
+    #   NVDA   +1.52%  range  89%  -> taken, green
+    #   PLTR   +1.92%  range  78%  -> would take
+    #   ACN   +17.95%  range  14%  -> REFUSED (gapped +18%, faded
+    #                                 227.58 -> 216.28, top-4 by the
+    #                                 bot's own priority_score)
+    #   GOOGL  -1.43%  range  21%  -> REFUSED (2nd highest score,
+    #                                 opened 351.44, sold to 339.16)
+    #
+    # ACN and GOOGL are the point: both looked strong on gap and score,
+    # which is all the existing gates measure, and both were failing.
+    # Distinct from range_ratio, which is how WIDE the range is
+    # (volatility, used to scale the stop) rather than where price sits
+    # in it - a name can be very volatile and sitting on its low.
+    #
+    # 0.55 is "upper half of the day's range": the weakest defensible
+    # statement of "not currently fading", NOT a value fitted to those
+    # trades. The evidence is one session and five names, so the margin
+    # matters more than the number - lowest accepted was 78%, highest
+    # refused 21%. Set 0 to disable.
+    stock_min_entry_range_position: Decimal = Field(
+        default=Decimal("0.55"),
+        ge=0,
+        le=1,
+    )
     # By explicit request ("as a human I can see and make profit off
     # of the swings... seeing when there is resistance so just sell
     # off the profit"): the exit-side mirror of entry_extension_ok's
