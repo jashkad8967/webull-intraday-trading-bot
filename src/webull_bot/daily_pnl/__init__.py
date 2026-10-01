@@ -4,6 +4,8 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+from webull_bot.atomic_replace import atomic_replace
+
 
 class DailyPnlTracker:
     """Persists today's running realized P&L/loss totals across restarts.
@@ -127,4 +129,4 @@ class DailyPnlTracker:
             temporary.write_text(
                 json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
             )
-            temporary.replace(self.path)
+            atomic_replace(temporary, self.path)

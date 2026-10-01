@@ -6,6 +6,8 @@ from collections import deque
 from decimal import Decimal
 from pathlib import Path
 
+from webull_bot.atomic_replace import atomic_replace
+
 log = logging.getLogger("webull-bot")
 
 
@@ -82,7 +84,7 @@ class StatusWriter:
             ),
             encoding="utf-8",
         )
-        temporary.replace(self.state_path)
+        atomic_replace(temporary, self.state_path)
 
     def record_trade(
         self,
@@ -289,4 +291,4 @@ class StatusWriter:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(".tmp")
             temporary.write_text(json.dumps(payload, default=str), encoding="utf-8")
-            temporary.replace(self.path)
+            atomic_replace(temporary, self.path)

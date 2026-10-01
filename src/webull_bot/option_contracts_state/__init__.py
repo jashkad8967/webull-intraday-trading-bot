@@ -3,6 +3,8 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+from webull_bot.atomic_replace import atomic_replace
+
 
 class OptionContractsStateStore:
     """Persists discovered option contracts (and which underlyings have
@@ -123,6 +125,6 @@ class OptionContractsStateStore:
                     if entry.get("count", 0) > 0
                 }
             temporary.write_text(json.dumps(payload), encoding="utf-8")
-            temporary.replace(self.path)
+            atomic_replace(temporary, self.path)
         except Exception as exc:
             self.log.warning("OPTIONS| contract state save failed | %s", exc)

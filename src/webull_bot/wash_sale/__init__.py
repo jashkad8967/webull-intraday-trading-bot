@@ -3,6 +3,8 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from webull_bot.atomic_replace import atomic_replace
+
 # The day count baked into every block written before this tracker switched
 # to storing the loss date instead of a precomputed block-until date. Used
 # once, at load time, to convert legacy entries - never touched afterward.
@@ -116,7 +118,7 @@ class WashSaleTracker:
             json.dumps(self.blocks, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        temporary.replace(self.path)
+        atomic_replace(temporary, self.path)
 
     def blocked_until(self, symbol: str) -> datetime | None:
         symbol = symbol.upper()
