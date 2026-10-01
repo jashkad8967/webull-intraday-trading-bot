@@ -199,6 +199,41 @@ def _prepare_option_scan_batch(self, positions: list[dict]):
         # lock - but shrinking the open-to-lock gap would eat into it.
         underlyings = sorted(set(self.daily_batch) | set(liquid))
         quote_symbols = underlyings
+    elif self.config.focus_mode_enabled:
+        # Focus mode with NEITHER a cohort nor a batch. Entries here are
+        # restricted to option_liquid_underlyings (see
+        # _evaluate_option_entry's cohort check), so quoting the whole
+        # discovered board buys nothing.
+        #
+        # Measured 2026-10-01, the dominant cloud cost on this host:
+        #
+        #   direction signals | quoted=147/147   <- this branch
+        #   direction signals | quoted=4/4       <- cohort locked
+        #
+        # ~141 of those 147 were underlyings an entry would reject on
+        # arrival, re-quoted every cycle. The VM's egress ran ~70GB/30d
+        # against a 1GiB free allowance, and the same request budget is
+        # what 429s the pre-close sweep and competes with order
+        # placement.
+        #
+        # Held positions' underlyings are kept so their IV/direction
+        # context stays warm. Note an OPTION position's top-level
+        # `symbol` IS the bare underlying in Webull's payload (the
+        # contract sits in `legs`), which is exactly what is wanted here
+        # - the same quirk that broke four guards elsewhere.
+        #
+        # Exits are unaffected: held contracts enter this batch through
+        # the held-contract backfill below regardless of the underlying
+        # set, and evaluate_held_option_exits quotes them on the fast
+        # loop independently.
+        held_underlyings = {
+            str(item.get("symbol", "")).upper()
+            for item in positions
+            if item.get("instrument_type") == "OPTION"
+            and str(item.get("symbol", ""))
+        }
+        underlyings = sorted(set(liquid) | held_underlyings)
+        quote_symbols = underlyings
     else:
         underlyings = sorted(
             {contract["underlying_symbol"] for contract in self.option_contracts}
