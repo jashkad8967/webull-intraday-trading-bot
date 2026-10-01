@@ -450,6 +450,7 @@ def _process_stock_symbol(
                 # Focus mode reserves the whole account for one
                 # option underlying - see stock_entries_suspended.
                 and not self.stock_entries_suspended()
+                and self.stock_entry_symbol_allowed(symbol)
                 and not self.new_entries_blocked()
                 and state.bucket_position_counts.get(bucket, 0)
                 < bucket_slot_limits.get(bucket, 0)
@@ -602,6 +603,7 @@ def _process_stock_symbol(
                 # Focus mode reserves the whole account for one
                 # option underlying - see stock_entries_suspended.
                 and not self.stock_entries_suspended()
+                and self.stock_entry_symbol_allowed(symbol)
                 and not self.new_entries_blocked()
                 and state.bucket_position_counts.get(bucket, 0)
                 < bucket_slot_limits.get(bucket, 0)
