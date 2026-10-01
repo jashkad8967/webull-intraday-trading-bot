@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from webull_bot.analyst_data import AnalystDataService
 from webull_bot.commands import CommandQueue
+from webull_bot.operator_overrides import OperatorOverrides
 from webull_bot.config import settings
 from webull_bot.daily_pnl import DailyPnlTracker
 from webull_bot.errors.broker_conflict import is_broker_position_conflict
@@ -983,6 +984,13 @@ class AutoTrader:
         # once-per-day counters in _resolve_targets_work_body.
         self.option_entry_occurred_today = False
         self.commands = CommandQueue(self.config.command_file)
+        # Standing operator vetoes, read before every entry decision.
+        # Distinct from `commands` above: that queue requests one-off
+        # ACTIONS (sell, buy, cancel) and is drained; this is policy that
+        # persists until the operator changes it.
+        self.operator_overrides = OperatorOverrides(
+            self.config.operator_overrides_state_file
+        )
         self.user_watchlist: set[str] = set(self.config.default_watchlist())
         # Symbols a dashboard "add to watchlist" command just added -
         # forced into the very next scan batch once, regardless of

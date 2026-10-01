@@ -53,6 +53,7 @@ services:
       # that caught it also found strategy_tuning had been doing the
       # same thing unnoticed for far longer.
       POSITION_OPEN_TIMES_STATE_FILE: /var/data/conf/position_open_times.json
+      OPERATOR_OVERRIDES_STATE_FILE: /var/data/conf/operator_overrides.json
       QUOTE_TAPE_DIRECTORY: /var/data/quotes
       STRATEGY_TUNING_STATE_FILE: /var/data/conf/strategy_tuning.json
       STATUS_FILE: /var/data/status.json

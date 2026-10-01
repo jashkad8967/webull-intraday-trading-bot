@@ -256,6 +256,17 @@ def new_entries_blocked(self) -> bool:
     # stay active - see option_entries_halted.
     if self.config.option_entries_halted:
         return True
+    # Standing operator halt, read from disk on every call so it takes
+    # effect on the next entry evaluation rather than the next restart.
+    # By explicit request, an override has to land BEFORE the bot
+    # decides - this is checked by the same gate the entry paths already
+    # consult, so there is no path that opens risk without seeing it.
+    # Fails open if the file is missing or unreadable; see
+    # OperatorOverrides for why halting on a typo would be worse than
+    # the mistakes it prevents.
+    overrides = getattr(self, "operator_overrides", None)
+    if overrides is not None and overrides.entries_halted():
+        return True
     return bool(
         self.config.focus_mode_enabled
         and self.profit_throttle_armed
