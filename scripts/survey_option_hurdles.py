@@ -91,7 +91,21 @@ def survey(api, underlying, max_premium, stop, dte_lo=7, dte_hi=21,
             if bid * 100 > max_premium:
                 continue
             hurdle = ((ask - bid) / 2 + FEE) / bid
-            rows.append((hurdle, quote.get("symbol"), bid, ask))
+            # Delta matters as much as the hurdle, and leaving it out
+            # made this script actively misleading: on 2026-10-01 it
+            # reported three contracts as TRADEABLE that the bot's own
+            # option_delta_ok (OPTION_DELTA_MIN 0.20) refuses outright,
+            # at delta 0.04-0.08. I nearly placed one.
+            #
+            # The reason that floor exists is the same reason the hurdle
+            # gate does. A 10% stop on the 0.082-delta SPY261016C00790000
+            # corresponds to a 0.73-point move in SPY - 0.096%, against a
+            # daily range of 0.86% - so it stops out on noise, several
+            # times an hour, whatever the spread looks like. Friction is
+            # only half of what makes a contract tradeable; the other
+            # half is whether the stop describes a real move.
+            delta = api.option_delta(quote)
+            rows.append((hurdle, quote.get("symbol"), bid, ask, delta))
     rows.sort(key=lambda r: r[0])
     note = f"quote errors: {','.join(errors)}" if errors and not rows else ""
     return rows, note
@@ -122,35 +136,47 @@ def main(argv):
           f"(${max_premium:.0f}/contract)"
           f"{'' if power else '  [buying power unavailable, assumed]'}\n")
 
+    from webull_bot.strategy_logic.constants import OPTION_DELTA_MIN
+
+    print(f"delta floor {OPTION_DELTA_MIN} (option_delta_ok) - below it a "
+          f"{stop * 100:.0f}% stop is triggered by noise, not by a move\n")
     print(f"{'underlying':<11} {'contract':<22} {'bid':>5} {'ask':>5} "
-          f"{'spr':>5} {'hurdle':>7} {'room':>6}  verdict")
-    print("-" * 78)
+          f"{'spr':>5} {'hurdle':>7} {'delta':>6}  verdict")
+    print("-" * 80)
     tradeable = []
     for underlying in argv or ["SPY", "QQQ", "IWM"]:
         rows, note = survey(api, underlying, max_premium, stop)
         if not rows:
             print(f"{underlying:<11} {note or 'nothing affordable+two-sided'}")
             continue
-        for hurdle, symbol, bid, ask in rows[:3]:
-            passes = hurdle <= ceiling
+        for hurdle, symbol, bid, ask, delta in rows[:3]:
+            thin = delta is not None and abs(delta) < OPTION_DELTA_MIN
+            passes = hurdle <= ceiling and not thin
             if passes:
-                tradeable.append((hurdle, underlying, symbol, bid, ask))
+                tradeable.append((hurdle, underlying, symbol, bid, ask, delta))
+            verdict = (
+                "TRADEABLE" if passes
+                else "delta too thin" if thin
+                else "hurdle too high"
+            )
             print(f"{underlying:<11} {str(symbol)[:22]:<22} {bid:>5} {ask:>5} "
                   f"{ask - bid:>5} {hurdle * 100:>6.1f}% "
-                  f"{(stop - hurdle) * 100:>5.1f}%  "
-                  f"{'TRADEABLE' if passes else 'refused'}")
+                  f"{(abs(delta) if delta is not None else 0):>6.3f}  {verdict}")
 
-    print("-" * 78)
+    print("-" * 80)
     if tradeable:
         tradeable.sort(key=lambda r: r[0])
-        print(f"\n{len(tradeable)} contract(s) clear the gate. Best:")
-        for hurdle, underlying, symbol, bid, ask in tradeable[:5]:
+        print(f"\n{len(tradeable)} contract(s) clear BOTH gates. Best:")
+        for hurdle, underlying, symbol, bid, ask, delta in tradeable[:5]:
             print(f"  {underlying:<6} {symbol:<22} {bid}/{ask} "
-                  f"hurdle {hurdle * 100:.1f}%  ${bid * 100:.0f}/contract")
+                  f"hurdle {hurdle * 100:.1f}% delta {abs(delta or 0):.2f}  "
+                  f"${bid * 100:.0f}/contract")
     else:
-        print("\nNothing clears the gate. That is the gate working, not a "
-              "fault: every affordable contract costs more in round-trip "
-              "friction than half its own stop budget.")
+        print("\nNothing clears both gates. Not a fault - the two gates "
+              "close from opposite directions: a contract cheap enough to "
+              "afford is far enough OTM that its delta cannot support a "
+              f"{stop * 100:.0f}% stop, and one with real delta costs more "
+              "than the account has.")
     return 0
 
 
