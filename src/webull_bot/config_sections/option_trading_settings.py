@@ -566,6 +566,33 @@ class OptionTradingSettings(BaseSettings):
     option_max_entry_hurdle_fraction: Decimal = Field(
         default=Decimal("0.5"), gt=0, le=2
     )
+    # The smallest UNDERLYING move an option stop may represent. Below
+    # this the stop is triggered by noise rather than by an adverse move,
+    # so the trade is a coin flip on the next tick.
+    #
+    # An option is levered to its underlying by premium/(delta x spot) -
+    # about 35x for a cheap at-the-money contract - so a stop set as a
+    # percentage of PREMIUM says almost nothing about the move it
+    # tolerates. Measured live 2026-10-01, cost $7.07 in 150 seconds:
+    #
+    #   PFE261009C00028000, delta 0.62, PFE spot 28.21
+    #   a 10% option stop = a 0.29% move in PFE
+    #
+    # PFE moves 0.29% many times an hour. That contract had passed every
+    # other gate - liquidity, spread, delta (0.62, well above the 0.20
+    # floor) and the round-trip hurdle - and still could not survive,
+    # because nothing was checking the stop against the instrument.
+    #
+    # 0.5% is set as a floor larger than ordinary intraday noise in a
+    # liquid name, not as a tuned value. At the current 10% stop this
+    # refuses essentially every option, which is the correct reading of
+    # the measurement rather than a malfunction: a 10% premium stop is
+    # simply too tight for the instrument. It is deliberately
+    # self-correcting - scale option_stop_loss_percent to the contract
+    # (~35% of premium for something like PFE's) and entries pass again.
+    option_min_stop_underlying_move_percent: Decimal = Field(
+        default=Decimal("0.005"), ge=0, le=1
+    )
     # Underlyings whose option chains are always eligible, regardless of
     # whether the day's focus cohort selected them.
     #
