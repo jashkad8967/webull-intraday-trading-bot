@@ -445,8 +445,13 @@ def _prepare_stock_scan_batch(
     # every eligible candidate and almost always succeeded, so
     # whole-share sizing (a LARGER capital slice than fractional's) was
     # essentially unreachable during core hours.
-    fractional_remaining = (
-        buying_power * self.config.stock_core_session_position_fraction
+    # Floored at the broker's fractional minimum when affordable - see
+    # core_session_fractional_budget. Without it a small account silently
+    # stops trading: at $80.54 of buying power the 30% pool is $24.16
+    # against a $25 minimum, so no candidate can ever be sized and the
+    # logs are indistinguishable from a day with no setups.
+    fractional_remaining = self.strategy.core_session_fractional_budget(
+        buying_power
     )
     whole_share_remaining = (
         buying_power * self.config.stock_whole_share_core_session_fraction

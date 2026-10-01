@@ -124,6 +124,42 @@ def fractional_stock_quantity(
     return quantity
 
 
+def core_session_fractional_budget(
+    self, buying_power: Decimal
+) -> Decimal:
+    """The core-session fractional budget, floored at the broker's
+    minimum when the account can actually cover it.
+
+    A SILENT CLIFF, hit live 2026-10-01 at 13:53. The account had fallen
+    from $84.70 to $80.54 over the session, and:
+
+        $80.54 x stock_core_session_position_fraction (0.30) = $24.16
+        fractional_shares_min_notional                        = $25.00
+
+    so dollar_stock_quantity returned 0 and every share entry was
+    refused with "no affordable quantity". The same NVDA setup had been
+    bought an hour earlier at $84.70, where 30% came to $25.41 and
+    cleared. Nothing announced the transition: below a $83.33 balance
+    the bot simply stops being able to trade, and the logs look exactly
+    like a day with no setups.
+
+    Combined with the option side being correctly blocked by
+    option_min_stop_underlying_move_percent, the account was unable to
+    place ANY trade while appearing to run normally.
+
+    If the minimum is affordable, trade the minimum. The concentration
+    this implies is real - $25 of an $80 account is 31% notional - but
+    position RISK is bounded by the stop, not the notional: at the
+    0.9-1.5% stock stop that is $0.23-$0.38. Refusing to trade at all is
+    the worse end of that trade-off.
+    """
+    target = buying_power * self.config.stock_core_session_position_fraction
+    minimum = self.config.fractional_shares_min_notional
+    if target < minimum <= buying_power:
+        return minimum
+    return target
+
+
 def dollar_stock_quantity(
     self,
     price: Decimal,
