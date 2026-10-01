@@ -82,6 +82,7 @@ def focus_config(**overrides):
         # tests/test_option_entry_breakeven_room.py, and the cases that
         # mean to exercise it pass their own fraction.
         option_max_entry_hurdle_fraction=Decimal("2.0"),
+        focus_mode_suspends_stock_entries=False,
         option_smoke_test_mode=False,
         option_scalp_enabled=True,
         option_straddle_enabled=False,
@@ -1893,15 +1894,44 @@ class CohortSelectionTests(unittest.TestCase):
 
 
 class StockSuspensionTests(unittest.TestCase):
-    def test_focus_mode_suspends_new_stock_entries(self):
-        bot = SimpleNamespace(config=focus_config())
-        suspended = AutoTrader.stock_entries_suspended.__get__(bot)
-        self.assertTrue(suspended())
+    def _suspended(self, **overrides):
+        bot = SimpleNamespace(config=focus_config(**overrides))
+        return AutoTrader.stock_entries_suspended.__get__(bot)()
+
+    def test_the_shipped_default_lets_stock_entries_run(self):
+        """Changed 2026-10-01 on measured evidence. Reserving the whole
+        account for options only makes sense while options are
+        tradeable; at this account size they are not - 8.1% round-trip
+        friction against a 10% stop, and 9 of 10 recorded positions
+        never traded above cost+fee on the bid. Suspending share
+        entries left the capital idle waiting for a contract the
+        hurdle gate refuses, so the cohort's screening now feeds share
+        trades instead (0.5% max spread, 1.8:1 reward:risk).
+        """
+        self.assertFalse(self._suspended())
+
+    def test_suspension_is_still_available_for_a_funded_account(self):
+        """The original "go all in on the focus symbol" behaviour, one
+        flag away - which is also when the hurdle gate stops rejecting
+        contracts, since a $1.50-$2 premium carries a 2-3% hurdle.
+        """
+        self.assertTrue(
+            self._suspended(focus_mode_suspends_stock_entries=True)
+        )
 
     def test_stock_entries_resume_when_focus_mode_is_off(self):
-        bot = SimpleNamespace(config=focus_config(focus_mode_enabled=False))
-        suspended = AutoTrader.stock_entries_suspended.__get__(bot)
-        self.assertFalse(suspended())
+        self.assertFalse(self._suspended(focus_mode_enabled=False))
+
+    def test_focus_mode_off_overrides_the_suspension_flag(self):
+        """Suspension is a focus-mode behaviour; with focus mode off
+        there is no cohort to reserve capital for.
+        """
+        self.assertFalse(
+            self._suspended(
+                focus_mode_enabled=False,
+                focus_mode_suspends_stock_entries=True,
+            )
+        )
 
 
 class RealSessionScheduleAlignmentTests(unittest.TestCase):
