@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+from webull_bot.atomic_replace import atomic_replace
+
 
 class InvalidSymbolTracker:
     """Persistent set of symbols that failed broker quote validation."""
@@ -29,7 +31,7 @@ class InvalidSymbolTracker:
             json.dumps(sorted(self.symbols), indent=2),
             encoding="utf-8",
         )
-        temporary.replace(self.path)
+        atomic_replace(temporary, self.path)
 
     def add(self, symbols) -> set[str]:
         candidates = {str(symbol).upper() for symbol in symbols if str(symbol).strip()}

@@ -3,6 +3,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from webull_bot.atomic_replace import atomic_replace
+
 
 class PositionOpenTimeStore:
     """Persists when each open position was entered, across restarts.
@@ -69,7 +71,7 @@ class PositionOpenTimeStore:
                 json.dumps(self.opened_at, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
-            temporary.replace(self.path)
+            atomic_replace(temporary, self.path)
         except Exception as exc:
             self.log.warning("POSAGE | state write failed | %s", exc)
             try:

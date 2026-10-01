@@ -92,12 +92,38 @@ def _position_protection_loop(self) -> None:
             # finished. Now written every fast-loop tick instead -
             # write_status_snapshot has its own internal poll_seconds
             # throttle already, so this doesn't over-write.
+        except Exception as exc:
+            log.error("PROTECT| position-protection cycle failed | %s", exc)
+        # The status snapshot is COSMETIC and is written outside the try
+        # above on purpose.
+        #
+        # Live 2026-10-01, within minutes of the dashboard starting on the
+        # same Windows machine:
+        #
+        #   PROTECT| position-protection cycle failed | [WinError 5]
+        #   Access is denied: 'status.tmp' -> 'status.json'
+        #
+        # Nothing protective had failed. os.replace succeeds on POSIX with
+        # the target open, but on Windows it fails while another process
+        # holds it - and the dashboard reads status.json. Every exit path
+        # above had already run; only the snapshot was lost. Yet the
+        # message said the protection cycle failed, which is the single
+        # most alarming thing this loop can say, and I nearly diagnosed a
+        # broken stop from it.
+        #
+        # A dashboard write must never be able to impersonate a stop
+        # failure, and it must never share a failure path with exit
+        # management.
+        try:
             self.write_status_snapshot(
                 self.cached_positions,
                 self.cached_raw_buying_power,
                 self.cached_circuit_active,
             )
         except Exception as exc:
-            log.error("PROTECT| position-protection cycle failed | %s", exc)
+            log.warning(
+                "PROTECT| status snapshot write failed (dashboard only - "
+                "exits ran normally) | %s", exc,
+            )
         elapsed = time.monotonic() - started
         time.sleep(max(0.0, float(self.config.poll_seconds) - elapsed))
