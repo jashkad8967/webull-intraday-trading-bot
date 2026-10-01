@@ -2,6 +2,9 @@ import logging
 import time
 from decimal import Decimal
 
+from webull_bot.errors.option_sell_into_flat_position import (
+    is_option_sell_into_flat_position,
+)
 from webull_bot.webull_api import QuoteUnavailableError
 
 log = logging.getLogger("webull-bot")
@@ -241,6 +244,27 @@ def boost_stalled_positions(
                     "STALL  | %s | broker returned an unresolvable "
                     "option symbol for this position - skipping this "
                     "cycle | %s", symbol, exc,
+                )
+                continue
+            if is_option_sell_into_flat_position(exc):
+                # Same stale-cache race the held-option exit path hits,
+                # reaching this sweep from its own angle: the position
+                # closed between account refreshes, so the boost sells
+                # into nothing. Benign - the broker's rejection is what
+                # stops a double-sell - and self-resolving on the next
+                # refresh, which this already forces below via
+                # last_account_refresh when anything was boosted.
+                #
+                # Not zeroed here, unlike the held-option path: this
+                # sweep iterates its own position list and does not hold
+                # the cached_positions dict, and matching one up by
+                # symbol would hit the bare-underlying vs OCC mismatch
+                # that already broke four guards. Forcing the refresh is
+                # both correct and sufficient.
+                self.last_account_refresh = 0.0
+                log.warning(
+                    "STALL  | %s | position already closed, nothing to "
+                    "boost - skipping | %s", symbol, exc,
                 )
                 continue
             log.error("STALL  | %s | %s", symbol, exc)

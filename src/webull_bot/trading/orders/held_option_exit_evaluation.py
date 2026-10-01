@@ -3,6 +3,10 @@ import time
 from datetime import date
 from decimal import Decimal
 
+from webull_bot.errors.option_sell_into_flat_position import (
+    is_option_sell_into_flat_position,
+)
+
 log = logging.getLogger("webull-bot")
 
 
@@ -148,4 +152,29 @@ def evaluate_held_option_exits(self) -> None:
                 self.cached_option_buying_power or Decimal("0"),
             )
         except Exception as exc:
+            if is_option_sell_into_flat_position(exc):
+                # The broker does not hold what cached_positions says it
+                # does - a sell filled between slow refreshes. Same
+                # benign race, and the same remedy, as the stock side in
+                # held_exit_evaluation: correct this cycle's own view
+                # rather than waiting out another full scan, which would
+                # re-submit the identical doomed sell every fast pass
+                # until the refresh landed.
+                #
+                # `item` IS the dict inside self.cached_positions (the
+                # candidates list holds the same references), so zeroing
+                # it here needs no symbol matching. That is deliberate:
+                # Webull reports an option position's `symbol` as the
+                # BARE UNDERLYING with the contract in `legs`, so
+                # matching on option_symbol - the OCC symbol - would
+                # silently never match, which is precisely the key
+                # mismatch that already broke four other guards.
+                item["quantity"] = "0"
+                log.warning(
+                    "PROTECT| %s | held-option exit found no real "
+                    "position (already closed) | %s",
+                    option_symbol,
+                    exc,
+                )
+                continue
             log.error("PROTECT| held-option exit failed | %s | %s", option_symbol, exc)
