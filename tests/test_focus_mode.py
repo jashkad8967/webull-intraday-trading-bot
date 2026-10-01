@@ -1894,11 +1894,15 @@ class CohortSelectionTests(unittest.TestCase):
 
 
 class StockSuspensionTests(unittest.TestCase):
-    def _suspended(self, **overrides):
-        bot = SimpleNamespace(config=focus_config(**overrides))
+    def _suspended(self, cohort=(), daily_batch=(), **overrides):
+        bot = SimpleNamespace(
+            config=focus_config(**overrides),
+            focus_cohort=list(cohort),
+            daily_batch=list(daily_batch),
+        )
         return AutoTrader.stock_entries_suspended.__get__(bot)()
 
-    def test_the_shipped_default_lets_stock_entries_run(self):
+    def test_a_locked_cohort_lets_stock_entries_run(self):
         """Changed 2026-10-01 on measured evidence. Reserving the whole
         account for options only makes sense while options are
         tradeable; at this account size they are not - 8.1% round-trip
@@ -1908,7 +1912,30 @@ class StockSuspensionTests(unittest.TestCase):
         hurdle gate refuses, so the cohort's screening now feeds share
         trades instead (0.5% max spread, 1.8:1 reward:risk).
         """
-        self.assertFalse(self._suspended())
+        self.assertFalse(self._suspended(cohort=["AAA"]))
+
+    def test_a_daily_batch_alone_is_enough_to_resume(self):
+        """Before the cohort locks, the daily batch is the screened set
+        and the scan batch is forced to it. It enforces the same
+        focus_min_price..focus_max_price band.
+        """
+        self.assertFalse(self._suspended(daily_batch=["AAA"]))
+
+    def test_nothing_screened_still_sits_out(self):
+        """The regression. Live 2026-10-01 10:27, minutes after the
+        resume flag shipped: "ORDER | STOCK | BUY | MEDS | limit=4.00".
+        A $4 name cannot be in the daily batch or the cohort - both
+        enforce focus_min_price ($10) - so it came from the full
+        universe rotation, which _build_forced_stock_scan_batch falls
+        back to when BOTH screened sets are empty and of which
+        stock_penny_fraction (10%) is sub-$5 names.
+
+        Resuming entries must mean resuming INTO the screened set. With
+        nothing screened there is nothing to resume into, and the
+        designed response to a weak field - sit out rather than spray
+        capital across the scanner's leftovers - still applies.
+        """
+        self.assertTrue(self._suspended())
 
     def test_suspension_is_still_available_for_a_funded_account(self):
         """The original "go all in on the focus symbol" behaviour, one
@@ -1916,15 +1943,18 @@ class StockSuspensionTests(unittest.TestCase):
         contracts, since a $1.50-$2 premium carries a 2-3% hurdle.
         """
         self.assertTrue(
-            self._suspended(focus_mode_suspends_stock_entries=True)
+            self._suspended(
+                cohort=["AAA"], focus_mode_suspends_stock_entries=True
+            )
         )
 
     def test_stock_entries_resume_when_focus_mode_is_off(self):
         self.assertFalse(self._suspended(focus_mode_enabled=False))
 
-    def test_focus_mode_off_overrides_the_suspension_flag(self):
+    def test_focus_mode_off_overrides_both_flags(self):
         """Suspension is a focus-mode behaviour; with focus mode off
-        there is no cohort to reserve capital for.
+        there is no cohort to reserve capital for, and the ordinary
+        multi-symbol scanner is the intended behaviour.
         """
         self.assertFalse(
             self._suspended(

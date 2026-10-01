@@ -30,11 +30,33 @@ def stock_entries_suspended(self) -> bool:
     (0.5% max spread, 1.8:1 reward:risk) rather than sitting idle
     waiting for a contract the hurdle gate will refuse. See
     focus_mode_suspends_stock_entries for the full arithmetic.
+
+    BUT ONLY INTO THE SCREENED SET, which is the whole point and was
+    briefly broken. Live 2026-10-01 10:27, within minutes of shipping
+    the flag above: "ORDER | STOCK | BUY | MEDS | limit=4.00" - a $4
+    name, below focus_min_price ($10), so neither the daily batch nor
+    the cohort could contain it. _build_forced_stock_scan_batch returns
+    None when BOTH are empty, and the scanner then rotates over the
+    full universe, of which stock_penny_fraction (10%) is deliberately
+    sub-$5 names. Allowing entries unconditionally therefore did not
+    redirect the account into screened names, it opened it to the
+    entire universe on exactly the days the screening had rejected
+    everything.
+
+    The paragraph above this one already said so - "the designed
+    response to a weak field is to sit out, not to fall back to
+    spraying capital across the scanner's leftovers" - and the flag
+    shipped anyway. So the condition is an AND on having something
+    screened to trade: with a locked cohort the scan batch is forced to
+    those names, with only a daily batch it is forced to that (both
+    enforce focus_min_price..focus_max_price), and with neither there is
+    nothing to resume INTO and the original sit-out stands.
     """
-    return bool(
-        self.config.focus_mode_enabled
-        and self.config.focus_mode_suspends_stock_entries
-    )
+    if not self.config.focus_mode_enabled:
+        return False
+    if self.config.focus_mode_suspends_stock_entries:
+        return True
+    return not (self.focus_cohort or self.daily_batch)
 
 
 def update_profit_throttle(self, total_equity: Decimal) -> None:
