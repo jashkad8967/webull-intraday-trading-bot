@@ -30,9 +30,56 @@ def close_fractional_positions_before_core_close(self) -> None:
     if now - self.last_fractional_sweep < self.config.eod_retry_seconds:
         return
     self.last_fractional_sweep = now
+    # Cheap cached pre-check BEFORE spending a live positions() call.
+    #
+    # Live 2026-10-01 14:50, on a FLAT account: this swept every
+    # eod_retry_seconds and logged
+    #
+    #   CLOSE | submitted=0 | remaining=0
+    #   CLOSE | fractional pre-close sweep failed | HTTP 429 TOO_MANY_REQUESTS
+    #
+    # four times in 75 seconds and would have continued to the close.
+    # The early return for "no fractional positions" sat BELOW the
+    # positions() call, so a flat account still burned a live request
+    # every cycle - and then retried at the same cadence on the 429,
+    # making the rate limit worse while having nothing to do. Same shape
+    # as the BMEA incident (~570 rejections over 5 hours, zero backoff).
+    #
+    # cached_positions is maintained by the main loop. If it is stale in
+    # the direction that matters - it shows flat while a fractional
+    # position actually exists - the next cycle catches it once the cache
+    # refreshes, and the window here is minutes before core close, not
+    # the close itself. Spending a request per cycle to learn "still
+    # flat" is the worse trade.
+    # A MISSING cache means "unknown" and falls through to the live call,
+    # preserving the original behaviour; a PRESENT one is authoritative,
+    # including when it is empty. Being one cycle late on a cache that
+    # has not filled yet is harmless - this sweep runs repeatedly through
+    # the whole pre-close window.
+    cached = getattr(self, "cached_positions", None)
+    if cached is not None and not any(
+        item.get("instrument_type") == "EQUITY"
+        and self.is_fractional_quantity(
+            Decimal(str(item.get("quantity", "0") or "0"))
+        )
+        for item in cached
+    ):
+        return
     try:
         positions = self.api.positions()
     except Exception as exc:
+        # Back off hard on a rate limit rather than returning to the
+        # normal cadence - retrying a 429 every eod_retry_seconds is what
+        # sustains it.
+        if "429" in str(exc) or "TOO_MANY_REQUESTS" in str(exc).upper():
+            self.last_fractional_sweep = now + float(
+                self.config.eod_retry_seconds
+            ) * 4
+            log.warning(
+                "CLOSE  | fractional pre-close sweep rate-limited | "
+                "backing off | %s", exc,
+            )
+            return
         log.error("CLOSE  | fractional pre-close sweep failed | %s", exc)
         return
     fractional_positions = [
