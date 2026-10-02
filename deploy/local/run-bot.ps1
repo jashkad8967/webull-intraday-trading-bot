@@ -24,14 +24,58 @@ $ErrorActionPreference = 'Continue'
 $Repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $Python = Join-Path $Repo '.venv\Scripts\python.exe'
 $LogDir = Join-Path $Repo 'logs'
-$Log = Join-Path $LogDir 'supervisor.log'
-
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+# ONE LOG FILE PER SUPERVISOR RUN, not a single shared supervisor.log.
+#
+# Live 2026-10-02: the shared file silently stopped accepting writes and
+# recorded NOTHING for fourteen hours -
+#
+#   IOException: The process cannot access the file 'supervisor.log'
+#   because it is being used by another process.
+#
+# A stale handle (from an earlier version of this script that redirected
+# the bot's own output into it with `*>>`) held it with restrictive
+# sharing, and killing every supervisor did not release it. Add-Content
+# failed, $ErrorActionPreference='Continue' swallowed the error, and the
+# supervisor went mute while still working.
+#
+# That mattered: the bot was frozen for 4h40m overnight by Modern Standby
+# and the watchdog restarted it, and NONE of that appeared here. The only
+# reason it was diagnosable at all was bot.err.log.prev. A supervisor that
+# cannot report its own restarts is the part you find out about last.
+#
+# A per-run filename cannot be contended by a previous run, so this
+# failure mode is structurally gone rather than retried.
+$Log = Join-Path $LogDir ("supervisor-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
 function Write-Log($Message) {
     $line = "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
-    Add-Content -Path $Log -Value $line -Encoding utf8
+    try {
+        # .NET with explicit ReadWrite sharing, so a reader (the dashboard,
+        # a tail, an editor) can never block the supervisor from recording.
+        $stream = [System.IO.File]::Open(
+            $Log, [System.IO.FileMode]::Append,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::ReadWrite)
+        try {
+            $writer = New-Object System.IO.StreamWriter($stream)
+            $writer.WriteLine($line)
+            $writer.Flush()
+            $writer.Dispose()
+        } finally { $stream.Dispose() }
+    } catch {
+        # Last resort: never let logging take down the supervisor that is
+        # keeping the trading bot alive.
+        Write-Host $line
+    }
 }
+
+# Keep the last 10 runs. Unbounded per-run files would quietly fill a disk,
+# which this project has already done once on the GCP host.
+Get-ChildItem (Join-Path $LogDir 'supervisor-*.log') -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -Skip 10 |
+    ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
 
 if (-not (Test-Path $Python)) {
     Write-Log "FATAL: no interpreter at $Python"
