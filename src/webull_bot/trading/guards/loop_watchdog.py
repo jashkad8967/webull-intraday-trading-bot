@@ -11,8 +11,23 @@ log = logging.getLogger("webull-bot")
 # ever measured, not near it.
 #
 # The slow scan has been observed at 5-7 MINUTES per cycle under host
-# load (2026-09-22, during an on-host image build), so 15 minutes is
-# roughly double the worst real case.
+# load (2026-09-22, during an on-host image build), so 15 minutes was
+# roughly double the worst real case AT THE TIME.
+#
+# It stopped being double anything. On 2026-10-02 real cycles ran 13-20
+# minutes - 165 option contracts evaluated per pass once the liquid-ETF
+# chains were discovered - and this bound killed a bot that was plainly
+# still working: it had logged option refusals four minutes before being
+# shot. Every restart dropped the daily batch, the cohort and the
+# direction-signal EMA history, and the signals never warmed up enough to
+# emit anything but HOLD. Three cycles in 35 minutes, zero trades. The
+# monitor was not detecting a livelock, it was causing one.
+#
+# The fix is NOT a bigger number - a bound tuned to today's cycle time
+# would rot again the next time the option universe grows. It is measuring
+# the right thing: main_loop_progress_at is updated at intermediate points
+# INSIDE a cycle, so this now means "no progress at all for 15 minutes",
+# which is a genuine hang rather than a slow pass.
 MAIN_LOOP_STALL_SECONDS = 900
 # The protection loop ticks every poll_seconds (sub-second), and it is
 # the one that actually submits stops and profit exits, so a stall here
@@ -26,7 +41,16 @@ def _watchdog_body(self) -> None:
         try:
             now = time.monotonic()
             for name, last, limit in (
-                ("main scan", self.main_loop_ticked_at, MAIN_LOOP_STALL_SECONDS),
+                (
+                    "main scan",
+                    # Progress, not cycle completion - see above.
+                    # Falls back to the cycle tick if progress was
+                    # never recorded, so an old caller still gets
+                    # the original behaviour rather than none.
+                    getattr(self, "main_loop_progress_at", None)
+                    or self.main_loop_ticked_at,
+                    MAIN_LOOP_STALL_SECONDS,
+                ),
                 (
                     "position protection",
                     self.protection_loop_ticked_at,

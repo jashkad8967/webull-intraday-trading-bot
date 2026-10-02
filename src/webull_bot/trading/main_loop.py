@@ -26,6 +26,7 @@ def run(self) -> None:
     start_loop_watchdog(self)
     while True:
         self.main_loop_ticked_at = time.monotonic()
+        self.main_loop_progress_at = time.monotonic()
         moment = self.now()
         if not self.is_trading_day(moment):
             time.sleep(60)

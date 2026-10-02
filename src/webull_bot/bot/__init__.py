@@ -760,6 +760,17 @@ class AutoTrader:
         # until each loop has run once - startup can legitimately take
         # a while and there is nothing to compare against yet.
         self.main_loop_ticked_at: float | None = None
+        # Updated at intermediate points INSIDE a cycle, not just at the
+        # top of one. The watchdog must detect a wedged loop, not a slow
+        # one: on 2026-10-02 a legitimate scan cycle took 13-20 minutes
+        # (165 option contracts evaluated and logged per pass) and the
+        # 900s main-loop bound killed a bot that was demonstrably still
+        # working - it had logged option refusals 4 minutes before being
+        # shot. Each restart then dropped the daily batch, the cohort and
+        # the direction-signal EMA history, so the signals never warmed up
+        # enough to emit anything but HOLD. Three cycles, zero trades: a
+        # livelock created by the monitor rather than detected by it.
+        self.main_loop_progress_at: float | None = None
         self.protection_loop_ticked_at: float | None = None
         # Date the carried-over option sweep last ran - see
         # close_carried_over_options. Once per day, at the option open.
@@ -1117,6 +1128,13 @@ class AutoTrader:
             return buying_power
         open_count, guard_active, directions, batch, quote_by_symbol, today, current_vixy = prepared
         for contract in batch:
+            # Heartbeat INSIDE the cycle. This loop is the slow part - 165
+            # contracts in a single pass on 2026-10-02 - and without a
+            # beat here the watchdog reads a 20-minute cycle as a
+            # 20-minute hang and kills a bot that is working, dropping the
+            # batch, cohort and EMA warm-up every time. See
+            # MAIN_LOOP_STALL_SECONDS for the livelock that caused.
+            self.main_loop_progress_at = time.monotonic()
             option_symbol = contract["symbol"]
             key = f"OPTION:{option_symbol}"
             if option_symbol in self.broker_conflict_symbols:
