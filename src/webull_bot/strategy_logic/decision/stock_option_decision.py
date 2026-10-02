@@ -1,6 +1,10 @@
 from decimal import Decimal
 
 from webull_bot.strategy_logic.types import Decision
+from webull_bot.strategy_logic.options.derived_stop import (
+    IMPLAUSIBLE_STOP_FRACTION,
+    option_stop_fraction,
+)
 
 
 def adaptive_stop_percent(
@@ -534,6 +538,8 @@ def option_decision(
     seconds_since_entry: float | None = None,
     peak_price: Decimal | None = None,
     giveback_fraction: Decimal | None = None,
+    delta: Decimal | None = None,
+    underlying_price: Decimal | None = None,
 ) -> Decision:
     """Exit-only: entries are now decided externally by
     option_direction_signal/option_entry_confirmed (bot.py calls those
@@ -559,7 +565,29 @@ def option_decision(
     target = average_cost * (
         Decimal("1") + self.config.option_take_profit_percent
     ) + fee_per_share
+    # Scale the stop to the UNDERLYING's move rather than to the premium.
+    #
+    # A flat percentage of premium means something different on every
+    # contract, because an option is levered to its underlying by
+    # premium/(delta x spot) - roughly 35x for a cheap ATM one. Live
+    # 2026-10-01: a 10% stop on PFE's 0.62-delta call was a 0.29% move in
+    # PFE, which happens many times an hour, and it cost $7.07 in 150
+    # seconds. Derived, the same contract gets 17.5%.
+    #
+    # Falls back to the flat configured percentage when delta or the
+    # underlying price is unavailable - some account snapshots omit greeks
+    # - because an unprotected position is worse than a mis-scaled stop.
+    # option_min_stop_underlying_move_percent remains the entry-side
+    # backstop for exactly those contracts.
     stop_percent = self.config.option_stop_loss_percent
+    derived = option_stop_fraction(
+        average_cost,
+        delta,
+        underlying_price,
+        self.config.option_stop_target_underlying_move,
+    )
+    if derived is not None and derived < IMPLAUSIBLE_STOP_FRACTION:
+        stop_percent = derived
     # Live incident (NKE): bought at $0.15, stop-loss fired just 6
     # minutes later at $0.10 (a 33% realized loss on a 10% stop,
     # slippage on a thin/fast contract) - normal short-term option
