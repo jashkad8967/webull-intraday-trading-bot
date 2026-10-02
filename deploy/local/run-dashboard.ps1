@@ -70,14 +70,30 @@ $env:PYTHONUNBUFFERED = '1'
 # the same relative-path-under-the-wrong-root failure that silently
 # destroyed state files on the GCP host until deploy/compose.yaml pinned
 # them absolutely.
-foreach ($name in @('STATUS_FILE', 'COMMAND_FILE')) {
-    $value = [Environment]::GetEnvironmentVariable($name, 'Process')
-    if ($value -and -not [System.IO.Path]::IsPathRooted($value)) {
-        $absolute = Join-Path $Repo $value
-        [Environment]::SetEnvironmentVariable($name, $absolute, 'Process')
-        Write-Log "$name -> $absolute"
-    }
+# EVERY *_FILE and *_DIRECTORY variable, not a hand-maintained list.
+#
+# The list approach already failed once: STATUS_FILE and COMMAND_FILE were
+# absolutised and LOG_DIRECTORY was not, so /api/logs resolved to
+# ui/logs/... , found nothing, and returned {"lines":[]} - an empty log
+# panel on a dashboard that otherwise looked healthy. Two of three paths
+# is the same partial-coverage mistake this codebase keeps making.
+#
+# Matching the convention tests/test_state_files_are_persisted.py already
+# enforces for the container: anything named *_file or *_directory is a
+# path, and a RELATIVE one resolves against whatever cwd happens to be -
+# here ui/, because server.py must be imported as a top-level module.
+$rewritten = 0
+foreach ($entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) {
+    $name = [string]$entry.Key
+    if ($name -notmatch '_(FILE|DIRECTORY)$') { continue }
+    $value = [string]$entry.Value
+    if (-not $value -or [System.IO.Path]::IsPathRooted($value)) { continue }
+    $absolute = Join-Path $Repo $value
+    [Environment]::SetEnvironmentVariable($name, $absolute, 'Process')
+    Write-Log "$name -> $absolute"
+    $rewritten++
 }
+Write-Log "absolutised $rewritten relative path setting(s) against $Repo"
 
 $recent = New-Object System.Collections.Generic.Queue[datetime]
 
