@@ -62,8 +62,18 @@ def _range_position(quote, api):
 
 def main(argv) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("side", choices=["buy", "sell"])
+    # "stop" places a RESTING broker-side protective stop. It is grouped
+    # with buy/sell here so the single permitted entry point covers it,
+    # and it is worth being explicit that this widens that permission:
+    # it can only ever submit a SELL stop against an existing position,
+    # so it reduces exposure and cannot open any. It is the one order
+    # type that keeps protecting a position while this process is not
+    # running - which on 2026-10-02 was four hours forty.
+    parser.add_argument("side", choices=["buy", "sell", "stop"])
     parser.add_argument("symbol")
+    parser.add_argument("--stop-price", type=Decimal, default=None,
+                        help="trigger price for 'stop'; defaults to the "
+                             "configured stock stop below the last price")
     parser.add_argument("--instrument", default="EQUITY",
                         choices=["EQUITY", "OPTION"])
     parser.add_argument("--min-range", type=Decimal, default=Decimal("0.70"))
@@ -137,6 +147,42 @@ def main(argv) -> int:
             "spread %.2f%%",
             symbol, last, change * 100, position * 100, spread * 100,
         )
+
+    if args.side == "stop":
+        # Placed DIRECTLY, not through the command queue. The queue is
+        # drained by the trader once per cycle, and the whole value of a
+        # resting stop is that it exists at the broker independently of
+        # this bot's loop - routing it through a queue the bot has to be
+        # alive to read would defeat the point.
+        from webull_bot.webull_api import WebullAPI
+
+        api = WebullAPI(settings)
+        quantity, _cost = api.stock_position(symbol, api.positions())
+        if quantity <= 0:
+            log.error("REFUSED %s: no position to protect", symbol)
+            return 4
+        stop_price = args.stop_price
+        if stop_price is None:
+            quotes, _ = api.stock_quotes_resilient([symbol], "US_STOCK")
+            if not quotes:
+                log.error("REFUSED %s: no quote to derive a stop from", symbol)
+                return 3
+            last = api.quote_price(quotes[0])
+            stop_price = last * (
+                Decimal("1") - settings.stock_stop_loss_max_percent
+            )
+        try:
+            order_id = api.place_stock_stop_loss(symbol, quantity, stop_price)
+        except ValueError as exc:
+            # The fractional case lands here, with its reason intact.
+            log.error("REFUSED %s: %s", symbol, exc)
+            return 5
+        log.warning(
+            "RESTING STOP placed | %s qty=%s stop=%s | id=%s | this survives "
+            "a sleep, a crash, and this process not running",
+            symbol, quantity, stop_price, order_id,
+        )
+        return 0
 
     queue = CommandQueue(settings.command_file)
     command_id = queue.enqueue(

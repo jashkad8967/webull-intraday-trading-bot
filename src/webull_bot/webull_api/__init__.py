@@ -38,6 +38,8 @@ from webull_bot.api.orders import (
     order_filled_price,
     order_status,
     place_stock,
+    place_stock_stop_loss,
+    resting_stop_orders,
 )
 from webull_bot.api.history_bars import (
     _average_amplitude,
@@ -259,6 +261,8 @@ class WebullAPI:
     order_filled_price = staticmethod(order_filled_price)
     cancel_all_orders = cancel_all_orders
     place_stock = place_stock
+    place_stock_stop_loss = place_stock_stop_loss
+    resting_stop_orders = resting_stop_orders
     order_history = order_history
 
     _bid_ask_last_midpoint = _bid_ask_last_midpoint

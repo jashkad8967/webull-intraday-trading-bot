@@ -192,6 +192,105 @@ def place_stock(
     return client_order_id
 
 
+def place_stock_stop_loss(
+    self,
+    symbol: str,
+    quantity: int | Decimal,
+    stop_price: Decimal,
+) -> str:
+    """A RESTING stop held by the broker, not by this process.
+
+    Every stop in this bot has until now been software-only: the
+    protection loop reads a quote, decides the stop is breached, and
+    submits a sell. That means protection exists only while the process
+    is alive, and on 2026-10-02 that assumption broke in production -
+    Modern Standby suspended the machine and the main scan loop did not
+    tick for 16804 seconds (4h40m) before the watchdog restarted it. The
+    account happened to be flat. A position held through that window
+    would have had no stop of any kind for four and a half hours.
+
+    A broker-side stop survives everything the software stop cannot:
+    the machine sleeping, power loss, a crash between restarts, and the
+    absence of any supervising session. The SDK has supported it all
+    along (OrderType.STOP_LOSS, with stop_price); nothing in this
+    codebase had ever asked for it - only LIMIT and MARKET were used.
+
+    GTC, not DAY, deliberately. The entire point is surviving a window
+    in which this process is not running to re-place anything, and that
+    window includes overnight. The cost is that an orphaned GTC stop
+    could later sell a position it was never meant to - see
+    reconcile_resting_stops, which is not optional for that reason.
+
+    FRACTIONAL QUANTITIES ARE REFUSED. Webull only supports fractional
+    share trading as a core-hours MARKET order, so a fractional STOP_LOSS
+    is not a thing that can rest. This matters more than it sounds: at
+    $25 of notional against a $231 share this account's stock positions
+    ARE fractional (0.1047 NVDA), which means they cannot be protected
+    this way at all. Whole-share positions in cheaper names can be, and
+    option contracts always can. Raising that as an explicit error
+    rather than letting the broker reject it keeps the reason visible.
+    """
+    if quantity is None or Decimal(str(quantity)) <= 0:
+        raise ValueError(f"stop-loss quantity must be positive: {quantity!r}")
+    whole = Decimal(str(quantity))
+    if whole != whole.to_integral_value():
+        raise ValueError(
+            f"cannot rest a broker stop on a FRACTIONAL quantity "
+            f"({symbol} {quantity}): Webull supports fractional shares only "
+            f"as core-hours MARKET orders. Size whole shares to get "
+            f"broker-side protection."
+        )
+    client_order_id = uuid4().hex
+    order = {
+        "combo_type": "NORMAL",
+        "client_order_id": client_order_id,
+        "symbol": symbol,
+        "instrument_type": "EQUITY",
+        "market": "US",
+        "order_type": "STOP_LOSS",
+        # Rounded DOWN for a sell stop: rounding up would move the
+        # trigger closer to the current price and fire earlier than the
+        # risk budget intended.
+        "stop_price": str(
+            stop_price.quantize(self.price_tick_size(stop_price))
+        ),
+        "quantity": str(int(whole)),
+        "support_trading_session": "CORE",
+        "side": "SELL",
+        "time_in_force": "GTC",
+        "entrust_type": "QTY",
+    }
+    self._call(
+        lambda: self.trade.order_v3.place_order(
+            self.config.account_id,
+            [order],
+        ),
+        "order",
+        retry=False,
+    )
+    return client_order_id
+
+
+def resting_stop_orders(self) -> list[dict]:
+    """Open STOP_LOSS orders currently held by the broker.
+
+    Used to reconcile at startup. An orphaned resting stop - left behind
+    because the process died between an exit filling and the stop being
+    cancelled - would sit there indefinitely under GTC and could sell a
+    LATER position in the same symbol that was never meant to be
+    protected by it. That is the one way this feature can lose money
+    rather than save it, so it has to be checked rather than assumed.
+    """
+    resting: list[dict] = []
+    for group in self.open_orders() or []:
+        candidates = group.get("orders") or [group]
+        for order in candidates:
+            if str(order.get("order_type", "")).upper() != "STOP_LOSS":
+                continue
+            resting.append(order)
+    return resting
+
+
 def order_history(self, start_date: str, end_date: str) -> list[dict]:
     """Every combo-order entry Webull has on record for the account
     in [start_date, end_date] (each "YYYY-MM-DD") - feeds
