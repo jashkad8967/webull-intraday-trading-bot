@@ -23,6 +23,38 @@ from webull_bot.webull_api import QuoteUnavailableError
 log = logging.getLogger("webull-bot")
 
 
+# One gate-rejection line per gate per underlying per minute.
+#
+# Live 2026-10-02: 165 REFUSED warnings in a SINGLE scan pass once the
+# liquid-ETF chains were discovered. Each one is a formatted log record on
+# the hot path, and together they stretched a cycle to 13-20 minutes -
+# past MAIN_LOOP_STALL_SECONDS, so the watchdog killed a working bot and
+# every restart wiped the batch, cohort and EMA warm-up. Three cycles,
+# zero trades. The gates were correct; the logging about them was the
+# problem.
+#
+# Throttled rather than silenced: those lines are how the gates were
+# verified in the first place ("a 10% stop is only a 0.48% move in NVDA"
+# is exactly the evidence that made the derived stop necessary). The
+# per-cycle option_gate_rejections counter still counts every rejection,
+# so nothing is lost from the totals - only the repetition.
+_GATE_LOG_INTERVAL_SECONDS = 60.0
+
+
+def _should_log_gate(self, gate: str, underlying: str) -> bool:
+    now = time.monotonic()
+    store = getattr(self, "_gate_log_last", None)
+    if store is None:
+        store = {}
+        self._gate_log_last = store
+    key = (gate, str(underlying or "?"))
+    last = store.get(key)
+    if last is not None and now - last < _GATE_LOG_INTERVAL_SECONDS:
+        return False
+    store[key] = now
+    return True
+
+
 def _position_quantity(position: dict) -> Decimal:
     try:
         return Decimal(str(position.get("quantity", 0) or 0))
@@ -255,18 +287,19 @@ def _evaluate_option_entry(
             self.config.option_stop_loss_percent
             * self.config.option_max_entry_hurdle_fraction
         )
-        log.warning(
-            "OPTIONS | %s | REFUSED | round-trip cost %.1f%% exceeds the "
-            "%.1f%% ceiling (%.0f%% stop x %s budget share) | bid=%s ask=%s "
-            "| skipping",
-            option_symbol,
-            hurdle * 100 if hurdle is not None else 0,
-            ceiling * 100,
-            self.config.option_stop_loss_percent * 100,
-            self.config.option_max_entry_hurdle_fraction,
-            self.api.quote_bid(quote),
-            self.api.quote_ask(quote),
-        )
+        if _should_log_gate(self, "hurdle", contract.get("underlying_symbol")):
+            log.warning(
+                "OPTIONS | %s | REFUSED | round-trip cost %.1f%% exceeds the "
+                "%.1f%% ceiling (%.0f%% stop x %s budget share) | bid=%s ask=%s "
+                "| skipping",
+                option_symbol,
+                hurdle * 100 if hurdle is not None else 0,
+                ceiling * 100,
+                self.config.option_stop_loss_percent * 100,
+                self.config.option_max_entry_hurdle_fraction,
+                self.api.quote_bid(quote),
+                self.api.quote_ask(quote),
+            )
         return open_count, buying_power
     underlying = contract["underlying_symbol"]
     # The stop must describe a real move, not the next tick. An option is
@@ -306,16 +339,17 @@ def _evaluate_option_entry(
         self.option_gate_rejections[
             "stop is smaller than the underlying's own noise"
         ] += 1
-        log.warning(
-            "OPTIONS | %s | REFUSED | a %.0f%% stop is only a %.2f%% move "
-            "in %s (floor %.2f%%) - it would be hit by noise, not by a "
-            "trend | skipping",
-            option_symbol,
-            self.config.option_stop_loss_percent * 100,
-            (implied_move * 100) if implied_move is not None else 0,
-            underlying,
-            self.config.option_min_stop_underlying_move_percent * 100,
-        )
+        if _should_log_gate(self, "noise", underlying):
+            log.warning(
+                "OPTIONS | %s | REFUSED | a %.0f%% stop is only a %.2f%% move "
+                "in %s (floor %.2f%%) - it would be hit by noise, not by a "
+                "trend | skipping",
+                option_symbol,
+                self.config.option_stop_loss_percent * 100,
+                (implied_move * 100) if implied_move is not None else 0,
+                underlying,
+                self.config.option_min_stop_underlying_move_percent * 100,
+            )
         return open_count, buying_power
     # What hitting that correctly-scaled stop would actually cost.
     #
@@ -342,17 +376,18 @@ def _evaluate_option_entry(
             self.option_gate_rejections[
                 "one contract risks more than the stop-risk cap"
             ] += 1
-            log.warning(
-                "OPTIONS | %s | REFUSED | a correctly scaled %.1f%% stop on "
-                "one contract risks $%.2f, over the $%.2f cap (%.0f%% of "
-                "$%.2f) | not shrinking the stop to fit | skipping",
-                option_symbol,
-                effective_stop * 100,
-                minimum_risk,
-                risk_cap,
-                self.config.option_max_stop_risk_fraction * 100,
-                buying_power,
-            )
+            if _should_log_gate(self, "riskcap", underlying):
+                log.warning(
+                    "OPTIONS | %s | REFUSED | a correctly scaled %.1f%% stop on "
+                    "one contract risks $%.2f, over the $%.2f cap (%.0f%% of "
+                    "$%.2f) | not shrinking the stop to fit | skipping",
+                    option_symbol,
+                    effective_stop * 100,
+                    minimum_risk,
+                    risk_cap,
+                    self.config.option_max_stop_risk_fraction * 100,
+                    buying_power,
+                )
             return open_count, buying_power
     # By explicit request: "allow a cohort of 5-10 stocks then, that
     # all fit the criteria so that there are more options to play
