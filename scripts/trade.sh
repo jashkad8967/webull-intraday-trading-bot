@@ -32,8 +32,9 @@ fi
 
 side="$1"
 case "$side" in
-    buy|sell) ;;
-    *) echo "trade.sh: side must be buy or sell, got '$side'" >&2; exit 64 ;;
+    buy|sell|stop) ;;
+    *) echo "trade.sh: side must be buy, sell or stop, got '$side'" >&2
+       exit 64 ;;
 esac
 
 if [ "$side" = "buy" ]; then
