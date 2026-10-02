@@ -55,6 +55,12 @@ class StrategyConfigMixin:
             extended_hours_spread_multiplier=Decimal("3"),
             option_take_profit_percent=Decimal("0.75"),
             option_stop_loss_percent=Decimal("0.50"),
+            # 0 disables stop DERIVATION so these shared fixtures keep
+            # asserting the flat option_stop_loss_percent they were written
+            # for. The derived stop (scaled to the underlying's move) has
+            # its own coverage in tests/test_option_derived_stop.py.
+            option_stop_target_underlying_move=Decimal("0"),
+            option_max_stop_risk_fraction=Decimal("1"),
             # Focus-mode additions: the profit-lock trail and the net
             # buy/sell pressure read. Defaults mirror
             # FocusModeSettings so existing expectations are

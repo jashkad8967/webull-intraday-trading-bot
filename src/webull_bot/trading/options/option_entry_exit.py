@@ -5,6 +5,11 @@ from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 from webull_bot.strategy_logic.types import Decision
 from webull_bot.trading.orders.locks import _working_orders_lock
+from webull_bot.strategy_logic.options.derived_stop import (
+    IMPLAUSIBLE_STOP_FRACTION,
+    option_stop_fraction,
+    option_stop_risk_dollars,
+)
 from webull_bot.trading.guards.price_sanity import (
     OPTION_PRICE_SANITY_TOLERANCE,
     option_entry_breakeven_hurdle,
@@ -271,17 +276,31 @@ def _evaluate_option_entry(
     # delta call passed liquidity, spread, delta and hurdle, then lost
     # $7.07 in 150 seconds, because a 10% option stop is a 0.29% move in
     # PFE and PFE does that many times an hour.
+    # The stop this contract will ACTUALLY get, which is the derived one
+    # whenever delta and spot are available - not the flat configured
+    # percentage. Measuring the gate against the flat value while the exit
+    # path uses a derived one would reject contracts that are in fact
+    # correctly protected, and would have kept options permanently closed.
+    entry_delta = self.api.option_delta(quote)
+    entry_spot = self.strategy.prices.get(underlying)
+    entry_premium = self.api.quote_bid(quote)
+    effective_stop = self.config.option_stop_loss_percent
+    derived_stop = option_stop_fraction(
+        entry_premium,
+        entry_delta,
+        entry_spot,
+        self.config.option_stop_target_underlying_move,
+    )
+    if derived_stop is not None and derived_stop < IMPLAUSIBLE_STOP_FRACTION:
+        effective_stop = derived_stop
     implied_move = option_stop_implied_underlying_move(
-        self.api.quote_bid(quote),
-        self.api.option_delta(quote),
-        self.strategy.prices.get(underlying),
-        self.config.option_stop_loss_percent,
+        entry_premium, entry_delta, entry_spot, effective_stop,
     )
     if not option_stop_survives_noise(
-        self.api.quote_bid(quote),
-        self.api.option_delta(quote),
-        self.strategy.prices.get(underlying),
-        self.config.option_stop_loss_percent,
+        entry_premium,
+        entry_delta,
+        entry_spot,
+        effective_stop,
         self.config.option_min_stop_underlying_move_percent,
     ):
         self.option_gate_rejections[
@@ -298,6 +317,43 @@ def _evaluate_option_entry(
             self.config.option_min_stop_underlying_move_percent * 100,
         )
         return open_count, buying_power
+    # What hitting that correctly-scaled stop would actually cost.
+    #
+    # This is the gate that keeps the fix honest. Scaling the stop to the
+    # underlying makes it 17.5% instead of 10% on a PFE-like contract, and
+    # 17.5% of a $50 contract is $8.73 - about 11% of an $80 account on one
+    # trade, with one contract being the minimum size so it cannot be
+    # reduced by trading smaller. Either the account can afford a correctly
+    # stopped position or it cannot.
+    #
+    # Deliberately refuses the ENTRY rather than tightening the stop to
+    # fit. A stop shrunk to be affordable is the original defect wearing a
+    # different number, and that reasoning is exactly how the 5% stop
+    # happened ($60.98 in 37 minutes).
+    #
+    # Measured against one contract, the floor: if the minimum possible
+    # position already risks too much, no size is acceptable.
+    if entry_premium and buying_power > 0:
+        minimum_risk = option_stop_risk_dollars(
+            entry_premium, 1, effective_stop
+        )
+        risk_cap = buying_power * self.config.option_max_stop_risk_fraction
+        if minimum_risk > risk_cap:
+            self.option_gate_rejections[
+                "one contract risks more than the stop-risk cap"
+            ] += 1
+            log.warning(
+                "OPTIONS | %s | REFUSED | a correctly scaled %.1f%% stop on "
+                "one contract risks $%.2f, over the $%.2f cap (%.0f%% of "
+                "$%.2f) | not shrinking the stop to fit | skipping",
+                option_symbol,
+                effective_stop * 100,
+                minimum_risk,
+                risk_cap,
+                self.config.option_max_stop_risk_fraction * 100,
+                buying_power,
+            )
+            return open_count, buying_power
     # By explicit request: "allow a cohort of 5-10 stocks then, that
     # all fit the criteria so that there are more options to play
     # with." Deliberately placed ABOVE the smoke-test bypass below,
@@ -939,6 +995,17 @@ def _evaluate_option_exit(
             self.config.profit_lock_giveback_fraction_after_throttle
             if self.profit_throttle_armed
             else self.config.profit_lock_giveback_fraction
+        ),
+        # The leverage, so the stop can be scaled to the UNDERLYING's
+        # move instead of to the premium. Without these two values every
+        # stop is a flat percentage of premium, which means something
+        # different on every contract - 10% was a 0.29% move in PFE and
+        # cost $7.07 in 150 seconds. Both are best-effort: a snapshot
+        # without greeks falls back to the flat percentage rather than
+        # leaving the position unprotected.
+        delta=self.api.option_delta(quote),
+        underlying_price=self.strategy.prices.get(
+            str(contract.get("underlying_symbol", "")).upper()
         ),
     )
     # By request (momentum-shift overview): a bearish price/RSI

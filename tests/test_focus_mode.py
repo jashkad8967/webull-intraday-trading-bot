@@ -82,6 +82,13 @@ def focus_config(**overrides):
         # tests/test_option_entry_breakeven_room.py, and the cases that
         # mean to exercise it pass their own fraction.
         option_max_entry_hurdle_fraction=Decimal("2.0"),
+        # 0 disables stop DERIVATION, so these fixtures keep asserting the
+        # flat option_stop_loss_percent behaviour they were written for;
+        # the derived stop has its own coverage in
+        # tests/test_option_derived_stop.py. The risk cap is permissive
+        # here for the same reason.
+        option_stop_target_underlying_move=Decimal("0"),
+        option_max_stop_risk_fraction=Decimal("1"),
         # 0 disables the stop-vs-noise gate for fixtures written before
         # it existed: their synthetic quotes carry no delta, and those
         # tests assert other gates. Its own coverage lives in

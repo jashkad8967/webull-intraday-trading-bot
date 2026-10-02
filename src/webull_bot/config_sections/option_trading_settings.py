@@ -566,6 +566,47 @@ class OptionTradingSettings(BaseSettings):
     option_max_entry_hurdle_fraction: Decimal = Field(
         default=Decimal("0.5"), gt=0, le=2
     )
+    # The underlying move an option stop should correspond to, used to
+    # DERIVE the stop per contract instead of applying a flat percentage
+    # of premium:
+    #
+    #     stop_fraction = target x |delta| x spot / premium
+    #
+    # Set to 0 to keep the old flat option_stop_loss_percent behaviour.
+    #
+    # An option is levered to its underlying by premium/(delta x spot) -
+    # about 35x for a cheap ATM contract - so the same percentage of
+    # premium means something completely different on two contracts. A
+    # 10% stop was a 0.29% move in PFE (noise, several times an hour) and
+    # cost $7.07 in 150 seconds on 2026-10-01. Deriving it means every
+    # position's stop represents the same move in its own underlying.
+    #
+    # 0.5% matches option_min_stop_underlying_move_percent, so a derived
+    # stop satisfies that gate by construction rather than by luck - the
+    # gate becomes a backstop for contracts whose delta is unavailable
+    # and which therefore still use the flat percentage.
+    #
+    # The dollar consequence is the uncomfortable part and is handled by
+    # option_max_stop_risk_fraction below, NOT by shrinking the stop: a
+    # stop reduced to be affordable is the original defect with a new
+    # number. For that PFE contract 0.5% gives a 17.5% stop, which on a
+    # $0.50 premium risks $8.75.
+    option_stop_target_underlying_move: Decimal = Field(
+        default=Decimal("0.005"), ge=0, le=Decimal("0.10")
+    )
+    # Most of the account a single option trade may risk once its stop is
+    # scaled correctly. Entries whose properly-scaled stop costs more than
+    # this are REFUSED rather than given a tighter stop.
+    #
+    # This is the gate that makes the arithmetic honest. At $80 of buying
+    # power a 17.5% stop on a $0.50 premium risks $8.75 - 11% of the
+    # account - and one contract is the minimum size, so it cannot be
+    # reduced by trading smaller. Either the account can afford a
+    # correctly stopped position or it cannot, and pretending otherwise is
+    # how the 5% stop happened.
+    option_max_stop_risk_fraction: Decimal = Field(
+        default=Decimal("0.12"), gt=0, le=1
+    )
     # The smallest UNDERLYING move an option stop may represent. Below
     # this the stop is triggered by noise rather than by an adverse move,
     # so the trade is a coin flip on the next tick.
